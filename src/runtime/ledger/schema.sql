@@ -18,11 +18,13 @@ CREATE TABLE job (
     root_id             uuid NOT NULL,          -- for cost_budget / chain_ttl over a tree
     depth               int  NOT NULL DEFAULT 0,-- for max_depth admission limit
     created_by          text NOT NULL,          -- agent_id | 'human' | inbound_event id
+    inbound_event_id    uuid REFERENCES inbound_event(id),  -- originating transport event; lets outbound resolve transport+reply_target
     to_agent            text NOT NULL,
     body                text NOT NULL,
     capability_required text,
     priority            int  NOT NULL DEFAULT 0,
-    status              text NOT NULL DEFAULT 'queued',  -- queued|leased|running|done|failed|dead
+    status              text NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued','leased','running','done','failed','dead')),  -- legal states enforced at the DB
     -- workspace (workspace-actors); base_ref = a prior job's artifact_ref enables chaining
     repo_id       text,
     base_ref      text,
@@ -40,11 +42,14 @@ CREATE TABLE attempt (
     lease_expires_at timestamptz NOT NULL,      -- expiry -> reclaim (crashed worker)
     started_at       timestamptz NOT NULL DEFAULT now(),
     ended_at         timestamptz,
-    status           text NOT NULL DEFAULT 'open',  -- open|ok|failed
+    status           text NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open','ok','failed')),
     result           jsonb,
     error_class      text                       -- retryable|terminal|needs_human
 );
 CREATE INDEX attempt_lease_idx ON attempt (lease_expires_at) WHERE status = 'open';
+-- at most ONE open attempt per job: the hard backstop behind lease_job's CAS (no double-lease)
+CREATE UNIQUE INDEX attempt_one_open_per_job ON attempt (job_id) WHERE status = 'open';
 
 -- append-only progress side channel; NOT part of the hot state machine
 CREATE TABLE attempt_log (
@@ -62,8 +67,9 @@ CREATE TABLE outbound (
     transport       text NOT NULL,
     reply_target    text NOT NULL,              -- from the inbound envelope
     body            text NOT NULL,
-    status          text NOT NULL DEFAULT 'pending',  -- pending|leased|sent|failed
-    provider_msg_id text UNIQUE,                -- dedupe delivery
+    status          text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','leased','sent','failed')),
+    provider_msg_id text UNIQUE,                -- dedupe delivery (exactly-once send)
     tries           int  NOT NULL DEFAULT 0
 );
 CREATE INDEX outbound_pending_idx ON outbound (status) WHERE status = 'pending';

@@ -22,11 +22,16 @@ class CommandAPI(Protocol):
     async def submit_job(
         self, *, to_agent: str, prompt: str,
         parent_id: Optional[UUID] = None,
+        inbound_event_id: Optional[UUID] = None,
+        created_by: str = "human",
         repo_id: Optional[str] = None, base_ref: Optional[str] = None,
         priority: int = 0,
     ) -> UUID:
         """controller|interface: run admission checks (max_depth / max_children /
-        cost_budget(root) / chain_ttl) then queue a job. Rejected -> dead_letter."""
+        cost_budget(root) / chain_ttl) then queue a job. Rejected -> dead_letter.
+        `inbound_event_id` links a transport-originated job to its event so any
+        descendant's reply can resolve transport+reply_target; `created_by` is the
+        provenance (agent_id | 'human' | inbound_event id)."""
         ...
 
     # -- worker lifecycle --

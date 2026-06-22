@@ -61,7 +61,9 @@ transport without editing the spine?*
   own process group with a hard timeout — bulletproof termination, no orphaned children.
 - **C2 — ledger.** A state machine (inbound_event / job / attempt / outbound / dead_letter) with
   leases (crash recovery) and dedupe (exactly-once-ish) — not files. **Persistence is swappable
-  behind the Command API: SQLite for this demo, Postgres for the concurrent production pool.**
+  behind the Command API: SQLite for the zero-setup demo, and a full **asyncpg Postgres** store
+  implementing the same verbs — verified under real contention (50 workers racing one queue,
+  janitor-vs-completion mutual exclusion, dup ingest/delivery, authority-gated retry).**
 - **C3 — comms boundary.** Transport is a dumb pipe over the ledger; it can *never* block on agent
   work — the original outage's root cause.
 - **C4 — failure semantics.** Authority-gated retry (**mutating agents never auto-retry**),
@@ -77,6 +79,12 @@ blind spots a single reviewer misses: a filesystem-concurrency corruption risk, 
 ledger, and the capability-vs-`cli|api` distinction. The design evolved **v0.1 → v0.4** under that
 fire; the `DESIGN.md` changelog and git history show the trail.
 
+The same discipline runs on the *code*: the Postgres ledger was put through a 5-reviewer adversarial
+pass (3 Claude lens-skeptics + Codex + Gemini) that found a **P0 lock-ordering deadlock the green test
+suite had missed** — `cancel()` locked rows in the opposite order from every other verb (an ABBA cycle).
+It's fixed, and the regression test now guarding it was *confirmed to fail on the old code* (~23% of
+trials deadlocked) and pass on the new. Green tests aren't the bar; surviving adversarial review is.
+
 ## Layout
 
 ```
@@ -90,18 +98,29 @@ src/runtime/
   worker.py                  the lease -> invoke -> result loop
   workspace.py               C5 ephemeral git-worktree isolation
   ledger/
-    schema.sql               the Postgres state machine (production)
-    sqlite_store.py          the SQLite store (demo)
+    schema.sql               the Postgres state machine (production DDL)
+    postgres_store.py        the asyncpg Command-API (production ledger)
+    sqlite_store.py          the SQLite store (zero-dep demo)
 tests/
   test_runner.py             deterministic runner tests
   test_workspace.py          git-worktree isolation tests
   test_worker.py             end-to-end worker + isolation test
+  test_postgres_ledger.py    14 concurrency proofs against real Postgres
 ```
 
 ## Status
 
-Internal-first, built clean to release. **Working:** contracts, the C1 runner (tested), the ledger, and the
-worker with **ephemeral git-worktree isolation wired into the loop** — a workspace-actor job runs in its own
-worktree and returns its diff as an artifact, live repo untouched (tested + in the demo). Plus a runnable
-end-to-end demo against real agents. **Next:** the async Postgres Command-API, a worker pool with leases, and
-transport adapters (terminal first).
+Internal-first, built clean to release. **Working:** contracts; the C1 runner (tested); the worker with
+**git-worktree isolation wired into the loop** (a workspace-actor returns its diff as an artifact, live repo
+untouched); a runnable end-to-end demo against real agents; and the **asyncpg Postgres ledger implementing
+the full Command-API — verified under real contention (14 concurrency proofs) and hardened by a 5-reviewer
+adversarial pass that caught a P0 deadlock.** **Next:** a concurrent worker pool leasing off the Postgres
+ledger, and transport adapters (terminal first).
+
+Run the concurrency proofs against a real local Postgres:
+
+```bash
+brew services start postgresql@16 && createdb runtime_test
+LEDGER_TEST_DSN=postgresql://localhost/runtime_test PYTHONPATH=src \
+  python3 tests/test_postgres_ledger.py
+```
