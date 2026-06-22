@@ -1,10 +1,12 @@
-"""Worker + C5 isolation, end-to-end - a workspace-actor job runs in an isolated
-worktree, its file change is captured as the job's artifact_ref, and the LIVE
-repo is untouched. Deterministic (a python-writer agent), no real LLM.
+"""Worker + C5 isolation over the SQLite store - a workspace-actor job runs in an
+isolated worktree, its change is captured as the job's artifact, and the LIVE repo
+is untouched. Deterministic (a python-writer agent), no real LLM. Uses the SAME
+worker.drain() the Postgres e2e test uses (test_postgres_e2e.py).
 
 Run: PYTHONPATH=src python3 tests/test_worker.py
 """
 import asyncio
+import inspect
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,7 +29,6 @@ def _init_repo() -> str:
 
 
 def _register_fixer():
-    # a deterministic workspace-actor: rewrites app.py in its cwd (the worktree)
     REGISTRY["test-fixer"] = AgentSpec(
         agent_id="test-fixer", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
         model="none", role="deterministic code fixer",
@@ -36,32 +37,33 @@ def _register_fixer():
             "open('app.py','w').write('def add(a, b):\\n    return a + b\\n')"]})
 
 
-def test_worker_isolates_a_workspace_actor():
+async def test_worker_isolates_a_workspace_actor():
     _register_fixer()
     repo = _init_repo()
     ledger = Ledger()
 
-    jid = ledger.submit_job("test-fixer", "fix the bug in add()", repo_id=repo)
-    processed = asyncio.run(worker.drain(ledger))
+    jid = await ledger.submit_job("test-fixer", "fix the bug in add()", repo_id=repo)
+    processed = await worker.drain(ledger)
     assert processed == 1
 
-    job = ledger.status(jid)
+    job = await ledger.status(jid)
     assert job["status"] == "done"
 
-    # the agent's change is captured as a diff artifact (NOT merged)
     artifact = job["artifact_ref"]
     assert artifact and Path(artifact).exists()
-    assert "return a + b" in Path(artifact).read_text()
-
-    # the LIVE repo is untouched
-    assert "return a - b" in Path(repo, "app.py").read_text()
+    assert "return a + b" in Path(artifact).read_text()           # the agent's change, captured
+    assert "return a - b" in Path(repo, "app.py").read_text()      # live repo untouched
 
 
-if __name__ == "__main__":
+async def _main():
     passed = 0
     for _name, _fn in sorted(globals().items()):
-        if _name.startswith("test_") and callable(_fn):
-            _fn()
+        if _name.startswith("test_") and inspect.iscoroutinefunction(_fn):
+            await _fn()
             print("PASS", _name)
             passed += 1
     print(f"ALL PASS ({passed})")
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

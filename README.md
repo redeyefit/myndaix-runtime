@@ -11,7 +11,11 @@ execution + config into one event loop — so any single slow part took the whol
 PYTHONPATH=src python3 demo.py            # fast, deterministic (in-process echo agent)
 PYTHONPATH=src python3 demo.py kilabz     # route to a REAL agent (Codex / GPT-5.5)
 PYTHONPATH=src python3 demo.py --isolate  # an agent edits code in an isolated git worktree
+PYTHONPATH=src python3 demo.py --postgres # the SAME worker.drain(), but state lives in Postgres
 ```
+
+`--isolate` (SQLite) and `--postgres` call the *same* `worker.drain()` — only the ledger differs. That's
+the whole thesis: persistence swaps behind the contract.
 
 The real-agent run routes a message through the spine to an actual GPT-5.5 process and back:
 
@@ -104,17 +108,20 @@ src/runtime/
 tests/
   test_runner.py             deterministic runner tests
   test_workspace.py          git-worktree isolation tests
-  test_worker.py             end-to-end worker + isolation test
+  test_worker.py             worker + isolation over the SQLite store
   test_postgres_ledger.py    14 concurrency proofs against real Postgres
+  test_postgres_e2e.py       a real job end-to-end through the Postgres ledger
 ```
 
 ## Status
 
-Internal-first, built clean to release. **Working:** contracts; the C1 runner (tested); the worker with
-**git-worktree isolation wired into the loop** (a workspace-actor returns its diff as an artifact, live repo
-untouched); a runnable end-to-end demo against real agents; and the **asyncpg Postgres ledger implementing
-the full Command-API — verified under real contention (14 concurrency proofs) and hardened by a 5-reviewer
-adversarial pass that caught a P0 deadlock.** **Next:** a concurrent worker pool leasing off the Postgres
+Internal-first, built clean to release. **Working:** contracts; the C1 runner (tested); a **ledger-agnostic
+worker** — one `drain()` drives the SQLite demo store *or* the Postgres production store — with **git-worktree
+isolation** (a workspace-actor returns its diff as an artifact, live repo untouched); the **asyncpg Postgres
+ledger implementing the full Command-API, verified under real contention (14 concurrency proofs), hardened by
+a 5-reviewer adversarial pass that caught a P0 deadlock, and proven end-to-end** (a real job: ingest → submit
+→ isolated worktree → artifact → outbox round-trip, all state in Postgres); plus a runnable demo against real
+agents. **Next:** a *concurrent* worker pool (the current `drain()` is sequential) leasing off the Postgres
 ledger, and transport adapters (terminal first).
 
 Run the concurrency proofs against a real local Postgres:

@@ -1,9 +1,11 @@
 """SQLite-backed ledger for the runnable DEMO (zero external deps).
 
-Production target is Postgres + asyncpg (DESIGN.md C2). The Command API is the
-contract; persistence is swappable behind it - this SQLite store and the
-Postgres one implement the same verbs. Demo store is sync + minimal: just the
-verbs the end-to-end path exercises.
+Production target is Postgres (postgres_store.py). Both stores expose the SAME
+async worker-facing surface - `lease_job -> attempt_id`, `get_attempt_job`,
+`complete_attempt(attempt_id)`, `fail_attempt(attempt_id)` - so ONE worker
+(worker.py) drives either. That is the 'swap persistence behind the contract'
+claim, made literal. Methods are `async` purely for interface parity; SQLite
+itself is synchronous + in-process underneath (fine for a sequential demo drain).
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ import sqlite3
 import uuid
 from typing import Optional
 
-from runtime.contracts import Result
+from runtime.contracts import Job, Result
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS job (
@@ -35,7 +37,7 @@ def _id() -> str:
 
 
 class Ledger:
-    """The demo ledger - the same Command-API verbs the spine uses, on SQLite."""
+    """The demo ledger - the same async worker-facing verbs as PostgresLedger."""
 
     def __init__(self, path: str = ":memory:"):
         self.db = sqlite3.connect(path)
@@ -43,9 +45,9 @@ class Ledger:
         self.db.executescript(_SCHEMA)
 
     # -- dispatch --
-    def submit_job(self, to_agent: str, prompt: str, *, reply_target: str = "demo",
-                   parent_id: Optional[str] = None, repo_id: Optional[str] = None,
-                   base_ref: Optional[str] = None) -> str:
+    async def submit_job(self, to_agent: str, prompt: str, *, reply_target: str = "demo",
+                         parent_id: Optional[str] = None, repo_id: Optional[str] = None,
+                         base_ref: Optional[str] = None) -> str:
         jid = _id()
         self.db.execute(
             "INSERT INTO job(id,parent_id,to_agent,body,reply_target,repo_id,base_ref) "
@@ -54,10 +56,11 @@ class Ledger:
         self.db.commit()
         return jid
 
-    # -- worker lifecycle --
-    def lease_job(self, worker_id: str) -> Optional[sqlite3.Row]:
+    # -- worker lifecycle (the shared WorkerLedger surface) --
+    async def lease_job(self, worker_id: str, capabilities: Optional[list[str]] = None) -> Optional[str]:
+        """Lease one queued job + open its attempt; return the attempt id (or None)."""
         row = self.db.execute(
-            "SELECT * FROM job WHERE status='queued' ORDER BY created_at, rowid LIMIT 1").fetchone()
+            "SELECT id FROM job WHERE status='queued' ORDER BY created_at, rowid LIMIT 1").fetchone()
         if row is None:
             return None
         aid = _id()
@@ -65,10 +68,27 @@ class Ledger:
         self.db.execute("INSERT INTO attempt(id,job_id,worker_id) VALUES(?,?,?)",
                         (aid, row["id"], worker_id))
         self.db.commit()
-        return self.db.execute(
-            "SELECT j.*, ? AS attempt_id FROM job j WHERE j.id=?", (aid, row["id"])).fetchone()
+        return aid
 
-    def complete_attempt(self, job_id: str, attempt_id: str, result: Result) -> None:
+    async def get_attempt_job(self, attempt_id: str) -> Optional[Job]:
+        """The Job a worker should run for this attempt; None if the lease is gone."""
+        row = self.db.execute(
+            "SELECT j.id, j.to_agent, j.body, j.repo_id, j.base_ref "
+            "FROM job j JOIN attempt a ON a.job_id=j.id "
+            "WHERE a.id=? AND a.status='open' AND j.status='leased'", (attempt_id,)).fetchone()
+        if row is None:
+            return None
+        return Job(id=uuid.UUID(row["id"]), to_agent=row["to_agent"], prompt=row["body"],
+                   repo_id=row["repo_id"], base_ref=row["base_ref"])
+
+    async def complete_attempt(self, attempt_id: str, result: Result) -> None:
+        """attempt open->ok, job->done (+artifact); enqueue the reply. No-op if the
+        attempt is already closed."""
+        att = self.db.execute(
+            "SELECT job_id FROM attempt WHERE id=? AND status='open'", (attempt_id,)).fetchone()
+        if att is None:
+            return
+        job_id = att["job_id"]
         self.db.execute("UPDATE attempt SET status='ok', result=? WHERE id=?",
                         (result.model_dump_json(), attempt_id))
         self.db.execute("UPDATE job SET status='done', artifact_ref=? WHERE id=?",
@@ -78,21 +98,26 @@ class Ledger:
                         (_id(), job_id, rt["reply_target"], result.text))
         self.db.commit()
 
-    def fail_attempt(self, job_id: str, attempt_id: str, result: Result) -> None:
+    async def fail_attempt(self, attempt_id: str, result: Result) -> None:
+        """attempt open->failed, job->failed. (The demo store does not auto-retry;
+        authority-gated retry is the Postgres store's job.) No-op if already closed."""
+        att = self.db.execute(
+            "SELECT job_id FROM attempt WHERE id=? AND status='open'", (attempt_id,)).fetchone()
+        if att is None:
+            return
         ec = result.error_class.value if result.error_class else None
         self.db.execute("UPDATE attempt SET status='failed', result=?, error_class=? WHERE id=?",
                         (result.model_dump_json(), ec, attempt_id))
-        # workspace-actors never auto-retry (C4); the demo marks the job failed.
-        self.db.execute("UPDATE job SET status='failed' WHERE id=?", (job_id,))
+        self.db.execute("UPDATE job SET status='failed' WHERE id=?", (att["job_id"],))
         self.db.commit()
 
     # -- outbox / status --
-    def pending_outbound(self) -> list[sqlite3.Row]:
+    async def pending_outbound(self) -> list[sqlite3.Row]:
         return self.db.execute("SELECT * FROM outbound WHERE status='pending'").fetchall()
 
-    def mark_sent(self, outbound_id: str) -> None:
+    async def mark_sent(self, outbound_id: str) -> None:
         self.db.execute("UPDATE outbound SET status='sent' WHERE id=?", (outbound_id,))
         self.db.commit()
 
-    def status(self, job_id: str) -> Optional[sqlite3.Row]:
+    async def status(self, job_id: str) -> Optional[sqlite3.Row]:
         return self.db.execute("SELECT * FROM job WHERE id=?", (job_id,)).fetchone()
