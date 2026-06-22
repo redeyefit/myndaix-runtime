@@ -74,6 +74,7 @@ src/runtime/
   command_api.py             the Command-API verb interface (sole ledger writer)
   runner.py                  C1 cli runner (process-group kill + timeout)
   worker.py                  the lease -> invoke -> result loop
+  workspace.py               C5 ephemeral git-worktree isolation
   ledger/
     schema.sql               the Postgres state machine (production)
     sqlite_store.py          the SQLite store (demo)
@@ -82,6 +83,7 @@ tests/test_runner.py         deterministic runner tests
 
 ## Status
 
-Internal-first, built clean to release. **Working:** contracts, runner (tested), ledger, worker,
-and a runnable end-to-end demo against real agents. **Next:** the async Postgres Command-API
-implementation, a worker pool with leases, and transport adapters (terminal first).
+Internal-first, built clean to release. **Working:** contracts, the C1 runner (tested), the ledger, the worker,
+**ephemeral git-worktree isolation (tested)**, and a runnable end-to-end demo against real agents.
+**Next:** wire worktree isolation into the worker loop, the async Postgres Command-API, a worker
+pool with leases, and transport adapters (terminal first).
