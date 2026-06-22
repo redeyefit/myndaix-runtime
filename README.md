@@ -10,6 +10,7 @@ execution + config into one event loop — so any single slow part took the whol
 ```bash
 PYTHONPATH=src python3 demo.py            # fast, deterministic (in-process echo agent)
 PYTHONPATH=src python3 demo.py kilabz     # route to a REAL agent (Codex / GPT-5.5)
+PYTHONPATH=src python3 demo.py --isolate  # an agent edits code in an isolated git worktree
 ```
 
 The real-agent run routes a message through the spine to an actual GPT-5.5 process and back:
@@ -24,6 +25,19 @@ The real-agent run routes a message through the spine to an actual GPT-5.5 proce
 ```
 
 No Postgres, no Docker, no API keys for the default demo — clone and run.
+
+The `--isolate` run shows a workspace-actor editing buggy code **in an ephemeral git worktree** — the
+live repo is never touched, and the change comes back as a reviewable diff artifact, never auto-merged:
+
+```
+  app.py before : 'def add(a, b):\n    return a - b  # bug'
+  job ee152ab6 -> done (ran in an isolated git worktree)
+  app.py AFTER  : 'def add(a, b):\n    return a - b  # bug'   <- LIVE REPO UNTOUCHED
+
+  the agent's change, captured as a reviewable artifact (NOT auto-merged):
+    -    return a - b  # bug
+    +    return a + b
+```
 
 ## Why it exists
 
@@ -78,12 +92,16 @@ src/runtime/
   ledger/
     schema.sql               the Postgres state machine (production)
     sqlite_store.py          the SQLite store (demo)
-tests/test_runner.py         deterministic runner tests
+tests/
+  test_runner.py             deterministic runner tests
+  test_workspace.py          git-worktree isolation tests
+  test_worker.py             end-to-end worker + isolation test
 ```
 
 ## Status
 
-Internal-first, built clean to release. **Working:** contracts, the C1 runner (tested), the ledger, the worker,
-**ephemeral git-worktree isolation (tested)**, and a runnable end-to-end demo against real agents.
-**Next:** wire worktree isolation into the worker loop, the async Postgres Command-API, a worker
-pool with leases, and transport adapters (terminal first).
+Internal-first, built clean to release. **Working:** contracts, the C1 runner (tested), the ledger, and the
+worker with **ephemeral git-worktree isolation wired into the loop** — a workspace-actor job runs in its own
+worktree and returns its diff as an artifact, live repo untouched (tested + in the demo). Plus a runnable
+end-to-end demo against real agents. **Next:** the async Postgres Command-API, a worker pool with leases, and
+transport adapters (terminal first).

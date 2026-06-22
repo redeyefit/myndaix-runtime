@@ -16,7 +16,7 @@ from runtime.contracts import Result
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS job (
   id TEXT PRIMARY KEY, parent_id TEXT, to_agent TEXT NOT NULL, body TEXT NOT NULL,
-  reply_target TEXT NOT NULL DEFAULT 'demo', base_ref TEXT, artifact_ref TEXT,
+  reply_target TEXT NOT NULL DEFAULT 'demo', repo_id TEXT, base_ref TEXT, artifact_ref TEXT,
   status TEXT NOT NULL DEFAULT 'queued', created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS attempt (
@@ -44,11 +44,13 @@ class Ledger:
 
     # -- dispatch --
     def submit_job(self, to_agent: str, prompt: str, *, reply_target: str = "demo",
-                   parent_id: Optional[str] = None, base_ref: Optional[str] = None) -> str:
+                   parent_id: Optional[str] = None, repo_id: Optional[str] = None,
+                   base_ref: Optional[str] = None) -> str:
         jid = _id()
         self.db.execute(
-            "INSERT INTO job(id,parent_id,to_agent,body,reply_target,base_ref) VALUES(?,?,?,?,?,?)",
-            (jid, parent_id, to_agent, prompt, reply_target, base_ref))
+            "INSERT INTO job(id,parent_id,to_agent,body,reply_target,repo_id,base_ref) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (jid, parent_id, to_agent, prompt, reply_target, repo_id, base_ref))
         self.db.commit()
         return jid
 
