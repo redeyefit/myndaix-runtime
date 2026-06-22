@@ -1,0 +1,27 @@
+[project]
+name = "myndaix-runtime"
+version = "0.1.0"
+description = "MyndAIX Team Runtime - a deterministic spine that routes work to agent CLIs/APIs. openclaw replacement."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "psutil>=5.9",      # process-tree control
+    "pexpect>=4.9",     # stubborn interactive CLIs
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/runtime"]
+
+[tool.ruff]
+line-length = 100
