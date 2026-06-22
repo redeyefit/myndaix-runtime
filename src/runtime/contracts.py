@@ -6,7 +6,7 @@ in ledger/schema.sql; the Command API (command_api.py) is the only writer.
 
 Nothing here knows *how* an agent does its work - only how it's reached
 (reach), what it's allowed to do (authority), and the shape of a job/result.
-That separation is the whole point (the openclaw failure was coupling).
+That separation is the whole point (the prior runtime's failure was coupling).
 """
 from __future__ import annotations
 
@@ -91,8 +91,8 @@ class FormattingCaps(BaseModel):
 
 class TransportEnvelope(BaseModel):
     """Normalized inbound context. Transport semantics live HERE and must never
-    leak into Job/agent fields - that leak was the Discord 'group -> lurk -> ghost'
-    failure of 2026-06-21."""
+    leak into Job/agent fields - that leak sank a prior system: a chat platform's
+    'group' classification made the bot silently drop replies."""
     transport: str
     account: str
     sender_id: str

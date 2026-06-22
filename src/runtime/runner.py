@@ -3,8 +3,8 @@ a hard timeout, and exit-code -> Result mapping. This is the piece that turns
 'agents answer direct local shell calls' into the C1 contract.
 
 No Postgres needed; testable standalone. Process-group kill (start_new_session +
-killpg) is the bulletproof termination the design requires (openclaw leaked
-orphaned children that kept spending tokens). The api adapter is the next phase
+killpg) is the bulletproof termination the design requires (a prior runtime
+leaked orphaned children that kept burning tokens). The api adapter is the next phase
 (recon is the only api agent).
 """
 from __future__ import annotations

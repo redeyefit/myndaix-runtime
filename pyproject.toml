@@ -1,7 +1,7 @@
 [project]
 name = "myndaix-runtime"
 version = "0.1.0"
-description = "MyndAIX Team Runtime - a deterministic spine that routes work to agent CLIs/APIs. openclaw replacement."
+description = "MyndAIX Team Runtime - a deterministic spine that routes work to agent CLIs/APIs. A clean-room replacement for a coupled multi-agent runtime."
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",

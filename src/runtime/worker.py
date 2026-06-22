@@ -3,8 +3,8 @@
 A worker leases a queued job from the ledger, invokes its agent via the C1
 runner, and records the result + a reply. Because the worker pulls from the
 ledger (and the transport reads outbound from it *separately*), a slow or failed
-agent can never starve the command center - the literal openclaw failure of
-2026-06-21. Demo worker = a sequential drain; production = a pool with leases.
+agent can never starve the command center - the prior runtime's exact failure
+mode. Demo worker = a sequential drain; production = a pool with leases.
 """
 from __future__ import annotations
 
