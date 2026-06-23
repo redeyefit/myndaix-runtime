@@ -149,11 +149,12 @@ worktree → artifact → outbox, all state in Postgres); and a **concurrent wor
 janitor) proven to drain a queue with no double-processing, recover a crashed worker's job via lease reclaim,
 keep a healthy long job alive via heartbeats, and **survive a poison job without losing a worker**; and a
 **terminal transport** (C3 dumb pipe) proven to ingest without ever blocking on an agent and to deliver
-replies fully decoupled; and a **FastAPI HTTP Command-API** so clients submit + observe work over the
-network while workers run as a separate process against the same ledger. Every layer was hardened by
-adversarial review, which caught — in turn — a P0 lock-order deadlock, a P0 fleet-death-on-poison-job, and
-a reply misrouted to the wrong sender. **Next:** authn/authz on the API, and a redelivering chat transport
-(at-least-once delivery, e.g. Slack) where the idempotent-dispatch guard earns its keep.
+replies fully decoupled; and a **FastAPI HTTP Command-API with API-key auth** — clients submit + observe **their own**
+work over the network (per-principal ownership; admin reads all; fail-closed) while workers run as a
+separate process against the same ledger. Every layer was hardened by adversarial review, which caught — in
+turn — a P0 lock-order deadlock, a P0 fleet-death-on-poison-job, and a reply misrouted to the wrong sender.
+**Next:** a redelivering chat transport (at-least-once delivery, e.g. Slack) where the idempotent-dispatch
+guard earns its keep, and an api-reach adapter so agents can be real model-API calls, not just CLIs.
 
 Run the concurrency proofs against a real local Postgres:
 

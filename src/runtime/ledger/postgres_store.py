@@ -503,7 +503,7 @@ class PostgresLedger:
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
                 """SELECT j.id, j.to_agent, j.status, j.depth, j.artifact_ref,
-                          j.created_at,
+                          j.created_at, j.created_by,
                           (SELECT json_agg(json_build_object(
                                 'id', a.id, 'status', a.status, 'worker_id', a.worker_id,
                                 'error_class', a.error_class))

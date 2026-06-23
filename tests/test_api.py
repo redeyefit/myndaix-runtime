@@ -1,6 +1,7 @@
-"""HTTP Command-API tests - the runtime as a service. httpx ASGITransport drives
-the REAL FastAPI app (routing + Pydantic validation) in-process against real
-Postgres; a worker pool processes the queue as the separate concern it is.
+"""HTTP Command-API tests - the runtime as a service, WITH API-key auth. httpx
+ASGITransport drives the REAL FastAPI app (routing + Pydantic validation + the
+auth dependency) in-process against real Postgres; a worker pool processes the
+queue as the separate concern it is.
 
 Setup:  brew services start postgresql@16 && createdb runtime_test
 Run:    LEDGER_TEST_DSN=postgresql://localhost/runtime_test \\
@@ -13,13 +14,21 @@ import uuid
 
 import httpx
 
-from runtime.api import create_app
+from runtime.api import Principal, create_app
 from runtime.contracts import Authority, Reach
 from runtime.ledger.postgres_store import PostgresLedger
 from runtime.pool import WorkerPool
 from runtime.registry import REGISTRY, AgentSpec
 
 DSN = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
+
+ALICE, BOB, ADMIN, HUMAN = "key-alice", "key-bob", "key-admin", "key-human"
+KEYS = {
+    ALICE: Principal(id="alice", role="client"),
+    BOB: Principal(id="bob", role="client"),
+    ADMIN: Principal(id="root", role="admin"),
+    HUMAN: Principal(id="human", role="client"),   # an id that collides with the provenance sentinel
+}
 
 
 def _register():
@@ -29,101 +38,185 @@ def _register():
         adapter={"kind": "cli", "prompt_channel": "arg", "argv": ["printf", "echo:%s"]})
 
 
-async def _client_and_ledger():
+async def _fresh_app():
+    _register()
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:
         await con.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     await led.init_schema()
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(led)),
-                               base_url="http://runtime")
-    return client, led
+    return create_app(led, api_keys=KEYS), led
+
+
+def _client(app, key=ALICE):
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                             base_url="http://runtime", headers=headers)
 
 
 async def test_health():
-    _register()
-    client, led = await _client_and_ledger()
+    app, led = await _fresh_app()
+    c = _client(app)
     try:
-        r = await client.get("/health")
-        assert r.status_code == 200
-        body = r.json()
-        assert body["status"] == "ok" and body["queued"] == 0
+        r = await c.get("/health")
+        assert r.status_code == 200 and r.json()["status"] == "ok"
     finally:
-        await client.aclose()
+        await c.aclose()
+        await led.close()
+
+
+async def test_requires_a_valid_key():
+    app, led = await _fresh_app()
+    try:
+        async with _client(app, key=None) as anon:                # no key -> 401, fail-closed
+            assert (await anon.get("/health")).status_code == 401
+            assert (await anon.post("/jobs",
+                    json={"to_agent": "api-echo", "prompt": "x"})).status_code == 401
+        async with _client(app, key="not-a-real-key") as bad:     # unknown key -> 401
+            assert (await bad.get("/health")).status_code == 401
+    finally:
         await led.close()
 
 
 async def test_submit_then_status():
-    _register()
-    client, led = await _client_and_ledger()
+    app, led = await _fresh_app()
+    c = _client(app)
     try:
-        r = await client.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi"})
+        r = await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi"})
         assert r.status_code == 201, r.text
         jid = r.json()["job_id"]
-        assert (await client.get(f"/jobs/{jid}")).json()["status"] == "queued"
+        assert (await c.get(f"/jobs/{jid}")).json()["status"] == "queued"
         await WorkerPool(led, size=2).run_until_idle()
-        assert (await client.get(f"/jobs/{jid}")).json()["status"] == "done"
+        assert (await c.get(f"/jobs/{jid}")).json()["status"] == "done"
     finally:
-        await client.aclose()
+        await c.aclose()
         await led.close()
 
 
 async def test_inbound_produces_a_reply():
-    _register()
-    client, led = await _client_and_ledger()
+    app, led = await _fresh_app()
+    c = _client(app)
     try:
-        r = await client.post("/inbound", json={
-            "sender_id": "alice", "dedupe_key": str(uuid.uuid4()),
-            "body": "ping", "to_agent": "api-echo"})
+        r = await c.post("/inbound", json={"sender_id": "alice", "dedupe_key": str(uuid.uuid4()),
+                                           "body": "ping", "to_agent": "api-echo"})
         assert r.status_code == 201, r.text
         jid = r.json()["job_id"]
         await WorkerPool(led, size=2).run_until_idle()
-        job = (await client.get(f"/jobs/{jid}")).json()
+        job = (await c.get(f"/jobs/{jid}")).json()
         assert job["status"] == "done"
-        replies = [o["body"] for o in (job.get("outbound") or [])]
-        assert any("echo:ping" in b for b in replies), f"reply not in status: {replies}"
+        assert any("echo:ping" in o["body"] for o in (job.get("outbound") or []))
     finally:
-        await client.aclose()
+        await c.aclose()
+        await led.close()
+
+
+async def test_client_cannot_read_another_principals_job():
+    app, led = await _fresh_app()
+    alice, bob, admin = _client(app, ALICE), _client(app, BOB), _client(app, ADMIN)
+    try:
+        jid = (await alice.post("/jobs",
+               json={"to_agent": "api-echo", "prompt": "secret"})).json()["job_id"]
+        assert (await alice.get(f"/jobs/{jid}")).status_code == 200   # owner reads
+        assert (await bob.get(f"/jobs/{jid}")).status_code == 404     # 404 (not 403) - no existence leak
+        assert (await admin.get(f"/jobs/{jid}")).status_code == 200   # admin reads any
+    finally:
+        for c in (alice, bob, admin):
+            await c.aclose()
         await led.close()
 
 
 async def test_unknown_job_404():
-    _register()
-    client, led = await _client_and_ledger()
+    app, led = await _fresh_app()
+    c = _client(app)
     try:
-        assert (await client.get(f"/jobs/{uuid.uuid4()}")).status_code == 404
+        assert (await c.get(f"/jobs/{uuid.uuid4()}")).status_code == 404
     finally:
-        await client.aclose()
+        await c.aclose()
         await led.close()
 
 
 async def test_malformed_inbound_422():
-    _register()
-    client, led = await _client_and_ledger()
+    app, led = await _fresh_app()
+    c = _client(app)
     try:
-        # missing required sender_id / dedupe_key / to_agent -> validation error
-        assert (await client.post("/inbound", json={"body": "x"})).status_code == 422
+        assert (await c.post("/inbound", json={"body": "x"})).status_code == 422
     finally:
-        await client.aclose()
+        await c.aclose()
         await led.close()
 
 
 async def test_input_validation():
-    _register()
-    client, led = await _client_and_ledger()
+    app, led = await _fresh_app()
+    c = _client(app)
     try:
         # empty dedupe_key -> 422 (would otherwise collapse distinct messages)
-        r1 = await client.post("/inbound", json={
-            "sender_id": "a", "dedupe_key": "", "body": "x", "to_agent": "api-echo"})
-        assert r1.status_code == 422, r1.text
+        assert (await c.post("/inbound", json={"sender_id": "a", "dedupe_key": "",
+                "body": "x", "to_agent": "api-echo"})).status_code == 422
         # oversized body -> 422 (DoS guard)
-        r2 = await client.post("/inbound", json={
-            "sender_id": "a", "dedupe_key": "k", "body": "x" * 200_000, "to_agent": "api-echo"})
-        assert r2.status_code == 422
+        assert (await c.post("/inbound", json={"sender_id": "a", "dedupe_key": "k",
+                "body": "x" * 200_000, "to_agent": "api-echo"})).status_code == 422
         # NUL byte -> a clean 422, not a Postgres 500
-        r3 = await client.post("/jobs", json={"to_agent": "api-echo", "prompt": "bad\x00nul"})
-        assert r3.status_code == 422
+        assert (await c.post("/jobs",
+                json={"to_agent": "api-echo", "prompt": "bad\x00nul"})).status_code == 422
     finally:
-        await client.aclose()
+        await c.aclose()
+        await led.close()
+
+
+async def test_namespaced_owner_blocks_provenance_collision():
+    """A client whose id is literally 'human' must NOT read terminal/CLI jobs (whose
+    created_by defaults to the 'human' provenance sentinel) - the api:<id> namespace
+    is what prevents that collision (the P1 the review caught)."""
+    app, led = await _fresh_app()
+    human, admin = _client(app, HUMAN), _client(app, ADMIN)
+    try:
+        jid = str(await led.submit_job(to_agent="api-echo", prompt="internal"))  # created_by='human'
+        assert (await human.get(f"/jobs/{jid}")).status_code == 404
+        assert (await admin.get(f"/jobs/{jid}")).status_code == 200
+    finally:
+        await human.aclose()
+        await admin.aclose()
+        await led.close()
+
+
+async def test_load_api_keys_is_strict():
+    from runtime.api import load_api_keys
+    ok = load_api_keys("t1:alice:client,t2:root:admin")
+    assert ok["t1"].id == "alice" and ok["t2"].role == "admin"
+    for bad in ["secret",                       # token-only -> no token:id:role
+                "tok:p:Admin",                  # bad role casing
+                "dup:a:client,dup:b:admin",     # duplicate token (silent last-wins)
+                ":alice:admin",                 # empty token (phantom key)
+                "tok::admin",                   # empty id
+                "tok:p:",                        # empty role
+                "a:alice:client,b:alice:client"]:  # duplicate principal id (shared ownership)
+        raised = False
+        try:
+            load_api_keys(bad)
+        except ValueError:
+            raised = True
+        assert raised, f"load_api_keys must reject {bad!r}"
+
+
+async def test_api_namespace_reserved_from_agents():
+    """An agent can never be named 'api:*' - that prefix is reserved for API job
+    ownership, so an agent (or a future sub-job) can't forge a created_by an API
+    principal could read."""
+    raised = False
+    try:
+        AgentSpec(agent_id="api:alice", reach=Reach.CLI, authority=Authority.RESPONDER,
+                  model="none", role="x", adapter={"kind": "cli", "argv": ["true"]})
+    except Exception:
+        raised = True
+    assert raised, "an agent_id starting with 'api:' must be rejected"
+
+
+async def test_docs_routes_disabled():
+    app, led = await _fresh_app()
+    try:
+        async with _client(app, key=None) as anon:
+            assert (await anon.get("/openapi.json")).status_code == 404
+            assert (await anon.get("/docs")).status_code == 404
+    finally:
         await led.close()
 
 

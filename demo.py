@@ -225,11 +225,12 @@ async def demo_terminal() -> None:
 
 
 async def demo_api() -> None:
+    import secrets
     import uuid as _uuid
 
     import httpx
 
-    from runtime.api import create_app
+    from runtime.api import Principal, create_app
     from runtime.ledger.postgres_store import PostgresLedger
     from runtime.pool import WorkerPool
 
@@ -244,28 +245,35 @@ async def demo_api() -> None:
         await con.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     await led.init_schema()
     try:
-        app = create_app(led)
+        api_key = "demo-" + secrets.token_hex(8)               # ephemeral, never in source
+        app = create_app(led, api_keys={api_key: Principal(id="alice", role="client")})
         pool = WorkerPool(led, size=4)
-        print("== MyndAIX Team Runtime - HTTP Command-API (FastAPI over Postgres) ==\n")
+        print("== MyndAIX Team Runtime - HTTP Command-API (FastAPI over Postgres, API-key auth) ==\n")
         print("  (httpx drives the real ASGI app in-process; `uvicorn runtime.api:app` serves the same one)\n")
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                     base_url="http://runtime") as client:
-            print(f"  GET  /health    -> {(await client.get('/health')).json()}")
+
+        asgi = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=asgi, base_url="http://runtime") as anon:
+            print(f"  GET  /health  (no API key)  -> {(await anon.get('/health')).status_code} "
+                  "Unauthorized (fail-closed)")
+
+        auth = {"Authorization": f"Bearer {api_key}"}
+        async with httpx.AsyncClient(transport=asgi, base_url="http://runtime", headers=auth) as client:
+            print(f"  GET  /health  (with key)    -> {(await client.get('/health')).json()}")
             r = await client.post("/inbound", json={
                 "sender_id": "alice", "dedupe_key": str(_uuid.uuid4()),
                 "body": "hello over http", "to_agent": "api-echo"})
             jid = r.json()["job_id"]
-            print(f"  POST /inbound   -> {r.status_code}  job {jid[:8]}")
+            print(f"  POST /inbound               -> {r.status_code}  job {jid[:8]}")
             queued = (await client.get(f"/jobs/{jid}")).json()["status"]
-            print(f"  GET  /jobs/{jid[:8]} -> {queued}  (the API only queued it; it never ran the agent)")
+            print(f"  GET  /jobs/{jid[:8]}          -> {queued}  (the API only queued it; never ran the agent)")
             print("\n  ...a separate worker pool drains the queue...")
             await pool.run_until_idle()
             job = (await client.get(f"/jobs/{jid}")).json()
             reply = next((o["body"] for o in (job.get("outbound") or [])), None)
-            print(f"\n  GET  /jobs/{jid[:8]} -> {job['status']}")
+            print(f"\n  GET  /jobs/{jid[:8]}          -> {job['status']}")
             print(f"  reply (from the outbox, read back via status): {reply!r}")
-        print("\nOK - the runtime is an HTTP service over the ledger: clients submit + observe, "
-              "workers run separately. The ledger is the only shared state.")
+        print("\nOK - an authenticated HTTP service over the ledger: clients submit + observe their own "
+              "work, workers run separately. The ledger is the only shared state.")
     finally:
         await led.close()
 

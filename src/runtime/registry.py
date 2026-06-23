@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from runtime.contracts import Authority, Profile, Reach
 
@@ -24,6 +24,16 @@ class AgentSpec(BaseModel):
     # adapter is intentionally a dict: cli {argv, prompt_channel} | api {endpoint, secret_ref, model}
     # (validated by the runner's adapter layer, not the spine)
     adapter: dict[str, Any]
+
+    @field_validator("agent_id")
+    @classmethod
+    def _reserve_api_namespace(cls, v: str) -> str:
+        # 'api:' is reserved for API job ownership (created_by = 'api:<principal>').
+        # Forbidding it here keeps that namespace airtight: an agent (or its sub-jobs)
+        # can never mint a created_by that an API principal could then read.
+        if v.startswith("api:"):
+            raise ValueError("agent_id must not start with the reserved 'api:' prefix")
+        return v
 
 
 # v1 seed roster (data - expected to change). See DESIGN.md S5.
