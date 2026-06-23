@@ -509,8 +509,8 @@ class PostgresLedger:
                                 'error_class', a.error_class))
                              FROM attempt a WHERE a.job_id = j.id) AS attempts,
                           (SELECT json_agg(json_build_object(
-                                'id', o.id, 'status', o.status,
-                                'provider_msg_id', o.provider_msg_id))
+                                'id', o.id, 'status', o.status, 'reply_target', o.reply_target,
+                                'body', o.body, 'provider_msg_id', o.provider_msg_id))
                              FROM outbound o WHERE o.job_id = j.id) AS outbound
                      FROM job j WHERE j.id = $1""", job_id)
         if row is None:

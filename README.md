@@ -14,6 +14,7 @@ PYTHONPATH=src python3 demo.py --isolate  # an agent edits code in an isolated g
 PYTHONPATH=src python3 demo.py --postgres # the SAME worker.drain(), but state lives in Postgres
 PYTHONPATH=src python3 demo.py --pool     # a pool of N workers drains a queue + recovers a crash
 PYTHONPATH=src python3 demo.py --terminal # the C3 dumb pipe: ingest -> queue -> reply, fully decoupled
+PYTHONPATH=src python3 demo.py --api      # the HTTP Command-API: POST a job, GET its status + reply
 ```
 
 `--isolate` (SQLite) and `--postgres` call the *same* `worker.drain()` — only the ledger differs. That's
@@ -115,6 +116,7 @@ src/runtime/
   contracts.py               C0-C3 as Pydantic
   registry.py                the agent roster, as data
   command_api.py             the Command-API verb interface (sole ledger writer)
+  api.py                     FastAPI HTTP surface over the Command-API
   runner.py                  C1 cli runner (process-group kill + timeout)
   worker.py                  the lease -> invoke -> result loop (shared core)
   pool.py                    concurrent worker pool (N workers + janitor + heartbeats)
@@ -133,6 +135,7 @@ tests/
   test_postgres_e2e.py       a real job end-to-end through the Postgres ledger
   test_pool.py               concurrent pool: exactly-once, crash recovery, heartbeat
   test_terminal.py           C3 transport: non-blocking ingest, decoupled delivery
+  test_api.py                HTTP Command-API: submit/status/inbound/validation
 ```
 
 ## Status
@@ -146,10 +149,11 @@ worktree → artifact → outbox, all state in Postgres); and a **concurrent wor
 janitor) proven to drain a queue with no double-processing, recover a crashed worker's job via lease reclaim,
 keep a healthy long job alive via heartbeats, and **survive a poison job without losing a worker**; and a
 **terminal transport** (C3 dumb pipe) proven to ingest without ever blocking on an agent and to deliver
-replies fully decoupled. All three layers were hardened by adversarial review, which caught — in turn — a
-P0 lock-order deadlock, a P0 fleet-death-on-poison-job, and a reply misrouted to the wrong sender. **Next:**
-a FastAPI surface over the Command-API (so transports and workers run as separate processes) and more
-transports (a redelivering one like Slack/Discord, where the idempotent-dispatch guard earns its keep).
+replies fully decoupled; and a **FastAPI HTTP Command-API** so clients submit + observe work over the
+network while workers run as a separate process against the same ledger. Every layer was hardened by
+adversarial review, which caught — in turn — a P0 lock-order deadlock, a P0 fleet-death-on-poison-job, and
+a reply misrouted to the wrong sender. **Next:** authn/authz on the API, and a redelivering chat transport
+(at-least-once delivery, e.g. Slack) where the idempotent-dispatch guard earns its keep.
 
 Run the concurrency proofs against a real local Postgres:
 

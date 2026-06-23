@@ -224,6 +224,52 @@ async def demo_terminal() -> None:
         await led.close()
 
 
+async def demo_api() -> None:
+    import uuid as _uuid
+
+    import httpx
+
+    from runtime.api import create_app
+    from runtime.ledger.postgres_store import PostgresLedger
+    from runtime.pool import WorkerPool
+
+    dsn = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
+    REGISTRY["api-echo"] = AgentSpec(
+        agent_id="api-echo", reach=Reach.CLI, authority=Authority.RESPONDER,
+        model="none", role="echo",
+        adapter={"kind": "cli", "prompt_channel": "arg", "argv": ["printf", "you said: %s"]})
+
+    led = await PostgresLedger.connect(dsn)
+    async with led._pool.acquire() as con:
+        await con.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    await led.init_schema()
+    try:
+        app = create_app(led)
+        pool = WorkerPool(led, size=4)
+        print("== MyndAIX Team Runtime - HTTP Command-API (FastAPI over Postgres) ==\n")
+        print("  (httpx drives the real ASGI app in-process; `uvicorn runtime.api:app` serves the same one)\n")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://runtime") as client:
+            print(f"  GET  /health    -> {(await client.get('/health')).json()}")
+            r = await client.post("/inbound", json={
+                "sender_id": "alice", "dedupe_key": str(_uuid.uuid4()),
+                "body": "hello over http", "to_agent": "api-echo"})
+            jid = r.json()["job_id"]
+            print(f"  POST /inbound   -> {r.status_code}  job {jid[:8]}")
+            queued = (await client.get(f"/jobs/{jid}")).json()["status"]
+            print(f"  GET  /jobs/{jid[:8]} -> {queued}  (the API only queued it; it never ran the agent)")
+            print("\n  ...a separate worker pool drains the queue...")
+            await pool.run_until_idle()
+            job = (await client.get(f"/jobs/{jid}")).json()
+            reply = next((o["body"] for o in (job.get("outbound") or [])), None)
+            print(f"\n  GET  /jobs/{jid[:8]} -> {job['status']}")
+            print(f"  reply (from the outbox, read back via status): {reply!r}")
+        print("\nOK - the runtime is an HTTP service over the ledger: clients submit + observe, "
+              "workers run separately. The ledger is the only shared state.")
+    finally:
+        await led.close()
+
+
 async def main() -> None:
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg == "--postgres":
@@ -232,6 +278,8 @@ async def main() -> None:
         await demo_pool()
     elif arg == "--terminal":
         await demo_terminal()
+    elif arg == "--api":
+        await demo_api()
     elif arg == "--isolate":
         await demo_isolated()
     else:
