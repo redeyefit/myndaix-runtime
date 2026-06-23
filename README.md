@@ -176,6 +176,22 @@ regression test that fails without it.
 - The C4 admission budgets (cost/chain-TTL), composite authority, capability-gated routing — specified in
   `DESIGN.md`, not yet exercised in code.
 
+## Prior art
+
+This sits in a real, active 2026 category — local coding-agent CLI orchestrators with a durable ledger and
+git-worktree isolation — not a novel one. Independent projects converged on nearly the same design:
+[striatum](https://github.com/halbritt/striatum) (Go; daemon-owned Postgres, leases, append-only
+hash-chained provenance), [gobby](https://github.com/GobbyAI/gobby) (Python; PostgreSQL as the source of
+truth, a stdio MCP server, a task→PR build loop), [persistent-agent-runtime](https://github.com/shenjianan97/persistent-agent-runtime)
+(Postgres, `FOR UPDATE SKIP LOCKED` leases, heartbeats, a reaper, dead-letter), and
+[yarli](https://github.com/rahulrajaram/yarli) (Rust; Postgres event store, worktrees). I built this
+independently, and the convergence is the point: when several teams reach the same primitives — a
+single-writer ledger, `SKIP LOCKED` leases, a transactional outbox, ephemeral worktrees — those are the
+load-bearing ones. What's mine to own here isn't the idea but the execution — a deliberately small
+single-Command-API-writer core, the Postgres concurrency proofs (50 workers racing one lease; a 200-trial
+reclaim-vs-complete mutual-exclusion proof), and a cross-family adversarial-review process that caught the
+bugs the green tests missed.
+
 ## Tests
 
 Each suite is a self-contained runner (no pytest config needed). The Postgres-backed suites need the DB
