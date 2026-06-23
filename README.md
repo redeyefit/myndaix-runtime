@@ -37,9 +37,13 @@ the wrapper around them was. This keeps the direct calls and replaces the wrappe
 
 ## Run it
 
-**Zero-dep (only needs `pydantic`; no Postgres, no API keys, no real LLM):**
+**Prerequisites:** Python 3.11+ and git — that's everything the zero-dep demos need. The Postgres demos
+add a local Postgres; the optional real-agent demos add an agent CLI (Node 18+). All three are below.
+
+### 1. Clone and run (zero-dep — no Postgres, no API keys, no LLM)
 
 ```bash
+git clone https://github.com/redeyefit/myndaix-runtime && cd myndaix-runtime
 pip install pydantic
 PYTHONPATH=src python3 demo.py            # route a message through the spine and back
 PYTHONPATH=src python3 demo.py --isolate  # an agent fixes a bug in a throwaway git worktree
@@ -57,11 +61,15 @@ is never touched; the change comes back as a reviewable diff, never auto-merged:
     +    return a + b
 ```
 
-**With a local Postgres** (this is where the real concurrency lives):
+### 2. The Postgres demos (where the real concurrency lives)
 
 ```bash
-pip install pydantic asyncpg fastapi uvicorn httpx
-brew services start postgresql@16 && createdb runtime
+pip install asyncpg fastapi uvicorn httpx
+
+# macOS:           brew install postgresql@16 && brew services start postgresql@16
+# Debian/Ubuntu:   sudo apt-get install -y postgresql && sudo service postgresql start
+
+createdb runtime
 export LEDGER_TEST_DSN=postgresql://localhost/runtime
 
 PYTHONPATH=src python3 demo.py --pool      # N workers drain a queue + recover a crashed worker
@@ -71,10 +79,23 @@ PYTHONPATH=src python3 demo.py --api        # the HTTP service: POST a job, GET 
 ```
 
 `--isolate` (SQLite) and `--postgres` call the *same* `worker.drain()` — only the ledger differs. Swapping
-persistence behind the contract is the central thesis, and it's verified by the code structure, not aspirational.
+persistence behind the contract is the central thesis, verified by the code structure, not aspirational.
 
-To route to a real agent instead of the built-in echo, `demo.py kilabz` runs an actual GPT-5.5 process
-through the spine (needs the `codex` CLI installed and authed).
+### 3. (Optional) Route to a real agent
+
+The roster in `src/runtime/registry.py` maps each agent to a local CLI, so a real model is just a CLI
+install + login away (needs Node 18+ and your own provider account). For example, `demo.py kilabz` runs a
+code-review agent through OpenAI's Codex CLI:
+
+```bash
+npm install -g @openai/codex          # the codex CLI
+codex login                           # OAuth — or: export OPENAI_API_KEY=sk-...
+PYTHONPATH=src python3 demo.py kilabz  # routes a real GPT-5.5 process through the spine
+```
+
+Every other agent in the roster works the same way — install its CLI, authenticate, and the adapter is
+already wired: Claude Code (`npm install -g @anthropic-ai/claude-code`) and the Gemini CLI
+(`npm install -g @google/gemini-cli`).
 
 ## The design
 

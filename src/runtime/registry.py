@@ -58,7 +58,7 @@ V1_ROSTER: list[AgentSpec] = [
                        "prompt_channel": "stdin"}),
     AgentSpec(agent_id="oracle", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gemini-3.1-pro", role="reviewer/vision",
-              adapter={"kind": "cli", "argv": ["agy", "-p"], "prompt_channel": "arg"}),
+              adapter={"kind": "cli", "argv": ["gemini", "-p"], "prompt_channel": "arg"}),
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
               model="sonar-pro+claude", role="research (read-only)",
               profile=Profile(cost_budget=5.0),
