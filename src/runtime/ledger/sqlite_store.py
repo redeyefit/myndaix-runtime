@@ -13,7 +13,7 @@ import sqlite3
 import uuid
 from typing import Optional
 
-from runtime.contracts import Job, Result
+from runtime.contracts import Job, LostLease, Result
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS job (
@@ -82,12 +82,13 @@ class Ledger:
                    repo_id=row["repo_id"], base_ref=row["base_ref"])
 
     async def complete_attempt(self, attempt_id: str, result: Result) -> None:
-        """attempt open->ok, job->done (+artifact); enqueue the reply. No-op if the
-        attempt is already closed."""
+        """attempt open->ok, job->done (+artifact); enqueue the reply. Raises
+        LostLease if the attempt is already closed (reclaimed) - same contract as
+        the Postgres store, so the worker handles both identically."""
         att = self.db.execute(
             "SELECT job_id FROM attempt WHERE id=? AND status='open'", (attempt_id,)).fetchone()
         if att is None:
-            return
+            raise LostLease(f"complete: attempt {attempt_id} no longer open")
         job_id = att["job_id"]
         self.db.execute("UPDATE attempt SET status='ok', result=? WHERE id=?",
                         (result.model_dump_json(), attempt_id))
@@ -100,11 +101,12 @@ class Ledger:
 
     async def fail_attempt(self, attempt_id: str, result: Result) -> None:
         """attempt open->failed, job->failed. (The demo store does not auto-retry;
-        authority-gated retry is the Postgres store's job.) No-op if already closed."""
+        authority-gated retry is the Postgres store's job.) Raises LostLease if the
+        attempt is already closed (reclaimed) - symmetric with complete_attempt."""
         att = self.db.execute(
             "SELECT job_id FROM attempt WHERE id=? AND status='open'", (attempt_id,)).fetchone()
         if att is None:
-            return
+            raise LostLease(f"fail: attempt {attempt_id} no longer open")
         ec = result.error_class.value if result.error_class else None
         self.db.execute("UPDATE attempt SET status='failed', result=?, error_class=? WHERE id=?",
                         (result.model_dump_json(), ec, attempt_id))
@@ -121,3 +123,6 @@ class Ledger:
 
     async def status(self, job_id: str) -> Optional[sqlite3.Row]:
         return self.db.execute("SELECT * FROM job WHERE id=?", (job_id,)).fetchone()
+
+    async def count_queued(self) -> int:
+        return self.db.execute("SELECT count(*) FROM job WHERE status='queued'").fetchone()[0]

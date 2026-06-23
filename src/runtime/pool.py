@@ -1,0 +1,187 @@
+"""Concurrent worker pool (DESIGN.md C4) - what the lease/reclaim machinery was
+built for. The sequential `worker.drain()` never exercised it; this does.
+
+`size` workers + a janitor all lease off the SAME ledger:
+  * FOR UPDATE SKIP LOCKED hands each worker a DIFFERENT job -> no double-process;
+  * the janitor periodically `reclaim_expired()`s, so a crashed worker's job is
+    requeued and finished by another worker - the pool survives worker death;
+  * each worker HEARTBEATS its in-flight job, so a healthy long job is NOT
+    reclaimed (only genuinely dead workers lose their lease).
+
+Robustness (a 'dumb supervisor' must survive its workers):
+  * a worker NEVER dies on a poison job - any unexpected error is caught, the
+    attempt is failed TERMINAL (so it isn't reclaimed forever), and the worker
+    keeps going. The runner is also total (spawn/api failures become Results).
+  * the janitor survives a transient ledger error (caught + continue).
+  * idle is judged against the ledger's real queue depth, not just local counters.
+  * shutdown is bounded: stragglers are cancelled after a grace period.
+
+Single-process asyncio (the per-box shape). Horizontal scale = more processes
+pointing at the same Postgres - the ledger is the only shared state.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Optional
+
+from runtime import worker
+from runtime.contracts import ErrorClass, Result, ResultStatus
+from runtime.workspace import WorkspaceManager
+
+log = logging.getLogger("runtime.pool")
+
+
+class WorkerPool:
+    def __init__(self, ledger, *, size: int = 4, poll_s: float = 0.02,
+                 janitor_interval_s: float = 0.2,
+                 heartbeat_interval_s: Optional[float] = None):
+        self.ledger = ledger
+        self.size = size
+        self.poll_s = poll_s                      # idle worker re-poll delay
+        self.janitor_interval_s = janitor_interval_s
+        self.heartbeat_interval_s = heartbeat_interval_s
+        # a heartbeat must beat well within the lease window or it's defeated (the
+        # lease expires before the first ping and the agent runs orphaned).
+        lease = getattr(ledger, "LEASE_SECONDS", None)
+        if heartbeat_interval_s and lease and heartbeat_interval_s > lease / 2:
+            raise ValueError(
+                f"heartbeat_interval_s={heartbeat_interval_s} too large for a {lease}s "
+                "lease; use <= LEASE_SECONDS/2 so a heartbeat fires before expiry")
+        self.wm = WorkspaceManager()
+        self.processed = 0                        # jobs this pool completed
+        self.reclaimed = 0                        # leases the janitor reclaimed
+        self.worker_faults = 0                    # caught worker errors (none fatal)
+        self.truncated = False                    # set if run_until_idle hit the cap
+        self._stop = asyncio.Event()
+        self._inflight = 0
+        self._last = 0.0
+        self._tasks: list = []
+
+    def _touch(self) -> None:
+        self._last = time.monotonic()
+
+    async def _queued(self) -> int:
+        if hasattr(self.ledger, "count_queued"):
+            return await self.ledger.count_queued()
+        return 0
+
+    async def _worker(self, worker_id: str) -> None:
+        while not self._stop.is_set():
+            attempt_id = None
+            try:
+                attempt_id = await self.ledger.lease_job(worker_id, [])
+                if attempt_id is None:
+                    await asyncio.sleep(self.poll_s)
+                    continue
+                self._inflight += 1
+                self._touch()
+                try:
+                    status = await worker.process_attempt(
+                        self.ledger, attempt_id, self.wm, self.heartbeat_interval_s)
+                    if status is not None:
+                        self.processed += 1
+                finally:
+                    self._inflight -= 1
+                    self._touch()
+            except asyncio.CancelledError:
+                raise  # shutdown cancellation - let the task end
+            except Exception:
+                # a poison job (bad adapter, transient ledger error) must NEVER kill
+                # the worker. Fail the attempt TERMINAL so it isn't reclaimed forever,
+                # then carry on - one bad job can't decimate the fleet.
+                self.worker_faults += 1
+                log.exception("pool worker %s: unexpected error; continuing", worker_id)
+                if attempt_id is not None:
+                    try:
+                        await self.ledger.fail_attempt(attempt_id, Result(
+                            status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                            text="worker caught an unexpected error"))
+                    except Exception:
+                        log.exception("pool worker %s: could not fail attempt %s",
+                                      worker_id, attempt_id)
+                await asyncio.sleep(self.poll_s)
+
+    async def _janitor(self) -> None:
+        if not hasattr(self.ledger, "reclaim_expired"):
+            return
+        while not self._stop.is_set():
+            try:
+                n = await self.ledger.reclaim_expired()
+                if n:
+                    self.reclaimed += n
+                    self._touch()              # reclaim requeued work; keep the pool alive
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # a transient ledger error must NOT permanently disable reclaim
+                # (that would silently revoke the crash-recovery guarantee).
+                log.exception("pool janitor: reclaim_expired failed; continuing")
+            await asyncio.sleep(self.janitor_interval_s)
+
+    async def _shutdown(self, grace_s: float) -> None:
+        self._stop.set()
+        if not self._tasks:
+            return
+        done, pending = await asyncio.wait(self._tasks, timeout=grace_s)
+        for t in pending:                          # stragglers (a wedged invoke) -> cancel
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:                             # surface, never swallow, real errors
+            if not t.cancelled() and t.exception() is not None:
+                log.error("pool task exited with an unexpected error", exc_info=t.exception())
+        self._tasks = []
+
+    async def run_until_idle(self, *, quiet_s: float = 0.5, max_runtime_s: float = 30.0,
+                             grace_s: float = 5.0) -> int:
+        """Spin `size` workers + a janitor, drain the queue concurrently, and stop
+        when nothing is in flight, the ledger queue is empty, and there's been no
+        activity for `quiet_s`. Returns jobs processed. If `max_runtime_s` fires
+        with work remaining, `self.truncated` is set (busy != done)."""
+        if any(not t.done() for t in self._tasks):
+            raise RuntimeError("pool already running")
+        if self.poll_s >= quiet_s:
+            raise ValueError(f"poll_s ({self.poll_s}) must be < quiet_s ({quiet_s}) or "
+                             "the pool can declare idle during a worker's poll gap")
+        if self.janitor_interval_s >= quiet_s:
+            raise ValueError(f"janitor_interval_s ({self.janitor_interval_s}) must be < "
+                             f"quiet_s ({quiet_s}) or a reclaimable crashed job may be "
+                             "missed at the idle check")
+        self._stop.clear()
+        self._touch()
+        self.truncated = False
+        self._tasks = [asyncio.ensure_future(self._worker(f"w{i}")) for i in range(self.size)]
+        self._tasks.append(asyncio.ensure_future(self._janitor()))
+        started = time.monotonic()
+        try:
+            while True:
+                await asyncio.sleep(min(quiet_s / 3, 0.1))
+                queued = await self._queued()
+                if (self._inflight == 0 and queued == 0
+                        and (time.monotonic() - self._last) > quiet_s):
+                    break
+                if (time.monotonic() - started) > max_runtime_s:
+                    self.truncated = True
+                    log.warning("pool run_until_idle hit max_runtime_s=%ss with work "
+                                "remaining (inflight=%s queued=%s)", max_runtime_s,
+                                self._inflight, queued)
+                    break
+        finally:
+            await self._shutdown(grace_s)
+        return self.processed
+
+    async def start(self) -> None:
+        """Long-running mode: workers + janitor run until stop() (a real service)."""
+        if any(not t.done() for t in self._tasks):
+            raise RuntimeError("pool already started")
+        self._stop.clear()
+        self._touch()
+        self._tasks = [asyncio.ensure_future(self._worker(f"w{i}")) for i in range(self.size)]
+        self._tasks.append(asyncio.ensure_future(self._janitor()))
+
+    async def stop(self, grace_s: float = 5.0) -> None:
+        """Graceful shutdown: stop leasing, let in-flight jobs finish within
+        grace_s, then cancel stragglers (their process groups are killed)."""
+        await self._shutdown(grace_s)

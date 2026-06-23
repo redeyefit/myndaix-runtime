@@ -33,14 +33,20 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
         stdin_data = job.prompt.encode()
 
     started = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=job.worktree_path or None,
-        start_new_session=True,  # own process group -> killpg reaches every child
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=job.worktree_path or None,
+            start_new_session=True,  # own process group -> killpg reaches every child
+        )
+    except (FileNotFoundError, PermissionError, NotADirectoryError, OSError) as e:
+        # a misconfigured argv/cwd is a TERMINAL failure, NOT a crash - the worker
+        # must record it and stay alive (a poison job can't take down the fleet).
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text=f"spawn failed: {e}", ms=_ms(started))
 
     comm = proc.communicate(stdin_data) if stdin_data is not None else proc.communicate()
     try:
@@ -52,6 +58,13 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
             status=ResultStatus.TIMEOUT, error_class=ErrorClass.RETRYABLE,
             text=f"timeout after {job.timeout_s}s", ms=_ms(started),
         )
+    except asyncio.CancelledError:
+        # cancelled (lease lost mid-run / pool shutdown) -> kill the process group
+        # so no orphaned child keeps burning, then propagate. shield the reap so a
+        # SECOND cancellation can't interrupt the SIGKILL escalation in _reap.
+        _kill_group(proc.pid)
+        await asyncio.shield(_reap(proc))
+        raise
 
     code = proc.returncode
     if code == 0:
@@ -70,7 +83,9 @@ async def invoke(agent_id: str, job: Job) -> Result:
                       text=f"unknown agent: {agent_id}")
     if spec.reach is Reach.CLI:
         return await invoke_cli(spec, job)
-    raise NotImplementedError("api adapter is the next build phase")
+    # api adapter is the next build phase: fail TERMINAL, never crash the worker
+    return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                  text=f"api adapter not implemented (agent '{agent_id}')")
 
 
 # -- helpers --

@@ -129,10 +129,61 @@ async def demo_isolated_postgres() -> None:
         await led.close()
 
 
+async def demo_pool() -> None:
+    import time
+
+    from runtime.ledger.postgres_store import PostgresLedger
+    from runtime.pool import WorkerPool
+
+    dsn = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
+    # a slow responder so concurrency is visible in wall-clock
+    REGISTRY["pool-demo"] = AgentSpec(
+        agent_id="pool-demo", reach=Reach.CLI, authority=Authority.RESPONDER,
+        model="none", role="slow responder",
+        adapter={"kind": "cli", "prompt_channel": "stdin",
+                 "argv": ["sh", "-c", "sleep 0.3; printf done"]})
+
+    led = await PostgresLedger.connect(dsn)
+    async with led._pool.acquire() as con:
+        await con.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    await led.init_schema()
+    try:
+        n, size = 13, 6
+        print("== MyndAIX Team Runtime - concurrent worker pool (Postgres) ==\n")
+        print(f"  {n} jobs (~0.3s each) | {size} workers | 1 simulated crashed worker\n")
+        for i in range(n):
+            await led.submit_job(to_agent="pool-demo", prompt=f"job {i}")
+
+        # simulate a crashed worker: lease one job, expire its lease, never complete it
+        crashed = await led.lease_job("crashed-worker", [])
+        async with led._pool.acquire() as con:
+            await con.execute("UPDATE attempt SET lease_expires_at = "
+                              "statement_timestamp() - interval '1 second' WHERE id=$1", crashed)
+        print("  a worker leased a job then 'crashed' (lease expired, never completed)")
+
+        pool = WorkerPool(led, size=size, janitor_interval_s=0.1)
+        t0 = time.monotonic()
+        processed = await pool.run_until_idle(quiet_s=0.5)
+        elapsed = time.monotonic() - t0
+
+        async with led._pool.acquire() as con:
+            done = await con.fetchval("SELECT count(*) FROM job WHERE status='done'")
+        print(f"\n  processed {processed} jobs in {elapsed:.2f}s "
+              f"(sequential would be ~{n * 0.3:.1f}s)")
+        print(f"  jobs done : {done}/{n}")
+        print(f"  reclaimed : {pool.reclaimed} (the crashed worker's job, recovered by the janitor)")
+        print("\nOK - workers drained the queue concurrently with no double-processing, and "
+              "the crashed worker's job was recovered. The ledger is the only shared state.")
+    finally:
+        await led.close()
+
+
 async def main() -> None:
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg == "--postgres":
         await demo_isolated_postgres()
+    elif arg == "--pool":
+        await demo_pool()
     elif arg == "--isolate":
         await demo_isolated()
     else:

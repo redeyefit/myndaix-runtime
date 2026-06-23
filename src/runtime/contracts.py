@@ -130,3 +130,11 @@ class Result(BaseModel):
     artifact_ref: Optional[str] = None   # e.g. a branch/patch for a workspace-actor diff
     cost: Optional[float] = None
     ms: Optional[int] = None
+
+
+# -- shared ledger signal -------------------------------------------------
+class LostLease(Exception):
+    """Raised by a ledger when a worker acts on an attempt it no longer holds
+    (reclaimed, cancelled, or already completed). The worker treats it as 'someone
+    else owns this job now' - abort, do NOT retry. (The SQLite demo store no-ops
+    instead of raising; the worker catches this so both stores behave the same.)"""

@@ -12,6 +12,7 @@ PYTHONPATH=src python3 demo.py            # fast, deterministic (in-process echo
 PYTHONPATH=src python3 demo.py kilabz     # route to a REAL agent (Codex / GPT-5.5)
 PYTHONPATH=src python3 demo.py --isolate  # an agent edits code in an isolated git worktree
 PYTHONPATH=src python3 demo.py --postgres # the SAME worker.drain(), but state lives in Postgres
+PYTHONPATH=src python3 demo.py --pool     # a pool of N workers drains a queue + recovers a crash
 ```
 
 `--isolate` (SQLite) and `--postgres` call the *same* `worker.drain()` — only the ledger differs. That's
@@ -71,7 +72,9 @@ transport without editing the spine?*
 - **C3 — comms boundary.** Transport is a dumb pipe over the ledger; it can *never* block on agent
   work — the original outage's root cause.
 - **C4 — failure semantics.** Authority-gated retry (**mutating agents never auto-retry**),
-  process-group kill, admission limits (no runaway job trees).
+  process-group kill, admission limits (no runaway job trees). A **concurrent worker pool** (N workers
+  + a janitor) realizes it: crashed workers' leases are reclaimed and their jobs finished by others;
+  healthy long jobs survive via heartbeats.
 - **C5 — workspace isolation.** Each file-mutating job runs in an ephemeral **git worktree**;
   concurrent agents can't corrupt a shared repo.
 
@@ -89,6 +92,12 @@ suite had missed** — `cancel()` locked rows in the opposite order from every o
 It's fixed, and the regression test now guarding it was *confirmed to fail on the old code* (~23% of
 trials deadlocked) and pass on the new. Green tests aren't the bar; surviving adversarial review is.
 
+The concurrent worker pool ran the same gauntlet and it earned its keep again: the reviewers found a
+**P0 where one poison job** (a bad agent binary, or the not-yet-built api adapter) **silently killed
+every worker** — `gather(return_exceptions=True)` swallowed the tracebacks, so the pool returned a false
+"done." Fixed with a worker exception boundary + a total runner, and the poison-survival regression test
+the suite had been missing.
+
 ## Layout
 
 ```
@@ -99,7 +108,8 @@ src/runtime/
   registry.py                the agent roster, as data
   command_api.py             the Command-API verb interface (sole ledger writer)
   runner.py                  C1 cli runner (process-group kill + timeout)
-  worker.py                  the lease -> invoke -> result loop
+  worker.py                  the lease -> invoke -> result loop (shared core)
+  pool.py                    concurrent worker pool (N workers + janitor + heartbeats)
   workspace.py               C5 ephemeral git-worktree isolation
   ledger/
     schema.sql               the Postgres state machine (production DDL)
@@ -111,18 +121,21 @@ tests/
   test_worker.py             worker + isolation over the SQLite store
   test_postgres_ledger.py    14 concurrency proofs against real Postgres
   test_postgres_e2e.py       a real job end-to-end through the Postgres ledger
+  test_pool.py               concurrent pool: exactly-once, crash recovery, heartbeat
 ```
 
 ## Status
 
 Internal-first, built clean to release. **Working:** contracts; the C1 runner (tested); a **ledger-agnostic
-worker** — one `drain()` drives the SQLite demo store *or* the Postgres production store — with **git-worktree
+worker** — one shared core drives the SQLite demo store *or* the Postgres production store — with **git-worktree
 isolation** (a workspace-actor returns its diff as an artifact, live repo untouched); the **asyncpg Postgres
-ledger implementing the full Command-API, verified under real contention (14 concurrency proofs), hardened by
-a 5-reviewer adversarial pass that caught a P0 deadlock, and proven end-to-end** (a real job: ingest → submit
-→ isolated worktree → artifact → outbox round-trip, all state in Postgres); plus a runnable demo against real
-agents. **Next:** a *concurrent* worker pool (the current `drain()` is sequential) leasing off the Postgres
-ledger, and transport adapters (terminal first).
+ledger implementing the full Command-API, verified under real contention (14 concurrency proofs), hardened by a
+5-reviewer adversarial pass that caught a P0 deadlock, and proven end-to-end** (ingest → submit → isolated
+worktree → artifact → outbox, all state in Postgres); and a **concurrent worker pool** (N async workers + a
+janitor) proven to drain a queue with no double-processing, recover a crashed worker's job via lease reclaim,
+keep a healthy long job alive via heartbeats, and **survive a poison job without losing a worker** (hardened
+by a second adversarial pass that caught a P0 fleet-death bug). **Next:** transport adapters (terminal first)
+and a FastAPI surface over the Command-API so transports and workers run as separate processes.
 
 Run the concurrency proofs against a real local Postgres:
 

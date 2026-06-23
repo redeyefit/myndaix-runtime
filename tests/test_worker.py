@@ -55,6 +55,82 @@ async def test_worker_isolates_a_workspace_actor():
     assert "return a - b" in Path(repo, "app.py").read_text()      # live repo untouched
 
 
+async def test_heartbeat_lost_lease_cancels_and_drops():
+    """If a heartbeat finds the lease gone mid-run, the agent is cancelled and the
+    job is dropped (return None) - never finalized, no double-mutation. No Postgres:
+    a fake ledger whose heartbeat reports the lease lost on the first beat."""
+    import uuid as _uuid
+
+    from runtime.contracts import Job, LostLease
+
+    REGISTRY["slow-sleeper"] = AgentSpec(
+        agent_id="slow-sleeper", reach=Reach.CLI, authority=Authority.RESPONDER,
+        model="none", role="slow",
+        adapter={"kind": "cli", "prompt_channel": "stdin",
+                 "argv": ["sh", "-c", "sleep 5; printf done"]})
+
+    class FakeLedger:
+        LEASE_SECONDS = 0.2
+
+        def __init__(self):
+            self.finalized = False
+
+        async def get_attempt_job(self, attempt_id):
+            return Job(id=_uuid.uuid4(), to_agent="slow-sleeper", prompt="x")
+
+        async def heartbeat_attempt(self, attempt_id):
+            raise LostLease("reclaimed")
+
+        async def complete_attempt(self, attempt_id, result):
+            self.finalized = True
+
+        async def fail_attempt(self, attempt_id, result):
+            self.finalized = True
+
+    led = FakeLedger()
+    status = await worker.process_attempt(led, "att-1", heartbeat_interval_s=0.05)
+    assert status is None, "a lost lease mid-run must return None"
+    assert not led.finalized, "must NOT finalize a job whose lease was lost"
+
+
+async def test_invoke_never_leaks_the_agent_task():
+    """_invoke must cancel + reap the heartbeat-wrapped agent on EVERY exit, not
+    just LostLease - a non-LostLease heartbeat error (or shutdown cancel) must not
+    orphan the subprocess. (Regression for a leak a fix introduced + review caught.)"""
+    import uuid as _uuid
+
+    from runtime import worker as _w
+    from runtime.contracts import Job
+
+    state = {"cancelled": False}
+
+    async def fake_invoke(agent_id, job):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    class BadLedger:  # heartbeat raises a NON-LostLease error
+        async def heartbeat_attempt(self, attempt_id):
+            raise RuntimeError("db down")
+
+    orig = _w.runner.invoke
+    _w.runner.invoke = fake_invoke
+    try:
+        job = Job(id=_uuid.uuid4(), to_agent="x", prompt="x")
+        raised = False
+        try:
+            await _w._invoke(BadLedger(), "att", job, 0.01)
+        except RuntimeError:
+            raised = True
+        assert raised, "a non-LostLease heartbeat error should propagate"
+        await asyncio.sleep(0.02)
+        assert state["cancelled"], "the agent task must be cancelled (not leaked)"
+    finally:
+        _w.runner.invoke = orig
+
+
 async def _main():
     passed = 0
     for _name, _fn in sorted(globals().items()):

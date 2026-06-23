@@ -36,14 +36,11 @@ from uuid import UUID
 import asyncpg
 
 from runtime import registry
-from runtime.contracts import Authority, ErrorClass, Job, Result, TransportEnvelope
+from runtime.contracts import (
+    Authority, ErrorClass, Job, LostLease, Result, TransportEnvelope,
+)
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-
-
-class LostLease(Exception):
-    """Raised when a worker acts on an attempt it no longer holds (it was
-    reclaimed, cancelled, or already completed). Signal to abort - do NOT retry."""
 
 
 def _new_id() -> str:
@@ -287,13 +284,14 @@ class PostgresLedger:
           retryable + responder/controller -> queued (requeue)
           retryable + workspace_actor/unknown -> dead + dead_letter (never replay a mutation)
           terminal / needs_human / unknown class -> failed (fail-closed)
-        Idempotent: a no-op on an already-closed attempt."""
+        Raises LostLease if the attempt is already closed (reclaimed) - symmetric
+        with complete_attempt, so a worker never double-counts a job it lost."""
         async with self._pool.acquire() as con:
             async with con.transaction():
                 att = await con.fetchrow(
                     "SELECT id, job_id, status FROM attempt WHERE id = $1 FOR UPDATE", attempt_id)
                 if att is None or att["status"] != "open":
-                    return  # idempotent no-op
+                    raise LostLease(f"fail: attempt {attempt_id} no longer open")
                 ec = result.error_class.value if result.error_class else None
                 await con.execute(
                     """UPDATE attempt SET status='failed', result=$2, error_class=$3,
@@ -493,3 +491,8 @@ class PostgresLedger:
         if isinstance(out.get("created_at"), _dt.datetime):
             out["created_at"] = out["created_at"].isoformat()
         return out
+
+    async def count_queued(self) -> int:
+        """Cheap queue-depth probe for a pool's idle detection."""
+        async with self._pool.acquire() as con:
+            return await con.fetchval("SELECT count(*) FROM job WHERE status = 'queued'")
