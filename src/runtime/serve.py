@@ -3,7 +3,7 @@
 This is the operational half of the runtime: a pool of workers that continuously
 leases jobs from the Postgres ledger and runs them through the real agent CLIs,
 plus a janitor that reclaims crashed leases. Submit work to it with `runtime.cli`
-(the `mx` command). It replaces the prior runtime's agent-dispatch loop with a
+(the `mxr` command). It replaces the prior runtime's agent-dispatch loop with a
 durable, crash-recoverable one that can't be wedged by a slow agent.
 
     createdb runtime && psql runtime < src/runtime/ledger/schema.sql   # one-time

@@ -2,7 +2,7 @@
 
 The runtime runs as two pieces against one Postgres database: a long-lived worker-pool
 **service** that drains the queue and runs jobs through the real agent CLIs, and a thin
-**`mx` CLI** that submits a task and prints the agent's reply. You name the agent; the
+**`mxr` CLI** that submits a task and prints the agent's reply. You name the agent; the
 runtime dispatches it durably and hands back the result — direct ops, no orchestrator in
 the loop.
 
@@ -26,13 +26,16 @@ PYTHONPATH=src python3 -m runtime.serve            # foreground; Ctrl-C to stop 
 PYTHONPATH=src python3 -m runtime.cli kilabz "one-line review: def add(a,b): return a-b"
 ```
 
-A convenient alias:
+A convenient wrapper on your `PATH` (e.g. `~/.local/bin/mxr`):
 
 ```bash
-mx() { MYNDAIX_DSN=postgresql://localhost/runtime PYTHONPATH="$HOME/code/myndaix-runtime/src" \
-       python3 -m runtime.cli "$@"; }
-mx kilabz "review the diff in ..."
+#!/bin/bash
+export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://localhost/runtime}"
+export PYTHONPATH="$HOME/code/myndaix-runtime/src"
+exec python3 -m runtime.cli "$@"
 ```
+
+then `mxr kilabz "review the diff in ..."`.
 
 The agent it dispatches to must have its CLI installed and authenticated in the service's
 environment (see the roster in `src/runtime/registry.py`).

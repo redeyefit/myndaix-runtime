@@ -1,7 +1,7 @@
-"""mx - submit a task to the running MyndAIX runtime and print the agent's reply.
+"""mxr - submit a task to the running MyndAIX runtime and print the agent's reply.
 
     PYTHONPATH=src python3 -m runtime.cli <agent> "<task>"
-    # or alias:  mx() { MYNDAIX_DSN=... PYTHONPATH=.../src python3 -m runtime.cli "$@"; }
+    # or a wrapper on PATH (see docs/OPERATING.md):  mxr <agent> "<task>"
 
 Needs the worker-pool service running (`python3 -m runtime.serve`) and $MYNDAIX_DSN.
 This is direct ops: you name the agent, the runtime dispatches it durably and hands
