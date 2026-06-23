@@ -1,5 +1,7 @@
 # MyndAIX Team Runtime
 
+[![ci](https://github.com/redeyefit/myndaix-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/redeyefit/myndaix-runtime/actions/workflows/ci.yml)
+
 A deterministic, Postgres-backed spine for multi-agent work. One Command API is the only thing that
 writes the ledger, so agents lease, run, and reply through database row locks instead of files — and the
 file-IPC bug classes (double-lease, lost update, duplicate delivery, a crashed worker's job stuck forever)
@@ -152,7 +154,7 @@ regression test that fails without it.
 
 ## What works, what doesn't
 
-**Built and tested (49 tests, all against real substrates — real Postgres, real subprocesses, real HTTP):**
+**Built and tested (50 tests, all against real substrates — real Postgres, real subprocesses, real HTTP):**
 
 - A ledger-agnostic worker: one core drives the SQLite demo store *or* the Postgres production store.
 - The asyncpg Postgres ledger: all the Command-API verbs, **15 concurrency proofs** against a live Postgres
@@ -206,5 +208,5 @@ src/runtime/
     sqlite_store.py          the SQLite store (zero-dep demo)
   transport/
     terminal.py              C3 terminal transport (dumb pipe over the ledger)
-tests/                       49 tests across 8 suites
+tests/                       50 tests across 8 suites
 ```
