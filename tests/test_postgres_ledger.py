@@ -71,7 +71,8 @@ async def test_no_double_lease(led: PostgresLedger) -> None:
 
 # -- invariant 2: reclaim vs complete are mutually exclusive (the crown jewel) --
 async def test_reclaim_vs_complete(led: PostgresLedger) -> None:
-    completed = lost = 0
+    # (A) 200 concurrent races: under real contention EXACTLY one writer acts on
+    # the attempt and the job ends in a single consistent state (mutual exclusion).
     for trial in range(200):
         await _truncate(led)
         jid = await led.submit_job(to_agent="kilabz", prompt="hi")  # responder -> requeues on reclaim
@@ -87,23 +88,39 @@ async def test_reclaim_vs_complete(led: PostgresLedger) -> None:
 
         reclaimed, outcome = await asyncio.gather(led.reclaim_expired(), _complete())
         st = await led.get_status(jid)
-
-        # EXACTLY one writer acted on the attempt; the outcomes are mutually exclusive
         assert (outcome == "completed" and reclaimed == 0) or \
                (outcome == "lost" and reclaimed == 1), \
             f"trial {trial}: outcome={outcome} reclaimed={reclaimed} (not mutually exclusive)"
-        if outcome == "completed":
-            assert st["status"] == "done", f"trial {trial}: completed but job={st['status']}"
-            completed += 1
-        else:
-            assert st["status"] == "queued", f"trial {trial}: lost but job={st['status']}"
-            lost += 1
+        assert st["status"] == ("done" if outcome == "completed" else "queued"), \
+            f"trial {trial}: outcome={outcome} but job={st['status']}"
         async with led._pool.acquire() as con:
             opn = await con.fetchval(
                 "SELECT count(*) FROM attempt WHERE job_id=$1 AND status='open'", jid)
         assert opn <= 1, f"trial {trial}: {opn} open attempts (double state)"
-    # both interleavings must actually occur, or the test isn't exercising the race
-    assert completed > 0 and lost > 0, f"weak race coverage: completed={completed} lost={lost}"
+
+    # (B) both outcomes proven DETERMINISTICALLY (timing-independent coverage):
+    # complete-wins: a worker finishing after expiry but before the janitor runs still wins
+    await _truncate(led)
+    jid = await led.submit_job(to_agent="kilabz", prompt="hi")
+    att = await led.lease_job("w1", [])
+    await _expire_lease(led, att)
+    await led.complete_attempt(att, _ok())
+    assert (await led.get_status(jid))["status"] == "done"
+    assert await led.reclaim_expired() == 0, "janitor must find nothing once the job is done"
+
+    # reclaim-wins: the janitor reclaims first; the late complete loses (LostLease)
+    await _truncate(led)
+    jid = await led.submit_job(to_agent="kilabz", prompt="hi")
+    att = await led.lease_job("w1", [])
+    await _expire_lease(led, att)
+    assert await led.reclaim_expired() == 1
+    lost = False
+    try:
+        await led.complete_attempt(att, _ok())
+    except LostLease:
+        lost = True
+    assert lost, "a complete after reclaim must raise LostLease"
+    assert (await led.get_status(jid))["status"] == "queued"
 
 
 # -- invariant 3: ingest dedupe is exactly-once --------------------------------
@@ -128,7 +145,7 @@ async def test_outbound_single_claim(led: PostgresLedger) -> None:
     claims = await asyncio.gather(*[led.claim_outbound("terminal") for _ in range(20)])
     got = [c for c in claims if c is not None]
     assert len(got) == 3, f"expected 3 claims, got {len(got)}"
-    assert len({str(c) for c in got}) == 3, "a row was claimed by two senders"
+    assert len({c["id"] for c in got}) == 3, "a row was claimed by two senders"
 
 
 # -- invariant 4b: a send is recorded exactly once (no double delivery) ---------
@@ -138,8 +155,8 @@ async def test_outbound_send_exactly_once(led: PostgresLedger) -> None:
     jid = await led.submit_job(to_agent="kilabz", prompt="hi", inbound_event_id=ev)
     ob = await led.enqueue_outbound(jid, "reply")
     claimed = await led.claim_outbound("terminal")
-    await led.mark_outbound_sent(claimed, "provider-xyz")
-    await led.mark_outbound_sent(claimed, "provider-xyz")  # duplicate: must not raise/re-deliver
+    await led.mark_outbound_sent(claimed["id"], "provider-xyz")
+    await led.mark_outbound_sent(claimed["id"], "provider-xyz")  # duplicate: must not raise/re-deliver
     async with led._pool.acquire() as con:
         st = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob)
         n = await con.fetchval(
@@ -242,10 +259,10 @@ async def test_happy_path_all_verbs(led: PostgresLedger) -> None:
     await led.heartbeat_attempt(att)
     await led.append_log(att, "stdout", "working...")
     await led.complete_attempt(att, _ok(text="result", artifact="patch.diff"))
-    await led.enqueue_outbound(jid, "the reply")
+    # complete auto-queued the reply (transactional outbox); claim + deliver it
     claimed = await led.claim_outbound("terminal")
-    assert claimed is not None
-    await led.mark_outbound_sent(claimed, "msg-1")
+    assert claimed is not None and claimed["body"] == "result"
+    await led.mark_outbound_sent(claimed["id"], "msg-1")
     st = await led.get_status(jid)
     assert st["status"] == "done", f"job status={st['status']}"
     assert st["artifact_ref"] == "patch.diff"
@@ -311,8 +328,8 @@ async def test_outbound_duplicate_provider_id_dead_letters(led: PostgresLedger) 
     await led.enqueue_outbound(jid, "reply 2")
     c1 = await led.claim_outbound("terminal")
     c2 = await led.claim_outbound("terminal")
-    await led.mark_outbound_sent(c1, "same-id")
-    await led.mark_outbound_sent(c2, "same-id")  # collision: must NOT silently mark sent
+    await led.mark_outbound_sent(c1["id"], "same-id")
+    await led.mark_outbound_sent(c2["id"], "same-id")  # collision: must NOT silently mark sent
     async with led._pool.acquire() as con:
         sent = await con.fetchval(
             "SELECT count(*) FROM outbound WHERE status='sent' AND provider_msg_id='same-id'")
@@ -322,6 +339,17 @@ async def test_outbound_duplicate_provider_id_dead_letters(led: PostgresLedger) 
     assert sent == 1, f"exactly one row should own the provider id, got {sent}"
     assert failed == 1, f"the duplicate should be failed, got {failed}"
     assert dl == 1, f"the duplicate should be dead-lettered, got {dl}"
+
+
+async def test_submit_idempotent_on_inbound_event(led: PostgresLedger) -> None:
+    await _truncate(led)
+    ev = await led.ingest_inbound(_env("idem-1"), "hi")
+    j1 = await led.submit_job(to_agent="kilabz", prompt="hi", inbound_event_id=ev)
+    j2 = await led.submit_job(to_agent="kilabz", prompt="hi again", inbound_event_id=ev)
+    assert str(j1) == str(j2), "a second submit for the same inbound_event must return the SAME job"
+    async with led._pool.acquire() as con:
+        n = await con.fetchval("SELECT count(*) FROM job WHERE inbound_event_id=$1", ev)
+    assert n == 1, f"expected exactly 1 job per inbound_event, got {n}"
 
 
 async def main() -> None:

@@ -178,12 +178,60 @@ async def demo_pool() -> None:
         await led.close()
 
 
+async def demo_terminal() -> None:
+    import time
+
+    from runtime.ledger.postgres_store import PostgresLedger
+    from runtime.pool import WorkerPool
+    from runtime.transport.terminal import TerminalTransport
+
+    dsn = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
+    REGISTRY["term-fast"] = AgentSpec(
+        agent_id="term-fast", reach=Reach.CLI, authority=Authority.RESPONDER,
+        model="none", role="fast responder",
+        adapter={"kind": "cli", "prompt_channel": "arg", "argv": ["printf", "you said: %s"]})
+    REGISTRY["term-slow"] = AgentSpec(
+        agent_id="term-slow", reach=Reach.CLI, authority=Authority.RESPONDER,
+        model="none", role="slow responder",
+        adapter={"kind": "cli", "prompt_channel": "stdin",
+                 "argv": ["sh", "-c", "sleep 0.6; printf '(slow agent, 0.6s) done'"]})
+
+    led = await PostgresLedger.connect(dsn)
+    async with led._pool.acquire() as con:
+        await con.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    await led.init_schema()
+    try:
+        print("== MyndAIX Team Runtime - terminal transport (C3 dumb pipe over Postgres) ==\n")
+        pool = WorkerPool(led, size=4)
+        transport = TerminalTransport(led)
+
+        print("  inbound - each line is ingested + queued instantly; the pipe NEVER waits on an agent:")
+        t0 = time.monotonic()
+        await transport.ingest("slow one", to_agent="term-slow")
+        await transport.ingest("hello", to_agent="term-fast")
+        await transport.ingest("world", to_agent="term-fast")
+        print(f"    3 messages queued in {(time.monotonic() - t0) * 1000:.0f}ms\n")
+
+        print("  outbound - replies stream back as each job finishes (fast ones before the slow one):")
+        stop = asyncio.Event()
+        delivery = asyncio.ensure_future(transport.run_delivery(stop, poll_s=0.02))
+        await pool.run_until_idle()
+        stop.set()
+        await delivery
+        print("\nOK - inbound and outbound are fully decoupled through the ledger; "
+              "a slow agent never blocks the pipe.")
+    finally:
+        await led.close()
+
+
 async def main() -> None:
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg == "--postgres":
         await demo_isolated_postgres()
     elif arg == "--pool":
         await demo_pool()
+    elif arg == "--terminal":
+        await demo_terminal()
     elif arg == "--isolate":
         await demo_isolated()
     else:

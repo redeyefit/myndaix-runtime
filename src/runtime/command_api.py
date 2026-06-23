@@ -62,7 +62,8 @@ class CommandAPI(Protocol):
     async def enqueue_outbound(self, job_id: UUID, body: str) -> UUID:
         ...
 
-    async def claim_outbound(self, transport: str) -> Optional[UUID]:
+    async def claim_outbound(self, transport: str) -> Optional[dict]:
+        """transport: claim one pending reply for delivery -> {id, reply_target, body}."""
         ...
 
     async def mark_outbound_sent(self, outbound_id: UUID, provider_msg_id: str) -> None:

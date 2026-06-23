@@ -76,11 +76,10 @@ async def test_workspace_job_through_postgres():
         # the LIVE repo is untouched - the agent worked in an isolated worktree
         assert "return a - b" in Path(repo, "app.py").read_text()
 
-        # full outbox round-trip: enqueue the reply, claim it, send it
-        await led.enqueue_outbound(jid, "fixed add()")
+        # the reply was auto-queued by complete (transactional outbox); deliver it
         claimed = await led.claim_outbound("terminal")
         assert claimed is not None, "the reply should be claimable"
-        await led.mark_outbound_sent(claimed, "e2e-msg-1")
+        await led.mark_outbound_sent(claimed["id"], "e2e-msg-1")
         st2 = await led.get_status(jid)
         assert any(o["status"] == "sent" for o in (st2["outbound"] or [])), "reply not sent"
     finally:

@@ -34,6 +34,8 @@ CREATE TABLE job (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX job_queued_idx ON job (priority DESC, created_at) WHERE status = 'queued';
+-- exactly-once dispatch: at most ONE job per originating inbound event (idempotent submit)
+CREATE UNIQUE INDEX job_one_per_inbound ON job (inbound_event_id) WHERE inbound_event_id IS NOT NULL;
 
 CREATE TABLE attempt (
     id               uuid PRIMARY KEY,

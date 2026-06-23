@@ -13,6 +13,7 @@ PYTHONPATH=src python3 demo.py kilabz     # route to a REAL agent (Codex / GPT-5
 PYTHONPATH=src python3 demo.py --isolate  # an agent edits code in an isolated git worktree
 PYTHONPATH=src python3 demo.py --postgres # the SAME worker.drain(), but state lives in Postgres
 PYTHONPATH=src python3 demo.py --pool     # a pool of N workers drains a queue + recovers a crash
+PYTHONPATH=src python3 demo.py --terminal # the C3 dumb pipe: ingest -> queue -> reply, fully decoupled
 ```
 
 `--isolate` (SQLite) and `--postgres` call the *same* `worker.drain()` — only the ledger differs. That's
@@ -70,7 +71,9 @@ transport without editing the spine?*
   implementing the same verbs — verified under real contention (50 workers racing one queue,
   janitor-vs-completion mutual exclusion, dup ingest/delivery, authority-gated retry).**
 - **C3 — comms boundary.** Transport is a dumb pipe over the ledger; it can *never* block on agent
-  work — the original outage's root cause.
+  work — the original outage's root cause. A **terminal transport** realizes it: inbound only queues
+  (never waits on an agent), outbound delivers replies as jobs complete, and transport semantics stay
+  in the envelope — they never leak into agent fields (the prior system's lurk-and-drop failure).
 - **C4 — failure semantics.** Authority-gated retry (**mutating agents never auto-retry**),
   process-group kill, admission limits (no runaway job trees). A **concurrent worker pool** (N workers
   + a janitor) realizes it: crashed workers' leases are reclaimed and their jobs finished by others;
@@ -98,6 +101,11 @@ every worker** — `gather(return_exceptions=True)` swallowed the tracebacks, so
 "done." Fixed with a worker exception boundary + a total runner, and the poison-survival regression test
 the suite had been missing.
 
+The terminal transport got the same treatment, which caught a reply being **misrouted to the wrong
+sender** after a restart (a per-process counter reused as a dedupe key) and a duplicate-job gap on
+message redelivery — both fixed before the slice landed. Three layers, three adversarial passes, a real
+bug each time the green suite couldn't see.
+
 ## Layout
 
 ```
@@ -115,6 +123,8 @@ src/runtime/
     schema.sql               the Postgres state machine (production DDL)
     postgres_store.py        the asyncpg Command-API (production ledger)
     sqlite_store.py          the SQLite store (zero-dep demo)
+  transport/
+    terminal.py              C3 terminal transport (dumb pipe over the ledger)
 tests/
   test_runner.py             deterministic runner tests
   test_workspace.py          git-worktree isolation tests
@@ -122,6 +132,7 @@ tests/
   test_postgres_ledger.py    14 concurrency proofs against real Postgres
   test_postgres_e2e.py       a real job end-to-end through the Postgres ledger
   test_pool.py               concurrent pool: exactly-once, crash recovery, heartbeat
+  test_terminal.py           C3 transport: non-blocking ingest, decoupled delivery
 ```
 
 ## Status
@@ -133,9 +144,12 @@ ledger implementing the full Command-API, verified under real contention (14 con
 5-reviewer adversarial pass that caught a P0 deadlock, and proven end-to-end** (ingest → submit → isolated
 worktree → artifact → outbox, all state in Postgres); and a **concurrent worker pool** (N async workers + a
 janitor) proven to drain a queue with no double-processing, recover a crashed worker's job via lease reclaim,
-keep a healthy long job alive via heartbeats, and **survive a poison job without losing a worker** (hardened
-by a second adversarial pass that caught a P0 fleet-death bug). **Next:** transport adapters (terminal first)
-and a FastAPI surface over the Command-API so transports and workers run as separate processes.
+keep a healthy long job alive via heartbeats, and **survive a poison job without losing a worker**; and a
+**terminal transport** (C3 dumb pipe) proven to ingest without ever blocking on an agent and to deliver
+replies fully decoupled. All three layers were hardened by adversarial review, which caught — in turn — a
+P0 lock-order deadlock, a P0 fleet-death-on-poison-job, and a reply misrouted to the wrong sender. **Next:**
+a FastAPI surface over the Command-API (so transports and workers run as separate processes) and more
+transports (a redelivering one like Slack/Discord, where the idempotent-dispatch guard earns its keep).
 
 Run the concurrency proofs against a real local Postgres:
 

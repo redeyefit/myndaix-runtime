@@ -169,12 +169,19 @@ class PostgresLedger:
                             "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
                             _new_id(), jid, reason)
                         return jid
-                await con.execute(
-                    """INSERT INTO job (id, parent_id, root_id, depth, created_by,
-                           inbound_event_id, to_agent, body, repo_id, base_ref, priority, status)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued')""",
-                    jid, parent_id, root_id, depth, created_by, inbound_event_id,
-                    to_agent, prompt, repo_id, base_ref, priority)
+                try:
+                    async with con.transaction():  # savepoint around the insert
+                        await con.execute(
+                            """INSERT INTO job (id, parent_id, root_id, depth, created_by,
+                                   inbound_event_id, to_agent, body, repo_id, base_ref, priority, status)
+                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued')""",
+                            jid, parent_id, root_id, depth, created_by, inbound_event_id,
+                            to_agent, prompt, repo_id, base_ref, priority)
+                except asyncpg.UniqueViolationError:
+                    # a job for this inbound_event already exists -> idempotent dispatch
+                    # (a redelivered message must not spawn a second job + second reply).
+                    return await con.fetchval(
+                        "SELECT id FROM job WHERE inbound_event_id = $1", inbound_event_id)
         return jid
 
     # ---- worker lifecycle --------------------------------------------------
@@ -249,15 +256,21 @@ class PostgresLedger:
 
     async def complete_attempt(self, attempt_id: UUID, result: Result) -> None:
         """attempt open->ok AND job leased/running->done, in one tx, locking BOTH
-        rows (FOR UPDATE OF a,j - attempt first, the canonical order). Zero rows
-        back means the lease was reclaimed out from under this worker -> LostLease
-        (NOT a harmless no-op: the worker must know its work was discarded).
+        rows (FOR UPDATE OF a,j - attempt first, the canonical order). Atomically
+        queues the reply (transactional outbox) for a transport-originated job, so
+        a 'done' job can never lose its reply. Zero rows back means the lease was
+        reclaimed out from under this worker -> LostLease (NOT a harmless no-op).
 
         Policy (intentional): a worker that finishes AFTER its lease expired but
         BEFORE reclaim_expired runs still wins - 'finished-before-the-janitor-
         noticed'. reclaim's SKIP LOCKED yields to the in-flight completion."""
+        # ONE statement (no explicit BEGIN round-trip, so it stays fast enough to
+        # win the complete-vs-reclaim race): the `reply` data-modifying CTE always
+        # executes and queues the outbound atomically (no-op for a controller job
+        # with no inbound_event), while the final SELECT returns the job id - or
+        # nothing, meaning the lease was reclaimed (LostLease).
         async with self._pool.acquire() as con:
-            row = await con.fetchval(
+            job_id = await con.fetchval(
                 """WITH locked AS (
                        SELECT a.id, a.job_id
                          FROM attempt a JOIN job j ON j.id = a.job_id
@@ -270,13 +283,25 @@ class PostgresLedger:
                           SET status = 'ok', ended_at = statement_timestamp(), result = $2
                          FROM locked l WHERE a.id = l.id
                        RETURNING a.job_id
+                   ),
+                   done AS (
+                       UPDATE job j SET status = 'done', artifact_ref = $3
+                         FROM closed c
+                        WHERE j.id = c.job_id AND j.status IN ('leased','running')
+                       RETURNING j.id, j.inbound_event_id
+                   ),
+                   reply AS (
+                       INSERT INTO outbound (id, job_id, transport, reply_target, body, status)
+                       SELECT $4, d.id, ie.transport,
+                              COALESCE(ie.envelope->>'reply_target', ie.transport || ':unknown'),
+                              $5, 'pending'
+                         FROM done d JOIN inbound_event ie ON ie.id = d.inbound_event_id
+                       RETURNING id
                    )
-                   UPDATE job j SET status = 'done', artifact_ref = $3
-                     FROM closed c
-                    WHERE j.id = c.job_id AND j.status IN ('leased','running')
-                   RETURNING j.id""",
-                attempt_id, _json(result.model_dump(mode="json")), result.artifact_ref)
-        if row is None:
+                   SELECT id FROM done""",
+                attempt_id, _json(result.model_dump(mode="json")), result.artifact_ref,
+                _new_id(), result.text)
+        if job_id is None:
             raise LostLease(f"complete: attempt {attempt_id} was reclaimed/closed")
 
     async def fail_attempt(self, attempt_id: UUID, result: Result) -> None:
@@ -339,11 +364,12 @@ class PostgresLedger:
                 "(controller-originated replies are a later slice)")
         return row["id"]
 
-    async def claim_outbound(self, transport: str) -> Optional[UUID]:
+    async def claim_outbound(self, transport: str) -> Optional[dict]:
         """Claim ONE pending row for a transport (SKIP LOCKED -> two senders get
-        different rows). pending->leased, tries+1. None if nothing pending."""
+        different rows) and return its payload {id, reply_target, body}, ready to
+        deliver. pending->leased, tries+1. None if nothing pending."""
         async with self._pool.acquire() as con:
-            return await con.fetchval(
+            row = await con.fetchrow(
                 """WITH picked AS (
                        SELECT id FROM outbound
                         WHERE transport = $1 AND status = 'pending'
@@ -351,7 +377,10 @@ class PostgresLedger:
                    )
                    UPDATE outbound o SET status = 'leased', tries = tries + 1
                      FROM picked p WHERE o.id = p.id
-                   RETURNING o.id""", transport)
+                   RETURNING o.id, o.reply_target, o.body""", transport)
+        if row is None:
+            return None
+        return {"id": row["id"], "reply_target": row["reply_target"], "body": row["body"]}
 
     async def mark_outbound_sent(self, outbound_id: UUID, provider_msg_id: str) -> None:
         """leased->sent, recording provider_msg_id (exactly-once via UNIQUE). A
