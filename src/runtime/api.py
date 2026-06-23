@@ -137,7 +137,7 @@ def create_app(ledger: Optional[PostgresLedger] = None, *,
                dsn: Optional[str] = None,
                api_keys: Optional[dict] = None) -> FastAPI:
     """Build the app. Pass a connected `ledger` (tests) OR leave it None to connect
-    on startup from `dsn`/$LEDGER_DSN (serving). `api_keys` (token -> Principal) is
+    on startup from `dsn`/$MYNDAIX_DSN (serving; $LEDGER_DSN still honored). `api_keys` (token -> Principal) is
     injected for tests/demo, else loaded from $MYNDAIX_API_KEYS (empty -> fail-closed)."""
     no_docs = dict(docs_url=None, redoc_url=None, openapi_url=None)  # nothing unauth'd
     if ledger is not None:
@@ -146,7 +146,8 @@ def create_app(ledger: Optional[PostgresLedger] = None, *,
     else:
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            target = dsn or os.environ.get("LEDGER_DSN", "postgresql://localhost/runtime")
+            target = (dsn or os.environ.get("MYNDAIX_DSN")
+                      or os.environ.get("LEDGER_DSN", "postgresql://localhost/runtime"))
             app.state.ledger = await PostgresLedger.connect(target)
             try:
                 yield

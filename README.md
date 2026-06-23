@@ -40,11 +40,15 @@ the wrapper around them was. This keeps the direct calls and replaces the wrappe
 **Prerequisites:** Python 3.11+ and git — that's everything the zero-dep demos need. The Postgres demos
 add a local Postgres; the optional real-agent demos add an agent CLI (Node 18+). All three are below.
 
+> **Full install guide** — every agent CLI (install / auth / verify), the always-on service, and
+> one-machine *and* two-machine deployment — is in **[SETUP.md](SETUP.md)**. What follows is the quick tour.
+
 ### 1. Clone and run (zero-dep — no Postgres, no API keys, no LLM)
 
 ```bash
 git clone https://github.com/redeyefit/myndaix-runtime && cd myndaix-runtime
-pip install pydantic
+python3 -m venv .venv && source .venv/bin/activate   # avoids the PEP 668 error on modern macOS/Debian
+pip install pydantic                                  # the zero-dep demos need only this
 PYTHONPATH=src python3 demo.py            # route a message through the spine and back
 PYTHONPATH=src python3 demo.py --isolate  # an agent fixes a bug in a throwaway git worktree
 ```
@@ -69,8 +73,9 @@ pip install asyncpg fastapi uvicorn httpx
 # macOS:           brew install postgresql@16 && brew services start postgresql@16
 # Debian/Ubuntu:   sudo apt-get install -y postgresql && sudo service postgresql start
 
-createdb runtime
-export LEDGER_TEST_DSN=postgresql://localhost/runtime
+# these demos DROP and recreate the schema — use a THROWAWAY db, never your ops 'runtime'
+createdb runtime_test
+export LEDGER_TEST_DSN=postgresql://localhost/runtime_test
 
 PYTHONPATH=src python3 demo.py --pool      # N workers drain a queue + recover a crashed worker
 PYTHONPATH=src python3 demo.py --postgres  # the SAME worker core, now backed by Postgres
@@ -79,13 +84,14 @@ PYTHONPATH=src python3 demo.py --api        # the HTTP service: POST a job, GET 
 ```
 
 `--isolate` (SQLite) and `--postgres` call the *same* `worker.drain()` — only the ledger differs. Swapping
-persistence behind the contract is the central thesis, verified by the code structure, not aspirational.
+persistence behind the contract is the central thesis, and it's structural: one core runs both stores.
 
 ### 3. (Optional) Route to a real agent
 
 The roster in `src/runtime/registry.py` maps each agent to a local CLI, so a real model is just a CLI
-install + login away (needs Node 18+ and your own provider account). For example, `demo.py kilabz` runs a
-code-review agent through OpenAI's Codex CLI:
+install + login away (needs Node 18+ and your own provider account). This needs no Postgres —
+`demo.py <agent>` uses an in-memory store; only the agent's CLI must be installed and authenticated.
+For example, `demo.py kilabz` runs a code-review agent through OpenAI's Codex CLI:
 
 ```bash
 npm install -g @openai/codex          # the codex CLI
@@ -95,7 +101,8 @@ PYTHONPATH=src python3 demo.py kilabz  # routes a real GPT-5.5 process through t
 
 Every other agent works the same way — install its CLI, authenticate, and the adapter is already wired
 (e.g. Claude Code: `npm install -g @anthropic-ai/claude-code`; the Gemini-backed `oracle` agent uses the
-`agy` CLI).
+`agy` CLI; `recon` is an API agent that just needs `PERPLEXITY_API_KEY` in the environment). The full
+per-agent install / auth / verify steps are in **[SETUP.md](SETUP.md#4-install-the-agent-clis)**.
 
 ## The design
 
@@ -138,10 +145,10 @@ review surfaced a real bug my passing tests had missed:
 | terminal transport | a per-process counter reused as a dedupe key misrouted a reply to the wrong sender after a restart | a restart / dedup test |
 | HTTP auth | `created_by` doubled as the owner *and* a provenance tag, so a client keyed `id=human` could read every internal job | a provenance-collision test |
 
-I confirmed the fixes the hard way rather than trusting the green bar. For the deadlock I reverted
+I confirmed each fix by reproducing the bug, not just trusting the green bar. For the deadlock I reverted
 `cancel()` to the old lock order, watched the regression test fail on the first trial with a
-`DeadlockDetectedError`, then re-applied the fix and watched it pass 150/150. Green tests weren't the bar;
-surviving the review was.
+`DeadlockDetectedError`, then re-applied the fix and watched it pass 150/150. Every fix here has a
+regression test that fails without it.
 
 ## What works, what doesn't
 
@@ -156,12 +163,13 @@ surviving the review was.
 - A terminal transport that never blocks on an agent, with replies delivered fully decoupled.
 - A FastAPI HTTP service with API-key auth: a client submits and reads only its own jobs (ownership is a
   namespaced `api:<id>`; reading someone else's job is a 404, not a 403, so ids never leak); admin reads any.
+- An api-reach adapter (OpenAI-compatible chat): `recon` runs as a live Perplexity API agent through the
+  *same* `invoke()` path as the CLI agents — the key comes from the environment, never the roster.
 
 **Not built yet (deferred, named on purpose):**
 
-- An api-reach adapter, so agents can be real model-API calls and not just CLIs.
 - A redelivering chat transport (Slack, say) — where the idempotent-dispatch guard already in the
-  ledger starts to earn its keep.
+  ledger would start to pay off.
 - The C4 admission budgets (cost/chain-TTL), composite authority, capability-gated routing — specified in
   `DESIGN.md`, not yet exercised in code.
 
@@ -174,8 +182,8 @@ from the "Run it" section above:
 # zero-dep
 PYTHONPATH=src python3 tests/test_worker.py
 
-# Postgres-backed (e.g. the 15 concurrency proofs)
-LEDGER_TEST_DSN=postgresql://localhost/runtime PYTHONPATH=src python3 tests/test_postgres_ledger.py
+# Postgres-backed (e.g. the 15 concurrency proofs) — throwaway db; the suite resets the schema
+LEDGER_TEST_DSN=postgresql://localhost/runtime_test PYTHONPATH=src python3 tests/test_postgres_ledger.py
 ```
 
 ## Layout

@@ -4,8 +4,8 @@ a hard timeout, and exit-code -> Result mapping. This is the piece that turns
 
 No Postgres needed; testable standalone. Process-group kill (start_new_session +
 killpg) is the bulletproof termination the design requires (a prior runtime
-leaked orphaned children that kept burning tokens). The api adapter is the next phase
-(recon is the only api agent).
+leaked orphaned children that kept burning tokens). API-reach agents (e.g. recon ->
+Perplexity) go through invoke_api below; the key comes from the environment, never the roster.
 """
 from __future__ import annotations
 

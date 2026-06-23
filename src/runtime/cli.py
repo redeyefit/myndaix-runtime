@@ -71,7 +71,7 @@ async def submit(agent: str, task: str, *, timeout_s: float = 180.0) -> int:
 
 def main() -> int:
     if len(sys.argv) < 3:
-        print('usage: mx <agent> "<task>"', file=sys.stderr)
+        print('usage: mxr <agent> "<task>"', file=sys.stderr)
         return 2
     return asyncio.run(submit(sys.argv[1], sys.argv[2]))
 
