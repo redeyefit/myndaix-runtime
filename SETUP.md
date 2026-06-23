@@ -26,6 +26,28 @@ pip install -e .     # installs all deps from pyproject AND makes `runtime` impo
 
 A venv avoids the PEP 668 `externally-managed-environment` error on modern macOS/Debian. After `pip install -e .` you can drop the `PYTHONPATH=src` prefix the demos show — the package is importable. If you'd rather not install, run from source with `PYTHONPATH=src python3 ...` and `pip install pydantic` (the zero-dep demos need only pydantic).
 
+## Run it with Docker (Postgres + service, one command)
+
+Have Docker? This is the fastest path to a running ledger + spine — it replaces the manual Postgres
+setup (step 3) and the service (step 5):
+
+```bash
+docker compose up --build       # Postgres (schema auto-loaded) + the worker pool
+```
+
+Postgres is published on `localhost:5432` (db `runtime`, user/pass `runtime`/`runtime`), so the `mxr`
+CLI on your host talks to the same ledger:
+
+```bash
+MYNDAIX_DSN=postgresql://runtime:runtime@localhost:5432/runtime mxr recon "latest stable Python release"
+```
+
+**What runs where:** the containerized worker runs the ledger and dispatches **API-reach agents**
+(`recon`, when you start compose with `PERPLEXITY_API_KEY` set in your shell). The **CLI agents**
+(`claude`, `codex`, `agy`) aren't installed in the image — run a `serve` on your *host* (where the CLIs
+are authenticated) pointed at the same DSN, and both workers drain one queue. Install the CLIs per
+step 4 below.
+
 ## 2. Kick the tires (zero-dep — no Postgres, no keys, no LLM)
 
 ```bash

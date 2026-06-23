@@ -44,6 +44,7 @@ add a local Postgres; the optional real-agent demos add an agent CLI (Node 18+).
 
 > **Full install guide** — every agent CLI (install / auth / verify), the always-on service, and
 > one-machine *and* two-machine deployment — is in **[SETUP.md](SETUP.md)**. What follows is the quick tour.
+> **Have Docker?** `docker compose up --build` brings up Postgres + the spine in one command (see [SETUP.md](SETUP.md#run-it-with-docker-postgres--service-one-command)).
 
 ### 1. Clone and run (zero-dep — no Postgres, no API keys, no LLM)
 
