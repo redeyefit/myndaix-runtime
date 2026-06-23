@@ -76,6 +76,50 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     )
 
 
+async def invoke_api(spec: AgentSpec, job: Job, *, transport=None) -> Result:
+    """Invoke an OpenAI-compatible chat-completions API agent (e.g. recon -> Perplexity).
+    The key comes from os.environ[secret_ref] - never the adapter - so secrets stay out
+    of the roster/config. A missing key, missing httpx, or a non-200 is a clean Result,
+    never a crash (4xx -> terminal, 5xx/network -> retryable)."""
+    try:
+        import httpx
+    except ImportError:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="api agents need httpx (pip install httpx)")
+    a = spec.adapter
+    endpoint = a.get("endpoint")
+    if not endpoint:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="api adapter missing 'endpoint'")
+    secret_ref = a.get("secret_ref")
+    key = os.environ.get(secret_ref) if secret_ref else None
+    if secret_ref and not key:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text=f"missing API key in env: {secret_ref}")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload = {"model": a.get("model"),
+               "messages": [{"role": "user", "content": job.prompt}]}
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=job.timeout_s, transport=transport) as client:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+    except httpx.HTTPError as e:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.RETRYABLE,
+                      text=f"api request failed: {e}", ms=_ms(started))
+    if resp.status_code != 200:
+        ec = ErrorClass.RETRYABLE if resp.status_code >= 500 else ErrorClass.TERMINAL
+        return Result(status=ResultStatus.ERROR, error_class=ec, exit_code=resp.status_code,
+                      text=f"api {resp.status_code}: {resp.text[:300]}", ms=_ms(started))
+    try:
+        text = resp.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, ValueError) as e:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text=f"unexpected api response shape: {e}", ms=_ms(started))
+    return Result(status=ResultStatus.OK, text=str(text).strip(), ms=_ms(started))
+
+
 async def invoke(agent_id: str, job: Job) -> Result:
     spec = get_spec(agent_id)
     if spec is None:
@@ -83,9 +127,7 @@ async def invoke(agent_id: str, job: Job) -> Result:
                       text=f"unknown agent: {agent_id}")
     if spec.reach is Reach.CLI:
         return await invoke_cli(spec, job)
-    # api adapter is the next build phase: fail TERMINAL, never crash the worker
-    return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                  text=f"api adapter not implemented (agent '{agent_id}')")
+    return await invoke_api(spec, job)
 
 
 # -- helpers --

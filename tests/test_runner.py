@@ -48,6 +48,42 @@ def test_cli_timeout_is_killed():
     assert r.status is ResultStatus.TIMEOUT
 
 
+def test_api_agent_via_mock_transport():
+    """invoke_api (OpenAI-compatible) with no live API: a mock transport proves it
+    parses the reply, maps 401->terminal / 5xx->retryable, and a missing key fails clean."""
+    import os
+
+    import httpx
+
+    spec = AgentSpec(
+        agent_id="t-api", reach=Reach.API, authority=Authority.RESPONDER,
+        model="test", role="test",
+        adapter={"kind": "api", "endpoint": "https://x/chat/completions",
+                 "secret_ref": "T_API_KEY", "model": "test-model"})
+    job = _job(prompt="hi")
+
+    # missing key -> terminal, no request made
+    r = asyncio.run(runner.invoke_api(spec, job))
+    assert r.status is ResultStatus.ERROR and "missing API key" in r.text
+
+    os.environ["T_API_KEY"] = "secret"
+    try:
+        ok = httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"choices": [{"message": {"content": "  4  "}}]}))
+        r = asyncio.run(runner.invoke_api(spec, job, transport=ok))
+        assert r.status is ResultStatus.OK and r.text == "4"   # parsed + stripped
+
+        r = asyncio.run(runner.invoke_api(spec, job, transport=httpx.MockTransport(
+            lambda req: httpx.Response(401, text="bad key"))))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+
+        r = asyncio.run(runner.invoke_api(spec, job, transport=httpx.MockTransport(
+            lambda req: httpx.Response(500, text="boom"))))
+        assert r.error_class is ErrorClass.RETRYABLE
+    finally:
+        del os.environ["T_API_KEY"]
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
