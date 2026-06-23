@@ -44,7 +44,7 @@ V1_ROSTER: list[AgentSpec] = [
                        "prompt_channel": "stdin"}),
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
-              adapter={"kind": "cli", "argv": ["claude"], "prompt_channel": "stdin"}),
+              adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin"}),
     AgentSpec(agent_id="mini", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="claude", role="pipeline builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin"}),
