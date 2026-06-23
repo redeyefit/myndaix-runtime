@@ -93,9 +93,9 @@ codex login                           # OAuth — or: export OPENAI_API_KEY=sk-.
 PYTHONPATH=src python3 demo.py kilabz  # routes a real GPT-5.5 process through the spine
 ```
 
-Every other agent in the roster works the same way — install its CLI, authenticate, and the adapter is
-already wired: Claude Code (`npm install -g @anthropic-ai/claude-code`) and the Gemini CLI
-(`npm install -g @google/gemini-cli`).
+Every other agent works the same way — install its CLI, authenticate, and the adapter is already wired
+(e.g. Claude Code: `npm install -g @anthropic-ai/claude-code`; the Gemini-backed `oracle` agent uses the
+`agy` CLI).
 
 ## The design
 
