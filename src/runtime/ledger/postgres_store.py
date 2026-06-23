@@ -506,7 +506,7 @@ class PostgresLedger:
                           j.created_at, j.created_by,
                           (SELECT json_agg(json_build_object(
                                 'id', a.id, 'status', a.status, 'worker_id', a.worker_id,
-                                'error_class', a.error_class))
+                                'error_class', a.error_class, 'text', a.result->>'text'))
                              FROM attempt a WHERE a.job_id = j.id) AS attempts,
                           (SELECT json_agg(json_build_object(
                                 'id', o.id, 'status', o.status, 'reply_target', o.reply_target,

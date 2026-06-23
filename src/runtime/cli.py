@@ -49,17 +49,22 @@ async def submit(agent: str, task: str, *, timeout_s: float = 180.0) -> int:
             print("timed out (is the pool running? `python3 -m runtime.serve`)", file=sys.stderr)
             return 1
 
-        reply = next((o["body"] for o in (st.get("outbound") or [])), None)
-        if reply is not None:
-            print(reply)
-        for o in (st.get("outbound") or []):           # mark delivered so it doesn't linger
-            if o["status"] == "pending":
-                await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
+        if st["status"] == "done":
+            reply = next((o["body"] for o in (st.get("outbound") or [])), None)
+            if reply is not None:
+                print(reply)
+            for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
+                if o["status"] == "pending":
+                    await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
+            return 0
 
-        if st["status"] != "done":
-            print(f"(job {st['status']})", file=sys.stderr)
-            return 1
-        return 0
+        # failed/dead: surface WHY (the agent's error output, from the attempt)
+        err = next((a.get("text") for a in (st.get("attempts") or [])
+                    if a.get("status") == "failed" and a.get("text")), None)
+        if err:
+            print(err.strip(), file=sys.stderr)
+        print(f"(job {st['status']})", file=sys.stderr)
+        return 1
     finally:
         await led.close()
 
