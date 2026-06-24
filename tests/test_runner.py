@@ -800,14 +800,16 @@ def test_higgsfield_resumable_timeout_does_not_cancel():
 
 def test_premium_rows_registered_and_route_higgsfield():
     """The v2 premium rows exist, all route to invoke_higgsfield (kind=higgsfield), and
-    keep the secret in env (secret_ref), never the row. dop-std carries its duration param."""
+    keep the secret in env (secret_ref), never the row. dop-std carries its duration param.
+    Rows are LIVE-VERIFIED paths only (Seedance's doc path 404'd live -> removed)."""
     from runtime.registry import get as _get
-    for aid in ("higgsfield", "higgsfield-dop-std", "higgsfield-kling", "higgsfield-seedance"):
+    for aid in ("higgsfield", "higgsfield-dop-std", "higgsfield-kling", "higgsfield-minimax"):
         s = _get(aid)
         assert s is not None, aid
         assert s.adapter["kind"] == "higgsfield" and s.adapter["secret_ref"] == "HF_KEY", aid
         assert "key" not in {k.lower() for k in s.adapter} or s.adapter.get("secret_ref"), aid
     assert _get("higgsfield-dop-std").adapter["params"] == {"duration": 5}
+    assert _get("higgsfield-seedance") is None   # removed: its documented path 404s live
 
 
 if __name__ == "__main__":

@@ -69,8 +69,9 @@ V1_ROSTER: list[AgentSpec] = [
     # is 'higgsfield', so the runner routes it to invoke_higgsfield, not invoke_api.
     # `higgsfield` stays the cheapest default (DoP/lite). v2 adds premium models as pure
     # rows behind the SAME runner — proving "a new model is a new row, never a spine edit".
-    # Only paths CONFIRMED live (the 400/422-signature probe, 2026-06-23 research) are
-    # listed; inferred premium paths are commented out below until gallery-verified.
+    # Every row's path was EXECUTED live (2026-06-24), not just doc-read: dop/lite, Kling
+    # 2.1 Pro, and MiniMax Hailuo-02 Pro all returned real mp4s. (The doc-"confirmed"
+    # Seedance path 404'd live and was REMOVED — see the note below.)
     AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,
               model="dop-lite", role="image/text->video generation",
               profile=Profile(timeout_s=600, cost_budget=2.0),
@@ -88,7 +89,8 @@ V1_ROSTER: list[AgentSpec] = [
                        "secret_ref": "HF_KEY",
                        "application": "/higgsfield-ai/dop/standard",
                        "params": {"duration": 5}}),
-    # Kling 2.1 Pro — premium tier (~$0.40/clip); path + body {prompt,image_url} documented.
+    # Kling 2.1 Pro — premium tier (~$0.40/clip); LIVE-VERIFIED (real 1080p mp4, 2026-06-24).
+    # Best crispness/$ of the premium models tested. Body {prompt,image_url}.
     AgentSpec(agent_id="higgsfield-kling", reach=Reach.API, authority=Authority.RESPONDER,
               model="kling-2.1-pro", role="premium image->video generation (Kling 2.1 Pro)",
               profile=Profile(timeout_s=600, cost_budget=4.0),
@@ -96,20 +98,25 @@ V1_ROSTER: list[AgentSpec] = [
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
                        "application": "/kling-video/v2.1/pro/image-to-video"}),
-    # Seedance 1.0 Pro — premium tier; path + body {prompt,image_url} documented.
-    AgentSpec(agent_id="higgsfield-seedance", reach=Reach.API, authority=Authority.RESPONDER,
-              model="seedance-1-pro", role="premium image->video generation (Seedance 1.0 Pro)",
-              profile=Profile(timeout_s=600, cost_budget=4.0),
+    # MiniMax Hailuo-02 Pro — premium tier; LIVE-VERIFIED (real 1080p mp4, 2026-06-24).
+    # Slower (~3.5 min) + lower bitrate than Kling; timeout bumped for the longer render.
+    AgentSpec(agent_id="higgsfield-minimax", reach=Reach.API, authority=Authority.RESPONDER,
+              model="minimax-hailuo-02-pro", role="premium image->video generation (Hailuo-02 Pro)",
+              profile=Profile(timeout_s=900, cost_budget=4.0),
               adapter={"kind": "higgsfield",
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
-                       "application": "/bytedance/seedance/v1/pro/image-to-video"}),
-    # NOT added — exact model_id NOT in public docs (LOW-confidence inferences only); verify
-    # in the authed gallery's "API" tab before promoting to a row, else a 404 "Model not found":
-    #   Veo 3.1 i2v      ~ /google/veo/v3.1/image-to-video
-    #   Kling 3.0 i2v    ~ /kling-video/v3/pro/image-to-video
-    #   Seedance 2.0 i2v ~ /bytedance/seedance/v2/pro/image-to-video
-    #   WAN 2.5 i2v      ~ /wan/v2.5/image-to-video
+                       "application": "/minimax/hailuo-02/pro/image-to-video"}),
+    # NOT added — live-probe findings (2026-06-24), supersede the earlier doc-read confidence:
+    #   Seedance 1.0 Pro: the "documented" /bytedance/seedance/v1/pro/image-to-video (and
+    #     7 slug variants) ALL 404 "Model not found" live -> not reachable; needs the authed
+    #     gallery's exact model_id (cloud.higgsfield.ai -> model -> API tab).
+    #   Sora-2 (/sora-2/image-to-video): path is LIVE (400 'prompt required' probe) BUT its
+    #     content filter false-positives benign prompts -> nsfw (refunded). Add only if you
+    #     need it + tune prompts; not a reliable default.
+    #   Inferred-only (LOW confidence, 404-risk until gallery-verified): Veo 3.1
+    #     ~/google/veo/v3.1/image-to-video, Kling 3.0 ~/kling-video/v3/pro/image-to-video,
+    #     Seedance 2.0 ~/bytedance/seedance/v2/pro/image-to-video, WAN 2.5 ~/wan/v2.5/image-to-video.
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}

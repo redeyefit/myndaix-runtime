@@ -34,17 +34,27 @@ set last from their canonical sources. Params must be a flat dict of JSON scalar
 non-dict or non-scalar value is dropped (never crashes the submit — same defensive posture
 as the v1 knob coercion).
 
-### Verified roster rows added (paths CONFIRMED, not inferred)
-| agent_id | application | body | ~cost |
-|---|---|---|---|
-| `higgsfield` (v1) | `/higgsfield-ai/dop/lite` | `{prompt,image_url}` | ~$0.13 |
-| `higgsfield-dop-std` | `/higgsfield-ai/dop/standard` | `+{duration}` | ~$0.13 |
-| `higgsfield-kling` | `/kling-video/v2.1/pro/image-to-video` | `{prompt,image_url}` | ~$0.40 |
-| `higgsfield-seedance` | `/bytedance/seedance/v1/pro/image-to-video` | `{prompt,image_url}` | premium |
+### Roster rows added — paths EXECUTED live (2026-06-24), not just doc-read
+| agent_id | application | body | ~cost | status |
+|---|---|---|---|---|
+| `higgsfield` (v1) | `/higgsfield-ai/dop/lite` | `{prompt,image_url}` | ~$0.13 | ✅ real mp4 |
+| `higgsfield-dop-std` | `/higgsfield-ai/dop/standard` | `+{duration}` | ~$0.13 | path family verified |
+| `higgsfield-kling` | `/kling-video/v2.1/pro/image-to-video` | `{prompt,image_url}` | ~$0.40 | ✅ real 1080p mp4 |
+| `higgsfield-minimax` | `/minimax/hailuo-02/pro/image-to-video` | `{prompt,image_url}` | ~$0.40 | ✅ real 1080p mp4 |
 
-`cost_budget` raised per tier. **NOT added** (would be guessing): Veo 3.1, Kling 3.0,
-Seedance 2.0, WAN 2.5 — their exact `model_id` paths are not in public docs (LOW confidence
-inferences only). Listed as commented candidates needing gallery verification.
+`cost_budget` raised per tier (minimax `timeout_s=900` — it renders ~3.5 min).
+
+**Live-probe findings (2026-06-24) — these SUPERSEDE the earlier doc-read confidence:**
+- **Seedance REMOVED.** The doc-"confirmed" `/bytedance/seedance/v1/pro/image-to-video` (and
+  7 slug variants) all 404 "Model not found" live. Lesson: a path read from docs but never
+  *executed* is not verified — the API's 404/400/422 signature is the only ground truth.
+- **Sora-2** (`/sora-2/image-to-video`) — path is live (400 'prompt required') but its content
+  filter false-positives benign prompts → `nsfw` (refunded). Not a reliable default; omitted.
+- **NOT added** (still inferred, 404-risk): Veo 3.1, Kling 3.0, Seedance 2.0, WAN 2.5 — exact
+  `model_id` only in the authed gallery's API tab.
+
+Quality (same seed+prompt): Kling = sharpest/best per-$; Hailuo = 1080p but ~1/5 the bitrate
+and slowest; dop/lite = 720p budget tier.
 
 ### Test plan (offline, mocked transport)
 - params merge: adapter-only, job-only, both (job wins), reserved keys protected, junk dropped.
