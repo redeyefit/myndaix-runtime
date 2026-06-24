@@ -477,6 +477,50 @@ def test_higgsfield_malformed_payload_never_raises_post_charge():
         del os.environ["HF_KEY"]
 
 
+def test_higgsfield_poll_loop_backstop_never_raises():
+    """§5-A airtight (final KilaBz trace): post-charge, NOTHING escapes invoke_higgsfield.
+    Covers nan sleep knobs and a generic non-HTTPError raised mid-poll."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        # nan poll_interval_s must not blow up asyncio.sleep; run still completes.
+        spec = _hf_spec(poll_interval_s="nan")
+        def slow_then_done(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-n"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/n.mp4"}})
+        r = _hf_run(spec, _hf_job(), slow_then_done)
+        assert r.status is ResultStatus.OK, r.text
+
+        # nan backoff with a transient blip first -> retry sleeps 0, recovers.
+        spec = _hf_spec(poll_retry_backoff_s="nan")
+        seq = {"n": 0}
+        def blip(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-nb"})
+            seq["n"] += 1
+            if seq["n"] == 1:
+                return httpx.Response(503, text="x")
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/nb.mp4"}})
+        r = _hf_run(spec, _hf_job(), blip)
+        assert r.status is ResultStatus.OK, r.text
+
+        # a generic (non-HTTPError) exception mid-poll is trapped by the backstop -> TERMINAL.
+        def boom(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-b"})
+            raise ValueError("surprise non-http error")
+        r = _hf_run(_hf_spec(), _hf_job(), boom)
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+        assert "post-charge" in r.text
+    finally:
+        del os.environ["HF_KEY"]
+
+
 def test_higgsfield_missing_secret_ref_fails_closed():
     """An adapter with no secret_ref must fail closed (TERMINAL), never send 'Key None'."""
     spec = AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,
