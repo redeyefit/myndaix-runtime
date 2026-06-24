@@ -434,6 +434,49 @@ def test_higgsfield_ipv4_mapped_ssrf_rejected():
         del os.environ["HF_KEY"]
 
 
+def test_higgsfield_malformed_payload_never_raises_post_charge():
+    """§5-A hardening (KilaBz re-review): after a request_id exists, malformed server
+    payloads must map to a TERMINAL Result, never raise out of invoke_higgsfield -
+    covers non-string status_url/cancel_url, non-string artifact url, bad poll_retry_max."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        # (1) non-string status_url/cancel_url in the submit response: _hf_pin_url must
+        # fall back to a constructed URL, not raise; the run still completes.
+        def bad_urls(req):
+            if req.method == "POST" and req.url.path.endswith("/cancel"):
+                return httpx.Response(200, json={})
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-bu",
+                                      "status_url": {"bad": "shape"}, "cancel_url": 123})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/ok.mp4"}})
+        r = _hf_run(_hf_spec(), _hf_job(), bad_urls)
+        assert r.status is ResultStatus.OK and r.artifact_ref.endswith("ok.mp4")
+
+        # (2) non-string artifact url on a completed result -> TERMINAL, not a raise.
+        def bad_artifact(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-ba"})
+            return httpx.Response(200, json={"status": "completed", "video": {"url": 123}})
+        r = _hf_run(_hf_spec(), _hf_job(), bad_artifact)
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+
+        # (3) non-numeric poll_retry_max must not raise at `fails > retry_max`; it falls
+        # back to the default and still fails closed after exhausting retries.
+        spec = _hf_spec(poll_retry_max="not-a-number")
+        def always_503(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-rm"})
+            return httpx.Response(503, text="upstream")
+        r = _hf_run(spec, _hf_job(), always_503)
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    finally:
+        del os.environ["HF_KEY"]
+
+
 def test_higgsfield_missing_secret_ref_fails_closed():
     """An adapter with no secret_ref must fail closed (TERMINAL), never send 'Key None'."""
     spec = AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,

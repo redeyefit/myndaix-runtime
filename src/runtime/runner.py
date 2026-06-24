@@ -190,9 +190,11 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
     headers = {"Content-Type": "application/json", "Authorization": f"Key {key}"}
     submit_url = base.rstrip("/") + "/" + application.lstrip("/")
     body = {"prompt": job.prompt, "image_url": image_url}
-    poll_interval = a.get("poll_interval_s", _HF_POLL_INTERVAL_S)
-    retry_backoff = a.get("poll_retry_backoff_s", _HF_POLL_RETRY_BACKOFF_S)
-    retry_max = a.get("poll_retry_max", _HF_POLL_RETRY_MAX)
+    # Coerce the tuning knobs up front: a malformed adapter value (e.g. "3") must
+    # never surface as a TypeError mid-poll (post-charge), which would violate §5-A.
+    poll_interval = _hf_float(a.get("poll_interval_s"), _HF_POLL_INTERVAL_S)
+    retry_backoff = _hf_float(a.get("poll_retry_backoff_s"), _HF_POLL_RETRY_BACKOFF_S)
+    retry_max = _hf_int(a.get("poll_retry_max"), _HF_POLL_RETRY_MAX)
 
     started = time.monotonic()
     deadline = started + job.timeout_s
@@ -306,15 +308,34 @@ def _ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+def _hf_int(v, default: int) -> int:
+    """Coerce an adapter knob to int, falling back on None/garbage (never raise)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _hf_float(v, default: float) -> float:
+    """Coerce an adapter knob to float, falling back on None/garbage (never raise)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _hf_artifact_url(data: dict) -> Optional[str]:
-    """Pull the result url from a completed Higgsfield status payload.
+    """Pull the result url from a completed Higgsfield status payload, ONLY if it is a
+    non-empty string. A non-string url (e.g. a number) must yield None -> 'completed but
+    no url' TERMINAL, never a non-string that crashes Result() post-charge (§5-A).
     image->video returns `video:{url}`; image paths return `images:[{url},...]`."""
     video = data.get("video")
-    if isinstance(video, dict) and video.get("url"):
+    if isinstance(video, dict) and isinstance(video.get("url"), str) and video["url"]:
         return video["url"]
     images = data.get("images")
-    if isinstance(images, list) and images and isinstance(images[0], dict):
-        return images[0].get("url")
+    if isinstance(images, list) and images and isinstance(images[0], dict) \
+            and isinstance(images[0].get("url"), str) and images[0]["url"]:
+        return images[0]["url"]
     return None
 
 
@@ -329,13 +350,13 @@ def _hf_pin_url(returned: Optional[str], base: str, fallback_path: str) -> str:
     """Trust a server-returned status/cancel URL only if it shares base's origin;
     otherwise construct our own from base. We attach the HF key to these requests, so
     an attacker-influenced submit response must not be able to point them at its host."""
-    if returned:
+    if isinstance(returned, str) and returned:   # non-string (e.g. a dict) -> fall through, never raise
         try:
             r, b = urllib.parse.urlparse(returned), urllib.parse.urlparse(base)
             if r.scheme in ("http", "https") and r.scheme == b.scheme \
                     and r.hostname == b.hostname and r.port == b.port:
                 return returned
-        except ValueError:
+        except (ValueError, TypeError):
             pass
     return base.rstrip("/") + fallback_path
 
