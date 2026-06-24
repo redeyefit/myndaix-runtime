@@ -225,21 +225,21 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
         except (KeyError, ValueError, TypeError) as e:
             return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                           text=f"higgsfield submit: unexpected shape: {e}", ms=_ms(started))
-        # Only trust server-returned status/cancel URLs if they share base's origin;
-        # otherwise build our own from request_id. Polling/cancelling carry the HF key,
-        # so we must never send it to a host the submit response could redirect us to.
-        status_url = _hf_pin_url(sub.get("status_url"), base, f"/requests/{request_id}/status")
-        cancel_url = _hf_pin_url(sub.get("cancel_url"), base, f"/requests/{request_id}/cancel")
-
         # -- poll (post-charge: per DESIGN S5-A, EVERY failure here is TERMINAL) --
         # §5-A structural guarantee: the job is now charged, so NO exception may escape
-        # this block. Targeted excepts below give precise messages; this outer catch-all
+        # this block. EVERY post-request_id statement (incl. URL construction) lives
+        # inside it. Targeted excepts below give precise messages; this outer catch-all
         # is the backstop so any unforeseen raise (a URL httpx rejects as InvalidURL, a
         # pathological adapter value, a future httpx quirk) becomes a TERMINAL Result
         # rather than escaping -> the worker can never reclaim & re-submit -> no double
         # charge. CancelledError is a BaseException, so cooperative cancellation still
         # propagates (we must not swallow it).
         try:
+            # Only trust server-returned status/cancel URLs if they share base's origin;
+            # otherwise build our own from request_id. Polling/cancelling carry the HF key,
+            # so we must never send it to a host the submit response could redirect us to.
+            status_url = _hf_pin_url(sub.get("status_url"), base, f"/requests/{request_id}/status")
+            cancel_url = _hf_pin_url(sub.get("cancel_url"), base, f"/requests/{request_id}/cancel")
             fails = 0
             while True:
                 if time.monotonic() >= deadline:
