@@ -21,6 +21,7 @@ class CommandAPI(Protocol):
 
     async def submit_job(
         self, *, to_agent: str, prompt: str,
+        context: Optional[dict] = None,
         parent_id: Optional[UUID] = None,
         inbound_event_id: Optional[UUID] = None,
         created_by: str = "human",

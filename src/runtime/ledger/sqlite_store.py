@@ -45,6 +45,14 @@ class Ledger:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS won't add a column to a PRE-EXISTING demo db file,
+        # so self-heal the one column added after this store first shipped. (No-op on a
+        # fresh/in-memory db where _SCHEMA already created it.)
+        try:
+            self.db.execute("ALTER TABLE job ADD COLUMN context TEXT NOT NULL DEFAULT '{}'")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # -- dispatch --
     async def submit_job(self, to_agent: str, prompt: str, *, reply_target: str = "demo",

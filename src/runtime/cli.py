@@ -37,7 +37,7 @@ async def submit(agent: str, task: str, *, context: Optional[dict] = None,
         env = TransportEnvelope(transport="cli", account="cli", sender_id="operator",
                                 reply_target="cli:operator", dedupe_key=str(uuid.uuid4()))
         event_id = await led.ingest_inbound(env, task)
-        jid = await led.submit_job(to_agent=agent, prompt=task, context=context or None,
+        jid = await led.submit_job(to_agent=agent, prompt=task, context=context,
                                    inbound_event_id=event_id, created_by="operator")
         print(f"-> {agent}  (job {str(jid)[:8]})", file=sys.stderr, flush=True)
 
@@ -84,7 +84,9 @@ def _build_context(args: argparse.Namespace) -> dict:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(prog="mxr", description='submit a task to the MyndAIX runtime')
+    p = argparse.ArgumentParser(
+        prog="mxr", description='submit a task to the MyndAIX runtime',
+        epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')
     p.add_argument("agent", help="roster agent id (e.g. recon, higgsfield)")
     p.add_argument("task", help="the prompt / task text")
     p.add_argument("--image", metavar="URL",
