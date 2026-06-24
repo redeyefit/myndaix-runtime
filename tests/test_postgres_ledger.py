@@ -288,6 +288,33 @@ async def test_context_round_trips(led: PostgresLedger) -> None:
     assert job2 is not None and job2.context == {}
 
 
+# -- regression: serve must auto-heal a stale schema on startup ----------------
+# Named test_zz_* so it runs LAST: it drops + restores job.context, so a failure
+# mid-way can't strand the column for the tests after it.
+async def test_zz_migrate_heals_stale_schema(led: PostgresLedger) -> None:
+    """migrate() re-applies migrations/*.sql idempotently. Simulate an OLD DB missing
+    job.context (the column the higgsfield deploy added), run migrate(), and the column
+    is restored — exactly what serve() now does on startup so a restart can never run
+    ahead of the schema (the 2026-06-24 dispatch outage)."""
+    async def _has_context() -> int:
+        async with led._pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name='job' AND column_name='context'")
+
+    async with led._pool.acquire() as con:
+        await con.execute("ALTER TABLE job DROP COLUMN IF EXISTS context")
+    assert await _has_context() == 0, "precondition: context column dropped"
+
+    applied = await led.migrate()
+    assert "0001_add_job_context.sql" in applied, f"0001 not applied: {applied}"
+    assert await _has_context() == 1, "migrate() should restore job.context"
+
+    # idempotent: a second run against the now-current schema must be a clean no-op
+    await led.migrate()
+    assert await _has_context() == 1
+
+
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------
 # Before the lock-order fix this failed ~99% of trials with DeadlockDetectedError;
 # it is the test the green suite was missing (cancel had zero coverage).
