@@ -269,6 +269,25 @@ async def test_happy_path_all_verbs(led: PostgresLedger) -> None:
     assert any(o["status"] == "sent" for o in (st["outbound"] or [])), "reply not sent"
 
 
+async def test_context_round_trips(led: PostgresLedger) -> None:
+    """Job.context persists through submit -> jsonb -> lease -> get_attempt_job (the
+    plumbing the higgsfield runner relies on to read job.context['image_url'])."""
+    await _truncate(led)
+    ctx = {"image_url": "http://example.com/cat.png", "application": "/higgsfield-ai/dop/lite"}
+    await led.submit_job(to_agent="higgsfield", prompt="gen", context=ctx)
+    att = await led.lease_job("w1", [])
+    job = await led.get_attempt_job(att)
+    assert job is not None and job.context == ctx, f"context lost: {job.context if job else None}"
+
+    # omitted context -> the jsonb DEFAULT '{}' -> an empty dict (never None), so the
+    # runner's job.context.get("image_url") is a clean None, not an AttributeError.
+    await _truncate(led)
+    await led.submit_job(to_agent="kilabz", prompt="no ctx")
+    att2 = await led.lease_job("w1", [])
+    job2 = await led.get_attempt_job(att2)
+    assert job2 is not None and job2.context == {}
+
+
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------
 # Before the lock-order fix this failed ~99% of trials with DeadlockDetectedError;
 # it is the test the green suite was missing (cancel had zero coverage).

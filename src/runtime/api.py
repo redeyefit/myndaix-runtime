@@ -26,8 +26,9 @@ Serve:  MYNDAIX_API_KEYS="s3cret:alice:client" LEDGER_DSN=postgresql://localhost
 from __future__ import annotations
 
 import os
+import json
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -38,6 +39,20 @@ from runtime.contracts import TransportEnvelope
 from runtime.ledger.postgres_store import PostgresLedger
 
 _MAX_BODY = 100_000          # bound the payload so a huge body can't DoS the queue/storage
+_MAX_CONTEXT = 20_000        # bound the free-form context dict (serialized) the same way
+
+
+def _has_nul(obj) -> bool:
+    """True if a NUL char hides anywhere in a JSON-ish structure. Postgres jsonb
+    cannot store \\u0000, and json.dumps ESCAPES it (so a check on the serialized
+    string misses it) - we must inspect the actual string values."""
+    if isinstance(obj, str):
+        return "\x00" in obj
+    if isinstance(obj, dict):
+        return any(_has_nul(k) or _has_nul(val) for k, val in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_nul(x) for x in obj)
+    return False
 _API_NS = "api:"             # API ownership namespace (never collides with provenance)
 _security = HTTPBearer(auto_error=False)  # we raise our own 401 (not 403) on no key
 
@@ -97,11 +112,27 @@ class InboundIn(BaseModel):
 
 
 class SubmitIn(BaseModel):
-    """A direct (non-transport) job submission."""
+    """A direct (non-transport) job submission. `context` is free-form per-job input
+    (e.g. {"image_url": ...} for media agents) - bounded so a huge dict can't DoS the
+    queue, and required to be JSON-serializable since it lands in a jsonb column."""
     to_agent: str = Field(min_length=1, max_length=100)
     prompt: str = Field(min_length=1, max_length=_MAX_BODY)
+    context: dict[str, Any] = Field(default_factory=dict)
 
     _strip_nul = field_validator("to_agent", "prompt")(_no_nul)
+
+    @field_validator("context")
+    @classmethod
+    def _bound_context(cls, v: dict) -> dict:
+        try:
+            serialized = json.dumps(v)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"context must be JSON-serializable: {e}")
+        if len(serialized) > _MAX_CONTEXT:
+            raise ValueError(f"context too large (> {_MAX_CONTEXT} bytes serialized)")
+        if _has_nul(v):                          # NUL would 500 Postgres jsonb, like _no_nul for text
+            raise ValueError("context must not contain NUL")
+        return v
 
 
 class JobOut(BaseModel):
@@ -179,7 +210,7 @@ def create_app(ledger: Optional[PostgresLedger] = None, *,
     async def submit(req: SubmitIn, p: Principal = Depends(_principal),
                      led: PostgresLedger = Depends(_ledger)):
         jid = await led.submit_job(to_agent=req.to_agent, prompt=req.prompt,
-                                   created_by=_API_NS + p.id)
+                                   context=req.context or None, created_by=_API_NS + p.id)
         return JobOut(job_id=str(jid))
 
     @app.get("/jobs/{job_id}", response_model=JobStatusOut)

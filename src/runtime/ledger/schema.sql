@@ -21,6 +21,7 @@ CREATE TABLE job (
     inbound_event_id    uuid REFERENCES inbound_event(id),  -- originating transport event; lets outbound resolve transport+reply_target
     to_agent            text NOT NULL,
     body                text NOT NULL,
+    context             jsonb NOT NULL DEFAULT '{}',
     capability_required text,
     priority            int  NOT NULL DEFAULT 0,
     status              text NOT NULL DEFAULT 'queued'

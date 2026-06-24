@@ -9,11 +9,13 @@ back the real reply. No orchestrator in the loop.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
 import time
 import uuid
+from typing import Optional
 
 from runtime.contracts import TransportEnvelope
 from runtime.ledger.postgres_store import PostgresLedger
@@ -22,7 +24,8 @@ from runtime.registry import REGISTRY
 DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 
-async def submit(agent: str, task: str, *, timeout_s: float = 180.0) -> int:
+async def submit(agent: str, task: str, *, context: Optional[dict] = None,
+                 timeout_s: float = 180.0) -> int:
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
         print(f"unknown agent '{agent}'. roster: {roster}", file=sys.stderr)
@@ -34,7 +37,7 @@ async def submit(agent: str, task: str, *, timeout_s: float = 180.0) -> int:
         env = TransportEnvelope(transport="cli", account="cli", sender_id="operator",
                                 reply_target="cli:operator", dedupe_key=str(uuid.uuid4()))
         event_id = await led.ingest_inbound(env, task)
-        jid = await led.submit_job(to_agent=agent, prompt=task,
+        jid = await led.submit_job(to_agent=agent, prompt=task, context=context or None,
                                    inbound_event_id=event_id, created_by="operator")
         print(f"-> {agent}  (job {str(jid)[:8]})", file=sys.stderr, flush=True)
 
@@ -69,11 +72,27 @@ async def submit(agent: str, task: str, *, timeout_s: float = 180.0) -> int:
         await led.close()
 
 
-def main() -> int:
-    if len(sys.argv) < 3:
-        print('usage: mxr <agent> "<task>"', file=sys.stderr)
-        return 2
-    return asyncio.run(submit(sys.argv[1], sys.argv[2]))
+def _build_context(args: argparse.Namespace) -> dict:
+    """Pack the optional media flags into Job.context (free-form dict, no contract
+    change). Only set keys the operator actually passed."""
+    ctx: dict = {}
+    if args.image is not None:
+        ctx["image_url"] = args.image
+    if args.application is not None:
+        ctx["application"] = args.application
+    return ctx
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="mxr", description='submit a task to the MyndAIX runtime')
+    p.add_argument("agent", help="roster agent id (e.g. recon, higgsfield)")
+    p.add_argument("task", help="the prompt / task text")
+    p.add_argument("--image", metavar="URL",
+                   help="input image url (media agents, e.g. higgsfield image->video)")
+    p.add_argument("--application", metavar="PATH",
+                   help="override the agent's media application/model path")
+    args = p.parse_args(argv)
+    return asyncio.run(submit(args.agent, args.task, context=_build_context(args)))
 
 
 if __name__ == "__main__":
