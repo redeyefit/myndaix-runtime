@@ -582,6 +582,198 @@ def test_higgsfield_premium_row_merges_params_into_body():
         del os.environ["HF_KEY"]
 
 
+class _Persist:
+    """Fake context-persist callback (the worker's ledger seam): records the deltas it's
+    handed, or raises if `fail` — to prove a failing ledger never enables a re-submit."""
+
+    def __init__(self, fail=False):
+        self.deltas = []
+        self.fail = fail
+
+    async def __call__(self, delta):
+        if self.fail:
+            raise RuntimeError("ledger down")
+        self.deltas.append(delta)
+
+    @property
+    def token(self):
+        for d in reversed(self.deltas):
+            if "_hf_resume" in d:
+                return d["_hf_resume"]
+        return None
+
+
+def _hf_run_p(spec, job, handler, persist):
+    import httpx
+    return asyncio.run(runner.invoke_higgsfield(
+        spec, job, transport=httpx.MockTransport(handler), persist=persist))
+
+
+def _is_submit(req):
+    return req.method == "POST" and not req.url.path.endswith(("/status", "/cancel"))
+
+
+def test_higgsfield_persists_resume_token_after_submit():
+    """v2: right after submit (before polling completes) the runner persists a resume
+    token {request_id, attempts:0} into job.context via the worker callback."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        p = _Persist()
+
+        def handler(req):
+            if _is_submit(req):
+                return httpx.Response(200, json={"request_id": "req-rt"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/rt.mp4"}})
+
+        r = _hf_run_p(_hf_spec(), _hf_job(), handler, p)
+        assert r.status is ResultStatus.OK, r.text
+        assert p.token is not None
+        assert p.token["request_id"] == "req-rt" and p.token["attempts"] == 0
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_post_submit_retryable_when_resumable():
+    """v2 contract change: with the token durably persisted, a post-submit poll failure
+    is RETRYABLE (the next attempt resumes) — NOT the v1 fail-closed TERMINAL."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def submit_then_die(req):
+            if _is_submit(req):
+                return httpx.Response(200, json={"request_id": "req-rr"})
+            raise httpx.ConnectError("network gone")
+
+        r = _hf_run_p(_hf_spec(), _hf_job(), submit_then_die, _Persist())
+        assert r.status is ResultStatus.ERROR
+        assert r.error_class is ErrorClass.RETRYABLE   # resumable -> retry, not fail-closed
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_resumes_without_resubmitting():
+    """A job whose context already holds a resume token RESUMES polling that request_id
+    and must NOT POST a submit again (the whole no-double-charge point of resume)."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        seen = {"submit": 0}
+
+        def handler(req):
+            if _is_submit(req):
+                seen["submit"] += 1
+                return httpx.Response(200, json={"request_id": "SHOULD-NOT-HAPPEN"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/res.mp4"}})
+
+        job = _hf_job()
+        job.context["_hf_resume"] = {"request_id": "req-prior", "attempts": 0}
+        p = _Persist()
+        r = _hf_run_p(_hf_spec(), job, handler, p)
+        assert r.status is ResultStatus.OK and r.artifact_ref.endswith("res.mp4"), r.text
+        assert seen["submit"] == 0, "resume must not re-submit"
+        assert p.token["request_id"] == "req-prior" and p.token["attempts"] == 1  # counter bumped
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_corrupt_resume_token_fails_closed():
+    """A present-but-corrupt resume token is TERMINAL and must NEVER trigger a re-submit
+    (it still means a prior attempt charged)."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        seen = {"submit": 0}
+
+        def handler(req):
+            if _is_submit(req):
+                seen["submit"] += 1
+            return httpx.Response(200, json={"request_id": "x"})
+
+        for bad in ({"attempts": 2}, {"request_id": 123}, {"request_id": ""}):
+            job = _hf_job()
+            job.context["_hf_resume"] = bad
+            r = _hf_run_p(_hf_spec(), job, handler, _Persist())
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, bad
+            assert "corrupt" in r.text
+        assert seen["submit"] == 0, "a corrupt token must never re-submit"
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_resume_budget_exhausted():
+    """Past _HF_RESUME_MAX re-leases the resume gives up (TERMINAL) so an externally-stuck
+    'in_progress' job can't re-poll forever."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        job = _hf_job()
+        job.context["_hf_resume"] = {"request_id": "req-max", "attempts": runner._HF_RESUME_MAX}
+        r = _hf_run_p(_hf_spec(), job,
+                      lambda req: httpx.Response(200, json={"status": "in_progress"}), _Persist())
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+        assert "exhausted" in r.text
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_persist_failure_falls_back_to_terminal():
+    """If the resume token can't be persisted (ledger error), post-submit failures stay
+    TERMINAL — a failing ledger must never enable a re-submit / double-charge."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def submit_then_die(req):
+            if _is_submit(req):
+                return httpx.Response(200, json={"request_id": "req-pf"})
+            raise httpx.ConnectError("gone")
+
+        r = _hf_run_p(_hf_spec(), _hf_job(), submit_then_die, _Persist(fail=True))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_resumable_timeout_does_not_cancel():
+    """A resumable poll timeout is RETRYABLE and must NOT cancel — the next attempt resumes
+    the same request_id (cancelling would kill it). Contrast test_higgsfield_cancel_on_timeout."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        hits = {"cancel": 0}
+
+        def handler(req):
+            if req.method == "POST" and req.url.path.endswith("/cancel"):
+                hits["cancel"] += 1
+                return httpx.Response(200, json={})
+            if _is_submit(req):
+                return httpx.Response(200, json={"request_id": "req-to",
+                                      "cancel_url": "https://platform.higgsfield.ai/requests/req-to/cancel"})
+            return httpx.Response(200, json={"status": "queued"})
+
+        r = _hf_run_p(_hf_spec(), _hf_job(timeout=1), handler, _Persist())
+        assert r.status is ResultStatus.TIMEOUT and r.error_class is ErrorClass.RETRYABLE
+        assert hits["cancel"] == 0, "resumable timeout must NOT cancel"
+    finally:
+        del os.environ["HF_KEY"]
+
+
 def test_premium_rows_registered_and_route_higgsfield():
     """The v2 premium rows exist, all route to invoke_higgsfield (kind=higgsfield), and
     keep the secret in env (secret_ref), never the row. dop-std carries its duration param."""

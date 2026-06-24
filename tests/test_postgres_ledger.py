@@ -288,6 +288,32 @@ async def test_context_round_trips(led: PostgresLedger) -> None:
     assert job2 is not None and job2.context == {}
 
 
+async def test_record_job_context_merges_and_status_guarded(led: PostgresLedger) -> None:
+    """v2 idempotent-resume seam: record_job_context merges a delta into a LIVE job's
+    context (jsonb ||), re-persist replaces the token, and it no-ops once the job is no
+    longer leased/running — so a lost lease can never let the runner re-submit."""
+    await _truncate(led)
+    jid = await led.submit_job(to_agent="higgsfield", prompt="clip",
+                               context={"image_url": "http://example.com/c.png"})
+    att = await led.lease_job("w1", [])
+
+    await led.record_job_context(jid, {"_hf_resume": {"request_id": "req-1", "attempts": 0}})
+    job = await led.get_attempt_job(att)
+    assert job.context["image_url"] == "http://example.com/c.png"          # original preserved
+    assert job.context["_hf_resume"] == {"request_id": "req-1", "attempts": 0}  # delta merged
+
+    await led.record_job_context(jid, {"_hf_resume": {"request_id": "req-1", "attempts": 3}})
+    job = await led.get_attempt_job(att)
+    assert job.context["_hf_resume"]["attempts"] == 3                      # token replaced wholesale
+
+    # complete the job -> status 'done'; a later record is a no-op (status-guarded)
+    await led.complete_attempt(att, _ok())
+    await led.record_job_context(jid, {"_hf_resume": {"request_id": "LATE"}})
+    async with led._pool.acquire() as con:
+        ctx = await con.fetchval("SELECT context FROM job WHERE id=$1", jid)
+    assert ctx["_hf_resume"]["request_id"] == "req-1", "no-op after the job left leased/running"
+
+
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------
 # Before the lock-order fix this failed ~99% of trials with DeadlockDetectedError;
 # it is the test the green suite was missing (cancel had zero coverage).

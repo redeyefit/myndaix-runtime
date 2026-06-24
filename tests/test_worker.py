@@ -104,7 +104,7 @@ async def test_invoke_never_leaks_the_agent_task():
 
     state = {"cancelled": False}
 
-    async def fake_invoke(agent_id, job):
+    async def fake_invoke(agent_id, job, *, persist=None):
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
@@ -147,6 +147,58 @@ async def test_sqlite_context_round_trips_to_job():
     aid2 = await led.lease_job("w1")
     job2 = await led.get_attempt_job(aid2)
     assert job2 is not None and job2.context == {}
+
+
+async def test_sqlite_record_job_context_merges_and_guards():
+    """record_job_context shallow-merges into a LIVE job's context (the v2 resume-token
+    seam), re-persist replaces the token wholesale, and it no-ops once the job isn't
+    leased/running (a lost lease -> the runner stays fail-closed, no re-submit)."""
+    import json as _json
+
+    from runtime.contracts import Result, ResultStatus
+
+    led = Ledger()
+    jid = await led.submit_job("higgsfield", "clip", context={"image_url": "http://x/c.png"})
+    aid = await led.lease_job("w1")
+    job = await led.get_attempt_job(aid)
+
+    await led.record_job_context(job.id, {"_hf_resume": {"request_id": "req-1", "attempts": 0}})
+    ctx = (await led.get_attempt_job(aid)).context
+    assert ctx["image_url"] == "http://x/c.png"            # original preserved
+    assert ctx["_hf_resume"] == {"request_id": "req-1", "attempts": 0}   # delta merged
+
+    await led.record_job_context(job.id, {"_hf_resume": {"request_id": "req-1", "attempts": 1}})
+    assert (await led.get_attempt_job(aid)).context["_hf_resume"]["attempts"] == 1  # replaced
+
+    # once done (not leased/running) the merge is a no-op (status-guarded)
+    await led.complete_attempt(aid, Result(status=ResultStatus.OK, text="done"))
+    await led.record_job_context(job.id, {"_hf_resume": {"request_id": "LATE"}})
+    final = _json.loads((await led.status(jid))["context"])
+    assert final["_hf_resume"]["request_id"] == "req-1", "no-op after the job left leased/running"
+
+
+async def test_context_persister_targets_job_id_and_is_optional():
+    """_context_persister builds a callback that writes the delta to THIS job's id via the
+    ledger; None when the ledger lacks record_job_context (so the runner stays fail-closed)."""
+    import uuid as _uuid
+
+    from runtime.contracts import Job
+
+    seen = {}
+
+    class L:
+        async def record_job_context(self, job_id, delta):
+            seen["job_id"] = job_id
+            seen["delta"] = delta
+
+    job = Job(id=_uuid.uuid4(), to_agent="higgsfield", prompt="x")
+    persist = worker._context_persister(L(), job)
+    await persist({"_hf_resume": {"request_id": "r"}})
+    assert seen["job_id"] == job.id and seen["delta"]["_hf_resume"]["request_id"] == "r"
+
+    class L2:  # no record_job_context verb
+        pass
+    assert worker._context_persister(L2(), job) is None
 
 
 async def _main():

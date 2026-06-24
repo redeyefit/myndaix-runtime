@@ -59,6 +59,14 @@ class CommandAPI(Protocol):
         off the hot state machine. Long jobs are never dark."""
         ...
 
+    async def record_job_context(self, job_id: UUID, delta: dict) -> None:
+        """worker/runner: shallow-merge `delta` into a live job's context (jsonb `||`),
+        status-guarded to leased/running (no-op otherwise). Lets a runner durably
+        checkpoint mid-execution state - v2 idempotent-resume persists the higgsfield
+        resume token (request_id) here so a post-submit retry resumes polling instead of
+        re-submitting (no double-charge). A no-op on a lost lease keeps it fail-closed."""
+        ...
+
     # -- outbox (reliable delivery) --
     async def enqueue_outbound(self, job_id: UUID, body: str) -> UUID:
         ...

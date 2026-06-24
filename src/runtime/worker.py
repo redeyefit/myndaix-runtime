@@ -49,14 +49,29 @@ def _unlink(path: Optional[str]) -> None:
             pass
 
 
+def _context_persister(ledger, job: Job):
+    """Build the job-scoped callback the runner uses to durably checkpoint state into
+    job.context mid-run (v2: the higgsfield resume token / request_id, so a post-submit
+    retry resumes instead of re-submitting). None if the ledger has no record_job_context
+    verb (e.g. a minimal test ledger) -> the runner stays fail-closed (no resume)."""
+    record = getattr(ledger, "record_job_context", None)
+    if record is None:
+        return None
+
+    async def persist(delta: dict) -> None:
+        await record(job.id, delta)
+    return persist
+
+
 async def _invoke(ledger, attempt_id, job: Job, heartbeat_interval_s: Optional[float]) -> Result:
     """Run the agent. With a heartbeat (and a ledger that supports it), extend the
     lease periodically so a job longer than the lease isn't reclaimed. If a
     heartbeat finds the lease GONE, cancel the now-orphaned agent (the runner kills
     its process group) and raise LostLease - do NOT let it run to completion."""
+    persist = _context_persister(ledger, job)
     if not heartbeat_interval_s or not hasattr(ledger, "heartbeat_attempt"):
-        return await runner.invoke(job.to_agent, job)
-    task = asyncio.ensure_future(runner.invoke(job.to_agent, job))
+        return await runner.invoke(job.to_agent, job, persist=persist)
+    task = asyncio.ensure_future(runner.invoke(job.to_agent, job, persist=persist))
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=heartbeat_interval_s)

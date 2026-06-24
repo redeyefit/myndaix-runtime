@@ -32,6 +32,8 @@ _HF_POLL_RETRY_BACKOFF_S = 2
 _HF_REQ_TIMEOUT_CAP_S = 30   # ceiling on any single submit/poll request (overall deadline still bounds total)
 _HF_CANCEL_TIMEOUT_S = 5     # best-effort cancel POST must not hang the timeout return
 _HF_ACTIVE_STATES = ("queued", "in_progress")   # everything else nonempty -> terminal (design §7b)
+_HF_RESUME_MAX = 20          # v2: cap idempotent-resume re-leases so an externally-stuck
+                             # 'in_progress' job can't re-poll forever (bounded, no re-charge)
 
 # Private / link-local IP ranges — blocked as image_url targets (SSRF defence)
 _PRIVATE_NETS = [
@@ -144,19 +146,26 @@ async def invoke_api(spec: AgentSpec, job: Job, *, transport=None) -> Result:
     return Result(status=ResultStatus.OK, text=str(text).strip(), ms=_ms(started))
 
 
-async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Result:
+async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None, persist=None) -> Result:
     """Invoke Higgsfield's async media queue (image/text -> video). Unlike invoke_api
     this is NOT OpenAI-shaped: auth is `Authorization: Key <key>`, submit returns a
     request_id, and the result is polled. The key comes from os.environ[secret_ref],
     never the adapter.
 
-    Idempotency (DESIGN S5, decision A - fail-closed): only a *pre-send* network
-    failure (couldn't connect) is RETRYABLE - nothing reached Higgsfield, nothing
-    charged. The submit POST is NON-idempotent, so an AMBIGUOUS failure (read timeout,
-    protocol error: the request may have been received & charged) is TERMINAL - we must
-    never re-submit and double-charge. Once submit returns a request_id the job is
-    charged, so EVERY later failure (poll error, timeout, bad payload, success-path
-    crash) is TERMINAL. Idempotent resume is deferred to v2."""
+    Idempotency — DESIGN v2 §B (idempotent-resume), supersedes v1 §5-A fail-closed:
+    a *pre-send* network failure is RETRYABLE (nothing charged); an AMBIGUOUS submit
+    failure (read timeout/protocol) is TERMINAL (the non-idempotent POST may have charged
+    — never risk a re-submit). Once submit returns a request_id, the job is charged and
+    we PERSIST a resume token (request_id + pinned urls) into job.context via `persist`
+    BEFORE polling. Then a post-submit *transient* failure (poll blip, attempt timeout,
+    worker crash) is RETRYABLE: the next attempt finds the token and RESUMES polling the
+    same request_id instead of re-submitting — no double-charge. If the token could not
+    be durably persisted (`persist` is None or it failed), post-submit failures fall back
+    to TERMINAL (v1 fail-closed). Genuine terminal outcomes (failed/nsfw/unknown status/
+    bad payload) and any unforeseen raise stay TERMINAL regardless. `persist(delta)` is a
+    job-scoped, status-guarded ledger merge supplied by the worker (no-op for a lost lease).
+
+    A present-but-corrupt resume token fails CLOSED (TERMINAL) — it still never re-submits."""
     try:
         import httpx
     except ImportError:
@@ -190,13 +199,6 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
 
     headers = {"Content-Type": "application/json", "Authorization": f"Key {key}"}
     submit_url = base.rstrip("/") + "/" + application.lstrip("/")
-    # Body = optional per-model params (adapter defaults, then job overrides) with the
-    # canonical prompt/image_url set LAST so params can never clobber them. This is what
-    # lets premium models (dop/standard's `duration`, image models' `aspect_ratio`, …) be
-    # added as pure roster rows — the runner stays generic over the application path.
-    body = _hf_merge_params(a.get("params"), job.context.get("params"))
-    body["prompt"] = job.prompt
-    body["image_url"] = image_url
     # Coerce the tuning knobs up front: a malformed adapter value (e.g. "3") must
     # never surface as a TypeError mid-poll (post-charge), which would violate §5-A.
     poll_interval = _hf_float(a.get("poll_interval_s"), _HF_POLL_INTERVAL_S)
@@ -206,55 +208,99 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
     started = time.monotonic()
     deadline = started + job.timeout_s
     async with httpx.AsyncClient(transport=transport) as client:
-        # -- submit (pre-charge) --
-        try:
-            resp = await client.post(submit_url, json=body, headers=headers,
-                                     timeout=_hf_req_timeout(deadline))
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-            # never reached the server -> nothing charged -> safe to retry
-            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.RETRYABLE,
-                          text=f"higgsfield submit unreachable: {e}", ms=_ms(started))
-        except httpx.HTTPError as e:
-            # ambiguous (read timeout / protocol): the POST may have landed & charged.
-            # The submit is non-idempotent, so fail CLOSED rather than risk a re-submit.
-            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                          text=f"higgsfield submit ambiguous failure (fail-closed, no retry): {e}",
-                          ms=_ms(started))
-        if resp.status_code >= 300:   # accept any 2xx (200/201/202 async-queue 'Accepted')
-            ec = ErrorClass.RETRYABLE if resp.status_code >= 500 else ErrorClass.TERMINAL
-            return Result(status=ResultStatus.ERROR, error_class=ec, exit_code=resp.status_code,
-                          text=f"higgsfield submit {resp.status_code}: {resp.text[:300]}",
-                          ms=_ms(started))
-        try:
-            sub = resp.json()
-            request_id = sub["request_id"]
-        except (KeyError, ValueError, TypeError) as e:
-            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                          text=f"higgsfield submit: unexpected shape: {e}", ms=_ms(started))
-        # -- poll (post-charge: per DESIGN S5-A, EVERY failure here is TERMINAL) --
-        # §5-A structural guarantee: the job is now charged, so NO exception may escape
-        # this block. EVERY post-request_id statement (incl. URL construction) lives
-        # inside it. Targeted excepts below give precise messages; this outer catch-all
-        # is the backstop so any unforeseen raise (a URL httpx rejects as InvalidURL, a
-        # pathological adapter value, a future httpx quirk) becomes a TERMINAL Result
-        # rather than escaping -> the worker can never reclaim & re-submit -> no double
-        # charge. CancelledError is a BaseException, so cooperative cancellation still
-        # propagates (we must not swallow it).
+        # -- resume vs submit (DESIGN v2 §B) --
+        # If a prior attempt already submitted, job.context carries a persisted resume
+        # token. We must NEVER submit again (that re-charges): resume polling the same
+        # request_id. A present-but-corrupt token fails CLOSED (still no re-submit).
+        prior = job.context.get("_hf_resume") if isinstance(job.context, dict) else None
+        if prior is not None:
+            request_id = prior.get("request_id") if isinstance(prior, dict) else None
+            if not isinstance(request_id, str) or not request_id:
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text="higgsfield resume token corrupt; refusing to re-submit "
+                                   "(no double-charge)", ms=_ms(started))
+            attempts = _hf_int(prior.get("attempts"), 0) + 1
+            if attempts > _HF_RESUME_MAX:
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text=f"higgsfield resume budget exhausted after {_HF_RESUME_MAX} "
+                                   f"re-leases (request_id={request_id})", ms=_ms(started))
+            token = {"request_id": request_id, "status_url": prior.get("status_url"),
+                     "cancel_url": prior.get("cancel_url"), "attempts": attempts}
+            # Bump the durable counter BEFORE polling. If it doesn't persist, this attempt
+            # is non-resumable (a later blip/timeout -> TERMINAL) so resume stays bounded
+            # even if the ledger write is failing.
+            resumable = await _hf_try_persist(persist, {"_hf_resume": token})
+        else:
+            # -- submit (pre-charge) --
+            # Body = optional per-model params (adapter defaults, then job overrides) with the
+            # canonical prompt/image_url set LAST so params can never clobber them — this is
+            # what lets premium models (dop/standard's `duration`, …) be pure roster rows.
+            body = _hf_merge_params(a.get("params"), job.context.get("params"))
+            body["prompt"] = job.prompt
+            body["image_url"] = image_url
+            try:
+                resp = await client.post(submit_url, json=body, headers=headers,
+                                         timeout=_hf_req_timeout(deadline))
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                # never reached the server -> nothing charged -> safe to retry
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.RETRYABLE,
+                              text=f"higgsfield submit unreachable: {e}", ms=_ms(started))
+            except httpx.HTTPError as e:
+                # ambiguous (read timeout / protocol): the POST may have landed & charged.
+                # The submit is non-idempotent, so fail CLOSED rather than risk a re-submit.
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text=f"higgsfield submit ambiguous failure (fail-closed, no retry): {e}",
+                              ms=_ms(started))
+            if resp.status_code >= 300:   # accept any 2xx (200/201/202 async-queue 'Accepted')
+                ec = ErrorClass.RETRYABLE if resp.status_code >= 500 else ErrorClass.TERMINAL
+                return Result(status=ResultStatus.ERROR, error_class=ec, exit_code=resp.status_code,
+                              text=f"higgsfield submit {resp.status_code}: {resp.text[:300]}",
+                              ms=_ms(started))
+            try:
+                sub = resp.json()
+                request_id = sub["request_id"]
+            except (KeyError, ValueError, TypeError) as e:
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text=f"higgsfield submit: unexpected shape: {e}", ms=_ms(started))
+            if not isinstance(request_id, str) or not request_id:
+                # a non-string request_id can't be polled or pinned -> fail closed (the
+                # submit charged, but we have no usable handle; do NOT loop on a bad id).
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text="higgsfield submit: non-string request_id", ms=_ms(started))
+            token = {"request_id": request_id, "status_url": sub.get("status_url"),
+                     "cancel_url": sub.get("cancel_url"), "attempts": 0}
+            # Persist the resume token IMMEDIATELY, before any polling: a post-submit
+            # retryable failure (or a worker crash before this attempt records a result)
+            # then RESUMES this request_id rather than re-submitting. resumable=True only
+            # if it durably persisted; else we fall back to v1 §5-A fail-closed below.
+            resumable = await _hf_try_persist(persist, {"_hf_resume": token})
+
+        # -- poll (post-charge) --
+        # §5-A structural guarantee preserved: the job is charged, so NO exception escapes
+        # this block (EVERY post-request_id statement, incl. URL construction, lives in it).
+        # What v2 changes is the post-charge error CLASS: RETRYABLE when the resume token is
+        # durably persisted (the next attempt resumes the SAME request_id — no re-charge),
+        # else TERMINAL (v1 fail-closed). failed/nsfw/unknown-status/bad-payload stay TERMINAL
+        # (genuine terminal outcomes), and the catch-all backstop stays TERMINAL (an unforeseen
+        # raise is fail-closed). CancelledError (BaseException) still propagates.
+        post_charge = ErrorClass.RETRYABLE if resumable else ErrorClass.TERMINAL
+        note = "resumable" if resumable else "charged, no retry"
         try:
             # Only trust server-returned status/cancel URLs if they share base's origin;
             # otherwise build our own from request_id. Polling/cancelling carry the HF key,
             # so we must never send it to a host the submit response could redirect us to.
-            status_url = _hf_pin_url(sub.get("status_url"), base, f"/requests/{request_id}/status")
-            cancel_url = _hf_pin_url(sub.get("cancel_url"), base, f"/requests/{request_id}/cancel")
+            status_url = _hf_pin_url(token.get("status_url"), base, f"/requests/{request_id}/status")
+            cancel_url = _hf_pin_url(token.get("cancel_url"), base, f"/requests/{request_id}/cancel")
             fails = 0
             while True:
                 if time.monotonic() >= deadline:
-                    # best-effort cancel so a still-QUEUED job stops charging (live-verified:
-                    # cancel only takes effect while queued, not mid-render).
-                    await _hf_best_effort_cancel(client, cancel_url, headers)
-                    return Result(status=ResultStatus.TIMEOUT, error_class=ErrorClass.TERMINAL,
+                    # Cancel ONLY when not resumable: a best-effort cancel would kill a job the
+                    # next attempt means to resume. When resumable, leave it running and retry.
+                    if not resumable:
+                        await _hf_best_effort_cancel(client, cancel_url, headers)
+                    return Result(status=ResultStatus.TIMEOUT, error_class=post_charge,
                                   text=f"higgsfield poll timed out after {job.timeout_s}s "
-                                       f"(request_id={request_id})", ms=_ms(started))
+                                       f"({note}, request_id={request_id})", ms=_ms(started))
                 err = None
                 try:
                     pr = await client.get(status_url, headers=headers,
@@ -263,11 +309,11 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
                         err = f"poll {pr.status_code}: {pr.text[:200]}"
                 except httpx.HTTPError as e:
                     err = f"poll error: {e}"
-                if err is not None:   # transient: retry up to retry_max, then fail closed
+                if err is not None:   # transient: retry up to retry_max, then resume-or-fail
                     fails += 1
                     if fails > retry_max:
-                        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                                      text=f"higgsfield {err} (charged, no retry)", ms=_ms(started))
+                        return Result(status=ResultStatus.ERROR, error_class=post_charge,
+                                      text=f"higgsfield {err} ({note})", ms=_ms(started))
                     await asyncio.sleep(_hf_sleep(retry_backoff, deadline))
                     continue
                 fails = 0
@@ -292,7 +338,7 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
                     return Result(status=ResultStatus.OK, text=url, artifact_ref=url,
                                   cost=cost, ms=_ms(started))
                 if status in ("failed", "nsfw"):
-                    # Higgsfield refunds these - terminal, no retry.
+                    # Higgsfield refunds these - terminal, no retry (resume wouldn't help).
                     return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                                   text=f"higgsfield {status} (request_id={request_id})",
                                   ms=_ms(started))
@@ -310,7 +356,7 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
                                f"(charged, no retry): {type(e).__name__}: {e}", ms=_ms(started))
 
 
-async def invoke(agent_id: str, job: Job) -> Result:
+async def invoke(agent_id: str, job: Job, *, persist=None) -> Result:
     spec = get_spec(agent_id)
     if spec is None:
         return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
@@ -318,7 +364,9 @@ async def invoke(agent_id: str, job: Job) -> Result:
     if spec.reach is Reach.CLI:
         return await invoke_cli(spec, job)
     if spec.adapter.get("kind") == "higgsfield":
-        return await invoke_higgsfield(spec, job)
+        # `persist` lets the runner durably checkpoint a resume token (request_id) into the
+        # ledger mid-execution (v2 idempotent-resume); only the higgsfield path uses it.
+        return await invoke_higgsfield(spec, job, persist=persist)
     return await invoke_api(spec, job)
 
 
@@ -333,6 +381,21 @@ def _hf_int(v, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+async def _hf_try_persist(persist, delta: dict) -> bool:
+    """Durably persist a resume-token delta into job.context via the worker-supplied
+    callback. Returns True iff it was written. A missing callback (no ledger seam) or
+    ANY failure (lost lease, ledger error) returns False -> the caller stays fail-closed
+    (post-submit failures TERMINAL), so a persist problem can NEVER cause a re-submit.
+    Best-effort by design: it must never raise out of the post-charge path."""
+    if persist is None:
+        return False
+    try:
+        await persist(delta)
+        return True
+    except Exception:
+        return False
 
 
 _HF_RESERVED_BODY_KEYS = ("prompt", "image_url")
