@@ -23,7 +23,8 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 ORCH="$HOME/.myndaix/orchestrator"                 # all state OUTSIDE any repo
 RUNS="$ORCH/runs"; STATE="$ORCH/state"
 INBOX="$HOME/.myndaix/bridge/inbox/jefe"           # human-only, no agent watcher
-TARGET_REF="refs/heads/main"
+TARGET_GLOB="refs/heads/*"                          # review pushes to ANY branch (skip tags/deletes)
+BASE_REF="main"                                     # a new branch's first push is diffed against this
 MAX_DIFF=65536                                      # ~64KB; bounded by the 300s review budget (tune with data)
 ERR_CAP=1000000
 DAILY_CAP=20
@@ -41,13 +42,15 @@ if [[ "${1:-}" != "--worker" ]]; then
   self="$repo/orchestrator/play-review.sh"
   [[ -x "$self" ]] || self="$0"
   while read -r localref localsha remoteref remotesha; do
-    [[ "$remoteref" == "$TARGET_REF" ]] || continue
-    [[ "$localsha" == "$ZERO" ]] && continue        # branch delete
-    if [[ "$remotesha" == "$ZERO" ]] \
-       || ! git -C "$repo" cat-file -e "${remotesha}^{commit}" 2>/dev/null; then
-      base="$EMPTY_TREE"
+    [[ "$remoteref" == $TARGET_GLOB ]] || continue          # any branch; skip tags (unquoted RHS = glob)
+    [[ "$localsha" == "$ZERO" ]] && continue                # branch delete
+    if [[ "$remotesha" != "$ZERO" ]] && git -C "$repo" cat-file -e "${remotesha}^{commit}" 2>/dev/null; then
+      base="$remotesha"                                     # existing branch: review the incremental push
+    elif base="$(git -C "$repo" merge-base "$BASE_REF" "$localsha" 2>/dev/null)" \
+         && [[ -n "$base" && "$base" != "$localsha" ]]; then
+      :                                                     # new branch: review vs its merge-base with main
     else
-      base="$remotesha"
+      base="$EMPTY_TREE"                                    # no base ref / root commit → whole-tree diff
     fi
     nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" >/dev/null 2>&1 &
   done
