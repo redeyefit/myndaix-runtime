@@ -239,6 +239,212 @@ def test_higgsfield_rejects_unsafe_image_url():
         del os.environ["HF_KEY"]
 
 
+def _hf_run(spec, job, handler):
+    import httpx
+    return asyncio.run(runner.invoke_higgsfield(spec, job, transport=httpx.MockTransport(handler)))
+
+
+def test_higgsfield_poll_retry_then_recovers():
+    """§7b P0: a transient 5xx during polling retries (up to poll_retry_max) and then
+    RECOVERS to a completed result - not just 'eventually gives up'."""
+    import os
+
+    import httpx
+    spec, job = _hf_spec(), _hf_job()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        polls = {"n": 0}
+
+        def handler(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-r"})
+            polls["n"] += 1
+            if polls["n"] <= 2:                       # two transient blips...
+                return httpx.Response(503, text="upstream")
+            return httpx.Response(200, json={"status": "completed",         # ...then success
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/r.mp4"}})
+
+        r = _hf_run(spec, job, handler)
+        assert r.status is ResultStatus.OK, r.text
+        assert r.artifact_ref == "https://cloud-cdn.higgsfield.ai/r.mp4"
+        assert polls["n"] == 3                        # proves it retried, didn't give up at #1
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_malformed_cost_preserves_artifact():
+    """A non-numeric upstream `cost` must NOT discard a paid result: keep artifact_ref,
+    just drop the cost. (Passing it raw to Result would raise pydantic ValidationError.)"""
+    import os
+
+    import httpx
+    spec = _hf_spec()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        for bad_cost in ("$0.13", {"amount": 0.13, "currency": "usd"}, "free", True):
+            def handler(req, _c=bad_cost):
+                if req.method == "POST":
+                    return httpx.Response(200, json={"request_id": "req-c"})
+                return httpx.Response(200, json={"status": "completed", "cost": _c,
+                                      "video": {"url": "https://cloud-cdn.higgsfield.ai/c.mp4"}})
+            r = _hf_run(spec, _hf_job(), handler)
+            assert r.status is ResultStatus.OK, (bad_cost, r.text)
+            assert r.artifact_ref == "https://cloud-cdn.higgsfield.ai/c.mp4"
+            assert r.cost is None, bad_cost          # malformed cost dropped, not fatal
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_nonstring_status_does_not_crash():
+    """A non-string poll `status` (e.g. an int code) must fail closed as TERMINAL,
+    never raise out of invoke_higgsfield (which would escape the result-recording path)."""
+    import os
+
+    import httpx
+    spec = _hf_spec()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def handler(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-i"})
+            return httpx.Response(200, json={"status": 200})
+
+        r = _hf_run(spec, _hf_job(), handler)
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_accepts_202_submit():
+    """An async queue may answer submit with 202 Accepted (not 200) carrying a
+    request_id - that must be honored, not dropped as a submit error."""
+    import os
+
+    import httpx
+    spec = _hf_spec()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def handler(req):
+            if req.method == "POST":
+                return httpx.Response(202, json={"request_id": "req-202"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "images": [{"url": "https://cloud-cdn.higgsfield.ai/a.png"}]})
+
+        r = _hf_run(spec, _hf_job(), handler)
+        assert r.status is ResultStatus.OK and r.artifact_ref.endswith("a.png")
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_unknown_and_nsfw_and_no_url_are_terminal():
+    """Unknown status (design §7b), nsfw, and completed-without-url all -> TERMINAL."""
+    import os
+
+    import httpx
+    spec = _hf_spec()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        cases = {
+            "weird-state": {"status": "weird-state"},
+            "nsfw": {"status": "nsfw"},
+            "nourl": {"status": "completed"},                 # no video/images
+        }
+        for name, payload in cases.items():
+            def handler(req, _p=payload):
+                if req.method == "POST":
+                    return httpx.Response(200, json={"request_id": "req-u"})
+                return httpx.Response(200, json=_p)
+            r = _hf_run(spec, _hf_job(), handler)
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, name
+        # the unknown-status case should surface the actual status for a human
+        def unk(req):
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-u"})
+            return httpx.Response(200, json={"status": "weird-state"})
+        assert "weird-state" in _hf_run(spec, _hf_job(), unk).text
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_submit_ambiguous_terminal_connect_retryable():
+    """Charge-correctness: a pre-send ConnectError is RETRYABLE (nothing charged), but
+    an ambiguous ReadTimeout on the non-idempotent submit is TERMINAL (may have charged)."""
+    import os
+
+    import httpx
+    spec = _hf_spec()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def conn(req):
+            raise httpx.ConnectError("refused")
+        r = _hf_run(spec, _hf_job(), conn)
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.RETRYABLE
+
+        def readto(req):
+            raise httpx.ReadTimeout("slow")
+        r = _hf_run(spec, _hf_job(), readto)
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_cancel_on_timeout():
+    """On poll timeout the runner best-effort POSTs Higgsfield's cancel_url so a still-
+    queued job stops charging (design §7b P1)."""
+    import os
+
+    import httpx
+    spec, job = _hf_spec(), _hf_job(timeout=1)
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        hits = {"cancel": 0}
+
+        def handler(req):
+            if req.method == "POST" and req.url.path.endswith("/cancel"):
+                hits["cancel"] += 1
+                return httpx.Response(200, json={"ok": True})
+            if req.method == "POST":
+                return httpx.Response(200, json={"request_id": "req-x",
+                                      "cancel_url": "https://platform.higgsfield.ai/requests/req-x/cancel"})
+            return httpx.Response(200, json={"status": "queued"})
+
+        r = _hf_run(spec, job, handler)
+        assert r.status is ResultStatus.TIMEOUT and r.error_class is ErrorClass.TERMINAL
+        assert hits["cancel"] == 1                 # cancel was attempted
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_ipv4_mapped_ssrf_rejected():
+    """IPv4-mapped IPv6 (::ffff:127.0.0.1) must not bypass the loopback guard."""
+    import os
+
+    import uuid as _uuid
+
+    from runtime.contracts import Job
+    spec = _hf_spec()
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        job = Job(id=_uuid.uuid4(), to_agent="higgsfield", prompt="x",
+                  context={"image_url": "http://[::ffff:127.0.0.1]/x.png"})
+        r = asyncio.run(runner.invoke_higgsfield(spec, job))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+        assert "rejected" in r.text
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_missing_secret_ref_fails_closed():
+    """An adapter with no secret_ref must fail closed (TERMINAL), never send 'Key None'."""
+    spec = AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,
+                     model="dop-lite", role="video",
+                     adapter={"kind": "higgsfield", "base": "https://platform.higgsfield.ai",
+                              "application": "/higgsfield-ai/dop/lite"})   # no secret_ref
+    r = asyncio.run(runner.invoke_higgsfield(spec, _hf_job()))
+    assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    assert "missing API key" in r.text
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
