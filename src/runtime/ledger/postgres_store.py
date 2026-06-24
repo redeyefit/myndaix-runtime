@@ -123,6 +123,7 @@ class PostgresLedger:
 
     async def submit_job(
         self, *, to_agent: str, prompt: str,
+        context: Optional[dict] = None,
         parent_id: Optional[UUID] = None,
         inbound_event_id: Optional[UUID] = None,
         created_by: str = "human",
@@ -161,10 +162,10 @@ class PostgresLedger:
                     if reason is not None:
                         await con.execute(
                             """INSERT INTO job (id, parent_id, root_id, depth, created_by,
-                                   inbound_event_id, to_agent, body, priority, status)
-                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'dead')""",
+                                   inbound_event_id, to_agent, body, context, priority, status)
+                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'dead')""",
                             jid, parent_id, root_id, depth, created_by, inbound_event_id,
-                            to_agent, prompt, priority)
+                            to_agent, prompt, context or {}, priority)
                         await con.execute(
                             "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
                             _new_id(), jid, reason)
@@ -173,10 +174,11 @@ class PostgresLedger:
                     async with con.transaction():  # savepoint around the insert
                         await con.execute(
                             """INSERT INTO job (id, parent_id, root_id, depth, created_by,
-                                   inbound_event_id, to_agent, body, repo_id, base_ref, priority, status)
-                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued')""",
+                                   inbound_event_id, to_agent, body, context, repo_id, base_ref,
+                                   priority, status)
+                               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'queued')""",
                             jid, parent_id, root_id, depth, created_by, inbound_event_id,
-                            to_agent, prompt, repo_id, base_ref, priority)
+                            to_agent, prompt, context or {}, repo_id, base_ref, priority)
                 except asyncpg.UniqueViolationError:
                     # a job for this inbound_event already exists -> idempotent dispatch
                     # (a redelivered message must not spawn a second job + second reply).
@@ -227,14 +229,15 @@ class PostgresLedger:
         cancelled or reclaimed) so the worker skips running already-discarded work."""
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
-                """SELECT j.id, j.to_agent, j.body, j.repo_id, j.base_ref, j.base_sha,
-                          j.worktree_path
+                """SELECT j.id, j.to_agent, j.body, j.context, j.repo_id, j.base_ref,
+                          j.base_sha, j.worktree_path
                      FROM job j JOIN attempt a ON a.job_id = j.id
                     WHERE a.id = $1 AND a.status = 'open'
                       AND j.status IN ('leased','running')""", attempt_id)
         if row is None:
             return None
         return Job(id=row["id"], to_agent=row["to_agent"], prompt=row["body"],
+                   context=row["context"] or {},
                    repo_id=row["repo_id"], base_ref=row["base_ref"],
                    base_sha=row["base_sha"], worktree_path=row["worktree_path"])
 

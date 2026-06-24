@@ -124,6 +124,78 @@ async def test_client_cannot_read_another_principals_job():
         await led.close()
 
 
+async def test_jobs_accepts_and_persists_context():
+    """POST /jobs with a context dict -> it survives to the leased Job (so an API
+    principal can drive a media agent: {"context": {"image_url": ...}})."""
+    app, led = await _fresh_app()
+    c = _client(app)
+    try:
+        ctx = {"image_url": "http://example.com/cat.png", "application": "/x/y"}
+        r = await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi", "context": ctx})
+        assert r.status_code == 201, r.text
+        att = await led.lease_job("w1", [])
+        job = await led.get_attempt_job(att)
+        assert job is not None and job.context == ctx
+    finally:
+        await c.aclose()
+        await led.close()
+
+
+async def test_context_validation():
+    app, led = await _fresh_app()
+    c = _client(app)
+    try:
+        # oversized context -> 422 (DoS guard), like the body bound
+        big = {"k": "v" * 30_000}
+        assert (await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi",
+                "context": big})).status_code == 422
+        # NUL inside context -> 422, not a Postgres 500
+        assert (await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi",
+                "context": {"k": "bad\x00nul"}})).status_code == 422
+        # omitted context still works (defaults to {})
+        assert (await c.post("/jobs",
+                json={"to_agent": "api-echo", "prompt": "hi"})).status_code == 201
+    finally:
+        await c.aclose()
+        await led.close()
+
+
+async def test_context_rejects_non_finite_numbers():
+    """NaN/Infinity are not valid JSON and Postgres jsonb rejects them - they must be a
+    clean 422 at validation, never a 500 at the INSERT. Sent as a RAW body because
+    httpx's json= would itself re-encode (and stdlib json.loads on the server accepts
+    the NaN/Infinity literals, so they reach our validator)."""
+    app, led = await _fresh_app()
+    c = _client(app)
+    try:
+        for tok in ("NaN", "Infinity", "-Infinity"):
+            body = '{"to_agent": "api-echo", "prompt": "hi", "context": {"k": %s}}' % tok
+            r = await c.post("/jobs", content=body,
+                             headers={"Content-Type": "application/json"})
+            assert r.status_code == 422, (tok, r.status_code, r.text)
+    finally:
+        await c.aclose()
+        await led.close()
+
+
+async def test_context_deep_nesting_is_clean_not_recursionerror():
+    """A deeply-nested context must not surface as an uncaught RecursionError (-> 500)
+    from our validator; a clean 422 (ValidationError) is the contract."""
+    from runtime.api import SubmitIn
+    deep: dict = {}
+    cur = deep
+    for _ in range(3000):                 # well past the default recursion limit
+        cur["k"] = {}
+        cur = cur["k"]
+    try:
+        SubmitIn(to_agent="api-echo", prompt="hi", context=deep)
+        # if it validates without error that's fine too (no 500); the point is NO raise
+    except RecursionError:
+        raise AssertionError("deep context surfaced as RecursionError (would be a 500)")
+    except Exception:
+        pass  # pydantic ValidationError (-> 422) is the expected/acceptable outcome
+
+
 async def test_unknown_job_404():
     app, led = await _fresh_app()
     c = _client(app)

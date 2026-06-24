@@ -9,6 +9,7 @@ itself is synchronous + in-process underneath (fine for a sequential demo drain)
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from typing import Optional
@@ -18,6 +19,7 @@ from runtime.contracts import Job, LostLease, Result
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS job (
   id TEXT PRIMARY KEY, parent_id TEXT, to_agent TEXT NOT NULL, body TEXT NOT NULL,
+  context TEXT NOT NULL DEFAULT '{}',
   reply_target TEXT NOT NULL DEFAULT 'demo', repo_id TEXT, base_ref TEXT, artifact_ref TEXT,
   status TEXT NOT NULL DEFAULT 'queued', created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -43,16 +45,26 @@ class Ledger:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS won't add a column to a PRE-EXISTING demo db file,
+        # so self-heal the one column added after this store first shipped. (No-op on a
+        # fresh/in-memory db where _SCHEMA already created it.)
+        try:
+            self.db.execute("ALTER TABLE job ADD COLUMN context TEXT NOT NULL DEFAULT '{}'")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # -- dispatch --
     async def submit_job(self, to_agent: str, prompt: str, *, reply_target: str = "demo",
+                         context: Optional[dict] = None,
                          parent_id: Optional[str] = None, repo_id: Optional[str] = None,
                          base_ref: Optional[str] = None) -> str:
         jid = _id()
         self.db.execute(
-            "INSERT INTO job(id,parent_id,to_agent,body,reply_target,repo_id,base_ref) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (jid, parent_id, to_agent, prompt, reply_target, repo_id, base_ref))
+            "INSERT INTO job(id,parent_id,to_agent,body,context,reply_target,repo_id,base_ref) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (jid, parent_id, to_agent, prompt, json.dumps(context or {}),
+             reply_target, repo_id, base_ref))
         self.db.commit()
         return jid
 
@@ -73,12 +85,13 @@ class Ledger:
     async def get_attempt_job(self, attempt_id: str) -> Optional[Job]:
         """The Job a worker should run for this attempt; None if the lease is gone."""
         row = self.db.execute(
-            "SELECT j.id, j.to_agent, j.body, j.repo_id, j.base_ref "
+            "SELECT j.id, j.to_agent, j.body, j.context, j.repo_id, j.base_ref "
             "FROM job j JOIN attempt a ON a.job_id=j.id "
             "WHERE a.id=? AND a.status='open' AND j.status='leased'", (attempt_id,)).fetchone()
         if row is None:
             return None
         return Job(id=uuid.UUID(row["id"]), to_agent=row["to_agent"], prompt=row["body"],
+                   context=json.loads(row["context"] or "{}"),
                    repo_id=row["repo_id"], base_ref=row["base_ref"])
 
     async def complete_attempt(self, attempt_id: str, result: Result) -> None:

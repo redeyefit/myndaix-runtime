@@ -131,6 +131,24 @@ async def test_invoke_never_leaks_the_agent_task():
         _w.runner.invoke = orig
 
 
+async def test_sqlite_context_round_trips_to_job():
+    """The plumbing that lets a media agent work: Job.context submitted -> persisted ->
+    rebuilt for the worker, so the runner can read job.context['image_url']."""
+    led = Ledger()
+    ctx = {"image_url": "http://example.com/cat.png", "application": "/higgsfield-ai/dop/lite"}
+    await led.submit_job("recon", "gen a clip", context=ctx)
+    aid = await led.lease_job("w1")
+    job = await led.get_attempt_job(aid)
+    assert job is not None and job.context == ctx
+
+    # a job submitted with NO context gets an empty dict (never None) - the runner's
+    # `job.context.get("image_url")` then returns a clean None, not an AttributeError.
+    await led.submit_job("recon", "no media")
+    aid2 = await led.lease_job("w1")
+    job2 = await led.get_attempt_job(aid2)
+    assert job2 is not None and job2.context == {}
+
+
 async def _main():
     passed = 0
     for _name, _fn in sorted(globals().items()):

@@ -135,11 +135,36 @@ on every transition, a single canonical lock order (attempt then job) so there's
 `FOR UPDATE SKIP LOCKED` to hand distinct rows to racing workers, and a transactional outbox so a finished
 job can't lose its reply. Full spec and decision log in [`DESIGN.md`](DESIGN.md).
 
+## Extending it: a video agent in one roster row
+
+The "additive, never structural" rule isn't aspirational — here's the receipt. Adding **Higgsfield**
+(image/text → video) was one `AgentSpec` row, one adapter function, and a two-line dispatch branch.
+No spine edit — even though its wire protocol looks nothing like the other agents'. CLI agents are
+subprocesses; `recon` is OpenAI-style chat; Higgsfield is an **async media queue**: submit returns a
+`request_id`, then you poll until the render lands. Three different shapes, one `invoke(agent, job) -> Result`:
+
+```
+higgsfield "gentle cinematic push-in"  +  --image <url>
+   └─ leased → submitted → polled (~65s) → Result.artifact_ref = https://cloud-cdn.higgsfield.ai/….mp4
+```
+
+The load-bearing problem here is **money**: a render is billed the moment it's submitted, so the worker
+must never auto-retry one. The runner is fail-closed by construction — once a job is submitted, every later
+failure (poll error, timeout, a malformed response, *anything*) returns a terminal result, never a
+retryable one, so a job can't be charged twice. Untrusted image URLs are SSRF-screened (no private /
+loopback / cloud-metadata targets), and it's **live-verified** end-to-end: a real call produced a 31 MB
+mp4 in 65 seconds.
+
+Built the same way as the rest — design-first, then pressure-tested across multiple model families. That
+review caught a success-path crash (a non-numeric `cost` field discarding an already-paid result) and
+several charge-correctness holes the green tests missed; each is now a regression test.
+
 ## How I built it
 
-Six slices — ledger, worker, concurrent pool, terminal transport, HTTP API, auth — and I pressure-tested
-each one with Codex and Gemini before moving on. Different model families catch different things, and every
-review surfaced a real bug my passing tests had missed:
+Six core slices — ledger, worker, concurrent pool, terminal transport, HTTP API, auth — plus the
+Higgsfield video agent later, each pressure-tested across model families (Codex, Gemini, Claude) before
+moving on. Different families catch different things, and every review surfaced a real bug my passing
+tests had missed:
 
 | Slice | The bug the green tests missed | Now caught by |
 |---|---|---|
@@ -147,6 +172,7 @@ review surfaced a real bug my passing tests had missed:
 | worker pool | one poison job (bad binary, or an api agent) silently killed *every* worker; `gather(return_exceptions=True)` ate the tracebacks | a poison-job survival test |
 | terminal transport | a per-process counter reused as a dedupe key misrouted a reply to the wrong sender after a restart | a restart / dedup test |
 | HTTP auth | `created_by` doubled as the owner *and* a provenance tag, so a client keyed `id=human` could read every internal job | a provenance-collision test |
+| Higgsfield agent | a non-numeric `cost` field crashed the *success* path — discarding an already-paid render, then re-charging it | a malformed-cost test + a post-charge fail-closed backstop |
 
 I confirmed each fix by reproducing the bug, not just trusting the green bar. For the deadlock I reverted
 `cancel()` to the old lock order, watched the regression test fail on the first trial with a
@@ -155,7 +181,9 @@ regression test that fails without it.
 
 ## What works, what doesn't
 
-**Built and tested (50 tests, all against real substrates — real Postgres, real subprocesses, real HTTP):**
+**Built and tested (75 tests across 9 suites — real Postgres, real subprocesses, and real HTTP for the
+integration suites; mocked transports for the API-adapter units; the Higgsfield agent additionally
+live-verified end to end against the real API):**
 
 - A ledger-agnostic worker: one core drives the SQLite demo store *or* the Postgres production store.
 - The asyncpg Postgres ledger: all the Command-API verbs, **15 concurrency proofs** against a live Postgres
@@ -168,6 +196,10 @@ regression test that fails without it.
   namespaced `api:<id>`; reading someone else's job is a 404, not a 403, so ids never leak); admin reads any.
 - An api-reach adapter (OpenAI-compatible chat): `recon` runs as a live Perplexity API agent through the
   *same* `invoke()` path as the CLI agents — the key comes from the environment, never the roster.
+- An async-media adapter (`higgsfield`, image/text→video): submits to a render queue and polls for the
+  result through that same `invoke()` path; **fail-closed** so a billed render is never auto-retried or
+  double-charged; input URLs are SSRF-screened; the mp4 URL returns as `Result.artifact_ref`. Live-verified
+  against the real API (a 31 MB video in 65s).
 
 **Not built yet (deferred, named on purpose):**
 
@@ -215,7 +247,9 @@ src/runtime/
   registry.py                the agent roster, as data
   command_api.py             the Command-API verb interface (sole ledger writer)
   api.py                     FastAPI HTTP surface + API-key auth
-  runner.py                  C1 cli runner (process-group kill + timeout)
+  runner.py                  C1 runner: CLI (process-group kill + timeout), the API
+                             adapter, and the Higgsfield async-media adapter
+  cli.py                     mxr — submit a job from the terminal (e.g. --image)
   worker.py                  the lease -> invoke -> result core (drives either store)
   pool.py                    concurrent worker pool (N workers + janitor + heartbeats)
   workspace.py               C5 ephemeral git-worktree isolation
@@ -223,7 +257,8 @@ src/runtime/
     schema.sql               the Postgres state machine (DDL)
     postgres_store.py        the asyncpg ledger (production)
     sqlite_store.py          the SQLite store (zero-dep demo)
+    migrations/              idempotent ALTERs for an already-deployed db
   transport/
     terminal.py              C3 terminal transport (dumb pipe over the ledger)
-tests/                       50 tests across 8 suites
+tests/                       75 tests across 9 suites
 ```
