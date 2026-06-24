@@ -41,6 +41,10 @@ from runtime.contracts import (
 )
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+_MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+# Fixed advisory-lock key so concurrent serve boots serialize their migrate() and
+# don't race the same DDL. Arbitrary stable bigint ("mxrMIG").
+_MIGRATE_LOCK_KEY = 0x6D7872_4D4947
 
 
 def _new_id() -> str:
@@ -88,6 +92,31 @@ class PostgresLedger:
         sql = _SCHEMA_PATH.read_text()
         async with self._pool.acquire() as con:
             await con.execute(sql)
+
+    async def migrate(self) -> list[str]:
+        """Apply every migrations/*.sql in filename order, idempotently.
+
+        serve() calls this on startup so deploying new code can NEVER run against a
+        stale schema. That ordering footgun took dispatch down on 2026-06-24: serve was
+        restarted onto code reading job.context before the column existed, so every
+        dispatch errored. Auto-migrate-on-start removes the ordering decision entirely.
+
+        Migrations MUST be idempotent (CREATE/ALTER ... IF NOT EXISTS) — they are
+        re-run on every boot, including ones already applied by hand on prod. A pg
+        advisory lock serializes concurrent serve instances so two boots can't race the
+        same DDL. A failing migration raises (fail-closed: serve refuses to come up on a
+        broken schema rather than serve a half-migrated DB). Returns filenames applied."""
+        files = sorted(_MIGRATIONS_DIR.glob("*.sql"))
+        if not files:
+            return []
+        async with self._pool.acquire() as con:
+            await con.execute("SELECT pg_advisory_lock($1)", _MIGRATE_LOCK_KEY)
+            try:
+                for path in files:
+                    await con.execute(path.read_text())
+            finally:
+                await con.execute("SELECT pg_advisory_unlock($1)", _MIGRATE_LOCK_KEY)
+        return [p.name for p in files]
 
     # ---- helpers -----------------------------------------------------------
     @staticmethod

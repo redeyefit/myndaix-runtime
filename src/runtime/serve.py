@@ -24,6 +24,13 @@ DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 async def serve(size: int = 4) -> None:
     led = await PostgresLedger.connect(DSN)
+    # Apply pending migrations BEFORE serving, so a deploy can never start workers
+    # against a stale schema (the 2026-06-24 dispatch outage). Idempotent + advisory-
+    # locked; raises (and we never come up) if a migration is broken.
+    applied = await led.migrate()
+    if applied:
+        print(f"[serve] schema migrations ensured (idempotent): {', '.join(applied)}",
+              file=sys.stderr, flush=True)
     pool = WorkerPool(led, size=size, heartbeat_interval_s=30.0)
     await pool.start()
     print(f"[serve] MyndAIX runtime up: {size}-worker pool draining {DSN}", file=sys.stderr, flush=True)
