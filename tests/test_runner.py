@@ -532,6 +532,68 @@ def test_higgsfield_missing_secret_ref_fails_closed():
     assert "missing API key" in r.text
 
 
+def test_higgsfield_param_merge_helper():
+    """v2 submit-body param merge: later sources win, reserved keys (prompt/image_url)
+    can't be injected, and None/dict/list/nan/inf are dropped (never sent)."""
+    import math as _m
+
+    m = runner._hf_merge_params
+    assert m({"duration": 5}, None) == {"duration": 5}                  # adapter default
+    assert m({"duration": 5, "fps": 24}, {"duration": 10}) == {"duration": 10, "fps": 24}  # job wins
+    assert m({"prompt": "x", "image_url": "y", "seed": 7}, None) == {"seed": 7}  # reserved blocked
+    merged = m({"a": None, "b": {"x": 1}, "c": [1], "d": _m.nan, "e": _m.inf,
+                "ok_b": True, "ok_s": "v", "ok_i": 3, "ok_f": 1.5}, None)
+    assert merged == {"ok_b": True, "ok_s": "v", "ok_i": 3, "ok_f": 1.5}  # only finite scalars
+    assert m("nope", 123, None) == {}                                  # non-dict sources ignored
+
+
+def test_higgsfield_premium_row_merges_params_into_body():
+    """A premium roster row submits to ITS application path with adapter+job params
+    merged into the body (job overrides adapter), prompt/image_url canonical. This is the
+    whole 'a new model is a new row, never a spine edit' claim, proven end to end."""
+    import json as _json
+    import os
+
+    import httpx
+    spec = _hf_spec(application="/kling-video/v2.1/pro/image-to-video",
+                    params={"duration": 5, "cfg_scale": 0.5})
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        seen = {}
+
+        def handler(req):
+            if req.method == "POST" and not req.url.path.endswith(("/status", "/cancel")):
+                seen["url"] = str(req.url)
+                seen["body"] = _json.loads(req.content)
+                return httpx.Response(200, json={"request_id": "req-k"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/k.mp4"}})
+
+        job = _hf_job()
+        job.context["params"] = {"duration": 8}    # job overrides the adapter default
+        r = _hf_run(spec, job, handler)
+        assert r.status is ResultStatus.OK, r.text
+        assert seen["url"].endswith("/kling-video/v2.1/pro/image-to-video")
+        assert seen["body"]["duration"] == 8        # job won
+        assert seen["body"]["cfg_scale"] == 0.5     # adapter default kept
+        assert seen["body"]["prompt"] == "push-in"
+        assert seen["body"]["image_url"] == "http://1.1.1.1/cat.png"
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_premium_rows_registered_and_route_higgsfield():
+    """The v2 premium rows exist, all route to invoke_higgsfield (kind=higgsfield), and
+    keep the secret in env (secret_ref), never the row. dop-std carries its duration param."""
+    from runtime.registry import get as _get
+    for aid in ("higgsfield", "higgsfield-dop-std", "higgsfield-kling", "higgsfield-seedance"):
+        s = _get(aid)
+        assert s is not None, aid
+        assert s.adapter["kind"] == "higgsfield" and s.adapter["secret_ref"] == "HF_KEY", aid
+        assert "key" not in {k.lower() for k in s.adapter} or s.adapter.get("secret_ref"), aid
+    assert _get("higgsfield-dop-std").adapter["params"] == {"duration": 5}
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):

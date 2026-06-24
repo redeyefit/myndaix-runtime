@@ -190,7 +190,13 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
 
     headers = {"Content-Type": "application/json", "Authorization": f"Key {key}"}
     submit_url = base.rstrip("/") + "/" + application.lstrip("/")
-    body = {"prompt": job.prompt, "image_url": image_url}
+    # Body = optional per-model params (adapter defaults, then job overrides) with the
+    # canonical prompt/image_url set LAST so params can never clobber them. This is what
+    # lets premium models (dop/standard's `duration`, image models' `aspect_ratio`, …) be
+    # added as pure roster rows — the runner stays generic over the application path.
+    body = _hf_merge_params(a.get("params"), job.context.get("params"))
+    body["prompt"] = job.prompt
+    body["image_url"] = image_url
     # Coerce the tuning knobs up front: a malformed adapter value (e.g. "3") must
     # never surface as a TypeError mid-poll (post-charge), which would violate §5-A.
     poll_interval = _hf_float(a.get("poll_interval_s"), _HF_POLL_INTERVAL_S)
@@ -327,6 +333,37 @@ def _hf_int(v, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+_HF_RESERVED_BODY_KEYS = ("prompt", "image_url")
+
+
+def _hf_scalar(v) -> bool:
+    """True for a JSON scalar safe to put in the submit body. bool/str/int always pass;
+    a float must be finite (nan/inf would make the body un-serializable). None, dict,
+    list, and non-finite floats are rejected so a malformed param is dropped, never sent."""
+    if isinstance(v, (bool, str, int)):
+        return True
+    if isinstance(v, float):
+        return math.isfinite(v)
+    return False
+
+
+def _hf_merge_params(*sources) -> dict:
+    """Merge per-model request-body params from each source (later sources win) into a
+    flat dict of JSON scalars. Reserved keys (prompt/image_url) and non-scalar/None
+    values are dropped — so an adapter default or caller-supplied param can extend the
+    body (e.g. dop/standard's `duration`) but can never clobber the canonical fields or
+    make the submit body un-serializable. Same defensive posture as the knob coercion."""
+    merged: dict = {}
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            if k in _HF_RESERVED_BODY_KEYS or not _hf_scalar(v):
+                continue
+            merged[k] = v
+    return merged
 
 
 def _hf_float(v, default: float) -> float:

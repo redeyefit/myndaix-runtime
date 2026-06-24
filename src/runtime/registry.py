@@ -67,7 +67,10 @@ V1_ROSTER: list[AgentSpec] = [
                        "secret_ref": "PERPLEXITY_API_KEY", "model": "sonar-pro"}),
     # Higgsfield async media queue (image/text->video). reach=API but adapter.kind
     # is 'higgsfield', so the runner routes it to invoke_higgsfield, not invoke_api.
-    # Pinned to DoP/lite for v1 (cheapest path); premium models are a later row.
+    # `higgsfield` stays the cheapest default (DoP/lite). v2 adds premium models as pure
+    # rows behind the SAME runner — proving "a new model is a new row, never a spine edit".
+    # Only paths CONFIRMED live (the 400/422-signature probe, 2026-06-23 research) are
+    # listed; inferred premium paths are commented out below until gallery-verified.
     AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,
               model="dop-lite", role="image/text->video generation",
               profile=Profile(timeout_s=600, cost_budget=2.0),
@@ -75,6 +78,38 @@ V1_ROSTER: list[AgentSpec] = [
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
                        "application": "/higgsfield-ai/dop/lite"}),
+    # DoP Standard — same body family + a `duration` knob (documented). `params` rides
+    # into the submit body via the runner's param-merge.
+    AgentSpec(agent_id="higgsfield-dop-std", reach=Reach.API, authority=Authority.RESPONDER,
+              model="dop-standard", role="image->video generation (DoP standard)",
+              profile=Profile(timeout_s=600, cost_budget=2.0),
+              adapter={"kind": "higgsfield",
+                       "base": "https://platform.higgsfield.ai",
+                       "secret_ref": "HF_KEY",
+                       "application": "/higgsfield-ai/dop/standard",
+                       "params": {"duration": 5}}),
+    # Kling 2.1 Pro — premium tier (~$0.40/clip); path + body {prompt,image_url} documented.
+    AgentSpec(agent_id="higgsfield-kling", reach=Reach.API, authority=Authority.RESPONDER,
+              model="kling-2.1-pro", role="premium image->video generation (Kling 2.1 Pro)",
+              profile=Profile(timeout_s=600, cost_budget=4.0),
+              adapter={"kind": "higgsfield",
+                       "base": "https://platform.higgsfield.ai",
+                       "secret_ref": "HF_KEY",
+                       "application": "/kling-video/v2.1/pro/image-to-video"}),
+    # Seedance 1.0 Pro — premium tier; path + body {prompt,image_url} documented.
+    AgentSpec(agent_id="higgsfield-seedance", reach=Reach.API, authority=Authority.RESPONDER,
+              model="seedance-1-pro", role="premium image->video generation (Seedance 1.0 Pro)",
+              profile=Profile(timeout_s=600, cost_budget=4.0),
+              adapter={"kind": "higgsfield",
+                       "base": "https://platform.higgsfield.ai",
+                       "secret_ref": "HF_KEY",
+                       "application": "/bytedance/seedance/v1/pro/image-to-video"}),
+    # NOT added — exact model_id NOT in public docs (LOW-confidence inferences only); verify
+    # in the authed gallery's "API" tab before promoting to a row, else a 404 "Model not found":
+    #   Veo 3.1 i2v      ~ /google/veo/v3.1/image-to-video
+    #   Kling 3.0 i2v    ~ /kling-video/v3/pro/image-to-video
+    #   Seedance 2.0 i2v ~ /bytedance/seedance/v2/pro/image-to-video
+    #   WAN 2.5 i2v      ~ /wan/v2.5/image-to-video
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}
