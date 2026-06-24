@@ -162,7 +162,8 @@ async def test_sqlite_record_job_context_merges_and_guards():
     aid = await led.lease_job("w1")
     job = await led.get_attempt_job(aid)
 
-    await led.record_job_context(job.id, {"_hf_resume": {"request_id": "req-1", "attempts": 0}})
+    wrote = await led.record_job_context(job.id, {"_hf_resume": {"request_id": "req-1", "attempts": 0}})
+    assert wrote is True, "a write to a live (leased) job returns True"
     ctx = (await led.get_attempt_job(aid)).context
     assert ctx["image_url"] == "http://x/c.png"            # original preserved
     assert ctx["_hf_resume"] == {"request_id": "req-1", "attempts": 0}   # delta merged
@@ -170,9 +171,11 @@ async def test_sqlite_record_job_context_merges_and_guards():
     await led.record_job_context(job.id, {"_hf_resume": {"request_id": "req-1", "attempts": 1}})
     assert (await led.get_attempt_job(aid)).context["_hf_resume"]["attempts"] == 1  # replaced
 
-    # once done (not leased/running) the merge is a no-op (status-guarded)
+    # once done (not leased/running) the merge is a no-op AND must report False (the
+    # runner relies on that bool to stay fail-closed - a silent no-op would re-submit).
     await led.complete_attempt(aid, Result(status=ResultStatus.OK, text="done"))
-    await led.record_job_context(job.id, {"_hf_resume": {"request_id": "LATE"}})
+    wrote = await led.record_job_context(job.id, {"_hf_resume": {"request_id": "LATE"}})
+    assert wrote is False, "a no-op (job not leased/running) must return False"
     final = _json.loads((await led.status(jid))["context"])
     assert final["_hf_resume"]["request_id"] == "req-1", "no-op after the job left leased/running"
 
@@ -190,10 +193,11 @@ async def test_context_persister_targets_job_id_and_is_optional():
         async def record_job_context(self, job_id, delta):
             seen["job_id"] = job_id
             seen["delta"] = delta
+            return True   # 'row written' - the callback must propagate this bool
 
     job = Job(id=_uuid.uuid4(), to_agent="higgsfield", prompt="x")
     persist = worker._context_persister(L(), job)
-    await persist({"_hf_resume": {"request_id": "r"}})
+    assert await persist({"_hf_resume": {"request_id": "r"}}) is True  # bool propagated
     assert seen["job_id"] == job.id and seen["delta"]["_hf_resume"]["request_id"] == "r"
 
     class L2:  # no record_job_context verb

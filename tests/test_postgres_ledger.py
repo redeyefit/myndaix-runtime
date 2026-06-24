@@ -297,7 +297,8 @@ async def test_record_job_context_merges_and_status_guarded(led: PostgresLedger)
                                context={"image_url": "http://example.com/c.png"})
     att = await led.lease_job("w1", [])
 
-    await led.record_job_context(jid, {"_hf_resume": {"request_id": "req-1", "attempts": 0}})
+    wrote = await led.record_job_context(jid, {"_hf_resume": {"request_id": "req-1", "attempts": 0}})
+    assert wrote is True, "a write to a live (leased) job returns True"
     job = await led.get_attempt_job(att)
     assert job.context["image_url"] == "http://example.com/c.png"          # original preserved
     assert job.context["_hf_resume"] == {"request_id": "req-1", "attempts": 0}  # delta merged
@@ -306,9 +307,11 @@ async def test_record_job_context_merges_and_status_guarded(led: PostgresLedger)
     job = await led.get_attempt_job(att)
     assert job.context["_hf_resume"]["attempts"] == 3                      # token replaced wholesale
 
-    # complete the job -> status 'done'; a later record is a no-op (status-guarded)
+    # complete the job -> status 'done'; a later record is a no-op AND must report False
+    # (the runner relies on that bool to stay fail-closed; a silent no-op would re-submit).
     await led.complete_attempt(att, _ok())
-    await led.record_job_context(jid, {"_hf_resume": {"request_id": "LATE"}})
+    wrote = await led.record_job_context(jid, {"_hf_resume": {"request_id": "LATE"}})
+    assert wrote is False, "a no-op (job not leased/running) must return False"
     async with led._pool.acquire() as con:
         ctx = await con.fetchval("SELECT context FROM job WHERE id=$1", jid)
     assert ctx["_hf_resume"]["request_id"] == "req-1", "no-op after the job left leased/running"

@@ -583,17 +583,20 @@ def test_higgsfield_premium_row_merges_params_into_body():
 
 
 class _Persist:
-    """Fake context-persist callback (the worker's ledger seam): records the deltas it's
-    handed, or raises if `fail` — to prove a failing ledger never enables a re-submit."""
+    """Fake context-persist callback (the worker's ledger seam). Returns True ('row
+    written') by default; `noop=True` returns False (status-guarded no-op: lease lost) and
+    `fail=True` raises — to prove neither a no-op nor a ledger error ever enables a re-submit."""
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, noop=False):
         self.deltas = []
         self.fail = fail
+        self.noop = noop
 
     async def __call__(self, delta):
         if self.fail:
             raise RuntimeError("ledger down")
         self.deltas.append(delta)
+        return not self.noop   # True = persisted; False = wrote 0 rows (job no longer live)
 
     @property
     def token(self):
@@ -743,6 +746,27 @@ def test_higgsfield_persist_failure_falls_back_to_terminal():
             raise httpx.ConnectError("gone")
 
         r = _hf_run_p(_hf_spec(), _hf_job(), submit_then_die, _Persist(fail=True))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_higgsfield_persist_noop_falls_back_to_terminal():
+    """REGRESSION (adversarial review P0): a persist that didn't raise but wrote 0 rows
+    (status-guarded no-op = the lease was lost) is NOT success. resumable=False -> a
+    post-submit failure is TERMINAL, so the requeue->re-submit->double-charge chain can't
+    form. A no-op that read as 'persisted' was the exact double-charge bug."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def submit_then_die(req):
+            if _is_submit(req):
+                return httpx.Response(200, json={"request_id": "req-noop"})
+            raise httpx.ConnectError("gone")
+
+        r = _hf_run_p(_hf_spec(), _hf_job(), submit_then_die, _Persist(noop=True))
         assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
     finally:
         del os.environ["HF_KEY"]

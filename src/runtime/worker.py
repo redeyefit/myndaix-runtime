@@ -58,8 +58,10 @@ def _context_persister(ledger, job: Job):
     if record is None:
         return None
 
-    async def persist(delta: dict) -> None:
-        await record(job.id, delta)
+    async def persist(delta: dict) -> bool:
+        # propagate the store's "row actually written" bool so the runner can tell a real
+        # checkpoint from a status-guarded no-op (lost lease) and stay fail-closed.
+        return await record(job.id, delta)
     return persist
 
 

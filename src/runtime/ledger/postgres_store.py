@@ -343,22 +343,27 @@ class PostgresLedger:
                         _new_id(), att["job_id"],
                         f"retryable failure on non-retry-safe agent '{to_agent}'")
 
-    async def record_job_context(self, job_id: UUID, delta: dict) -> None:
+    async def record_job_context(self, job_id: UUID, delta: dict) -> bool:
         """Merge `delta` into job.context (jsonb `||`) for a job still leased/running -
         ONE status-guarded statement. v2 idempotent-resume uses this so the higgsfield
         runner can durably checkpoint its resume token (request_id) mid-execution: a
         post-submit retry/crash then resumes polling instead of re-submitting (no
-        double-charge). A no-op when the job is no longer live (lease reclaimed/cancelled)
-        -> the runner reads that as 'not persisted' and stays fail-closed, so a lost lease
-        can never produce a re-submit. `||` is a shallow top-level merge, so re-persisting
-        `{'_hf_resume': {...}}` replaces the whole token atomically."""
+        double-charge). Returns True iff a row was ACTUALLY written; False when the job is
+        no longer live (lease reclaimed/cancelled) - the runner reads False as 'not
+        persisted' and stays fail-closed, so a lost lease can never produce a re-submit.
+        (RETURNING id makes the no-op observable - a bare UPDATE's 'UPDATE 0' tag is
+        swallowed by execute(), which silently reports success and breaks that contract.)
+        `||` is a shallow top-level merge, so re-persisting `{'_hf_resume': {...}}` replaces
+        the whole token atomically."""
         if not isinstance(delta, dict):
-            return
+            return False
         async with self._pool.acquire() as con:
-            await con.execute(
+            row = await con.fetchval(
                 """UPDATE job SET context = context || $2::jsonb
-                    WHERE id = $1 AND status IN ('leased','running')""",
+                    WHERE id = $1 AND status IN ('leased','running')
+                   RETURNING id""",
                 job_id, _json(delta))
+        return row is not None
 
     async def append_log(self, attempt_id: UUID, stream: str, chunk: str) -> None:
         async with self._pool.acquire() as con:

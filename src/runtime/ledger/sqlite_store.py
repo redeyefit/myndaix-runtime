@@ -94,23 +94,25 @@ class Ledger:
                    context=json.loads(row["context"] or "{}"),
                    repo_id=row["repo_id"], base_ref=row["base_ref"])
 
-    async def record_job_context(self, job_id, delta: dict) -> None:
+    async def record_job_context(self, job_id, delta: dict) -> bool:
         """Shallow-merge `delta` into a live job's context (v2 idempotent-resume: the
-        higgsfield runner persists its resume token here mid-run). Status-guarded: a no-op
-        if the job is no longer leased/running (lease lost) - the runner treats 'not
-        written' as fail-closed, so a lost lease can never lead to a re-submit. Mirrors the
-        Postgres `context || delta` jsonb merge so both stores behave identically."""
+        higgsfield runner persists its resume token here mid-run). Returns True iff a row
+        was actually written; False (status-guarded no-op) if the job is no longer
+        leased/running (lease lost) - the runner reads False as 'not persisted' and stays
+        fail-closed, so a lost lease can never lead to a re-submit. Mirrors the Postgres
+        `context || delta` jsonb merge + its bool contract so both stores behave identically."""
         if not isinstance(delta, dict):
-            return
+            return False
         row = self.db.execute(
             "SELECT context FROM job WHERE id=? AND status IN ('leased','running')",
             (str(job_id),)).fetchone()
         if row is None:
-            return
+            return False
         ctx = json.loads(row["context"] or "{}")
         ctx.update(delta)   # top-level merge == jsonb `||`
         self.db.execute("UPDATE job SET context=? WHERE id=?", (json.dumps(ctx), str(job_id)))
         self.db.commit()
+        return True
 
     async def complete_attempt(self, attempt_id: str, result: Result) -> None:
         """attempt open->ok, job->done (+artifact); enqueue the reply. Raises

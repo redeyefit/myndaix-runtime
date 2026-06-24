@@ -221,6 +221,12 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None, persis
                                    "(no double-charge)", ms=_ms(started))
             attempts = _hf_int(prior.get("attempts"), 0) + 1
             if attempts > _HF_RESUME_MAX:
+                # Giving up for good -> best-effort cancel so a still-QUEUED job stops
+                # charging (we won't resume it again). Cost hygiene, same as a non-resumable
+                # timeout; cancel only bites while queued, never mid-render.
+                cancel_url = _hf_pin_url(prior.get("cancel_url"), base,
+                                         f"/requests/{request_id}/cancel")
+                await _hf_best_effort_cancel(client, cancel_url, headers)
                 return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                               text=f"higgsfield resume budget exhausted after {_HF_RESUME_MAX} "
                                    f"re-leases (request_id={request_id})", ms=_ms(started))
@@ -385,15 +391,17 @@ def _hf_int(v, default: int) -> int:
 
 async def _hf_try_persist(persist, delta: dict) -> bool:
     """Durably persist a resume-token delta into job.context via the worker-supplied
-    callback. Returns True iff it was written. A missing callback (no ledger seam) or
-    ANY failure (lost lease, ledger error) returns False -> the caller stays fail-closed
-    (post-submit failures TERMINAL), so a persist problem can NEVER cause a re-submit.
-    Best-effort by design: it must never raise out of the post-charge path."""
+    callback. Returns True ONLY when the callback confirms a row was actually written
+    (a truthy return). A missing callback, a falsy return (status-guarded no-op: the lease
+    was lost, so the write hit 0 rows), or ANY exception -> False, so the caller stays
+    fail-closed (post-submit failures TERMINAL) and a persist problem can NEVER cause a
+    re-submit. (A no-op that merely 'didn't raise' is NOT success - that false positive is
+    exactly the double-charge bug the adversarial review caught.) Best-effort: never raises
+    out of the post-charge path."""
     if persist is None:
         return False
     try:
-        await persist(delta)
-        return True
+        return bool(await persist(delta))
     except Exception:
         return False
 

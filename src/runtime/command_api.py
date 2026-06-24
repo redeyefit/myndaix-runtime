@@ -59,12 +59,14 @@ class CommandAPI(Protocol):
         off the hot state machine. Long jobs are never dark."""
         ...
 
-    async def record_job_context(self, job_id: UUID, delta: dict) -> None:
+    async def record_job_context(self, job_id: UUID, delta: dict) -> bool:
         """worker/runner: shallow-merge `delta` into a live job's context (jsonb `||`),
-        status-guarded to leased/running (no-op otherwise). Lets a runner durably
-        checkpoint mid-execution state - v2 idempotent-resume persists the higgsfield
-        resume token (request_id) here so a post-submit retry resumes polling instead of
-        re-submitting (no double-charge). A no-op on a lost lease keeps it fail-closed."""
+        status-guarded to leased/running. Returns True iff a row was actually written;
+        False on the status-guarded no-op (lost lease). Lets a runner durably checkpoint
+        mid-execution state - v2 idempotent-resume persists the higgsfield resume token
+        (request_id) here so a post-submit retry resumes instead of re-submitting (no
+        double-charge). The bool is load-bearing: the runner treats False as 'not
+        persisted' -> fail-closed, so a lost lease can never produce a re-submit."""
         ...
 
     # -- outbox (reliable delivery) --

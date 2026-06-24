@@ -96,6 +96,23 @@ For (2) to be safe, `request_id` must be persisted the instant submit returns �
   and happens before polling, so a crash anywhere after submit leaves a resumable token.
   Worst case the persist itself fails → fall back to v1 behavior (TERMINAL, no resume) — never
   a re-submit. (Persist-failure ⇒ fail-closed, exactly like v1.)
+- **`resumable` must reflect a CONFIRMED write, not just "didn't raise"** (adversarial-review
+  P0, fixed): `record_job_context` returns True only when a row was actually written (Postgres
+  `RETURNING id`; sqlite the guarded SELECT hit). A status-guarded no-op (the lease was lost, so
+  the merge matched 0 rows) returns **False** → `resumable=False` → post-submit failures stay
+  TERMINAL. If False read as "persisted", a lost-lease requeue would re-enter submit and
+  double-charge — the bool is therefore load-bearing, not cosmetic.
+- **Residual window (documented limitation, accepted for v2):** the only irreducible gap is a
+  worker crash in the milliseconds *between* submit returning (charged) and the persist UPDATE
+  committing — the token isn't written, so a reclaim requeues with no token and the next attempt
+  re-submits. It cannot be fully closed (the external submit can't share a txn with the ledger
+  write). Mitigation: persist fires immediately after submit, before any polling; the 120 s lease
+  means `reclaim_expired` can't fire during that window unless the worker dies in exactly those
+  ms; in the only path with a janitor (the pool) the heartbeat keeps the lease alive. Same risk
+  class as v1's ambiguous-submit-failure. If unacceptable, the next step is a pre-submit
+  "intent" row, but that's out of v2 scope.
+- **Cancel on giving up:** resume-budget exhaustion best-effort cancels the still-queued job
+  (cost hygiene), matching the non-resumable timeout path.
 - **Resume-loop bound:** a resumed attempt that times out re-queues and resumes — cheap (no
   re-charge), polling the same id until Higgsfield reaches a terminal status. Add a
   `_hf_resume.attempts` counter incremented on each persist; past `RESUME_MAX` (e.g. 20) →
