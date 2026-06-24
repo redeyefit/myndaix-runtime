@@ -10,9 +10,12 @@ Perplexity) go through invoke_api below; the key comes from the environment, nev
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import signal
+import socket
 import time
+import urllib.parse
 from typing import Optional
 
 from runtime.contracts import ErrorClass, Job, Reach, Result, ResultStatus
@@ -20,6 +23,23 @@ from runtime.registry import AgentSpec
 from runtime.registry import get as get_spec
 
 _KILL_GRACE_S = 3
+
+# Higgsfield polling constants
+_HF_POLL_INTERVAL_S = 2
+_HF_POLL_RETRY_MAX = 3
+_HF_POLL_RETRY_BACKOFF_S = 2
+
+# Private / link-local IP ranges — blocked as image_url targets (SSRF defence)
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local / AWS IMDS
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
 
 
 async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
@@ -120,6 +140,125 @@ async def invoke_api(spec: AgentSpec, job: Job, *, transport=None) -> Result:
     return Result(status=ResultStatus.OK, text=str(text).strip(), ms=_ms(started))
 
 
+async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Result:
+    """Invoke Higgsfield's async media queue (image/text -> video). Unlike invoke_api
+    this is NOT OpenAI-shaped: auth is `Authorization: Key <key>`, submit returns a
+    request_id, and the result is polled. The key comes from os.environ[secret_ref],
+    never the adapter.
+
+    Idempotency (DESIGN S5, decision A - fail-closed): a network/network-ish failure
+    BEFORE we hold a request_id is RETRYABLE (nothing charged). Once submit returns a
+    request_id the job is charged, so EVERY later failure (poll error, timeout) is
+    TERMINAL - the worker must never auto-retry and double-charge. Idempotent resume
+    is deferred to v2."""
+    try:
+        import httpx
+    except ImportError:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="higgsfield agents need httpx (pip install httpx)")
+    a = spec.adapter
+    base = a.get("base")
+    if not base:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="higgsfield adapter missing 'base'")
+    application = job.context.get("application") or a.get("application")
+    if not application:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="higgsfield job missing 'application' (no adapter default)")
+    secret_ref = a.get("secret_ref")
+    key = os.environ.get(secret_ref) if secret_ref else None
+    if secret_ref and not key:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text=f"missing API key in env: {secret_ref}")
+
+    image_url = job.context.get("image_url")
+    if not image_url:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="higgsfield job missing 'image_url' (required for image->video)")
+    ssrf = _reject_unsafe_url(image_url)
+    if ssrf:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text=f"image_url rejected: {ssrf}")
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Key {key}"}
+    submit_url = base.rstrip("/") + "/" + application.lstrip("/")
+    body = {"prompt": job.prompt, "image_url": image_url}
+    poll_interval = a.get("poll_interval_s", _HF_POLL_INTERVAL_S)
+    retry_backoff = a.get("poll_retry_backoff_s", _HF_POLL_RETRY_BACKOFF_S)
+
+    started = time.monotonic()
+    deadline = started + job.timeout_s
+    async with httpx.AsyncClient(timeout=job.timeout_s, transport=transport) as client:
+        # -- submit (pre-charge: network/5xx is RETRYABLE, nothing was billed) --
+        try:
+            resp = await client.post(submit_url, json=body, headers=headers)
+        except httpx.HTTPError as e:
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.RETRYABLE,
+                          text=f"higgsfield submit failed: {e}", ms=_ms(started))
+        if resp.status_code != 200:
+            ec = ErrorClass.RETRYABLE if resp.status_code >= 500 else ErrorClass.TERMINAL
+            return Result(status=ResultStatus.ERROR, error_class=ec, exit_code=resp.status_code,
+                          text=f"higgsfield submit {resp.status_code}: {resp.text[:300]}",
+                          ms=_ms(started))
+        try:
+            sub = resp.json()
+            request_id = sub["request_id"]
+        except (KeyError, ValueError) as e:
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                          text=f"higgsfield submit: unexpected shape: {e}", ms=_ms(started))
+        # status_url may be absolute (returned) or constructed from request_id.
+        status_url = sub.get("status_url") or (
+            base.rstrip("/") + f"/requests/{request_id}/status")
+
+        # -- poll (post-charge: per DESIGN S5-A, EVERY failure here is TERMINAL) --
+        fails = 0
+        while True:
+            if time.monotonic() >= deadline:
+                return Result(status=ResultStatus.TIMEOUT, error_class=ErrorClass.TERMINAL,
+                              text=f"higgsfield poll timed out after {job.timeout_s}s "
+                                   f"(request_id={request_id})", ms=_ms(started))
+            try:
+                pr = await client.get(status_url, headers=headers)
+            except httpx.HTTPError as e:
+                fails += 1
+                if fails > _HF_POLL_RETRY_MAX:
+                    return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                                  text=f"higgsfield poll failed (charged, no retry): {e}",
+                                  ms=_ms(started))
+                await asyncio.sleep(min(retry_backoff, max(0, deadline - time.monotonic())))
+                continue
+            if pr.status_code != 200:
+                fails += 1
+                if fails > _HF_POLL_RETRY_MAX:
+                    return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                                  text=f"higgsfield poll {pr.status_code} (charged, no retry): "
+                                       f"{pr.text[:200]}", ms=_ms(started))
+                await asyncio.sleep(min(retry_backoff, max(0, deadline - time.monotonic())))
+                continue
+            fails = 0
+            try:
+                data = pr.json()
+            except ValueError as e:
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text=f"higgsfield poll: bad json (charged): {e}", ms=_ms(started))
+            status = (data.get("status") or "").lower()
+            if status == "completed":
+                url = _hf_artifact_url(data)
+                if not url:
+                    return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                                  text="higgsfield completed but no video/image url",
+                                  ms=_ms(started))
+                return Result(status=ResultStatus.OK, text=url, artifact_ref=url,
+                              cost=data.get("cost"), ms=_ms(started))
+            if status in ("failed", "nsfw"):
+                # Higgsfield refunds these - terminal, no retry.
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text=f"higgsfield {status} (request_id={request_id})",
+                              ms=_ms(started))
+            # queued / in_progress / unknown -> keep waiting until the deadline.
+            await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+
+
 async def invoke(agent_id: str, job: Job) -> Result:
     spec = get_spec(agent_id)
     if spec is None:
@@ -127,12 +266,56 @@ async def invoke(agent_id: str, job: Job) -> Result:
                       text=f"unknown agent: {agent_id}")
     if spec.reach is Reach.CLI:
         return await invoke_cli(spec, job)
+    if spec.adapter.get("kind") == "higgsfield":
+        return await invoke_higgsfield(spec, job)
     return await invoke_api(spec, job)
 
 
 # -- helpers --
 def _ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _hf_artifact_url(data: dict) -> Optional[str]:
+    """Pull the result url from a completed Higgsfield status payload.
+    image->video returns `video:{url}`; image paths return `images:[{url},...]`."""
+    video = data.get("video")
+    if isinstance(video, dict) and video.get("url"):
+        return video["url"]
+    images = data.get("images")
+    if isinstance(images, list) and images and isinstance(images[0], dict):
+        return images[0].get("url")
+    return None
+
+
+def _reject_unsafe_url(url: str) -> Optional[str]:
+    """SSRF guard for image_url (sent to a third party AND fetched server-side).
+    Returns a rejection reason, or None if the url is safe. Only http(s); the host
+    must not resolve to a private/loopback/link-local address (blocks file://, the
+    AWS metadata IP, internal services)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as e:
+        return f"unparseable url ({e})"
+    if parsed.scheme not in ("http", "https"):
+        return f"scheme {parsed.scheme!r} not allowed (http/https only)"
+    host = parsed.hostname
+    if not host:
+        return "no host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        return f"host did not resolve ({e})"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if any(ip in net for net in _PRIVATE_NETS) or ip.is_private \
+                or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return f"host resolves to non-public address {addr}"
+    return None
 
 
 def _decode(b: bytes) -> str:

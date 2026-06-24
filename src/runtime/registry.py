@@ -65,6 +65,16 @@ V1_ROSTER: list[AgentSpec] = [
               profile=Profile(cost_budget=5.0),
               adapter={"kind": "api", "endpoint": "https://api.perplexity.ai/chat/completions",
                        "secret_ref": "PERPLEXITY_API_KEY", "model": "sonar-pro"}),
+    # Higgsfield async media queue (image/text->video). reach=API but adapter.kind
+    # is 'higgsfield', so the runner routes it to invoke_higgsfield, not invoke_api.
+    # Pinned to DoP/lite for v1 (cheapest path); premium models are a later row.
+    AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,
+              model="dop-lite", role="image/text->video generation",
+              profile=Profile(timeout_s=600, cost_budget=2.0),
+              adapter={"kind": "higgsfield",
+                       "base": "https://platform.higgsfield.ai",
+                       "secret_ref": "HF_KEY",
+                       "application": "/higgsfield-ai/dop/lite"}),
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}
