@@ -48,6 +48,104 @@ def test_cli_timeout_is_killed():
     assert r.status is ResultStatus.TIMEOUT
 
 
+# -- P2 env scrub: a CLI subprocess must NOT inherit sibling agents' secrets ----
+
+def _printenv_run(spec):
+    """Run `printenv` as the CLI agent and return its (scrubbed) environment dump."""
+    r = asyncio.run(runner.invoke_cli(spec, _job(prompt="ignored")))
+    assert r.status is ResultStatus.OK, r.text
+    return r.text
+
+
+def test_cli_env_scrubbed_of_inherited_secrets():
+    """A CLI agent that declares no secret_ref sees the operational baseline but NONE
+    of the pool's secrets (HF_KEY, PERPLEXITY_API_KEY) — they must not leak into codex."""
+    import os
+    os.environ["HF_KEY"] = "hf-secret"
+    os.environ["PERPLEXITY_API_KEY"] = "perp-secret"
+    try:
+        env = _printenv_run(_spec(["printenv"], "stdin"))
+        assert "HF_KEY" not in env and "hf-secret" not in env
+        assert "PERPLEXITY_API_KEY" not in env and "perp-secret" not in env
+        assert "PATH=" in env          # operational baseline still present so the agent runs
+    finally:
+        del os.environ["HF_KEY"]
+        del os.environ["PERPLEXITY_API_KEY"]
+
+
+def test_cli_env_declared_secret_ref_passes_through():
+    """An agent's OWN declared secret_ref is allowed through; a sibling's is still dropped."""
+    import os
+    spec = AgentSpec(agent_id="t", reach=Reach.CLI, authority=Authority.RESPONDER,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["printenv"], "prompt_channel": "stdin",
+                              "secret_ref": "T_DECLARED_KEY"})
+    os.environ["T_DECLARED_KEY"] = "mine"
+    os.environ["HF_KEY"] = "not-mine"
+    try:
+        env = _printenv_run(spec)
+        assert "T_DECLARED_KEY=mine" in env       # declared -> allowed
+        assert "HF_KEY" not in env                 # sibling secret -> still dropped
+    finally:
+        del os.environ["T_DECLARED_KEY"]
+        del os.environ["HF_KEY"]
+
+
+def test_cli_env_per_agent_passthrough_list():
+    """An agent may declare adapter['env_passthrough'] for non-secret vars it needs."""
+    import os
+    spec = AgentSpec(agent_id="t", reach=Reach.CLI, authority=Authority.RESPONDER,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["printenv"], "prompt_channel": "stdin",
+                              "env_passthrough": ["AGENT_NEEDS_THIS"]})
+    os.environ["AGENT_NEEDS_THIS"] = "ok"
+    try:
+        assert "AGENT_NEEDS_THIS=ok" in _printenv_run(spec)
+    finally:
+        del os.environ["AGENT_NEEDS_THIS"]
+
+
+def test_cli_env_operator_passthrough_escape_hatch():
+    """$MYNDAIX_CLI_ENV_PASSTHROUGH lets the operator open a hole at deploy time (e.g. an
+    env-based CLI auth key) without a source edit — comma-separated, whitespace-tolerant."""
+    import os
+    os.environ["MYNDAIX_CLI_ENV_PASSTHROUGH"] = " EXTRA_ONE , EXTRA_TWO "
+    os.environ["EXTRA_ONE"] = "1"
+    os.environ["EXTRA_TWO"] = "2"
+    os.environ["HF_KEY"] = "still-secret"
+    try:
+        env = _printenv_run(_spec(["printenv"], "stdin"))
+        assert "EXTRA_ONE=1" in env and "EXTRA_TWO=2" in env
+        assert "HF_KEY" not in env                 # the hatch is scoped, not a free-for-all
+    finally:
+        for k in ("MYNDAIX_CLI_ENV_PASSTHROUGH", "EXTRA_ONE", "EXTRA_TWO", "HF_KEY"):
+            del os.environ[k]
+
+
+def test_roster_cli_agents_get_only_their_own_key():
+    """Each live CLI agent inherits its OWN auth key and NONE of the others' — the
+    cross-agent containment + deploy-safety property of the P2 scrub. With every secret
+    set in the pool's env, codex must see OPENAI_API_KEY but never ANTHROPIC/GEMINI/HF/etc."""
+    import os
+    from runtime.registry import REGISTRY
+    keys = {"ANTHROPIC_API_KEY": "ak", "OPENAI_API_KEY": "ok", "GEMINI_API_KEY": "gk",
+            "GOOGLE_API_KEY": "gok", "HF_KEY": "hf", "PERPLEXITY_API_KEY": "pk"}
+    for k, v in keys.items():
+        os.environ[k] = v
+    try:
+        expect = {"lobster": {"ANTHROPIC_API_KEY"}, "mack": {"ANTHROPIC_API_KEY"},
+                  "mini": {"ANTHROPIC_API_KEY"}, "kilabz": {"OPENAI_API_KEY"},
+                  "codex": {"OPENAI_API_KEY"}, "oracle": {"GEMINI_API_KEY", "GOOGLE_API_KEY"}}
+        for aid, own in expect.items():
+            env = runner._cli_env(REGISTRY[aid])
+            leaked = set(keys) & set(env)         # which secret keys reached this agent
+            assert leaked == own, (aid, leaked, own)
+            assert "PATH" in env                   # operational baseline kept -> agent still runs
+    finally:
+        for k in keys:
+            del os.environ[k]
+
+
 def test_api_agent_via_mock_transport():
     """invoke_api (OpenAI-compatible) with no live API: a mock transport proves it
     parses the reply, maps 401->terminal / 5xx->retryable, and a missing key fails clean."""
