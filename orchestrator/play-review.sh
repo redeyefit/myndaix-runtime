@@ -41,7 +41,13 @@ if [[ "${1:-}" != "--worker" ]]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$repo" ]] || exit 0                        # never abort a push by erroring
   remote_url="${2:-}"                               # git passes remote name as $1, URL as $2; the URL handles pushurl/direct-URL pushes
-  self="$repo/orchestrator/play-review.sh"
+  # Re-exec the long-lived WORKER from a FIXED installed path outside the repo when one
+  # exists, so a push that modifies the worktree copy of this script can't run as the
+  # worker (defense-in-depth for an untrusted worktree). Falls back to the worktree copy
+  # then $0, so an un-installed setup still works. Harden by installing a trusted copy:
+  #   cp orchestrator/play-review.sh "$ORCH/play-review.sh"   (re-copy when you update it)
+  self="${PLAY_SELF:-$ORCH/play-review.sh}"
+  [[ -x "$self" ]] || self="$repo/orchestrator/play-review.sh"
   [[ -x "$self" ]] || self="$0"
   while read -r localref localsha remoteref remotesha; do
     [[ "$remoteref" == $TARGET_GLOB ]] || continue          # any branch; skip tags (unquoted RHS = glob)

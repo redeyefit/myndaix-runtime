@@ -75,5 +75,18 @@ echo "16. PR-0a: scope flags forwarded to mxr (repo bucket + reviewed SHA)"; res
   if [[ "$nscoped" -eq 2 ]]; then echo "  ok: review+triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 2 scoped mxr calls, got $nscoped"; FAIL=$((FAIL+1)); fi
   if grep -q "READY.*--repo" "$log" 2>/dev/null; then echo "  FAIL: canary must stay cap-exempt"; FAIL=$((FAIL+1)); else echo "  ok: canary cap-exempt (no --repo)"; PASS=$((PASS+1)); fi
 
+echo "17. PR-1a: front re-execs the FIXED installed worker, not the worktree copy"; reset
+  mkdir -p "$FAKE/.myndaix/orchestrator"
+  fixed="$FAKE/.myndaix/orchestrator/play-review.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'mkdir -p "$HOME/.myndaix" 2>/dev/null' \
+    'printf "%s" "$0" > "$HOME/.myndaix/which-self"' 'exit 0' > "$fixed"
+  chmod +x "$fixed"
+  ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/main "$TIP" refs/heads/main \
+      0000000000000000000000000000000000000000 | env HOME="$FAKE" bash "$SCRIPT" origin "" ) >/dev/null 2>&1
+  for _ in $(seq 1 30); do [[ -f "$FAKE/.myndaix/which-self" ]] && break; sleep 0.1; done
+  if [[ -f "$FAKE/.myndaix/which-self" ]] && grep -q "/.myndaix/orchestrator/play-review.sh" "$FAKE/.myndaix/which-self"; then
+    echo "  ok: worker re-exec'd the fixed install path"; PASS=$((PASS+1))
+  else echo "  FAIL: worker did not re-exec the fixed path"; FAIL=$((FAIL+1)); fi
+
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
