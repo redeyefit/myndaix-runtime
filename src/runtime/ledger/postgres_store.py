@@ -63,14 +63,21 @@ def _json(obj: dict) -> dict:
 
 class PostgresLedger:
     # policy constants - NOT part of the Protocol; tuned at construction
-    # LEASE + HEARTBEAT are set TOGETHER (~600, design M4). LEASE_SECONDS is the
-    # window a fresh attempt gets; HEARTBEAT_SECONDS is the EXTEND amount each ping
-    # pushes expiry to (must be >= LEASE so a ping never SHRINKS the window). The pool's
-    # FIRING cadence (heartbeat_interval_s, a separate quantity) must be <= lease/3.
-    # Tradeoff: a bigger lease means a crashed worker holds its repo slot up to ~LEASE
-    # before reclaim frees it — mitigated by a tight janitor reclaim cadence.
-    LEASE_SECONDS = 600          # a fresh lease; heartbeat extends long jobs
-    HEARTBEAT_SECONDS = 600      # each heartbeat pushes expiry to now()+this (>= LEASE)
+    # LEASE + HEARTBEAT set TOGETHER (design M4 structure). LEASE_SECONDS is the window a
+    # fresh attempt gets; HEARTBEAT_SECONDS is the EXTEND amount each ping pushes expiry to
+    # (must be >= LEASE so a ping never SHRINKS the window). The pool's FIRING cadence
+    # (heartbeat_interval_s, a separate quantity) must be <= lease/3 so a healthy job
+    # heartbeats well within the window.
+    #   CRASH-RECOVERY: the value also bounds slot-hold-after-crash. A crashed worker's
+    #   lease expires HEARTBEAT_SECONDS after its LAST heartbeat — and a tight reclaim
+    #   cadence does NOT shrink that (it only reclaims promptly AT expiry, not sooner). So
+    #   with a per-repo cap, a long value would let a few crashed workers paralyze a repo
+    #   for that long (cross-family review caught the design's flawed "reclaim mitigates"
+    #   claim). Kept at 120s: heartbeats still cover arbitrarily long live jobs (the ping
+    #   re-extends every <= lease/3), so a short window costs nothing and frees a crashed
+    #   slot in ~2min instead of ~10. Tune up only if heartbeat churn ever matters.
+    LEASE_SECONDS = 120          # a fresh lease; heartbeat extends long jobs
+    HEARTBEAT_SECONDS = 120      # each heartbeat pushes expiry to now()+this (>= LEASE)
     RECLAIM_BATCH = 100          # reclaim_expired processes at most this per call
     OUTBOUND_MAX_TRIES = 5       # mark_outbound_failed exhaustion threshold
     MAX_CHILDREN = 32            # admission: max direct children per parent
@@ -724,13 +731,20 @@ class PostgresLedger:
         async with self._pool.acquire() as con:
             async with con.transaction():
                 # 0. orphan backstop: an open attempt on a non-live job is dead work.
+                #    Lock the rows in a deterministic id order (FOR UPDATE OF a SKIP LOCKED)
+                #    BEFORE updating, so two concurrent reconcilers (multiple serve
+                #    instances) can't acquire attempt locks in clashing heap order -> no
+                #    40P01. SKIP LOCKED yields any orphan a fast-heal/cancel already holds.
                 await con.execute(
-                    """UPDATE attempt a
+                    """WITH o AS (
+                           SELECT a.id FROM attempt a JOIN job j ON j.id = a.job_id
+                            WHERE a.status = 'open' AND j.status NOT IN ('leased','running')
+                            ORDER BY a.id FOR UPDATE OF a SKIP LOCKED
+                       )
+                       UPDATE attempt a
                           SET status='failed', ended_at=statement_timestamp(),
                               error_class='terminal'
-                         FROM job j
-                        WHERE a.job_id = j.id AND a.status = 'open'
-                          AND j.status NOT IN ('leased','running')""")
+                        WHERE a.id IN (SELECT id FROM o)""")
                 # serialize against lease/decrement: lock all rc rows in PK order.
                 await con.execute(
                     "SELECT repo_id FROM repo_concurrency ORDER BY repo_id FOR UPDATE")
@@ -764,50 +778,49 @@ class PostgresLedger:
 
     async def cancel(self, job_id: UUID) -> None:
         """Administratively terminate a non-terminal job -> 'dead', failing its open
-        attempt, in ONE atomic statement. The supervisor kills the OS process on the
-        worker's next heartbeat (which will now raise LostLease).
+        attempt. The supervisor kills the OS process on the worker's next heartbeat
+        (which will now raise LostLease).
 
-        Lock order: attempt THEN job THEN repo_concurrency (counter LAST) — the `closed`
-        UPDATE locks the attempt first, `killed` the job, `dec` the rc row, so cancel
-        keeps the canonical A->J->R order and can't ABBA with complete/fail/reclaim
-        (a job-first cancel WOULD ABBA: it'd hold the job while wanting the attempt that
-        complete/fail hold while wanting the job — so we deliberately keep attempt-first).
-        The decrement is gated on `closed` actually closing a REAL open attempt
-        (RETURNING), so a queued / already-terminal / duplicate cancel decrements ZERO.
-        NULL repo_id is cap-exempt.
+        THREE EXPLICIT SEQUENTIAL statements, NOT one CTE: sibling data-modifying CTEs in
+        a single statement execute in a planner-UNPREDICTABLE order (Postgres gives no
+        text-order guarantee), so a single-CTE form could lock the job (`killed`) BEFORE
+        the attempt (`closed`) -> job-then-attempt -> an ABBA / 40P01 deadlock with
+        complete/fail (which lock attempt-then-job). Sequential statements GUARANTEE the
+        canonical attempt -> job -> repo_concurrency (counter LAST) order. (Cross-family
+        review — codex + Oracle — both caught the CTE-order risk; the single CTE also gave
+        ZERO benefit since it never closed the orphan race below.) The decrement is gated
+        on a REAL open-attempt close (stmt 1's RETURNING), so a queued / already-terminal /
+        duplicate cancel decrements ZERO. NULL repo_id is cap-exempt.
 
-        NOTE — this does NOT fully close the queued-cancel-vs-lease race, and the
-        attempt-first order is why: all CTEs in one statement share ONE snapshot, so if a
-        racing lease COMMITS its CLAIM (job queued->leased + open attempt) after cancel's
-        snapshot while cancel's `killed` is blocked on the job lock, `killed` flips the
-        now-leased job to dead (EvalPlanQual) but `closed` — bound to the pre-lease
-        snapshot — can't see the freshly-inserted attempt, so it closes 0 and leaks a
-        slot + orphans an open attempt on the dead job. That orphan is HARMLESS to the
-        cap (the hard count is scoped to leased/running, so it's never counted) and is
-        healed within ONE janitor tick by reclaim_expired's fast orphan-heal (+ the slow
-        reconciler as backstop). Fixing it inside cancel would require job-first locking,
-        which reintroduces the ABBA above — not worth it for a transient soft-cache blip."""
+        NOTE — this does NOT fully close the queued-cancel-vs-lease race: a lease that
+        COMMITS its CLAIM after cancel's stmt-1 snapshot (while stmt-2 is about to flip the
+        job) leaves an orphan open attempt on the dead job + a leaked soft slot. That
+        orphan is HARMLESS to the cap (the hard count is scoped to leased/running, so it's
+        never counted) and is healed within ONE janitor tick by reclaim_expired's fast
+        orphan-heal (+ the reconciler backstop). A job-first cancel that COULD close it is
+        rejected — it reintroduces the ABBA above."""
         async with self._pool.acquire() as con:
-            await con.execute(
-                """WITH closed AS (
-                       UPDATE attempt SET status='failed', ended_at=statement_timestamp(),
-                              error_class='terminal'
-                        WHERE job_id = $1 AND status = 'open'
-                       RETURNING job_id
-                   ),
-                   killed AS (
-                       UPDATE job SET status='dead'
-                        WHERE id = $1 AND status IN ('queued','leased','running')
-                       RETURNING id
-                   ),
-                   dec AS (   -- counter LAST; gated on a REAL open-attempt close.
-                       UPDATE repo_concurrency rc SET active = GREATEST(rc.active - 1, 0)
-                         FROM closed c JOIN job j ON j.id = c.job_id
-                        WHERE j.repo_id IS NOT NULL AND rc.repo_id = j.repo_id
-                       RETURNING rc.repo_id
-                   )
-                   SELECT 1""",
-                job_id)
+            async with con.transaction():
+                # 1. close any open attempt FIRST (locks the attempt row). RETURNING tells
+                #    us whether a REAL open attempt closed here.
+                closed_job = await con.fetchval(
+                    """UPDATE attempt SET status='failed', ended_at=statement_timestamp(),
+                           error_class='terminal'
+                        WHERE job_id = $1 AND status = 'open' RETURNING job_id""",
+                    job_id)
+                # 2. flip the job dead (locks the job row) — attempt-then-job, canonical.
+                await con.execute(
+                    """UPDATE job SET status='dead'
+                        WHERE id = $1 AND status IN ('queued','leased','running')""",
+                    job_id)
+                # 3. counter LAST: decrement iff a real open attempt closed, non-NULL repo
+                #    (the job row is already locked by stmt 2 in this tx).
+                if closed_job is not None:
+                    await con.execute(
+                        """UPDATE repo_concurrency rc SET active = GREATEST(rc.active - 1, 0)
+                             FROM job j WHERE j.id = $1 AND j.repo_id IS NOT NULL
+                              AND rc.repo_id = j.repo_id""",
+                        job_id)
 
     async def get_status(self, job_id: UUID) -> dict:
         """Job + its attempts + outbound, as a plain dict. {} for an unknown id."""

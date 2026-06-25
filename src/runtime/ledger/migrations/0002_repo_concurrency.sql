@@ -45,3 +45,14 @@ SELECT j.repo_id, count(*)
    AND j.status IN ('leased','running')
  GROUP BY j.repo_id
 ON CONFLICT (repo_id) DO UPDATE SET active = EXCLUDED.active;
+
+-- The upsert above only touches repos that CURRENTLY have live open attempts. On a
+-- re-run, a row whose repo has drained to zero open attempts would otherwise keep its
+-- old (stale-high) active until the slow reconciler. Zero those too, so the migration
+-- converges to ABSOLUTE truth on every run (mirrors the reconciler's drift-down step).
+UPDATE repo_concurrency SET active = 0
+ WHERE active <> 0
+   AND NOT EXISTS (
+       SELECT 1 FROM attempt a JOIN job j ON j.id = a.job_id
+        WHERE a.status = 'open' AND j.repo_id = repo_concurrency.repo_id
+          AND j.status IN ('leased','running'));
