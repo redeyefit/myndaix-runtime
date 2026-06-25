@@ -86,5 +86,17 @@ Both families reviewed the implementation; converged + unique findings all folde
 
 Tests: `orchestrator/test-fix.sh` now 13 cases incl. rename-bypass→TAMPERED, nested-.envrc→UNVERIFIED, secret→withheld+flagged, hanging-verify→UNVERIFIED(timeout).
 
+## Re-review round 2 (codex + Oracle on the hardened code) — folded
+Both re-reviewed; converged + unique findings fixed:
+- **`grep -P` fails open on macOS** (both — codex confirmed live `bsd_grep_P_rc=2`): control-char path check silently skipped → now `grep '[[:cntrl:]]'`.
+- **runtime harness tampering** (Oracle BLOCKER): patched code runs with worktree write access and could rewrite a test / drop a `conftest.py` at runtime, past the static policy → post-execution integrity check (tracked-diff sha unchanged since apply + no untracked test/config file appeared) → `TAMPERED`.
+- **sandbox subpath canonicalization**: `$cwd`/scratch were `/var/...` but the real path is `/private/var/...`, so the allow-write subpath didn't match → legit worktree writes denied (false UNVERIFIED) AND the tamper-detect path couldn't trigger. Now `pwd -P` canonical.
+- **ungated test seam** (codex): `MYNDAIX_FIX_PATCH_OVERRIDE` now requires `MYNDAIX_FIX_TEST_MODE=1`, else fail-closed (no production bypass).
+- **terminal-escape injection** (Oracle): the delivered markdown is run through `clean` (strips ESC/C0) so a `cat` of the inbox file can't repaint the screen.
+- **unreaped daemons** (Oracle): `run_sandboxed` now kills the whole process group unconditionally, not only on timeout.
+- secret-in-filename reflected in flags → `deliver` redacts `SECRET_RE` across the whole record; patch rehashed before delivery (not just apply); 1 MB patch cap (OOM); `repos.json` path required absolute + `pwd -P` canonical; `abs_argv` NUL-delimited; git-config drift caps the verdict at `TAMPERED`.
+
+**KNOWN v1 RESIDUAL (flagged to Jefe — codex BLOCKER not yet implemented):** the live codex *fix* job still runs through the runtime with the host `HOME`/`CODEX_HOME` (so it can read host files and encode them into the patch; the signature secrets-scan + human diff review are the mitigations, plus `network_access=false` blocks exfil). Implementing a per-job scratch HOME risks breaking codex's CLI auth (same deploy-gate class as PR-0b) and needs its own live verification — deferred to the verifier-hardening / Docker milestone (the same gate as auto-on-NEEDS-FIX). For v1 honest-minimal this is consistent with "the human merge gate is the backstop."
+
 ## Deliberately NOT in v1
 Docker/hardened sandbox (→ before any auto-fix), parent-verdict SHA binding (v1 validates the commit only), clean-base `.agent/verify.sh`, sample-N, auto-on-NEEDS-FIX, auto-merge verb, repo_id/repo_path spine split (v1 uses config-resolved abs path as the fix job's repo).

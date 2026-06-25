@@ -50,16 +50,25 @@ note(){ printf '[%s] [play-fix] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$r
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }
 
 deliver(){ # deliver <verdict> <body>   (body is fenced with the SECRET delivery nonce)
-  local v="$1" body="$2" f="$INBOX/$(date +%Y%m%d%H%M%S)-fix-$play.md"
-  printf '# fix %s — %s\n\nplay: %s\nrepo: %s\nbase: %s\nflags: %s\n\n===BEGIN FIX nonce=%s===\n%s\n===END FIX nonce=%s===\n' \
-    "$v" "${repo_id:-?}" "$play" "${repo_id:-?}" "${base_sha:-?}" "${flags:-none}" "$nonce" "$body" "$nonce" \
-    > "$f" 2>/dev/null || { printf '[%s] INBOX WRITE FAILED: %s\n%s\n' "$play" "$v" "$body" >&2; return 0; }
+  local v="$1" body="$2" f="$INBOX/$(date +%Y%m%d%H%M%S)-fix-$play.md" md
+  md="$(printf '# fix %s — %s\n\nplay: %s\nrepo: %s\nbase: %s\nflags: %s\n\n===BEGIN FIX nonce=%s===\n%s\n===END FIX nonce=%s===\n' \
+    "$v" "${repo_id:-?}" "$play" "${repo_id:-?}" "${base_sha:-?}" "${flags:-none}" "$nonce" "$body" "$nonce")"
+  # sanitize the human-facing record: strip terminal/control escapes (Oracle MAJOR 3 — a diff
+  # cat'd in a terminal could repaint the screen) and redact secret signatures ANYWHERE,
+  # incl. reflected in flags/reason via a malicious filename (Oracle MINOR 1).
+  md="$(printf '%s' "$md" | clean | LC_ALL=C sed -E "s/$SECRET_RE/[REDACTED-SECRET]/g")"
+  printf '%s\n' "$md" > "$f" 2>/dev/null || { printf '[%s] INBOX WRITE FAILED: %s\n' "$play" "$v" >&2; return 0; }
 }
 
 finish(){ # finish <verdict> <reason> [patch-path-for-diff]
   # the secret-scan + flag MUST run here (parent shell), not inside the $() below, or the
   # flag wouldn't propagate (codex MAJOR / Oracle 5: withhold the diff body on a secret hit)
   verdict="$1"; reason="$2"; local pp="${3:-}" diff=""
+  # re-validate the immutable copy's hash before delivery too (codex: was only checked
+  # before apply) — the human reads/applies only what we hashed.
+  if [[ -n "$pp" && -f "$pp" && -n "${patch_sha:-}" && "$pp" == "${patch:-}" ]]; then
+    [[ "$(shasum -a 256 "$pp" | awk '{print $1}')" == "$patch_sha" ]] || { reason="$reason (NOTE: patch hash changed before delivery — diff withheld)"; pp=""; }
+  fi
   if [[ -n "$pp" && -f "$pp" ]]; then
     if LC_ALL=C grep -aE "$SECRET_RE" "$pp" >/dev/null 2>&1; then
       flags="$flags secrets-hit"
@@ -82,20 +91,24 @@ fence(){ printf '===BEGIN UNTRUSTED %s nonce=%s===\n' "$1" "$prompt_nonce"; prin
 # deny reads of operator secret stores. argv[0] MUST be absolute (env is wiped).
 have_sandbox(){ command -v sandbox-exec >/dev/null 2>&1; }
 run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
-  local cwd="$1"; shift
+  local cwd; cwd="$(cd "$1" && pwd -P)"; shift     # CANONICAL path: sandbox subpaths must match
+  local sh st; sh="$(cd "$SCRATCH_HOME" && pwd -P)"; st="$(cd "$SCRATCH_TMP" && pwd -P)"
   local prof
   prof="(version 1)(allow default)(deny network*)(deny file-write*)"
-  prof="$prof(allow file-write* (subpath \"$cwd\"))(allow file-write* (subpath \"$SCRATCH_TMP\"))(allow file-write* (subpath \"$SCRATCH_HOME\"))"
+  prof="$prof(allow file-write* (subpath \"$cwd\"))(allow file-write* (subpath \"$st\"))(allow file-write* (subpath \"$sh\"))"
   prof="$prof(deny file-read* (subpath \"$HOME/.myndaix\"))(deny file-read* (subpath \"$HOME/.ssh\"))(deny file-read* (subpath \"$HOME/.aws\"))(deny file-read* (subpath \"$HOME/.gnupg\"))(deny file-read* (subpath \"$HOME/.config\"))"
   set -m 2>/dev/null || true                            # each bg job gets its own process group
   ( cd "$cwd" && exec env -i PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
-      HOME="$SCRATCH_HOME" TMPDIR="$SCRATCH_TMP" PYTHONDONTWRITEBYTECODE=1 \
+      HOME="$sh" TMPDIR="$st" PYTHONDONTWRITEBYTECODE=1 \
       sandbox-exec -p "$prof" "$@" ) &
   local pid=$!
   ( sleep "$VERIFY_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
   kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
+  # reap the WHOLE process group unconditionally — a test that forks a daemon and exits 0
+  # would otherwise leave it running past our exit (Oracle MAJOR 4).
+  kill -TERM -"$pid" 2>/dev/null || true; kill -KILL -"$pid" 2>/dev/null || true
   set +m 2>/dev/null || true
   return "$rc"
 }
@@ -112,7 +125,9 @@ command -v jq >/dev/null 2>&1 || fail_closed "jq required"
 have_sandbox || fail_closed "no sandbox-exec available — refusing to execute untrusted code (would be UNVERIFIED anyway)"
 [[ -f "$REPOS_JSON" ]] || fail_closed "no repo config at $REPOS_JSON"
 repo_path="$(jq -r --arg r "$repo_id" '.[$r].path // empty' "$REPOS_JSON" 2>/dev/null || true)"
-[[ -n "$repo_path" && -d "$repo_path/.git" ]] || fail_closed "repo_id '$repo_id' not in config or path is not a git repo"
+[[ "$repo_path" == /* ]] || fail_closed "repo_id '$repo_id' path must be absolute in config"
+[[ -d "$repo_path/.git" ]] || fail_closed "repo_id '$repo_id' not in config or path is not a git repo"
+repo_path="$(cd "$repo_path" && pwd -P)"               # canonicalize so submit + ledger binding agree (codex MINOR)
 [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || fail_closed "base_sha must be a full 40-hex SHA"
 git -C "$repo_path" cat-file -e "${base_sha}^{commit}" 2>/dev/null || fail_closed "base_sha is not a commit in $repo_id"
 [[ -s "$fixlist_file" ]] || fail_closed "empty/missing fix-list"
@@ -123,7 +138,7 @@ fixlist="$(clean < "$fixlist_file")"
 abs_argv(){ # abs_argv <json> -> JV[] ; fail_closed unless non-empty array w/ absolute argv0
   local j="$1" k="$2"
   [[ "$(printf '%s' "$j" | jq -r 'type' 2>/dev/null)" == "array" ]] || fail_closed "$k must be a JSON array"
-  JV=(); local x; while IFS= read -r x; do JV+=("$x"); done < <(printf '%s' "$j" | jq -r '.[]')
+  JV=(); local x; while IFS= read -r -d '' x; do JV+=("$x"); done < <(printf '%s' "$j" | jq -j '.[] | . + "\u0000"')
   [[ "${#JV[@]}" -ge 1 ]] || fail_closed "$k is empty"
   [[ "${JV[0]}" == /* ]] || fail_closed "$k argv0 must be an absolute path (env is wiped)"
 }
@@ -150,8 +165,13 @@ n="$(cat "$day" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
 #    TEST SEAM: MYNDAIX_FIX_PATCH_OVERRIDE=<path> skips the live codex submit.
 # ----------------------------------------------------------------------------
 src_patch=""
-if [[ -n "${MYNDAIX_FIX_PATCH_OVERRIDE:-}" ]]; then
+# the override is a TEST seam — it skips live submit, job-id binding, ledger asserts, and the
+# daily charge, so it must be DOUBLE-gated (codex MAJOR: an inherited env var would be a
+# provenance-erasing production bypass). Both the explicit test-mode flag AND the patch var.
+if [[ "${MYNDAIX_FIX_TEST_MODE:-}" == "1" && -n "${MYNDAIX_FIX_PATCH_OVERRIDE:-}" ]]; then
   src_patch="$MYNDAIX_FIX_PATCH_OVERRIDE"; note "TEST SEAM: override patch $src_patch"
+elif [[ -n "${MYNDAIX_FIX_PATCH_OVERRIDE:-}" ]]; then
+  fail_closed "MYNDAIX_FIX_PATCH_OVERRIDE set without MYNDAIX_FIX_TEST_MODE=1 — refusing (not a production path)"
 else
   command -v mxr >/dev/null 2>&1 || fail_closed "mxr not on PATH"
   mxr codex "reply with exactly: READY" >/dev/null 2>&1 || fail_closed "codex unreachable (auth or pool down)"
@@ -179,6 +199,8 @@ $(fence fix-list "$fixlist")"
   [[ -n "$src_patch" ]] || finish "NO_FIX" "codex produced no change (empty diff)"
 fi
 [[ -f "$src_patch" && -s "$src_patch" ]] || finish "NO_FIX" "no patch artifact produced"
+# cap the artifact before we ever cat it into a bash var (Oracle MINOR 6 — OOM via a giant patch)
+[[ "$(wc -c < "$src_patch")" -le 1048576 ]] || fail_closed "patch artifact over 1MB — refusing"
 
 # private immutable copy (codex BLOCKER 3 — verify never re-reads an agent-writable path;
 # the copy lives in the 0700 run dir and is denied to the sandbox)
@@ -206,7 +228,7 @@ tamper=0
 while IFS= read -r -d '' rec; do
   p="${rec#*$'\t'}"; p="${p#*$'\t'}"      # strip the two numstat count columns -> exact path
   [[ -z "$p" ]] && continue
-  printf '%s' "$p" | LC_ALL=C grep -qP '[\x00-\x1f\x7f]' 2>/dev/null && finish "UNVERIFIED" "patch policy: control char in path"
+  printf '%s' "$p" | LC_ALL=C grep -q '[[:cntrl:]]' && finish "UNVERIFIED" "patch policy: control char in path"
   printf '%s' "$p" | grep -qE "$DENY_RE" && finish "UNVERIFIED" "patch policy: refuses $p"
   printf '%s' "$p" | grep -qE "$TAMPER_RE" && { tamper=1; flags="$flags touched:$p"; }
 done < <(git -C "$vwt" apply --numstat -z "$patch" 2>/dev/null)
@@ -232,6 +254,8 @@ git -C "$repo_path" worktree remove --force "$pwt" >/dev/null 2>&1 || rm -rf "$p
 # re-validate the immutable copy, then apply into the (separate) verify worktree
 [[ "$(shasum -a 256 "$patch" | awk '{print $1}')" == "$patch_sha" ]] || fail_closed "patch copy changed (integrity)"
 git -C "$vwt" apply "$patch" 2>/dev/null || finish "UNVERIFIED" "patch failed to apply at verify time" "$patch"
+# snapshot the EXPECTED tracked state after apply — used to detect runtime harness tampering
+applied_diff_sha="$(git -C "$vwt" diff | shasum -a 256 | awk '{print $1}')"
 
 if [[ -n "$build_argv_json" ]]; then
   abs_argv "$build_argv_json" build; BUILD=("${JV[@]}")
@@ -240,8 +264,19 @@ fi
 run_sandboxed "$vwt" "${VERIFY[@]}" >"$run/verify.log" 2>&1 || finish "UNVERIFIED" "regression: verify suite failed after applying the patch" "$patch"
 run_sandboxed "$vwt" "${F2P[@]}" >>"$run/verify.log" 2>&1 || finish "UNVERIFIED" "fix did not make the target test pass (or the target test was removed)" "$patch"
 
-# all checks ran sandboxed and passed. a patch that edits the harness is never trustworthy-green.
-if [[ "$tamper" -eq 1 ]]; then
-  finish "TAMPERED" "verify passed, but the patch edits tests/config/manifests — the green result is NOT trustworthy; review the diff carefully" "$patch"
+# POST-EXECUTION INTEGRITY (Oracle BLOCKER 1): the static policy only inspected the patch, but
+# the patched code ran with write access to the worktree and could have rewritten a test file
+# or dropped a conftest.py at RUNTIME to fake green. Detect both: any change to tracked files
+# beyond the applied patch, or any untracked test/config file that appeared during execution.
+[[ "$(git -C "$vwt" diff | shasum -a 256 | awk '{print $1}')" == "$applied_diff_sha" ]] \
+  || finish "TAMPERED" "tracked files were modified DURING test execution (runtime harness tampering) — green is not trustworthy" "$patch"
+while IFS= read -r -d '' f; do
+  printf '%s' "$f" | grep -qE "$TAMPER_RE|$DENY_RE" && finish "TAMPERED" "a test/config file ($f) appeared DURING execution (runtime tampering)" "$patch"
+done < <(git -C "$vwt" ls-files --others -z 2>/dev/null)
+
+# all checks ran sandboxed and passed. a patch that edits the harness — statically OR at runtime,
+# or that perturbed shared git config — is never trustworthy-green.
+if [[ "$tamper" -eq 1 || "$flags" == *git-config-drift* ]]; then
+  finish "TAMPERED" "verify passed, but the patch edits tests/config/manifests (or perturbed git config) — the green result is NOT trustworthy; review the diff carefully" "$patch"
 fi
 finish "REGRESSION_CHECK_ONLY" "verify suite + target test passed under a best-effort sandbox (a regression signal, NOT a guarantee — review the diff before applying)" "$patch"

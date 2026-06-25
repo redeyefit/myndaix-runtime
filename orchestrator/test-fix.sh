@@ -77,10 +77,17 @@ open(p,"w").write("import time\ndef add(a, b):\n    while True:\n        time.sl
 PY
 mint "$TMP/hang.patch"
 
+# runtime tamper: calc.py rewrites a test file when imported (static policy can't see it)
+"$PY" - "$REPO/calc.py" <<'PY'
+import sys; p=sys.argv[1]
+open(p,"w").write('open("test_add.py","w").write("assert True\\n")\ndef add(a, b):\n    return a + b\n')
+PY
+mint "$TMP/runtime_tamper.patch"
+
 run(){ # run <repo_id> <patch>
   rm -f "$INBOX"/*.md 2>/dev/null || true
   MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
-    MYNDAIX_FIX_PATCH_OVERRIDE="$2" bash "$PLAY" "$1" "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+    MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$2" bash "$PLAY" "$1" "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
 }
 verdict(){ grep -h '^# fix ' "$INBOX"/*.md 2>/dev/null | head -1 | awk '{print $3}'; }
 check(){ # check <label> <expected>
@@ -105,14 +112,14 @@ run ghost "$TMP/good.patch";       check "missing config" ABORTED
 echo "7. bad base_sha -> ABORTED (fail-closed)"
 rm -f "$INBOX"/*.md 2>/dev/null || true
 MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
-  MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture deadbeef "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture deadbeef "$TMP/fixlist.txt" >/dev/null 2>&1 || true
 check "bad sha" ABORTED
 
 echo "8. over-cap fix-list -> ABORTED (fail-closed, no truncation)"
 "$PY" -c "open('$TMP/big.txt','w').write('x'*70000)"
 rm -f "$INBOX"/*.md 2>/dev/null || true
 MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
-  MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/big.txt" >/dev/null 2>&1 || true
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/big.txt" >/dev/null 2>&1 || true
 check "over-cap" ABORTED
 
 flagcheck(){ # flagcheck <substr> <label>
@@ -129,8 +136,17 @@ run fixture "$TMP/secret.patch";   check "secret verdict" REGRESSION_CHECK_ONLY;
 echo "12. hanging verify -> UNVERIFIED (timeout fires, script does not wedge)"
 rm -f "$INBOX"/*.md 2>/dev/null || true
 MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
-  MYNDAIX_FIX_TIMEOUT=2 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/hang.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_TIMEOUT=2 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/hang.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
 check "timeout" UNVERIFIED
+
+echo "13. RUNTIME harness tampering (code rewrites a test on import) -> TAMPERED"
+run fixture "$TMP/runtime_tamper.patch"; check "runtime tamper" TAMPERED
+
+echo "14. override WITHOUT test-mode -> ABORTED (no production bypass)"
+rm -f "$INBOX"/*.md 2>/dev/null || true
+MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+  MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+check "ungated override" ABORTED
 
 echo
 echo "=== $pass passed, $fail failed ==="
