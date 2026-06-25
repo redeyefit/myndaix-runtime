@@ -42,6 +42,7 @@ run="$RUNS/$play"
 mkdir -p "$RUNS" "$STATE" "$INBOX"
 ( umask 077; mkdir -p "$run" )                          # 0700 run dir: holds the private patch copy
 RUN_CANON="$(cd "$run" && pwd -P)"                       # canonical: sandbox read-deny must match (C1)
+HOME_CANON="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"   # canonical home for the SBPL denies + TMPDIR guard (C4)
 nonce="$(openssl rand -hex 16)"                          # DELIVERY fence — NEVER shown to codex
 prompt_nonce="$(openssl rand -hex 16)"                   # codex-input fence (codex sees this one only)
 verdict="UNVERIFIED"; reason=""; flags=""
@@ -102,7 +103,7 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
   # (git, pytest, most CLIs open it) — without this the whole suite returns UNVERIFIED. Single
   # literal, NOT a subpath: containment (net-deny, real-FS write-deny, secret-read-deny) unchanged.
   prof="$prof(allow file-write* (literal \"/dev/null\"))"
-  prof="$prof(deny file-read* (subpath \"$HOME/.myndaix\"))(deny file-read* (subpath \"$HOME/.ssh\"))(deny file-read* (subpath \"$HOME/.aws\"))(deny file-read* (subpath \"$HOME/.gnupg\"))(deny file-read* (subpath \"$HOME/.config\"))"
+  prof="$prof(deny file-read* (subpath \"$HOME_CANON/.myndaix\"))(deny file-read* (subpath \"$HOME_CANON/.ssh\"))(deny file-read* (subpath \"$HOME_CANON/.aws\"))(deny file-read* (subpath \"$HOME_CANON/.gnupg\"))(deny file-read* (subpath \"$HOME_CANON/.config\"))"
   # The private patch (0400) lives in $run; chmod alone does NOT stop same-user sandboxed code from
   # reading it — only this read-deny does. Deny $run explicitly (canonical) so it holds for ANY $ORCH,
   # not just one under $HOME/.myndaix (codex C1). $run is never under $EXEC, so this can't block the test.
@@ -165,11 +166,18 @@ if [[ -n "$f2p_selector" ]]; then
   [[ "$f2p_selector" != /* ]] || fail_closed "fail_to_pass selector must be a relative in-repo path"
   [[ "$f2p_selector" != *..* ]] || fail_closed "fail_to_pass selector must not contain '..'"
   [[ "$f2p_selector" != -* ]] || fail_closed "fail_to_pass selector must not start with '-' (would be parsed as a flag)"   # C3
-  # Existence is NOT enough: a tracked SYMLINK (mode 120000) or tree/gitlink could redirect the
-  # "proof" to a NON-test file the patch can then doctor without tripping the test-tamper gate
-  # (codex C2). Require a REGULAR blob at base.
-  f2p_mode="$(git -C "$repo_path" ls-tree "$base_sha" -- "$f2p_selector" 2>/dev/null | awk 'NR==1{print $1}')"
-  [[ "$f2p_mode" == "100644" || "$f2p_mode" == "100755" ]] || fail_closed "fail_to_pass selector '$f2p_selector' must be a regular tracked file at base ${base_sha:0:8} (got mode '${f2p_mode:-none}')"
+  # Existence is NOT enough: a tracked SYMLINK (120000), tree (040000), or gitlink (160000) could
+  # redirect the "proof" to a NON-test file the patch can then doctor without tripping the test-tamper
+  # gate (codex C2). A trailing slash / '/.' makes ls-tree emit CHILD rows, so checking only row 1
+  # would let a directory through (codex re-review). Require EXACTLY one row, a regular blob, AND the
+  # row's path to equal the selector verbatim.
+  [[ "$f2p_selector" != */ && "$f2p_selector" != */. ]] || fail_closed "fail_to_pass selector must not end in '/' or '/.'"
+  f2p_ls="$(git -C "$repo_path" ls-tree "$base_sha" -- "$f2p_selector" 2>/dev/null)"
+  [[ "$(printf '%s' "$f2p_ls" | grep -c .)" == "1" ]] || fail_closed "fail_to_pass selector '$f2p_selector' must resolve to exactly one tracked entry at base ${base_sha:0:8}"
+  f2p_mode="$(printf '%s' "$f2p_ls" | awk '{print $1}')"
+  f2p_path="$(printf '%s' "$f2p_ls" | sed 's/^[^\t]*\t//')"   # path is the field after the TAB
+  [[ "$f2p_mode" == "100644" || "$f2p_mode" == "100755" ]] || fail_closed "fail_to_pass selector '$f2p_selector' must be a regular tracked file at base (got mode '${f2p_mode:-none}')"
+  [[ "$f2p_path" == "$f2p_selector" ]] || fail_closed "fail_to_pass selector '$f2p_selector' did not resolve to that exact path (got '$f2p_path')"
   f2p_tmpl_json="$(jq -c --arg r "$repo_id" '.[$r].fail_to_pass_template // empty' "$REPOS_JSON")"
   [[ "$(printf '%s' "$f2p_tmpl_json" | jq -r 'type' 2>/dev/null)" == "array" ]] || fail_closed "fail_to_pass_template missing/not an array but a selector was supplied"
   [[ "$(printf '%s' "$f2p_tmpl_json" | jq '[.[] | select(. == "{TEST}")] | length')" == "1" ]] || fail_closed "fail_to_pass_template must contain exactly one {TEST} placeholder"
@@ -183,27 +191,41 @@ if ! mkdir "$lock" 2>/dev/null; then
   if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; mkdir "$lock" 2>/dev/null || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
 fi
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
-# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined.
-EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")"
-trap 'rm -rf "$EXEC" 2>/dev/null || true' EXIT          # covers a validation abort; replaced once cleanup is set
+# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. A lock-removing
+# EXIT trap is armed FIRST so a mktemp failure or a signal before the full trap can't strand the lock
+# (codex MAJOR: lock leak on the EXEC-validation abort path).
+trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
 trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
+EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
+trap 'rm -rf "$EXEC" "$lock" 2>/dev/null || true' EXIT  # now reap BOTH on any abort, incl. validation below
 EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
-HOME_CANON="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"   # compare canonical-vs-canonical (symlinked HOME)
-case "$EXEC" in "$HOME_CANON/.myndaix"*|"$HOME_CANON/.ssh"*|"$HOME_CANON/.aws"*|"$HOME_CANON/.gnupg"*|"$HOME_CANON/.config"*) fail_closed "TMPDIR resolved under a read-denied path ($EXEC) — set TMPDIR elsewhere";; esac
+[[ "$HOME_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "home path unsafe for the sandbox profile: $HOME_CANON"
+# reject a TMPDIR that lands ON or UNDER a read-denied dir; the trailing '/' avoids a false hit on a
+# sibling like .myndaix-tmp (codex C4)
+case "$EXEC/" in "$HOME_CANON/.myndaix/"*|"$HOME_CANON/.ssh/"*|"$HOME_CANON/.aws/"*|"$HOME_CANON/.gnupg/"*|"$HOME_CANON/.config/"*) fail_closed "TMPDIR resolved under a read-denied path ($EXEC) — set TMPDIR elsewhere";; esac
 [[ "$EXEC" == /* && "$EXEC" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "exec dir path unsafe for the sandbox profile: $EXEC"
 [[ "$RUN_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "run dir path unsafe for the sandbox profile: $RUN_CANON"
 SCRATCH_HOME="$EXEC/home"; SCRATCH_TMP="$EXEC/tmp"; mkdir -p "$SCRATCH_HOME" "$SCRATCH_TMP"
-# untrusted patched code runs with write access to $EXEC and can chmod 000 / chflags uchg files to
-# sabotage cleanup (Oracle O3 DoS) — strip immutables + restore perms BEFORE removing.
+# untrusted patched code runs with write access to $EXEC and can chmod 000 / chflags uchg (even NESTED)
+# to sabotage cleanup (Oracle/codex O3 DoS). A single chflags -R can't traverse INTO a 000 dir, so peel
+# iteratively (chmod opens traversal, chflags clears immutables, one more level each pass). The periodic
+# TMPDIR sweep is the backstop for pathological depth + SIGKILL leaks.
 cleanup(){
-  chflags -R nouchg "$EXEC" >/dev/null 2>&1 || true
-  chmod -R u+rwX "$EXEC" >/dev/null 2>&1 || true
-  for w in "$EXEC/verify-wt" "$EXEC/precheck-wt"; do [[ -e "$w" ]] && { git -C "$repo_path" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w" 2>/dev/null || true; }; done
+  trap '' INT TERM                                      # a 2nd signal must not abort cleanup (Oracle O2)
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -e "$EXEC" ]] || break
+    chmod -R u+rwX "$EXEC" >/dev/null 2>&1 || true      # restore traversal FIRST so chflags can descend
+    chflags -R nouchg "$EXEC" >/dev/null 2>&1 || true
+    git -C "$repo_path" worktree remove --force "$EXEC/verify-wt" >/dev/null 2>&1 || true
+    git -C "$repo_path" worktree remove --force "$EXEC/precheck-wt" >/dev/null 2>&1 || true
+    rm -rf "$EXEC" >/dev/null 2>&1 || true
+  done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
-  rm -rf "$EXEC" "$lock" 2>/dev/null || true
+  rm -rf "$lock" >/dev/null 2>&1 || true
+  [[ -e "$EXEC" ]] && note "WARN: could not fully remove $EXEC (adversarial lockdown?) — left for periodic sweep"
 }
 trap cleanup EXIT                                       # full reap once we hold the lock + own $EXEC
-trap 'exit 143' INT TERM                                # signals route through EXIT -> cleanup, never resume (O2)
 find "$RUNS" -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev/null || true
 
 day="$STATE/count-$(date +%Y%m%d)"

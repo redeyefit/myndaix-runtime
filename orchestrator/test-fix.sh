@@ -24,6 +24,7 @@ printf 'print("ok")\n' > "$REPO/test_other.py"
 printf 'open("/dev/null","w").write("x")\nprint("ok")\n' > "$REPO/test_devnull.py"
 printf 'x = 1\n' > "$REPO/dummy.py"     # a tracked file to rename in the bypass test
 ln -s calc.py "$REPO/test_link.py"      # a tracked SYMLINK (mode 120000) for the C2 selector test
+mkdir -p "$REPO/pkg"; printf 'print("ok")\n' > "$REPO/pkg/mod.py"   # a tracked TREE for the C2 tree-selector test
 git -C "$REPO" add -A
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm init
 BASE="$(git -C "$REPO" rev-parse HEAD)"
@@ -197,6 +198,14 @@ BADTMP="$TMP/.myndaix/tmp"; mkdir -p "$BADTMP"
 HOME="$TMP" TMPDIR="$BADTMP" MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
   MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
 check "TMPDIR under denied path" ABORTED
+
+echo "25. lock released after a validation abort -> next run still succeeds (codex MAJOR: lock leak)"
+# case 24 aborted inside the EXEC-validation block; if the lock leaked, this normal run would abort.
+run fixture "$TMP/good.patch"; check "lock not leaked" REGRESSION_CHECK_ONLY
+echo "26. selector is a TREE (directory) -> ABORTED (codex re-review: mode must be a blob, path exact)"
+run_sel fixture "$TMP/good.patch" "pkg"; check "selector tree" ABORTED
+echo "27. selector with a trailing slash -> ABORTED (codex re-review: ls-tree child-row bypass)"
+run_sel fixture "$TMP/good.patch" "test_add.py/"; check "selector trailing slash" ABORTED
 
 echo
 echo "=== $pass passed, $fail failed ==="
