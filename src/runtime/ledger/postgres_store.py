@@ -64,6 +64,9 @@ class PostgresLedger:
     OUTBOUND_MAX_TRIES = 5       # mark_outbound_failed exhaustion threshold
     MAX_CHILDREN = 32            # admission: max direct children per parent
     MAX_DEPTH = 8                # admission: max job-tree depth
+    MAX_ATTEMPTS = 3             # poison ceiling: a job that fails/crashes this many
+                                 # times stops requeuing -> dead + dead_letter (both
+                                 # fail_attempt and reclaim_expired enforce it)
 
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
@@ -357,10 +360,23 @@ class PostgresLedger:
                 job = await con.fetchrow(
                     "SELECT id, to_agent FROM job WHERE id = $1 FOR UPDATE", att["job_id"])
                 to_agent = job["to_agent"]
+                dead_reason = None
                 if result.error_class is ErrorClass.RETRYABLE and self._requeue_safe(to_agent):
-                    new_status = "queued"
+                    # poison ceiling: count ALL attempts (incl. the one just closed above,
+                    # so the off-by-one is intentional) and dead-letter instead of requeuing
+                    # once it reaches MAX_ATTEMPTS — a job that fails retryably every time
+                    # can't requeue forever.
+                    n_att = await con.fetchval(
+                        "SELECT count(*) FROM attempt WHERE job_id = $1", att["job_id"])
+                    if n_att >= self.MAX_ATTEMPTS:
+                        new_status = "dead"
+                        dead_reason = (f"poison: {n_att} attempts reached MAX_ATTEMPTS "
+                                       f"({self.MAX_ATTEMPTS}) on '{to_agent}'")
+                    else:
+                        new_status = "queued"
                 elif result.error_class is ErrorClass.RETRYABLE:
                     new_status = "dead"   # mutating/unknown agent: do not replay
+                    dead_reason = f"retryable failure on non-retry-safe agent '{to_agent}'"
                 else:
                     new_status = "failed"  # terminal / needs_human / None -> fail-closed
                 await con.execute(
@@ -369,8 +385,7 @@ class PostgresLedger:
                 if new_status == "dead":
                     await con.execute(
                         "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
-                        _new_id(), att["job_id"],
-                        f"retryable failure on non-retry-safe agent '{to_agent}'")
+                        _new_id(), att["job_id"], dead_reason)
 
     async def append_log(self, attempt_id: UUID, stream: str, chunk: str) -> None:
         async with self._pool.acquire() as con:
@@ -482,8 +497,26 @@ class PostgresLedger:
                     self.RECLAIM_BATCH)
                 if not rows:
                     return 0
-                requeue = [r["job_id"] for r in rows if self._requeue_safe(r["to_agent"])]
-                dead = [r["job_id"] for r in rows if not self._requeue_safe(r["to_agent"])]
+                # Split the expired batch: workspace_actors die (never replay a mutation);
+                # requeue-safe jobs requeue UNLESS they've hit the poison ceiling (a worker
+                # that keeps crashing mid-run would otherwise reclaim->requeue forever). The
+                # count includes the attempt the `closed` CTE just failed above (off-by-one
+                # intended), so the Nth crash is the one that dead-letters.
+                requeue, dead, dead_reasons = [], [], {}
+                for r in rows:
+                    jid = r["job_id"]
+                    if not self._requeue_safe(r["to_agent"]):
+                        dead.append(jid)
+                        dead_reasons[jid] = "lease expired; workspace_actor not auto-retried"
+                        continue
+                    n_att = await con.fetchval(
+                        "SELECT count(*) FROM attempt WHERE job_id = $1", jid)
+                    if n_att >= self.MAX_ATTEMPTS:
+                        dead.append(jid)
+                        dead_reasons[jid] = (f"poison: {n_att} attempts reached MAX_ATTEMPTS "
+                                             f"({self.MAX_ATTEMPTS}) after lease expiry")
+                    else:
+                        requeue.append(jid)
                 if requeue:
                     await con.execute(
                         """UPDATE job SET status='queued'
@@ -497,8 +530,7 @@ class PostgresLedger:
                     for jid in dead:
                         await con.execute(
                             "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
-                            _new_id(), jid,
-                            "lease expired; workspace_actor not auto-retried")
+                            _new_id(), jid, dead_reasons[jid])
                 return len(rows)
 
     async def dead_letter(self, source_id: UUID, reason: str) -> None:

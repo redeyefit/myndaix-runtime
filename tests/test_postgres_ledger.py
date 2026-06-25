@@ -234,6 +234,53 @@ async def test_responder_requeues_on_retryable(led: PostgresLedger) -> None:
     assert att2 is not None, "requeued job should be re-leasable"
 
 
+# -- bounded reclaim: poison job stops requeuing after MAX_ATTEMPTS (PR-1b) -----
+async def test_poison_responder_dead_letters_after_max_attempts(led: PostgresLedger) -> None:
+    """A responder that fails retryably EVERY attempt requeues up to MAX_ATTEMPTS-1 times,
+    then the Nth failure dead-letters instead of looping forever. The count includes the
+    just-closed attempt, so EXACTLY MAX_ATTEMPTS runs happen (off-by-one is intentional)."""
+    await _truncate(led)
+    jid = await led.submit_job(to_agent="kilabz", prompt="poison")   # responder, requeue-safe
+    for i in range(1, led.MAX_ATTEMPTS + 1):
+        att = await led.lease_job(f"w{i}", [])
+        assert att is not None, f"attempt {i} should lease (under the cap)"
+        await led.fail_attempt(att, _retryable())
+        st = await led.get_status(jid)
+        if i < led.MAX_ATTEMPTS:
+            assert st["status"] == "queued", f"attempt {i}: under cap -> requeue, got {st['status']}"
+        else:
+            assert st["status"] == "dead", f"attempt {i}: at cap -> dead, got {st['status']}"
+    assert await led.lease_job("w-final", []) is None, "dead job must not re-lease"
+    async with led._pool.acquire() as con:
+        nd = await con.fetchval(
+            "SELECT count(*) FROM dead_letter WHERE source_id=$1 AND reason LIKE 'poison:%'", jid)
+        natt = await con.fetchval("SELECT count(*) FROM attempt WHERE job_id=$1", jid)
+    assert nd == 1, "exactly one poison dead_letter recorded"
+    assert natt == led.MAX_ATTEMPTS, f"exactly MAX_ATTEMPTS runs, got {natt}"
+
+
+async def test_poison_reclaim_dead_letters_after_max_attempts(led: PostgresLedger) -> None:
+    """A responder whose worker keeps crashing (lease expires, never completes) is
+    reclaimed->requeued up to the cap, then dead-lettered by reclaim_expired itself —
+    closing the crash-loop that the requeue path alone never terminates."""
+    await _truncate(led)
+    jid = await led.submit_job(to_agent="kilabz", prompt="crash-loop")
+    for i in range(1, led.MAX_ATTEMPTS + 1):
+        att = await led.lease_job(f"w{i}", [])
+        assert att is not None, f"attempt {i} should lease"
+        await _expire_lease(led, att)
+        assert await led.reclaim_expired() == 1, f"attempt {i} should be reclaimed"
+        st = await led.get_status(jid)
+        if i < led.MAX_ATTEMPTS:
+            assert st["status"] == "queued", f"attempt {i}: under cap -> requeue"
+        else:
+            assert st["status"] == "dead", f"attempt {i}: at cap -> dead"
+    async with led._pool.acquire() as con:
+        nd = await con.fetchval(
+            "SELECT count(*) FROM dead_letter WHERE source_id=$1 AND reason LIKE 'poison:%'", jid)
+    assert nd == 1, "reclaim recorded exactly one poison dead_letter"
+
+
 # -- the DB itself rejects an illegal status (CHECK enforcement) ---------------
 async def test_db_rejects_illegal_status(led: PostgresLedger) -> None:
     await _truncate(led)
