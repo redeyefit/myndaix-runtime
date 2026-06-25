@@ -78,6 +78,14 @@ async def _expire_lease(led: PostgresLedger, attempt_id) -> None:
             "WHERE id = $1", attempt_id)
 
 
+async def _orphan_open_count(led: PostgresLedger) -> int:
+    """Open attempts whose job is already terminal — the cancel-race orphan (should heal to 0)."""
+    async with led._pool.acquire() as con:
+        return await con.fetchval(
+            "SELECT count(*) FROM attempt a JOIN job j ON j.id=a.job_id "
+            "WHERE a.status='open' AND j.status NOT IN ('leased','running')")
+
+
 # -- (a) cap never exceeded under N>cap hammer, drift-proof ---------------------
 async def test_a_cap_never_exceeded_under_hammer(led: PostgresLedger) -> None:
     led.MAX_PER_REPO = 2
@@ -255,6 +263,114 @@ async def test_j_queries_are_index_usable(led: PostgresLedger) -> None:
                     ORDER BY j.priority DESC, j.created_at, j.id LIMIT 1""", 2)
             ptxt = "\n".join(r["QUERY PLAN"] for r in pick)
             assert "Index" in ptxt or "Bitmap" in ptxt, f"PICK not index-backed:\n{ptxt}"
+
+
+# -- (e2) close-race EXACT decrement on a multi-slot base (over-decrement detector) ---
+async def test_e2_close_race_exact_decrement_multislot(led: PostgresLedger) -> None:
+    """test_e's 1-slot base can't catch OVER-decrement (GREATEST(active-1,0) floors 1 and
+    2 decrements both to 0). On a 3-slot base, race ONE attempt's four close paths and
+    assert active drops to EXACTLY 2 — catching both double-decrement (->1) and zero (->3)."""
+    led.MAX_PER_REPO = 4
+    for _ in range(6):
+        await _truncate(led)
+        jids = await _submit_n(led, "R", 3)
+        atts = [a for a in [await led.lease_job(f"w{i}", []) for i in range(3)] if a]
+        assert len(atts) == 3 and await _active(led, "R") == 3
+        await _expire_lease(led, atts[0])
+        await asyncio.gather(
+            led.complete_attempt(atts[0], _ok()),
+            led.fail_attempt(atts[0], _retryable()),
+            led.cancel(jids[0]),
+            led.reclaim_expired(),
+            return_exceptions=True)
+        assert await _active(led, "R") == 2, "close race did NOT decrement exactly once (multi-slot)"
+        assert await _open_count(led, "R") == 2
+
+
+# -- (k) the queued-cancel-vs-lease race: no breach, and reclaim heals the orphan fast ---
+async def test_k_concurrent_lease_cancel_no_breach_self_heals(led: PostgresLedger) -> None:
+    """Hammer lease_job CONCURRENT with cancel on the SAME queued jobs (the orphan race the
+    single-CTE cancel can't fully close). Invariants: (1) the cap is NEVER breached during
+    the storm; (2) reclaim_expired's fast orphan-heal closes any orphan attempt within a
+    tick; (3) the reconciler heals active back to truth. This is the test the original
+    harness lacked (it leased sequentially before cancelling)."""
+    led.MAX_PER_REPO = 3
+    await _truncate(led)
+    jids = await _submit_n(led, "R", 12)
+    ops = [led.lease_job(f"w{i}", []) for i in range(12)] + [led.cancel(j) for j in jids]
+    await asyncio.gather(*ops, return_exceptions=True)
+    assert await _open_count(led, "R") <= 3, "cap breached during concurrent lease||cancel"
+    await led.reclaim_expired()                       # fast orphan-heal (one janitor tick)
+    assert await _orphan_open_count(led) == 0, "reclaim did not close the cancel-race orphan(s)"
+    assert await _open_count(led, "R") <= 3
+    await led.reconcile_repo_concurrency()            # absolute backstop -> active == truth
+    assert await _active(led, "R") == await _open_count(led, "R"), "active not healed to truth"
+
+
+# -- (l) NULL repo_id is cap-EXEMPT, even alongside a fully-capped repo ----------------
+async def test_l_null_repo_cap_exempt(led: PostgresLedger) -> None:
+    led.MAX_PER_REPO = 1
+    await _truncate(led)
+    await _submit_n(led, None, 1)                     # cap-exempt
+    await _submit_n(led, "R", 3)                      # capped at 1
+    await asyncio.gather(*[led.lease_job(f"w{i}", []) for i in range(8)])
+    assert await _open_count(led, "R") <= 1, "cap breached on R"
+    async with led._pool.acquire() as con:
+        null_open = await con.fetchval(
+            "SELECT count(*) FROM attempt a JOIN job j ON j.id=a.job_id "
+            "WHERE a.status='open' AND j.repo_id IS NULL")
+        rc_rows = await con.fetchval("SELECT count(*) FROM repo_concurrency WHERE repo_id IS NULL")
+    assert null_open == 1, "cap-exempt NULL-repo job did not lease while R was capped"
+    assert rc_rows == 0, "a NULL-repo rc row was created (cap-exempt must never seed one)"
+
+
+# -- (m) bounded re-PICK budget exhausts to None (anti-spin), liveness preserved -------
+async def test_m_repick_budget_bounded_no_spin(led: PostgresLedger) -> None:
+    led.MAX_PER_REPO = 1
+    await _truncate(led)
+    n = led.LEASE_MAX_REPICKS + 4                     # more distinct capped repos than the budget
+    for i in range(n):
+        await _submit_n(led, f"repo{i}", 2)
+    for i in range(n):                                # fill the cap on each repo (1 open)
+        assert await led.lease_job(f"filler{i}", []) is not None
+    # corrupt every cache stale-low: the SOFT filter now passes but the HARD count rejects,
+    # forcing the re-PICK budget to engage across > LEASE_MAX_REPICKS repos.
+    async with led._pool.acquire() as con:
+        await con.execute("UPDATE repo_concurrency SET active = 0")
+    start = time.monotonic()
+    a = await led.lease_job("late", [])
+    elapsed = time.monotonic() - start
+    assert a is None, "leased despite every repo at the hard cap"
+    assert elapsed < 5.0, f"re-PICK spun {elapsed:.2f}s instead of a bounded None"
+    await _submit_n(led, "fresh", 1)                  # liveness: a fresh uncapped repo still leases
+    assert await led.lease_job("fw", []) is not None, "fresh repo starved after budget exhaustion"
+
+
+# -- (n) reconciler heals injected drift (both directions) to truth --------------------
+async def test_n_reconcile_heals_injected_drift(led: PostgresLedger) -> None:
+    led.MAX_PER_REPO = 4
+    await _truncate(led)
+    await _submit_n(led, "R", 2)
+    assert await led.lease_job("w1", []) is not None and await led.lease_job("w2", []) is not None
+    async with led._pool.acquire() as con:            # inject drift both ways
+        await con.execute("UPDATE repo_concurrency SET active = 99 WHERE repo_id='R'")
+        await con.execute("INSERT INTO repo_concurrency(repo_id, active) VALUES ('ghost', 7)")
+    await led.reconcile_repo_concurrency()
+    assert await _active(led, "R") == 2, "reconcile did not heal an over-count to truth"
+    assert await _active(led, "ghost") == 0, "reconcile did not zero a no-attempt repo"
+
+
+# -- (o) priority order under the cap: a capped high-pri repo can't block a cold one ---
+async def test_o_priority_under_cap(led: PostgresLedger) -> None:
+    led.MAX_PER_REPO = 1
+    await _truncate(led)
+    await _submit_n(led, "hot", 1)
+    assert await led.lease_job("w1", []) is not None          # hot now at cap
+    await led.submit_job(to_agent="kilabz", prompt="hp", repo_id="hot", priority=9)  # high-pri, capped
+    await led.submit_job(to_agent="kilabz", prompt="c", repo_id="cold", priority=0)  # low-pri, free
+    a = await led.lease_job("w2", [])
+    assert a is not None, "nothing leased — the capped high-priority job wrongly blocked the queue"
+    assert await _open_count(led, "cold") == 1, "capped high-priority repo starved a cold repo"
 
 
 async def _main() -> None:

@@ -578,9 +578,39 @@ class PostgresLedger:
         """Requeue (or dead-letter) jobs whose lease expired - a crashed worker.
         FOR UPDATE OF a,j SKIP LOCKED means the janitor NEVER grabs a row a worker
         is mid-completing (that worker holds the lock without SKIP LOCKED, so it
-        wins). Authority decides the fate: workspace_actors go dead, not requeued."""
+        wins). Authority decides the fate: workspace_actors go dead, not requeued.
+
+        Also heals the transient cancel-race orphan FAST (every tick): a queued job
+        cancelled while a lease is mid-CLAIM can end up 'dead' with an open attempt the
+        cancel's snapshot couldn't see (and a leaked rc slot). The hard count already
+        ignores it (scoped to leased/running), so it's never a cap breach — but left
+        until the slow reconciler it could soft-filter-starve the repo for ~45s. Closing
+        it here (attempt-first lock, canonical order) + freeing its slot shrinks that to
+        one janitor tick. Returns the count of EXPIRED leases reclaimed (orphans are a
+        side-effect heal, not counted)."""
         async with self._pool.acquire() as con:
             async with con.transaction():
+                # FAST orphan heal — runs unconditionally, before the expired-lease pass.
+                orphans = await con.fetch(
+                    """WITH o AS (
+                           SELECT a.id, j.repo_id FROM attempt a JOIN job j ON j.id = a.job_id
+                            WHERE a.status='open' AND j.status NOT IN ('leased','running')
+                            FOR UPDATE OF a SKIP LOCKED
+                       ),
+                       oc AS (
+                           UPDATE attempt a SET status='failed', ended_at=statement_timestamp(),
+                                  error_class='terminal'
+                            WHERE a.id IN (SELECT id FROM o) RETURNING id
+                       )
+                       SELECT repo_id FROM o WHERE repo_id IS NOT NULL""")
+                if orphans:
+                    odec: dict[str, int] = {}
+                    for r in orphans:
+                        odec[r["repo_id"]] = odec.get(r["repo_id"], 0) + 1
+                    for rid in sorted(odec):      # counter LAST, repo_id order (deadlock-safe)
+                        await con.execute(
+                            "UPDATE repo_concurrency SET active = GREATEST(active - $2, 0) "
+                            "WHERE repo_id = $1", rid, odec[rid])
                 rows = await con.fetch(
                     """WITH expired AS (
                            SELECT a.id AS attempt_id, a.job_id, j.to_agent, j.repo_id
@@ -672,8 +702,12 @@ class PostgresLedger:
         TRUTH = count of open attempts whose job is leased/running, per repo. Correctness
         never depends on it (the hard COUNT under the rc lock at lease time is the cap
         authority); this only restores soft-filter fairness, so disabling it leaves the
-        cap intact and, via the attempt-close decrements alone, active still reconverges
-        to EXACTLY 0 at quiescence.
+        cap intact. For the NORMAL close paths (complete/fail/reclaim of a live lease) the
+        attempt-close decrements alone reconverge active to EXACTLY 0 at quiescence; the
+        ONE case the decrements can't self-heal is the queued-cancel orphan (see cancel()
+        — a leaked slot + orphan attempt on a dead job), which reclaim_expired's fast
+        orphan-heal closes within a janitor tick. THIS reconciler is the slow absolute
+        backstop that heals any residual drift (incl. that orphan if reclaim is idle).
 
         Three steps, all idempotent:
           0. ORPHAN backstop: close any open attempt whose job is ALREADY terminal (the
@@ -733,19 +767,26 @@ class PostgresLedger:
         attempt, in ONE atomic statement. The supervisor kills the OS process on the
         worker's next heartbeat (which will now raise LostLease).
 
-        ONE statement closes the queued-cancel orphan-attempt race: today's two-step
-        form let lease_job interleave between the attempt-close and the job-flip (cancel
-        closes 0 attempts on a queued job, blocks on the job lock, lease opens an attempt
-        + increments active, cancel flips job->dead -> an orphan open attempt + leaked
-        increment forever). Collapsing it removes that window.
-
         Lock order: attempt THEN job THEN repo_concurrency (counter LAST) — the `closed`
         UPDATE locks the attempt first, `killed` the job, `dec` the rc row, so cancel
-        keeps the canonical A->J->R order and can't ABBA with complete/fail/reclaim. The
-        decrement is gated on `closed` actually closing a REAL open attempt (RETURNING),
-        so a queued / already-terminal / duplicate cancel decrements ZERO. NULL repo_id is
-        cap-exempt. (Belt-and-suspenders: should a transient orphan ever arise, the hard
-        count ignores it — scoped to leased/running jobs — and the reconciler closes it.)"""
+        keeps the canonical A->J->R order and can't ABBA with complete/fail/reclaim
+        (a job-first cancel WOULD ABBA: it'd hold the job while wanting the attempt that
+        complete/fail hold while wanting the job — so we deliberately keep attempt-first).
+        The decrement is gated on `closed` actually closing a REAL open attempt
+        (RETURNING), so a queued / already-terminal / duplicate cancel decrements ZERO.
+        NULL repo_id is cap-exempt.
+
+        NOTE — this does NOT fully close the queued-cancel-vs-lease race, and the
+        attempt-first order is why: all CTEs in one statement share ONE snapshot, so if a
+        racing lease COMMITS its CLAIM (job queued->leased + open attempt) after cancel's
+        snapshot while cancel's `killed` is blocked on the job lock, `killed` flips the
+        now-leased job to dead (EvalPlanQual) but `closed` — bound to the pre-lease
+        snapshot — can't see the freshly-inserted attempt, so it closes 0 and leaks a
+        slot + orphans an open attempt on the dead job. That orphan is HARMLESS to the
+        cap (the hard count is scoped to leased/running, so it's never counted) and is
+        healed within ONE janitor tick by reclaim_expired's fast orphan-heal (+ the slow
+        reconciler as backstop). Fixing it inside cancel would require job-first locking,
+        which reintroduces the ABBA above — not worth it for a transient soft-cache blip."""
         async with self._pool.acquire() as con:
             await con.execute(
                 """WITH closed AS (
