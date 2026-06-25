@@ -23,6 +23,7 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 ORCH="$HOME/.myndaix/orchestrator"                 # all state OUTSIDE any repo
 RUNS="$ORCH/runs"; STATE="$ORCH/state"
 INBOX="$HOME/.myndaix/bridge/inbox/jefe"           # human-only, no agent watcher
+IMESSAGE_TO="${PLAY_IMESSAGE_TO:-makebeats24@icloud.com}"  # one-way review ping; set empty to disable
 TARGET_GLOB="refs/heads/*"                          # review pushes to ANY branch (skip tags/deletes)
 BASE_REF="main"                                     # a new branch's first push is diffed against this
 MAX_DIFF=65536                                      # ~64KB; bounded by the 300s review budget (tune with data)
@@ -73,15 +74,21 @@ note(){ jq -cn --arg p "$play" --arg s "$1" --arg n "${2:-}" \
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }   # strip C0 + DEL; keep \t \n
 
 deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits the fallback
-  local subj="$1" body="$2" f="$INBOX/$(date +%Y%m%d%H%M%S)-$play.md"
+  local subj="$1" body="$2" f="$INBOX/$(date +%Y%m%d%H%M%S)-$play.md" msg
   if ! printf '# %s\n\nplay: %s\nref: %s\nrange: %s..%s\n\n===BEGIN VERDICT nonce=%s===\n%s\n===END VERDICT nonce=%s===\n' \
         "$subj" "$play" "$ref" "$base" "$tip" "$nonce" "$body" "$nonce" > "$f" 2>/dev/null; then
     printf '[%s] INBOX WRITE FAILED — verdict follows:\n%s\n' "$play" "$body" >&2
     : > "$STATE/UNDELIVERED-$play" 2>/dev/null || true
     return 0
   fi
-  osascript -e 'on run {t,m}' -e 'display notification m with title t' -e 'end run' \
-            -- "MyndAIX review" "$subj" >/dev/null 2>&1 || true
+  # one-way iMessage ping — carries the verdict text itself (argv form = injection-safe).
+  # Best-effort tap; the durable record is the file above. set empty IMESSAGE_TO to disable.
+  if [[ -n "$IMESSAGE_TO" ]]; then
+    msg="$subj"$'\n\n'"$body"; msg="${msg:0:1500}"
+    osascript -e 'on run {m, t}' \
+              -e 'tell application "Messages" to send m to buddy t of (service 1 whose service type is iMessage)' \
+              -e 'end run' -- "$msg" "$IMESSAGE_TO" >/dev/null 2>&1 || true
+  fi
 }
 
 abort(){ note "$1" "ABORT: $2"; deliver "review ABORTED — $1" "$2"; exit 0; }
