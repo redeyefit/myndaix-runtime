@@ -281,6 +281,30 @@ async def test_poison_reclaim_dead_letters_after_max_attempts(led: PostgresLedge
     assert nd == 1, "reclaim recorded exactly one poison dead_letter"
 
 
+# -- worktree GC: reapable set excludes live + just-closed leases (PR-1c) -------
+async def test_reapable_attempt_ids_respects_grace_window(led: PostgresLedger) -> None:
+    """The worktree GC must never reap a live (open) attempt nor one closed within the
+    grace window — only attempts CLOSED at least min_age_s ago are reapable. This is what
+    keeps a sweep from deleting a worktree whose worker may still be writing."""
+    await _truncate(led)
+    # (a) an OPEN attempt — a live lease — is never reapable
+    await led.submit_job(to_agent="kilabz", prompt="open")
+    a_open = await led.lease_job("w-open", [])
+    # (b) a CLOSED attempt, just now (ended_at = now) — excluded by the grace window
+    await led.submit_job(to_agent="kilabz", prompt="closed")
+    a_closed = await led.lease_job("w-closed", [])
+    await led.fail_attempt(a_closed, _retryable())     # closed (failed), ended_at = now
+    assert await led.reapable_attempt_ids(3600.0) == set(), "open + just-closed excluded"
+    # backdate the closed attempt past the grace window -> now reapable; open stays out
+    async with led._pool.acquire() as con:
+        await con.execute(
+            "UPDATE attempt SET ended_at = statement_timestamp() - interval '2 hours' "
+            "WHERE id = $1", a_closed)
+    reapable = await led.reapable_attempt_ids(3600.0)
+    assert str(a_closed) in reapable, "an attempt closed past the grace window is reapable"
+    assert str(a_open) not in reapable, "an open lease is never reapable"
+
+
 # -- the DB itself rejects an illegal status (CHECK enforcement) ---------------
 async def test_db_rejects_illegal_status(led: PostgresLedger) -> None:
     await _truncate(led)

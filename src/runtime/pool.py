@@ -130,19 +130,19 @@ class WorkerPool:
         worktree_sweep_interval_s, off the same janitor loop. The blocking git/fs work
         runs in an executor so it never stalls the event loop. Best-effort: a sweep
         error never disables reclaim (the crash-recovery guarantee)."""
-        if not hasattr(self.ledger, "open_attempt_ids"):
+        if not hasattr(self.ledger, "reapable_attempt_ids"):
             return
         now = time.monotonic()
         if now - self._last_sweep < self.worktree_sweep_interval_s:
             return
         self._last_sweep = now
         try:
-            open_ids = await self.ledger.open_attempt_ids()
-            # never reap a worktree younger than the lease — it may be a just-leased
-            # attempt whose open status this snapshot raced.
+            # 'reapable' = attempts CLOSED for at least one lease — never an open or
+            # just-closed lease, so a worktree whose worker may still be writing is safe.
             min_age = float(getattr(self.ledger, "LEASE_SECONDS", 600))
+            reapable = await self.ledger.reapable_attempt_ids(min_age)
             n = await asyncio.get_running_loop().run_in_executor(
-                None, self.wm.sweep, open_ids, min_age)
+                None, self.wm.sweep, reapable)
             if n:
                 self.worktrees_swept += n
                 log.info("pool janitor: swept %d orphan worktree(s)", n)

@@ -216,14 +216,15 @@ async def test_janitor_sweeps_orphan_worktrees_on_cadence():
     attempt set + the lease as the age floor, and respects the slow sweep cadence."""
     class FakeLedger:
         LEASE_SECONDS = 120
-        async def open_attempt_ids(self):
-            return {"keep-me"}
+        async def reapable_attempt_ids(self, min_age_s):
+            assert min_age_s == 120.0          # lease forwarded as the grace window
+            return {"reap-me"}
 
     calls = []
     pool = WorkerPool(FakeLedger(), size=1, worktree_sweep_interval_s=0.0)
-    pool.wm.sweep = lambda open_ids, min_age: (calls.append((set(open_ids), min_age)) or 2)
+    pool.wm.sweep = lambda reapable: (calls.append(set(reapable)) or 2)
     await pool._maybe_sweep_worktrees()
-    assert calls == [({"keep-me"}, 120.0)], calls   # open set + lease-as-floor forwarded
+    assert calls == [{"reap-me"}], calls         # the ledger's reapable set forwarded to sweep
     assert pool.worktrees_swept == 2
     # within the cadence window it must NOT sweep again
     pool.worktree_sweep_interval_s = 999.0
@@ -233,7 +234,7 @@ async def test_janitor_sweeps_orphan_worktrees_on_cadence():
 
 
 async def test_janitor_sweep_skips_ledger_without_support():
-    """A ledger lacking open_attempt_ids (the sqlite demo store) just skips the sweep."""
+    """A ledger lacking reapable_attempt_ids (the sqlite demo store) just skips the sweep."""
     class MinimalLedger:
         pass
     pool = WorkerPool(MinimalLedger(), size=1, worktree_sweep_interval_s=0.0)

@@ -533,11 +533,19 @@ class PostgresLedger:
                             _new_id(), jid, dead_reasons[jid])
                 return len(rows)
 
-    async def open_attempt_ids(self) -> set[str]:
-        """The attempt ids with a live ('open') lease right now. The worktree GC uses
-        this to tell an in-flight worktree from a hard-crash orphan."""
+    async def reapable_attempt_ids(self, min_age_s: float) -> set[str]:
+        """Attempt ids the worktree GC may safely reap: CLOSED (status <> 'open') and
+        closed at least min_age_s ago (by ended_at). This EXCLUDES live leases AND
+        just-closed attempts, so the sweep can never delete a worktree whose worker might
+        still be writing — a lost lease is only noticed on the worker's next heartbeat, so
+        the grace window gives it time to abort and run its own cleanup first. Decided by
+        attempt state, never filesystem mtime (an in-place edit doesn't refresh dir mtime)."""
         async with self._pool.acquire() as con:
-            rows = await con.fetch("SELECT id FROM attempt WHERE status = 'open'")
+            rows = await con.fetch(
+                """SELECT id FROM attempt
+                    WHERE status <> 'open' AND ended_at IS NOT NULL
+                      AND ended_at <= statement_timestamp() - make_interval(secs => $1)""",
+                float(min_age_s))
         return {str(r["id"]) for r in rows}
 
     async def dead_letter(self, source_id: UUID, reason: str) -> None:

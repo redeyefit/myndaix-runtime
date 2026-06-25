@@ -21,7 +21,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Optional
@@ -78,32 +77,30 @@ class WorkspaceManager:
         except subprocess.CalledProcessError:
             shutil.rmtree(worktree_path, ignore_errors=True)
 
-    def sweep(self, open_attempt_ids: Iterable[str], min_age_s: float) -> int:
-        """GC orphaned worktrees after a hard crash. Removes any wt-<attempt_id> dir
-        whose attempt is NOT in open_attempt_ids (its worker is gone) AND which is older
-        than min_age_s. The age floor (>= the lease) is the safety margin: a worktree
-        younger than the lease may belong to a just-leased attempt whose open status the
-        caller's snapshot raced, so it is never reaped. Returns the count removed.
+    def sweep(self, reapable_attempt_ids: Iterable[str]) -> int:
+        """GC orphaned worktrees after a crash. Removes ONLY the wt-<attempt_id> dirs
+        whose attempt is in reapable_attempt_ids — a FAIL-SAFE allowlist the caller (the
+        ledger) defines as an attempt that is CLOSED and has stayed closed past a grace
+        window. Anything else — an open lease, a just-closed attempt, or an unknown dir —
+        is kept. Liveness is decided by ATTEMPT STATE, never directory mtime: an agent
+        editing files in place does not refresh the worktree-root mtime, so an mtime-based
+        guard would leave a long-running worktree unprotected. With this gate a worktree
+        whose worker may still be writing (open, or a lease lost only moments ago) can
+        never be reaped. Also drops the matching .patch artifact. Live repo untouched.
 
         Self-contained: each worktree's parent repo is recovered from its own `.git`
-        pointer so the dir is properly deregistered, with a hard rmtree fallback. The
-        live repo is never touched."""
+        pointer so the dir is properly deregistered, with a hard rmtree fallback."""
         if not self.root.exists():
             return 0
-        open_ids = set(open_attempt_ids)
-        now = time.time()
+        reapable = set(reapable_attempt_ids)
+        if not reapable:
+            return 0
         removed = 0
         for wt in self.root.iterdir():
             if not wt.is_dir() or not wt.name.startswith(_PREFIX):
                 continue
-            attempt_id = wt.name[len(_PREFIX):]
-            if attempt_id in open_ids:
-                continue                              # a live worktree - leave it
-            try:
-                if now - wt.stat().st_mtime < min_age_s:
-                    continue                          # too young - may be a racing live lease
-            except OSError:
-                continue
+            if wt.name[len(_PREFIX):] not in reapable:
+                continue                              # not provably-dead -> keep (fail-safe)
             repo = self._worktree_repo(wt)
             removed_ok = False
             if repo is not None:
@@ -119,6 +116,11 @@ class WorkspaceManager:
                         _git(["worktree", "prune"], cwd=repo)   # drop the now-stale admin entry
                     except subprocess.CalledProcessError:
                         pass
+            patch = self.root / f"{wt.name}.patch"     # the captured-diff artifact, if any
+            try:
+                patch.unlink()
+            except OSError:
+                pass
             removed += 1
         return removed
 
@@ -133,11 +135,10 @@ class WorkspaceManager:
             return None
         if not text.startswith("gitdir:"):
             return None
-        gitdir = Path(text.split(":", 1)[1].strip())
-        parts = gitdir.parts
-        # .../<repo>/.git/worktrees/<name>  ->  <repo> is everything before '.git'
-        if ".git" in parts:
-            i = parts.index(".git")
-            if i > 0:
-                return str(Path(*parts[:i]))
+        parts = Path(text.split(":", 1)[1].strip()).parts
+        # match the EXACT '.git/worktrees' pair so a repo path containing a '.git'
+        # component can't mis-parse; <repo> is everything before that '.git'.
+        for i in range(len(parts) - 1):
+            if parts[i] == ".git" and parts[i + 1] == "worktrees":
+                return str(Path(*parts[:i])) if i > 0 else None
         return None

@@ -71,32 +71,44 @@ def test_no_changes_yields_no_artifact():
     wm.cleanup(repo, wt)
 
 
-def test_sweep_removes_orphan_keeps_live():
-    """PR-1c gate: a worktree whose attempt is NOT open (its worker crashed) is GC'd;
-    one whose attempt is still open is kept. Live repo untouched."""
+def test_sweep_removes_only_reapable():
+    """PR-1c gate (fail-safe): sweep removes ONLY worktrees whose attempt is in the
+    reapable allowlist (the ledger's 'closed past the grace window' set); a worktree not
+    in the set — an open or just-closed lease — is kept. Live repo untouched."""
     repo = _init_repo()
     wm = WorkspaceManager(tempfile.mkdtemp(prefix="mdx-wt-root-"))
     orphan = wm.create(repo, "HEAD", attempt_id="orphan-1")
     live = wm.create(repo, "HEAD", attempt_id="live-1")
-    removed = wm.sweep(open_attempt_ids={"live-1"}, min_age_s=0.0)   # age never protects here
+    removed = wm.sweep(reapable_attempt_ids={"orphan-1"})   # only orphan-1 is provably dead
     assert removed == 1
-    assert not Path(orphan).exists(), "orphan worktree should be swept"
-    assert Path(live).exists(), "live (open-attempt) worktree must be kept"
+    assert not Path(orphan).exists(), "reapable orphan should be swept"
+    assert Path(live).exists(), "a worktree not in the reapable set must be kept"
     assert Path(repo, "app.py").read_text() == "print('v1')\n"      # live repo untouched
-    # the swept worktree is also deregistered (not left dangling in `git worktree list`)
     listing = subprocess.run(["git", "worktree", "list"], cwd=repo,
                              capture_output=True, text=True, check=True).stdout
     assert "orphan-1" not in listing and "live-1" in listing
 
 
-def test_sweep_keeps_too_young():
-    """A worktree younger than min_age_s is never reaped, even if its attempt isn't in
-    the open set — it may be a just-leased attempt whose open status the snapshot raced."""
+def test_sweep_keeps_everything_when_nothing_reapable():
+    """An empty reapable set (the common case — no crash orphans) reaps nothing, even
+    for a worktree with no live attempt: liveness is the caller's call, not mtime's."""
     repo = _init_repo()
     wm = WorkspaceManager(tempfile.mkdtemp(prefix="mdx-wt-root-"))
-    fresh = wm.create(repo, "HEAD", attempt_id="fresh-1")
-    removed = wm.sweep(open_attempt_ids=set(), min_age_s=3600.0)     # 1h floor; dir is seconds old
-    assert removed == 0 and Path(fresh).exists()
+    wt = wm.create(repo, "HEAD", attempt_id="some-1")
+    assert wm.sweep(reapable_attempt_ids=set()) == 0 and Path(wt).exists()
+
+
+def test_sweep_removes_patch_artifact():
+    """Reaping a worktree also drops its captured-diff .patch so the shared root doesn't
+    leak artifacts across restarts."""
+    repo = _init_repo()
+    wm = WorkspaceManager(tempfile.mkdtemp(prefix="mdx-wt-root-"))
+    wt = wm.create(repo, "HEAD", attempt_id="diffy-1")
+    Path(wt, "app.py").write_text("print('changed')\n")
+    patch = wm.capture_diff(wt)
+    assert patch and Path(patch).exists()
+    wm.sweep(reapable_attempt_ids={"diffy-1"})
+    assert not Path(wt).exists() and not Path(patch).exists()
 
 
 def test_sweep_fallback_hard_removes_when_repo_unrecoverable():
@@ -105,7 +117,7 @@ def test_sweep_fallback_hard_removes_when_repo_unrecoverable():
     wm = WorkspaceManager(tempfile.mkdtemp(prefix="mdx-wt-root-"))
     wt = wm.create(repo, "HEAD", attempt_id="broken-1")
     (Path(wt) / ".git").unlink()                                     # break the back-pointer
-    removed = wm.sweep(open_attempt_ids=set(), min_age_s=0.0)
+    removed = wm.sweep(reapable_attempt_ids={"broken-1"})
     assert removed == 1 and not Path(wt).exists()
 
 
