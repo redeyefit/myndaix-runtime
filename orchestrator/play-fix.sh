@@ -192,8 +192,10 @@ if ! mkdir "$lock" 2>/dev/null; then
 fi
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
 # AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. A lock-removing
-# EXIT trap is armed FIRST so a mktemp failure or a signal before the full trap can't strand the lock
-# (codex MAJOR: lock leak on the EXEC-validation abort path).
+# EXIT trap is armed FIRST so a mktemp failure or any validation abort can't strand the lock (codex
+# MAJOR). RESIDUAL (accepted): a signal landing in the one-statement window between `mkdir "$lock"` and
+# this trap — like an un-trappable SIGKILL — can still strand it; the STALE-lock reaper (line ~183) is
+# the catch-all for that, same as for any crash.
 trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
 trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
 EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
@@ -212,9 +214,9 @@ SCRATCH_HOME="$EXEC/home"; SCRATCH_TMP="$EXEC/tmp"; mkdir -p "$SCRATCH_HOME" "$S
 # TMPDIR sweep is the backstop for pathological depth + SIGKILL leaks.
 cleanup(){
   trap '' INT TERM                                      # a 2nd signal must not abort cleanup (Oracle O2)
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    [[ -e "$EXEC" ]] || break
+  local i=0
+  while [[ -e "$EXEC" && $i -lt 40 ]]; do               # peel until gone (each pass opens+clears one more
+    i=$((i + 1))                                        # level); cap 40 >> any real or sane-adversarial depth
     chmod -R u+rwX "$EXEC" >/dev/null 2>&1 || true      # restore traversal FIRST so chflags can descend
     chflags -R nouchg "$EXEC" >/dev/null 2>&1 || true
     git -C "$repo_path" worktree remove --force "$EXEC/verify-wt" >/dev/null 2>&1 || true
@@ -224,6 +226,7 @@ cleanup(){
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
   rm -rf "$lock" >/dev/null 2>&1 || true
   [[ -e "$EXEC" ]] && note "WARN: could not fully remove $EXEC (adversarial lockdown?) — left for periodic sweep"
+  return 0                                              # cleanup is the EXIT trap: never let its last test set $?
 }
 trap cleanup EXIT                                       # full reap once we hold the lock + own $EXEC
 find "$RUNS" -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev/null || true
