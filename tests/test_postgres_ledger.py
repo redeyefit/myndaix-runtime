@@ -45,8 +45,8 @@ def _retryable() -> Result:
 async def _truncate(led: PostgresLedger) -> None:
     async with led._pool.acquire() as con:
         await con.execute(
-            "TRUNCATE inbound_event, job, attempt, attempt_log, outbound, dead_letter "
-            "RESTART IDENTITY CASCADE")
+            "TRUNCATE inbound_event, job, attempt, attempt_log, outbound, dead_letter, "
+            "repo_concurrency RESTART IDENTITY CASCADE")
 
 
 async def _expire_lease(led: PostgresLedger, attempt_id) -> None:

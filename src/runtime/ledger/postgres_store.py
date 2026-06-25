@@ -16,11 +16,15 @@ Design rules, enforced everywhere below:
         FOR UPDATE SKIP LOCKED - hand DISTINCT rows to concurrent workers (lease, claim)
   * READ COMMITTED isolation (Postgres default) is sufficient: correctness comes
     from the locks + the WHERE re-check, not from snapshot isolation.
-  * ONE canonical lock order everywhere: attempt-row THEN job-row. Holding to a
-    single order is what keeps the locks deadlock-free, so no verb raises a
+  * ONE canonical lock order everywhere: attempt-row THEN job-row THEN
+    repo_concurrency-row (the per-repo cap counter is ALWAYS locked LAST). Holding
+    to a single order is what keeps the locks deadlock-free, so no verb raises a
     serialization/deadlock error and no retry loop is needed. (A cancel() that
     locked job-then-attempt formed an ABBA cycle with complete/fail/reclaim - a
     real deadlock caught by adversarial review; cancel now locks attempt-first.)
+    lease_job locks the job (PICK) before the rc row, and its hard COUNT is a
+    NON-locking read, so it never holds an attempt lock while waiting on the job.
+    Multi-repo writers (reclaim batch, reconciler) lock rc rows in repo_id order.
   * authority (retry-safety) is NOT in the DB - only job.to_agent is - so the
     retry decision consults the registry (fail-closed on unknown agents).
 """
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -58,8 +63,14 @@ def _json(obj: dict) -> dict:
 
 class PostgresLedger:
     # policy constants - NOT part of the Protocol; tuned at construction
-    LEASE_SECONDS = 120          # a fresh lease; heartbeat extends long jobs
-    HEARTBEAT_SECONDS = 120      # each heartbeat pushes expiry to now()+this
+    # LEASE + HEARTBEAT are set TOGETHER (~600, design M4). LEASE_SECONDS is the
+    # window a fresh attempt gets; HEARTBEAT_SECONDS is the EXTEND amount each ping
+    # pushes expiry to (must be >= LEASE so a ping never SHRINKS the window). The pool's
+    # FIRING cadence (heartbeat_interval_s, a separate quantity) must be <= lease/3.
+    # Tradeoff: a bigger lease means a crashed worker holds its repo slot up to ~LEASE
+    # before reclaim frees it — mitigated by a tight janitor reclaim cadence.
+    LEASE_SECONDS = 600          # a fresh lease; heartbeat extends long jobs
+    HEARTBEAT_SECONDS = 600      # each heartbeat pushes expiry to now()+this (>= LEASE)
     RECLAIM_BATCH = 100          # reclaim_expired processes at most this per call
     OUTBOUND_MAX_TRIES = 5       # mark_outbound_failed exhaustion threshold
     MAX_CHILDREN = 32            # admission: max direct children per parent
@@ -67,6 +78,13 @@ class PostgresLedger:
     MAX_ATTEMPTS = 3             # poison ceiling: a job that fails/crashes this many
                                  # times stops requeuing -> dead + dead_letter (both
                                  # fail_attempt and reclaim_expired enforce it)
+    # per-repo concurrency cap (design §4). FEATURE FLAG: a huge value disables the cap
+    # (soft filter and hard count never trip) for instant rollback WITHOUT a code revert
+    # — set $MYNDAIX_MAX_PER_REPO=1000000 in the pool's env and restart. Default 4.
+    MAX_PER_REPO = int(os.environ.get("MYNDAIX_MAX_PER_REPO") or 4)
+    LEASE_MAX_REPICKS = 16       # bounded re-PICK budget per lease_job call: each over-cap
+                                 # repo is excluded from the next PICK, so the eligible set
+                                 # strictly shrinks (anti-spin). Exhaustion -> None (re-poll).
 
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
@@ -219,40 +237,110 @@ class PostgresLedger:
         return jid
 
     # ---- worker lifecycle --------------------------------------------------
-    async def lease_job(self, worker_id: str, capabilities: list[str]) -> Optional[UUID]:
-        """Atomically lease ONE queued job and open its attempt - all in one
-        statement. FOR UPDATE SKIP LOCKED hands two racing workers DIFFERENT rows
-        (never the same one); the `AND j.status='queued'` re-check is the backstop,
-        and `NOT EXISTS (open attempt)` makes the partial-unique index a true
-        backstop (a job is never picked while a stale attempt is still open).
-        Returns the attempt id, or None if nothing is leasable.
+    # ONE INSERT-attempt CTE used by both the NULL-repo (cap-exempt) and the capped
+    # CLAIM paths: flip job queued->leased and open the attempt in one statement.
+    _CLAIM_SQL = """WITH leased AS (
+                        UPDATE job SET status = 'leased'
+                         WHERE id = $1 AND status = 'queued'
+                        RETURNING id
+                    )
+                    INSERT INTO attempt (id, job_id, worker_id, lease_expires_at, status)
+                    SELECT $2, id, $3,
+                           statement_timestamp() + ($4 * interval '1 second'), 'open'
+                      FROM leased
+                    RETURNING id"""
 
-        `capabilities` is accepted (Protocol) but capability-gated routing is a
-        later slice: submit_job has no way to SET capability_required yet, so
-        filtering on it here would only ever STARVE a gated job. Enforce nothing
-        until both sides land coherently."""
+    async def lease_job(self, worker_id: str, capabilities: list[str]) -> Optional[UUID]:
+        """Atomically lease ONE queued job and open its attempt, enforcing the per-repo
+        cap (design §4): PICK -> LOCK+SEED -> HARD-COUNT -> CLAIM, with a bounded re-PICK.
+
+        PICK applies the SOFT filter (repo_id IS NULL OR cached active < cap) under
+        FOR UPDATE OF j SKIP LOCKED LIMIT 1, so racing workers get DIFFERENT job rows.
+        For a non-NULL repo we then seed+lock the rc row and take the HARD AUTHORITY:
+        count(*) of OPEN attempts on the repo's LEASED/RUNNING jobs, UNDER that rc lock.
+        < cap -> CLAIM (job->leased, INSERT attempt, set active=count+1). >= cap -> the
+        soft filter was stale; sync the cache up and re-PICK with this repo EXCLUDED
+        (so no spin). NULL repo_id is cap-EXEMPT and claims directly without touching rc.
+
+        Because the cached `active` is only a soft filter, drift can never breach the
+        cap — only the count-under-lock gates admission. Lock order is the canonical
+        attempt -> job -> repo_concurrency (counter LAST): PICK locks the job (FOR UPDATE
+        OF j); the rc row is locked AFTER, and the hard COUNT is a NON-locking read, so
+        lease never holds an attempt lock while waiting on the job (no ABBA / 40P01).
+        The hard count is scoped to leased/running jobs, so an orphan open attempt on an
+        already-dead job (a transient cancel-race artifact) can never inflate the count.
+
+        `capabilities` is accepted (Protocol) but capability-gated routing is a later
+        slice: filtering on it now would only STARVE a gated job."""
+        skip_repos: list[str] = []   # repos found AT-CAP this call; excluded from re-PICK
         async with self._pool.acquire() as con:
-            return await con.fetchval(
-                """WITH picked AS (
-                       SELECT j.id FROM job j
-                        WHERE j.status = 'queued'
-                          AND NOT EXISTS (SELECT 1 FROM attempt a
-                                           WHERE a.job_id = j.id AND a.status = 'open')
-                        ORDER BY j.priority DESC, j.created_at, j.id
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT 1
-                   ),
-                   leased AS (
-                       UPDATE job j SET status = 'leased'
-                         FROM picked p
-                        WHERE j.id = p.id AND j.status = 'queued'
-                       RETURNING j.id
-                   )
-                   INSERT INTO attempt (id, job_id, worker_id, lease_expires_at, status)
-                   SELECT $2, id, $1, statement_timestamp() + ($3 * interval '1 second'), 'open'
-                     FROM leased
-                   RETURNING id""",
-                worker_id, _new_id(), self.LEASE_SECONDS)
+            for _ in range(self.LEASE_MAX_REPICKS):
+                # one transaction per iteration: a re-PICK 'continue' COMMITS, releasing
+                # the rejected candidate's job lock + the rc lock before the next PICK, so
+                # locks never accumulate across iterations (no queue-wide serialization).
+                async with con.transaction():
+                    picked = await con.fetchrow(
+                        """SELECT j.id, j.repo_id FROM job j
+                             LEFT JOIN repo_concurrency rc ON rc.repo_id = j.repo_id
+                            WHERE j.status = 'queued'
+                              AND NOT EXISTS (SELECT 1 FROM attempt a
+                                               WHERE a.job_id = j.id AND a.status = 'open')
+                              AND (j.repo_id IS NULL OR COALESCE(rc.active, 0) < $1)
+                              AND (j.repo_id IS NULL OR j.repo_id <> ALL($2::text[]))
+                            ORDER BY j.priority DESC, j.created_at, j.id
+                            FOR UPDATE OF j SKIP LOCKED
+                            LIMIT 1""",
+                        self.MAX_PER_REPO, skip_repos)
+                    if picked is None:
+                        return None                       # nothing leasable right now
+                    repo_id = picked["repo_id"]
+                    attempt_id = _new_id()
+
+                    if repo_id is None:                   # NULL repo -> cap-EXEMPT
+                        leased = await con.fetchval(
+                            self._CLAIM_SQL, picked["id"], attempt_id, worker_id,
+                            self.LEASE_SECONDS)
+                        if leased is not None:
+                            return leased
+                        continue                          # lost the status race -> re-PICK
+
+                    # SEED then LOCK the rc row (B4: ON CONFLICT DO NOTHING doesn't lock the
+                    # conflicting row, so a separate FOR UPDATE select is required). Counter
+                    # locked LAST, after the job row from PICK -> canonical order.
+                    await con.execute(
+                        "INSERT INTO repo_concurrency (repo_id, active) VALUES ($1, 0)"
+                        " ON CONFLICT (repo_id) DO NOTHING", repo_id)
+                    await con.fetchval(
+                        "SELECT active FROM repo_concurrency WHERE repo_id = $1 FOR UPDATE",
+                        repo_id)
+                    # HARD authority: reality under the rc lock (NON-locking read of attempt).
+                    open_now = await con.fetchval(
+                        """SELECT count(*) FROM attempt a JOIN job j2 ON j2.id = a.job_id
+                            WHERE a.status = 'open' AND j2.repo_id = $1
+                              AND j2.status IN ('leased','running')""",
+                        repo_id)
+                    if open_now >= self.MAX_PER_REPO:
+                        # cache was stale-low: sync it up to truth so OTHER workers' soft
+                        # filter excludes this repo too, then exclude it from THIS call's
+                        # next PICK (deterministic anti-spin) and re-PICK.
+                        await con.execute(
+                            "UPDATE repo_concurrency SET active = $2 WHERE repo_id = $1",
+                            repo_id, open_now)
+                        skip_repos.append(repo_id)
+                        continue
+
+                    leased = await con.fetchval(
+                        self._CLAIM_SQL, picked["id"], attempt_id, worker_id,
+                        self.LEASE_SECONDS)
+                    if leased is None:
+                        continue                          # job no longer queued -> re-PICK
+                    # keep the soft filter honest: active := the true count we measured + 1
+                    # (absolute, so it self-corrects prior increment-side drift too).
+                    await con.execute(
+                        "UPDATE repo_concurrency SET active = $2 WHERE repo_id = $1",
+                        repo_id, open_now + 1)
+                    return leased
+            return None   # re-PICK budget exhausted (all eligible repos capped) -> re-poll
 
     async def get_attempt_job(self, attempt_id: UUID) -> Optional[Job]:
         """Internal: the Job a worker should run after leasing (the Protocol's
@@ -319,6 +407,15 @@ class PostgresLedger:
                          FROM locked l WHERE a.id = l.id
                        RETURNING a.job_id
                    ),
+                   dec AS (   -- per-repo cap: decrement gated on the attempt open->ok
+                              -- close (RETURNING job_id), counter LAST. NULL repo_id ->
+                              -- no matching rc row -> no-op (cap-exempt). GREATEST floors drift.
+                       UPDATE repo_concurrency rc
+                          SET active = GREATEST(rc.active - 1, 0)
+                         FROM closed c JOIN job j2 ON j2.id = c.job_id
+                        WHERE j2.repo_id IS NOT NULL AND rc.repo_id = j2.repo_id
+                       RETURNING rc.repo_id
+                   ),
                    done AS (
                        UPDATE job j SET status = 'done', artifact_ref = $3
                          FROM closed c
@@ -358,7 +455,8 @@ class PostgresLedger:
                            ended_at = statement_timestamp() WHERE id = $1""",
                     attempt_id, _json(result.model_dump(mode="json")), ec)
                 job = await con.fetchrow(
-                    "SELECT id, to_agent FROM job WHERE id = $1 FOR UPDATE", att["job_id"])
+                    "SELECT id, to_agent, repo_id FROM job WHERE id = $1 FOR UPDATE",
+                    att["job_id"])
                 to_agent = job["to_agent"]
                 dead_reason = None
                 if result.error_class is ErrorClass.RETRYABLE and self._requeue_safe(to_agent):
@@ -386,6 +484,14 @@ class PostgresLedger:
                     await con.execute(
                         "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
                         _new_id(), att["job_id"], dead_reason)
+                # per-repo cap: counter LAST. We KNOW the attempt went open->failed (the
+                # FOR UPDATE + status guard above raised LostLease otherwise), so exactly
+                # one slot is freed regardless of the requeue/dead/failed route. NULL repo
+                # is cap-exempt; GREATEST floors any soft-cache drift at 0.
+                if job["repo_id"] is not None:
+                    await con.execute(
+                        "UPDATE repo_concurrency SET active = GREATEST(active - 1, 0) "
+                        "WHERE repo_id = $1", job["repo_id"])
 
     async def append_log(self, attempt_id: UUID, stream: str, chunk: str) -> None:
         async with self._pool.acquire() as con:
@@ -477,7 +583,7 @@ class PostgresLedger:
             async with con.transaction():
                 rows = await con.fetch(
                     """WITH expired AS (
-                           SELECT a.id AS attempt_id, a.job_id, j.to_agent
+                           SELECT a.id AS attempt_id, a.job_id, j.to_agent, j.repo_id
                              FROM attempt a JOIN job j ON j.id = a.job_id
                             WHERE a.status = 'open'
                               AND a.lease_expires_at <= statement_timestamp()
@@ -492,7 +598,7 @@ class PostgresLedger:
                             WHERE a.id IN (SELECT attempt_id FROM expired)
                            RETURNING a.id, a.job_id
                        )
-                       SELECT c.job_id, e.to_agent
+                       SELECT c.job_id, e.to_agent, e.repo_id
                          FROM closed c JOIN expired e ON e.attempt_id = c.id""",
                     self.RECLAIM_BATCH)
                 if not rows:
@@ -501,10 +607,15 @@ class PostgresLedger:
                 # requeue-safe jobs requeue UNLESS they've hit the poison ceiling (a worker
                 # that keeps crashing mid-run would otherwise reclaim->requeue forever). The
                 # count includes the attempt the `closed` CTE just failed above (off-by-one
-                # intended), so the Nth crash is the one that dead-letters.
+                # intended), so the Nth crash is the one that dead-letters. Every closed
+                # attempt frees a repo slot (BOTH requeue and dead), so accumulate the
+                # per-repo decrement here (NULL repo_id is cap-exempt -> excluded).
                 requeue, dead, dead_reasons = [], [], {}
+                repo_dec: dict[str, int] = {}
                 for r in rows:
                     jid = r["job_id"]
+                    if r["repo_id"] is not None:
+                        repo_dec[r["repo_id"]] = repo_dec.get(r["repo_id"], 0) + 1
                     if not self._requeue_safe(r["to_agent"]):
                         dead.append(jid)
                         dead_reasons[jid] = "lease expired; workspace_actor not auto-retried"
@@ -531,6 +642,13 @@ class PostgresLedger:
                         await con.execute(
                             "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
                             _new_id(), jid, dead_reasons[jid])
+                # per-repo cap: counter LAST, applied per-repo in repo_id ORDER (so two
+                # concurrent reclaimers/the reconciler acquire rc rows in a consistent
+                # order -> no rc<->rc ABBA). GREATEST floors soft-cache drift at 0.
+                for rid in sorted(repo_dec):
+                    await con.execute(
+                        "UPDATE repo_concurrency SET active = GREATEST(active - $2, 0) "
+                        "WHERE repo_id = $1", rid, repo_dec[rid])
                 return len(rows)
 
     async def reapable_attempt_ids(self, min_age_s: float) -> set[str]:
@@ -548,6 +666,60 @@ class PostgresLedger:
                 float(min_age_s))
         return {str(r["id"]) for r in rows}
 
+    async def reconcile_repo_concurrency(self) -> int:
+        """Slow soft-cache backstop (design §4 M1) — runs off the janitor at a slow
+        cadence. Pure soft-cache maintenance: heals repo_concurrency.active back to the
+        TRUTH = count of open attempts whose job is leased/running, per repo. Correctness
+        never depends on it (the hard COUNT under the rc lock at lease time is the cap
+        authority); this only restores soft-filter fairness, so disabling it leaves the
+        cap intact and, via the attempt-close decrements alone, active still reconverges
+        to EXACTLY 0 at quiescence.
+
+        Three steps, all idempotent:
+          0. ORPHAN backstop: close any open attempt whose job is ALREADY terminal (the
+             transient cancel-race artifact). The hard count is scoped to leased/running
+             so an orphan never breaches the cap, but closing it keeps the attempt table
+             clean and lets the count below see truth.
+          1. UPSERT-heal active to truth for every repo with live open attempts — UPSERT
+             so a MISSING row is created (a missing row reads 0 -> over-FILTERS, never
+             over-admits since the hard COUNT gates).
+          2. Zero any rc row whose repo now has no live open attempts (drift-down).
+        Locks every rc row FOR UPDATE in PK order first, so it serializes with — and never
+        clobbers — a concurrent lease/decrement (which lock the rc row last), and can't
+        ABBA another multi-repo writer. Returns the number of rc rows healed."""
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                # 0. orphan backstop: an open attempt on a non-live job is dead work.
+                await con.execute(
+                    """UPDATE attempt a
+                          SET status='failed', ended_at=statement_timestamp(),
+                              error_class='terminal'
+                         FROM job j
+                        WHERE a.job_id = j.id AND a.status = 'open'
+                          AND j.status NOT IN ('leased','running')""")
+                # serialize against lease/decrement: lock all rc rows in PK order.
+                await con.execute(
+                    "SELECT repo_id FROM repo_concurrency ORDER BY repo_id FOR UPDATE")
+                # 1. heal/create rows to truth (open attempts on leased/running jobs).
+                healed = await con.fetch(
+                    """INSERT INTO repo_concurrency (repo_id, active)
+                       SELECT j.repo_id, count(*)
+                         FROM attempt a JOIN job j ON j.id = a.job_id
+                        WHERE a.status = 'open' AND j.repo_id IS NOT NULL
+                          AND j.status IN ('leased','running')
+                        GROUP BY j.repo_id
+                       ON CONFLICT (repo_id) DO UPDATE SET active = EXCLUDED.active
+                       RETURNING repo_id""")
+                # 2. zero rc rows whose repo has no live open attempts (drift-down).
+                await con.execute(
+                    """UPDATE repo_concurrency SET active = 0
+                        WHERE active <> 0
+                          AND NOT EXISTS (
+                              SELECT 1 FROM attempt a JOIN job j ON j.id = a.job_id
+                               WHERE a.status = 'open' AND j.repo_id = repo_concurrency.repo_id
+                                 AND j.status IN ('leased','running'))""")
+                return len(healed)
+
     async def dead_letter(self, source_id: UUID, reason: str) -> None:
         """Pure log-write. The owning verb already performed the source's state
         transition; this only records why."""
@@ -557,25 +729,44 @@ class PostgresLedger:
                 _new_id(), source_id, reason)
 
     async def cancel(self, job_id: UUID) -> None:
-        """Administratively terminate a non-terminal job -> 'dead', failing its
-        open attempt. The supervisor kills the OS process on the worker's next
-        heartbeat (which will now raise LostLease).
+        """Administratively terminate a non-terminal job -> 'dead', failing its open
+        attempt, in ONE atomic statement. The supervisor kills the OS process on the
+        worker's next heartbeat (which will now raise LostLease).
 
-        Lock order: attempt THEN job - the SAME canonical order every other
-        multi-row verb uses, so cancel can't form an ABBA deadlock cycle with
-        complete/fail/reclaim. Both UPDATEs are safe no-ops for a terminal/unknown
-        job, so no separate existence check is needed (one would lock job-first
-        and reintroduce the deadlock)."""
+        ONE statement closes the queued-cancel orphan-attempt race: today's two-step
+        form let lease_job interleave between the attempt-close and the job-flip (cancel
+        closes 0 attempts on a queued job, blocks on the job lock, lease opens an attempt
+        + increments active, cancel flips job->dead -> an orphan open attempt + leaked
+        increment forever). Collapsing it removes that window.
+
+        Lock order: attempt THEN job THEN repo_concurrency (counter LAST) — the `closed`
+        UPDATE locks the attempt first, `killed` the job, `dec` the rc row, so cancel
+        keeps the canonical A->J->R order and can't ABBA with complete/fail/reclaim. The
+        decrement is gated on `closed` actually closing a REAL open attempt (RETURNING),
+        so a queued / already-terminal / duplicate cancel decrements ZERO. NULL repo_id is
+        cap-exempt. (Belt-and-suspenders: should a transient orphan ever arise, the hard
+        count ignores it — scoped to leased/running jobs — and the reconciler closes it.)"""
         async with self._pool.acquire() as con:
-            async with con.transaction():
-                await con.execute(
-                    """UPDATE attempt SET status='failed', ended_at=statement_timestamp(),
-                           error_class='terminal' WHERE job_id = $1 AND status = 'open'""",
-                    job_id)
-                await con.execute(
-                    """UPDATE job SET status='dead'
-                        WHERE id = $1 AND status IN ('queued','leased','running')""",
-                    job_id)
+            await con.execute(
+                """WITH closed AS (
+                       UPDATE attempt SET status='failed', ended_at=statement_timestamp(),
+                              error_class='terminal'
+                        WHERE job_id = $1 AND status = 'open'
+                       RETURNING job_id
+                   ),
+                   killed AS (
+                       UPDATE job SET status='dead'
+                        WHERE id = $1 AND status IN ('queued','leased','running')
+                       RETURNING id
+                   ),
+                   dec AS (   -- counter LAST; gated on a REAL open-attempt close.
+                       UPDATE repo_concurrency rc SET active = GREATEST(rc.active - 1, 0)
+                         FROM closed c JOIN job j ON j.id = c.job_id
+                        WHERE j.repo_id IS NOT NULL AND rc.repo_id = j.repo_id
+                       RETURNING rc.repo_id
+                   )
+                   SELECT 1""",
+                job_id)
 
     async def get_status(self, job_id: UUID) -> dict:
         """Job + its attempts + outbound, as a plain dict. {} for an unknown id."""

@@ -53,6 +53,18 @@ CREATE TABLE attempt (
 CREATE INDEX attempt_lease_idx ON attempt (lease_expires_at) WHERE status = 'open';
 -- at most ONE open attempt per job: the hard backstop behind lease_job's CAS (no double-lease)
 CREATE UNIQUE INDEX attempt_one_open_per_job ON attempt (job_id) WHERE status = 'open';
+-- per-repo concurrency cap (phase2 §4): the HARD count = count(*) open attempts joined to a repo's jobs
+CREATE INDEX attempt_status_job_idx ON attempt (status, job_id);
+
+-- per-repo concurrency cap counter (phase2 §4). `active` is a SOFT filter (perf only);
+-- the COUNT(*) of open attempts under this row's FOR UPDATE lock at lease time is the HARD
+-- cap authority, so counter drift can never breach the cap. Lazily seeded by lease_job
+-- (INSERT ... ON CONFLICT DO NOTHING), self-healed by the reconciler. CHECK is a guard:
+-- decrements use GREATEST(active-1,0) so it can never fire from correct code.
+CREATE TABLE repo_concurrency (
+    repo_id text PRIMARY KEY,
+    active  int  NOT NULL DEFAULT 0 CHECK (active >= 0)
+);
 
 -- append-only progress side channel; NOT part of the hot state machine
 CREATE TABLE attempt_log (
