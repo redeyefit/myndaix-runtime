@@ -36,12 +36,14 @@ log = logging.getLogger("runtime.pool")
 class WorkerPool:
     def __init__(self, ledger, *, size: int = 4, poll_s: float = 0.02,
                  janitor_interval_s: float = 0.2,
-                 heartbeat_interval_s: Optional[float] = None):
+                 heartbeat_interval_s: Optional[float] = None,
+                 worktree_sweep_interval_s: float = 300.0):
         self.ledger = ledger
         self.size = size
         self.poll_s = poll_s                      # idle worker re-poll delay
         self.janitor_interval_s = janitor_interval_s
         self.heartbeat_interval_s = heartbeat_interval_s
+        self.worktree_sweep_interval_s = worktree_sweep_interval_s  # slow GC cadence (PR-1c)
         # a heartbeat must beat well within the lease window or it's defeated (the
         # lease expires before the first ping and the agent runs orphaned).
         lease = getattr(ledger, "LEASE_SECONDS", None)
@@ -52,11 +54,13 @@ class WorkerPool:
         self.wm = WorkspaceManager()
         self.processed = 0                        # jobs this pool completed
         self.reclaimed = 0                        # leases the janitor reclaimed
+        self.worktrees_swept = 0                  # orphan worktrees GC'd by the janitor
         self.worker_faults = 0                    # caught worker errors (none fatal)
         self.truncated = False                    # set if run_until_idle hit the cap
         self._stop = asyncio.Event()
         self._inflight = 0
         self._last = 0.0
+        self._last_sweep = 0.0
         self._tasks: list = []
 
     def _touch(self) -> None:
@@ -118,7 +122,34 @@ class WorkerPool:
                 # a transient ledger error must NOT permanently disable reclaim
                 # (that would silently revoke the crash-recovery guarantee).
                 log.exception("pool janitor: reclaim_expired failed; continuing")
+            await self._maybe_sweep_worktrees()
             await asyncio.sleep(self.janitor_interval_s)
+
+    async def _maybe_sweep_worktrees(self) -> None:
+        """Slow-cadence GC of hard-crash orphan worktrees (PR-1c) — runs at most every
+        worktree_sweep_interval_s, off the same janitor loop. The blocking git/fs work
+        runs in an executor so it never stalls the event loop. Best-effort: a sweep
+        error never disables reclaim (the crash-recovery guarantee)."""
+        if not hasattr(self.ledger, "open_attempt_ids"):
+            return
+        now = time.monotonic()
+        if now - self._last_sweep < self.worktree_sweep_interval_s:
+            return
+        self._last_sweep = now
+        try:
+            open_ids = await self.ledger.open_attempt_ids()
+            # never reap a worktree younger than the lease — it may be a just-leased
+            # attempt whose open status this snapshot raced.
+            min_age = float(getattr(self.ledger, "LEASE_SECONDS", 600))
+            n = await asyncio.get_running_loop().run_in_executor(
+                None, self.wm.sweep, open_ids, min_age)
+            if n:
+                self.worktrees_swept += n
+                log.info("pool janitor: swept %d orphan worktree(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("pool janitor: worktree sweep failed; continuing")
 
     async def _shutdown(self, grace_s: float) -> None:
         self._stop.set()

@@ -7,15 +7,27 @@ concurrent actors get separate worktrees, so they can't corrupt a shared repo -
 the failure a single-threaded runtime only prevented by accident.
 
 The runner enforces cwd=worktree (C5); this class manages the worktree lifecycle.
+
+Crash recovery (PR-1c): the graceful path removes a worktree in the worker's
+`finally`, but a HARD crash (SIGKILL, power loss) leaves an orphan. So the root
+is STABLE and shared (from $MYNDAIX_WORKTREE_ROOT or a fixed tmp path, NOT a
+per-process mkdtemp), worktree dirs are named by `attempt_id`, and `sweep()` GCs
+any whose attempt is no longer open - which a NEW process can run over a DEAD
+one's leftovers precisely because the root is shared.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
+
+_ROOT_ENV = "MYNDAIX_WORKTREE_ROOT"
+_PREFIX = "wt-"                       # worktree dir = wt-<attempt_id>; sweep() keys off this
 
 
 def _git(args: list[str], cwd: str) -> str:
@@ -27,13 +39,21 @@ class WorkspaceManager:
     """Creates, captures, and tears down ephemeral git worktrees per job."""
 
     def __init__(self, worktree_root: Optional[str] = None):
-        self.root = Path(worktree_root or tempfile.mkdtemp(prefix="mdx-worktrees-"))
+        # STABLE root (not per-process mkdtemp) so a restarted process can sweep a
+        # crashed one's orphans. Explicit arg > $MYNDAIX_WORKTREE_ROOT > a fixed tmp path.
+        root = (worktree_root or os.environ.get(_ROOT_ENV)
+                or str(Path(tempfile.gettempdir()) / "mdx-worktrees"))
+        self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def create(self, repo_path: str, base_ref: str = "HEAD") -> str:
+    def create(self, repo_path: str, base_ref: str = "HEAD",
+               attempt_id: Optional[str] = None) -> str:
         """git worktree add a fresh, isolated, detached checkout at base_ref.
-        Returns the worktree path. The agent mutates only this directory."""
-        wt = self.root / f"wt-{uuid.uuid4().hex[:12]}"
+        Returns the worktree path. The agent mutates only this directory. Naming
+        by attempt_id lets sweep() correlate a leftover dir to its (closed) attempt;
+        a random suffix is used only when no attempt_id is given (ad-hoc/tests)."""
+        name = f"{_PREFIX}{attempt_id}" if attempt_id else f"{_PREFIX}{uuid.uuid4().hex[:12]}"
+        wt = self.root / name
         _git(["worktree", "add", "--detach", str(wt), base_ref], cwd=repo_path)
         return str(wt)
 
@@ -57,3 +77,67 @@ class WorkspaceManager:
             _git(["worktree", "remove", "--force", worktree_path], cwd=repo_path)
         except subprocess.CalledProcessError:
             shutil.rmtree(worktree_path, ignore_errors=True)
+
+    def sweep(self, open_attempt_ids: Iterable[str], min_age_s: float) -> int:
+        """GC orphaned worktrees after a hard crash. Removes any wt-<attempt_id> dir
+        whose attempt is NOT in open_attempt_ids (its worker is gone) AND which is older
+        than min_age_s. The age floor (>= the lease) is the safety margin: a worktree
+        younger than the lease may belong to a just-leased attempt whose open status the
+        caller's snapshot raced, so it is never reaped. Returns the count removed.
+
+        Self-contained: each worktree's parent repo is recovered from its own `.git`
+        pointer so the dir is properly deregistered, with a hard rmtree fallback. The
+        live repo is never touched."""
+        if not self.root.exists():
+            return 0
+        open_ids = set(open_attempt_ids)
+        now = time.time()
+        removed = 0
+        for wt in self.root.iterdir():
+            if not wt.is_dir() or not wt.name.startswith(_PREFIX):
+                continue
+            attempt_id = wt.name[len(_PREFIX):]
+            if attempt_id in open_ids:
+                continue                              # a live worktree - leave it
+            try:
+                if now - wt.stat().st_mtime < min_age_s:
+                    continue                          # too young - may be a racing live lease
+            except OSError:
+                continue
+            repo = self._worktree_repo(wt)
+            removed_ok = False
+            if repo is not None:
+                try:
+                    _git(["worktree", "remove", "--force", str(wt)], cwd=repo)
+                    removed_ok = True
+                except subprocess.CalledProcessError:
+                    pass
+            if not removed_ok:
+                shutil.rmtree(wt, ignore_errors=True)  # fallback: hard remove the orphan
+                if repo is not None:
+                    try:
+                        _git(["worktree", "prune"], cwd=repo)   # drop the now-stale admin entry
+                    except subprocess.CalledProcessError:
+                        pass
+            removed += 1
+        return removed
+
+    @staticmethod
+    def _worktree_repo(wt: Path) -> Optional[str]:
+        """Recover a worktree's main repo path from its `.git` pointer file
+        (`gitdir: <repo>/.git/worktrees/<name>`), so sweep() can deregister it.
+        Returns None if the pointer is missing/unexpected (then a hard rmtree is used)."""
+        try:
+            text = (wt / ".git").read_text().strip()
+        except OSError:
+            return None
+        if not text.startswith("gitdir:"):
+            return None
+        gitdir = Path(text.split(":", 1)[1].strip())
+        parts = gitdir.parts
+        # .../<repo>/.git/worktrees/<name>  ->  <repo> is everything before '.git'
+        if ".git" in parts:
+            i = parts.index(".git")
+            if i > 0:
+                return str(Path(*parts[:i]))
+        return None

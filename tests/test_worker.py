@@ -7,6 +7,7 @@ Run: PYTHONPATH=src python3 tests/test_worker.py
 """
 import asyncio
 import inspect
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +16,11 @@ from runtime import worker
 from runtime.contracts import Authority, Reach
 from runtime.ledger.sqlite_store import Ledger
 from runtime.registry import REGISTRY, AgentSpec
+
+# isolate the worktree root: the worker uses WorkspaceManager() with no explicit root,
+# whose default is now a STABLE shared dir — give this suite its own so a fixed test
+# attempt_id can't collide across runs.
+os.environ.setdefault("MYNDAIX_WORKTREE_ROOT", tempfile.mkdtemp(prefix="mdx-test-wt-"))
 
 
 def _init_repo() -> str:

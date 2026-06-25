@@ -533,6 +533,13 @@ class PostgresLedger:
                             _new_id(), jid, dead_reasons[jid])
                 return len(rows)
 
+    async def open_attempt_ids(self) -> set[str]:
+        """The attempt ids with a live ('open') lease right now. The worktree GC uses
+        this to tell an in-flight worktree from a hard-crash orphan."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch("SELECT id FROM attempt WHERE status = 'open'")
+        return {str(r["id"]) for r in rows}
+
     async def dead_letter(self, source_id: UUID, reason: str) -> None:
         """Pure log-write. The owning verb already performed the source's state
         transition; this only records why."""

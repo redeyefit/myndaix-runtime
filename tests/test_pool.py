@@ -21,6 +21,9 @@ from runtime.ledger.postgres_store import PostgresLedger
 from runtime.pool import WorkerPool
 from runtime.registry import REGISTRY, AgentSpec
 
+# isolate the (now stable, shared-by-default) worktree GC root for this suite
+os.environ.setdefault("MYNDAIX_WORKTREE_ROOT", tempfile.mkdtemp(prefix="mdx-test-wt-"))
+
 DSN = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
 
 
@@ -206,6 +209,36 @@ async def test_pool_rejects_bad_config():
         assert bad_poll, "should reject poll_s >= quiet_s"
     finally:
         await led.close()
+
+
+async def test_janitor_sweeps_orphan_worktrees_on_cadence():
+    """The janitor GCs orphan worktrees off the same loop: it passes the ledger's open
+    attempt set + the lease as the age floor, and respects the slow sweep cadence."""
+    class FakeLedger:
+        LEASE_SECONDS = 120
+        async def open_attempt_ids(self):
+            return {"keep-me"}
+
+    calls = []
+    pool = WorkerPool(FakeLedger(), size=1, worktree_sweep_interval_s=0.0)
+    pool.wm.sweep = lambda open_ids, min_age: (calls.append((set(open_ids), min_age)) or 2)
+    await pool._maybe_sweep_worktrees()
+    assert calls == [({"keep-me"}, 120.0)], calls   # open set + lease-as-floor forwarded
+    assert pool.worktrees_swept == 2
+    # within the cadence window it must NOT sweep again
+    pool.worktree_sweep_interval_s = 999.0
+    calls.clear()
+    await pool._maybe_sweep_worktrees()
+    assert calls == [], "should not re-sweep before the interval elapses"
+
+
+async def test_janitor_sweep_skips_ledger_without_support():
+    """A ledger lacking open_attempt_ids (the sqlite demo store) just skips the sweep."""
+    class MinimalLedger:
+        pass
+    pool = WorkerPool(MinimalLedger(), size=1, worktree_sweep_interval_s=0.0)
+    await pool._maybe_sweep_worktrees()              # must not raise
+    assert pool.worktrees_swept == 0
 
 
 async def _main():
