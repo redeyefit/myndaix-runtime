@@ -125,6 +125,45 @@ def test_cli_env_per_agent_passthrough_list():
         del os.environ["AGENT_NEEDS_THIS"]
 
 
+def test_scratch_home_seeds_auth_and_isolates(tmpdir=None):
+    """A scratch_home agent (codex fix actor) runs under a throwaway HOME seeded with ONLY its
+    auth dir — so it can't read the operator's ~/.ssh etc. (PR-4 fix-stage containment)."""
+    import os, shutil, tempfile
+    real = tempfile.mkdtemp()
+    os.makedirs(os.path.join(real, ".codex"))
+    with open(os.path.join(real, ".codex", "auth.json"), "w") as fh:
+        fh.write("{}")
+    spec = AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["codex"], "prompt_channel": "stdin",
+                              "scratch_home": True})
+    old = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = os.path.join(real, ".codex")
+    scratch = None
+    try:
+        env, scratch = runner._make_scratch_home(spec, {"HOME": "/real/home", "CODEX_HOME": "/x"})
+        assert scratch and env["HOME"] == scratch and env["HOME"] != "/real/home"
+        assert os.path.isfile(os.path.join(scratch, ".codex", "auth.json"))   # auth seeded
+        assert "CODEX_HOME" not in env                                        # host override dropped
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(real, ignore_errors=True)
+        if old is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = old
+
+
+def test_scratch_home_noop_without_flag():
+    """No scratch_home flag -> env passes through unchanged, no temp dir created."""
+    spec = AgentSpec(agent_id="t", reach=Reach.CLI, authority=Authority.RESPONDER,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["printenv"], "prompt_channel": "stdin"})
+    env, scratch = runner._make_scratch_home(spec, {"HOME": "/real/home"})
+    assert scratch is None and env == {"HOME": "/real/home"}
+
+
 def test_cli_env_operator_passthrough_escape_hatch():
     """$MYNDAIX_CLI_ENV_PASSTHROUGH lets the operator open a hole at deploy time (e.g. an
     env-based CLI auth key) without a source edit — comma-separated, whitespace-tolerant."""

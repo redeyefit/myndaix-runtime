@@ -1,0 +1,17 @@
+{
+  "_comment": "play-fix.sh trusted repo map. Copy to $MYNDAIX_ORCH/repos.json (default ~/.myndaix/orchestrator/repos.json) — it lives OUTSIDE any repo so a patch can never redefine the repo path or the verify command. 'path' is the ONLY source of the worktree repo path (resolves the repo_id-as-path hazard). 'verify'/'build'/'fail_to_pass' are structured argv with ABSOLUTE tool paths (the verify env is wiped). A repo absent here fails closed (ABORTED). No verify command -> UNVERIFIED (never a clean signal).",
+
+  "myndaix-runtime": {
+    "path": "/Users/you/code/active/myndaix-runtime",
+    "verify": ["/Users/you/code/active/myndaix-runtime/.venv/bin/python", "-m", "pytest", "-q"],
+    "build": null,
+    "fail_to_pass": ["/Users/you/code/active/myndaix-runtime/.venv/bin/python", "-m", "pytest", "-q", "tests/test_worker.py"]
+  },
+
+  "fieldvision": {
+    "path": "/Users/you/code/active/fieldvision",
+    "verify": ["/usr/bin/xcodebuild", "test", "-scheme", "FieldVision"],
+    "build": null,
+    "fail_to_pass": null
+  }
+}

@@ -75,6 +75,30 @@ def test_cli_no_scope_flags_are_none():
         restore()
 
 
+def test_cli_get_routes_to_get_job():
+    # `mxr get <id>` is special-cased above the flat submit parser (D1 artifact read)
+    captured = {}
+
+    async def fake_get(job_id):
+        captured["job_id"] = job_id
+        return 0
+
+    orig = cli.get_job
+    cli.get_job = fake_get
+    try:
+        rc = cli.main(["get", "11111111-2222-3333-4444-555555555555"])
+        assert rc == 0
+        assert captured["job_id"] == "11111111-2222-3333-4444-555555555555"
+    finally:
+        cli.get_job = orig
+
+
+def test_cli_get_rejects_non_uuid_before_db():
+    # a malformed id fails closed (rc 2) at parse time — never touches the ledger
+    import asyncio
+    assert asyncio.run(cli.get_job("not-a-uuid")) == 2
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
