@@ -66,10 +66,13 @@ V1_ROSTER: list[AgentSpec] = [
               # worktree cwd (+ tmp); executed-command network egress is restricted ONLY if the
               # host ~/.codex config hasn't re-enabled it, so treat egress as best-effort, NOT
               # guaranteed. Per design §7 the sandbox is weak; the human merge gate is the real
-              # backstop (PR-4 should pass `-c sandbox_workspace_write.network_access=false`
-              # explicitly + verify). The env-scrub still denies this process every secret it
-              # didn't declare, regardless of sandbox config.
+              # backstop. PR-4 pins `-c sandbox_workspace_write.network_access=false` here so the
+              # fixer's executed commands can't phone home from a config-default-on host (best-
+              # effort: a hardened ~/.codex could still override; the human merge gate remains the
+              # real backstop). The env-scrub still denies this process every secret it didn't
+              # declare, regardless of sandbox config.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "workspace-write",
+                       "-c", "sandbox_workspace_write.network_access=false",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="oracle", reach=Reach.CLI, authority=Authority.RESPONDER,
