@@ -40,6 +40,7 @@ EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 if [[ "${1:-}" != "--worker" ]]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$repo" ]] || exit 0                        # never abort a push by erroring
+  remote_name="${1:-}"                              # git passes the remote name as $1 to a pre-push hook
   self="$repo/orchestrator/play-review.sh"
   [[ -x "$self" ]] || self="$0"
   while read -r localref localsha remoteref remotesha; do
@@ -53,7 +54,7 @@ if [[ "${1:-}" != "--worker" ]]; then
     else
       base="$EMPTY_TREE"                                    # no base ref / root commit → whole-tree diff
     fi
-    nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" >/dev/null 2>&1 &
+    nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" "$remote_name" >/dev/null 2>&1 &
   done
   exit 0
 fi
@@ -61,7 +62,7 @@ fi
 # ===========================================================================
 # WORKER: canary -> review -> triage -> deliver. Bounded. Spine is the ledger.
 # ===========================================================================
-repo="$2"; base="$3"; tip="$4"; ref="$5"
+repo="$2"; base="$3"; tip="$4"; ref="$5"; remote="${6:-}"
 play="$(date +%Y%m%d%H%M%S)-$$"
 run="$RUNS/$play"
 mkdir -p "$run" "$STATE" "$INBOX"
@@ -79,7 +80,7 @@ deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits
         "$subj" "$play" "$ref" "$base" "$tip" "$nonce" "$body" "$nonce" > "$f" 2>/dev/null; then
     printf '[%s] INBOX WRITE FAILED — verdict follows:\n%s\n' "$play" "$body" >&2
     : > "$STATE/UNDELIVERED-$play" 2>/dev/null || true
-    return 0
+    return 1                                          # durable write FAILED — caller must NOT mark done
   fi
   # one-way iMessage ping — carries the verdict text itself (argv form = injection-safe).
   # Best-effort tap; the durable record is the file above. set empty IMESSAGE_TO to disable.
@@ -89,9 +90,10 @@ deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits
               -e 'tell application "Messages" to send m to buddy t of (service 1 whose service type is iMessage)' \
               -e 'end run' -- "$msg" "$IMESSAGE_TO" >/dev/null 2>&1 || true
   fi
+  return 0                                            # durable write succeeded
 }
 
-abort(){ note "$1" "ABORT: $2"; deliver "review ABORTED — $1" "$2"; exit 0; }
+abort(){ note "$1" "ABORT: $2"; deliver "review ABORTED — $1" "$2" || true; exit 0; }
 
 fence(){ # fence <label> <text> — nonce-gated on BOTH boundaries
   printf '===BEGIN UNTRUSTED %s nonce=%s===\n' "$1" "$nonce"
@@ -110,10 +112,19 @@ call(){ # call <agent> <prompt> -> echo reply ; return 1 on fail/empty
   [[ "$rc" -eq 0 && -n "${out//[[:space:]]/}" ]]                            # success = rc0 AND non-empty
 }
 
+confirm_pushed(){ # did the push actually land on the remote? empty remote = manual/test run -> yes
+  [[ -z "$remote" ]] && return 0
+  git -C "$repo" ls-remote "$remote" 2>/dev/null | grep -q "^$tip"
+}
+
+# dedupe ONLY a review that both delivered durably AND landed on the remote
+# (pre-push fires before git confirms acceptance — a rejected push must stay re-reviewable)
+mark_done(){ confirm_pushed && : > "$STATE/done-$tip" 2>/dev/null || true; }
+
 contention(){ # lock held by a live worker: record the skip (NEVER silent), then exit
   : > "$STATE/SKIPPED-$tip" 2>/dev/null || true
   note contention "lock held; skipped $tip"
-  deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. Re-push to retry (e.g. git commit --allow-empty -m retrigger && git push)."
+  deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. Re-push to retry (e.g. git commit --allow-empty -m retrigger && git push)." || true
   exit 0
 }
 
@@ -171,17 +182,16 @@ $(fence kilabz-review "$review")")" \
   || abort triage "lobster failed/empty/timeout (job id in $run/lobster.err)"
 
 # --- gate: PASS iff trimmed == EXACTLY PLAY_PASS (no forgeable substring) ---
-if [[ "$(printf '%s' "$triage" | tr -d '[:space:]')" == "PLAY_PASS" ]]; then
+if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimmed match — no embedded-space forgery
   note done clean-pass
   deliver "review PASS — $ref" "Clean — no fixes needed.
 
 --- reviewer notes ---
-$review"
+$review" && mark_done || true
 else
   note done needs-fix
   deliver "review NEEDS-FIX — $ref" "$triage
 
 --- full review ---
-$review"
+$review" && mark_done || true
 fi
-: > "$STATE/done-$tip" 2>/dev/null || true          # dedupe marker (success only)

@@ -39,7 +39,7 @@ INBOX="$FAKE/.myndaix/bridge/inbox/jefe"
 STATE="$FAKE/.myndaix/orchestrator/state"
 
 reset(){ rm -rf "$FAKE/.myndaix"; }
-run(){ env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>"$ROOT/stderr"; }
+run(){ env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "${1:-}" 2>"$ROOT/stderr"; }
 latest(){ ls -t "$INBOX"/*.md 2>/dev/null | head -1; }
 ck(){ # ck <label> <substr> <file-or-empty>
   local f="${3:-$(latest)}"
@@ -61,6 +61,9 @@ echo "7. oversize diff FAILs fast"; reset; head -c 70000 /dev/zero | tr '\0' 'x'
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 echo "8. contention records a visible skip"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"; ckfile "$STATE/SKIPPED-$TIP" "SKIPPED sentinel written"
 echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock"; touch -t 202001010000 "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "reaps stale lock + reviews" "review PASS"
+echo "10. embedded-whitespace token is NOT a pass"; reset; STUB_TRIAGE="P L A Y _ P A S S" run; ck "spaced token -> NEEDS-FIX" "review NEEDS-FIX"
+echo "11. unconfirmed push is NOT deduped"; reset; STUB_TRIAGE="PLAY_PASS" run "/tmp/no-such-remote-$$"; ck "still delivers PASS" "review PASS"; cknofile "$STATE/done-$TIP" "unconfirmed push not marked done"
+echo "12. delivery failure is NOT deduped"; reset; mkdir -p "$INBOX"; chmod 000 "$INBOX"; STUB_TRIAGE="PLAY_PASS" run; chmod 755 "$INBOX"; cknofile "$STATE/done-$TIP" "lost delivery not marked done"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
