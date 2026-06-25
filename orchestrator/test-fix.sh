@@ -19,6 +19,7 @@ git -C "$REPO" init -q
 printf 'def add(a, b):\n    return a - b   # BUG: should be +\n' > "$REPO/calc.py"
 printf 'from calc import add\nassert add(2, 2) == 4, "add broken"\nprint("ok")\n' > "$REPO/test_add.py"
 printf 'print("ok")\n' > "$REPO/test_other.py"
+printf 'x = 1\n' > "$REPO/dummy.py"     # a tracked file to rename in the bypass test
 git -C "$REPO" add -A
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm init
 BASE="$(git -C "$REPO" rev-parse HEAD)"
@@ -50,6 +51,31 @@ git -C "$REPO" reset -q; rm -f "$REPO/evil"
 # non-applying patch (context not present at base)
 printf -- '--- a/calc.py\n+++ b/calc.py\n@@ -99,1 +99,1 @@\n-nope\n+nah\n' > "$TMP/nonapply.patch"
 : > "$TMP/empty.patch"
+
+# rename-bypass: fix the bug AND rename a dummy file to a test-harness path (must still TAMPER)
+"$PY" - "$REPO/calc.py" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read().replace("a - b","a + b"); open(p,"w").write(s)
+PY
+git -C "$REPO" add calc.py; mkdir -p "$REPO/sub"; git -C "$REPO" mv dummy.py sub/conftest.py
+git -C "$REPO" diff --cached > "$TMP/renamefix.patch"; git -C "$REPO" reset -q --hard "$BASE" >/dev/null
+
+# nested .envrc (DENY_RE regardless of fix)
+ln -sf /dev/null /dev/null 2>/dev/null || true
+printf -- 'diff --git a/sub/.envrc b/sub/.envrc\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/sub/.envrc\n@@ -0,0 +1 @@\n+export EVIL=1\n' > "$TMP/envrc.patch"
+
+# secrets in the produced patch: fix the bug AND embed an AWS-key signature in a comment
+"$PY" - "$REPO/calc.py" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read().replace("a - b","a + b")
+open(p,"w").write(s + "# AKIA0000000000000000\n")
+PY
+mint "$TMP/secret.patch"
+
+# timeout: patch makes the imported module hang -> target test times out -> UNVERIFIED
+"$PY" - "$REPO/calc.py" <<'PY'
+import sys; p=sys.argv[1]
+open(p,"w").write("import time\ndef add(a, b):\n    while True:\n        time.sleep(1)\n    return a + b\n")
+PY
+mint "$TMP/hang.patch"
 
 run(){ # run <repo_id> <patch>
   rm -f "$INBOX"/*.md 2>/dev/null || true
@@ -88,6 +114,23 @@ rm -f "$INBOX"/*.md 2>/dev/null || true
 MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
   MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/big.txt" >/dev/null 2>&1 || true
 check "over-cap" ABORTED
+
+flagcheck(){ # flagcheck <substr> <label>
+  if grep -hq "$1" "$INBOX"/*.md 2>/dev/null; then echo "  ok: $2"; pass=$((pass+1));
+  else echo "  FAIL: $2 (expected '$1' in delivery)"; fail=$((fail+1)); fi
+}
+
+echo "9. rename-to-test bypass -> TAMPERED (NUL-safe policy, even with a real fix)"
+run fixture "$TMP/renamefix.patch"; check "rename bypass" TAMPERED
+echo "10. nested .envrc -> UNVERIFIED (DENY_RE)"
+run fixture "$TMP/envrc.patch";    check "nested envrc" UNVERIFIED
+echo "11. secret signature in patch -> REGRESSION_CHECK_ONLY but diff withheld + flagged"
+run fixture "$TMP/secret.patch";   check "secret verdict" REGRESSION_CHECK_ONLY; flagcheck "secrets-hit" "secret flagged + withheld"
+echo "12. hanging verify -> UNVERIFIED (timeout fires, script does not wedge)"
+rm -f "$INBOX"/*.md 2>/dev/null || true
+MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+  MYNDAIX_FIX_TIMEOUT=2 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/hang.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+check "timeout" UNVERIFIED
 
 echo
 echo "=== $pass passed, $fail failed ==="

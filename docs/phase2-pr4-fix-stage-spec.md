@@ -71,5 +71,20 @@ Flow:
 - `orchestrator/test.sh` +: a known-buggy fixture git repo (a real failing test + passing tests); play-fix produces `REGRESSION_CHECK_ONLY` on a genuine fix; `TAMPERED` on a test-deletion patch; `UNVERIFIED` on patch-doesn't-apply; policy rejects symlink/exec-bit; `NO_FIX` on empty; fail-closed on missing-config + bad-SHA + over-cap.
 - Full suite (10 py + orchestrator) stays green.
 
+## Code-review hardening applied (codex + Oracle, post-build)
+Both families reviewed the implementation; converged + unique findings all folded in:
+- **sandbox must exist BEFORE execution** — `play-fix.sh` aborts up front if `sandbox-exec` is absent (never runs untrusted code then downgrades).
+- **write-deny sandbox** — sbpl now `deny file-write*` except worktree+scratch, plus `deny file-read*` of `~/.ssh`/`~/.aws`/`~/.gnupg`/`~/.config`/`~/.myndaix` (was `allow default` = writes everywhere).
+- **NUL-safe patch policy** — `git apply --numstat -z` exact paths (defeats rename `=>` / quoted-path bypass); reject control chars; broadened TAMPER set (uv.lock/poetry.lock/Dockerfile/pom.xml/noxfile/nested `.envrc`/test-file naming conventions); `.envrc`/`.gitmodules`/`.git/` hard-denied anywhere.
+- **split nonce** — independent prompt-nonce (shown to codex) vs delivery-nonce (secret), so the agent can't forge the inbox markdown / spoof a verdict.
+- **private patch copy** — artifact copied into the 0700 run dir (`chmod 0400`), hashed, used for policy/apply/delivery, re-validated before apply (TOCTOU close).
+- **timeout + process-group kill** — every sandboxed run is watchdog-killed (no `timeout` on macOS); a hang can't hold the global lock.
+- **REGRESSION_CHECK_ONLY requires a real `fail_to_pass`** (else UNVERIFIED); test-deletion caught via the path policy.
+- **strict job-id binding** — require successful submit, first (trusted) `JOB_ID` line, UUID-validated; assert `status=done`, `to_agent=codex`, `base_ref==base_sha`, `repo_id==repo_path` via `mxr get` JSON.
+- **secrets-scan** — patch scanned for key signatures before delivery; hit ⇒ flag + withhold the diff body.
+- **git-config drift audit** across the live fix job (linked-worktree shares `.git`; full clone-isolation deferred — human gate is the backstop).
+
+Tests: `orchestrator/test-fix.sh` now 13 cases incl. rename-bypass→TAMPERED, nested-.envrc→UNVERIFIED, secret→withheld+flagged, hanging-verify→UNVERIFIED(timeout).
+
 ## Deliberately NOT in v1
 Docker/hardened sandbox (→ before any auto-fix), parent-verdict SHA binding (v1 validates the commit only), clean-base `.agent/verify.sh`, sample-N, auto-on-NEEDS-FIX, auto-merge verb, repo_id/repo_path spine split (v1 uses config-resolved abs path as the fix job's repo).

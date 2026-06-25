@@ -109,7 +109,12 @@ async def get_job(job_id: str) -> int:
         out = {
             "job": str(st.get("id")),
             "status": st.get("status"),
+            "to_agent": st.get("to_agent"),
+            "repo_id": st.get("repo_id"),
             "artifact_ref": st.get("artifact_ref"),
+            # base_ref carries the anchor the caller passed (--base-ref); base_sha is a
+            # distinct column not populated on this path, so binding uses base_ref.
+            "base_ref": st.get("base_ref"),
             "base_sha": st.get("base_sha"),
             "attempts": [{"status": a.get("status")} for a in (st.get("attempts") or [])],
         }
