@@ -19,13 +19,22 @@ git -C "$REPO" init -q
 printf 'def add(a, b):\n    return a - b   # BUG: should be +\n' > "$REPO/calc.py"
 printf 'from calc import add\nassert add(2, 2) == 4, "add broken"\nprint("ok")\n' > "$REPO/test_add.py"
 printf 'print("ok")\n' > "$REPO/test_other.py"
+# writes to /dev/null inside the sandbox: passes ONLY if the sbpl /dev/null allow is present,
+# else PermissionError -> verify fails -> UNVERIFIED (regression test for the sandbox hardening)
+printf 'open("/dev/null","w").write("x")\nprint("ok")\n' > "$REPO/test_devnull.py"
 printf 'x = 1\n' > "$REPO/dummy.py"     # a tracked file to rename in the bypass test
+ln -s calc.py "$REPO/test_link.py"      # a tracked SYMLINK (mode 120000) for the C2 selector test
+mkdir -p "$REPO/pkg"; printf 'print("ok")\n' > "$REPO/pkg/mod.py"   # a tracked TREE for the C2 tree-selector test
 git -C "$REPO" add -A
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm init
 BASE="$(git -C "$REPO" rev-parse HEAD)"
 
-printf '{ "fixture": { "path": "%s", "verify": ["%s", "test_other.py"], "fail_to_pass": ["%s", "test_add.py"] } }\n' \
-  "$REPO" "$PY" "$PY" > "$ORCH/repos.json"
+# 'fixture' carries a fail_to_pass_template (selector tests); 'fixture_devnull' verifies via a
+# test that writes /dev/null (sandbox-hardening regression) and has NO template (missing-template test)
+jq -n --arg repo "$REPO" --arg py "$PY" '{
+  fixture: { path: $repo, verify: [$py, "test_other.py"], fail_to_pass: [$py, "test_add.py"], fail_to_pass_template: [$py, "{TEST}"] },
+  fixture_devnull: { path: $repo, verify: [$py, "test_devnull.py"], fail_to_pass: [$py, "test_add.py"] }
+}' > "$ORCH/repos.json"
 printf 'fix the add() bug so add(2,2)==4\n' > "$TMP/fixlist.txt"
 
 # ---- helpers to mint patches from the fixture working tree ----
@@ -147,6 +156,56 @@ rm -f "$INBOX"/*.md 2>/dev/null || true
 MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
   MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
 check "ungated override" ABORTED
+
+# ---- sandbox /dev/null hardening + per-fix fail_to_pass selector ----
+run_sel(){ # run_sel <repo_id> <patch> <selector>
+  rm -f "$INBOX"/*.md 2>/dev/null || true
+  MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+    MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$2" bash "$PLAY" "$1" "$BASE" "$TMP/fixlist.txt" "$3" >/dev/null 2>&1 || true
+}
+
+echo "15. /dev/null write under sandbox -> REGRESSION_CHECK_ONLY (proves the sbpl allow)"
+run fixture_devnull "$TMP/good.patch"; check "devnull allow" REGRESSION_CHECK_ONLY
+echo "16. per-fix selector -> REGRESSION_CHECK_ONLY (substituted into trusted template)"
+run_sel fixture "$TMP/good.patch" "test_add.py"; check "selector good" REGRESSION_CHECK_ONLY
+echo "17. selector with shell metachars -> ABORTED (no injection)"
+run_sel fixture "$TMP/good.patch" 'test_add.py;rm -rf /'; check "selector injection" ABORTED
+echo "18. selector path traversal -> ABORTED"
+run_sel fixture "$TMP/good.patch" '../calc.py'; check "selector traversal" ABORTED
+echo "19. selector names a non-existent file -> ABORTED"
+run_sel fixture "$TMP/good.patch" "test_ghost.py"; check "selector missing file" ABORTED
+echo "20. selector supplied but repo has no template -> ABORTED"
+run_sel fixture_devnull "$TMP/good.patch" "test_add.py"; check "selector no template" ABORTED
+
+echo "21. \$ORCH under a read-denied \$HOME/.myndaix -> exec relocated outside it (REGRESSION_CHECK_ONLY)"
+# the live default $ORCH is $HOME/.myndaix/orchestrator, which the sbpl read-denies; if the verify
+# worktree/scratch lived there, git would die traversing the read-denied ancestor. The fix relocates
+# exec OUTSIDE the deny tree. Reproduce by pointing HOME + $ORCH under a .myndaix path; exec (mktemp
+# in the real TMPDIR) stays readable, so verify still reaches REGRESSION_CHECK_ONLY.
+DENIED_ORCH="$TMP/.myndaix/orchestrator"; mkdir -p "$DENIED_ORCH"; cp "$ORCH/repos.json" "$DENIED_ORCH/repos.json"
+rm -f "$INBOX"/*.md 2>/dev/null || true
+HOME="$TMP" MYNDAIX_ORCH="$DENIED_ORCH" MYNDAIX_REPOS_JSON="$DENIED_ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+check "read-denied run dir" REGRESSION_CHECK_ONLY
+
+echo "22. selector is a tracked SYMLINK -> ABORTED (codex C2: must be a regular blob)"
+run_sel fixture "$TMP/good.patch" "test_link.py"; check "selector symlink" ABORTED
+echo "23. selector starts with '-' -> ABORTED (codex C3: no flag injection)"
+run_sel fixture "$TMP/good.patch" "-rf"; check "selector leading-dash" ABORTED
+echo "24. TMPDIR under a read-denied path -> ABORTED (codex C4)"
+rm -f "$INBOX"/*.md 2>/dev/null || true
+BADTMP="$TMP/.myndaix/tmp"; mkdir -p "$BADTMP"
+HOME="$TMP" TMPDIR="$BADTMP" MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+check "TMPDIR under denied path" ABORTED
+
+echo "25. lock released after a validation abort -> next run still succeeds (codex MAJOR: lock leak)"
+# case 24 aborted inside the EXEC-validation block; if the lock leaked, this normal run would abort.
+run fixture "$TMP/good.patch"; check "lock not leaked" REGRESSION_CHECK_ONLY
+echo "26. selector is a TREE (directory) -> ABORTED (codex re-review: mode must be a blob, path exact)"
+run_sel fixture "$TMP/good.patch" "pkg"; check "selector tree" ABORTED
+echo "27. selector with a trailing slash -> ABORTED (codex re-review: ls-tree child-row bypass)"
+run_sel fixture "$TMP/good.patch" "test_add.py/"; check "selector trailing slash" ABORTED
 
 echo
 echo "=== $pass passed, $fail failed ==="
