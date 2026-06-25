@@ -25,6 +25,54 @@ from runtime.registry import get as get_spec
 
 _KILL_GRACE_S = 3
 
+# -- CLI subprocess env scrub (P2 codex containment) ----------------------
+# A CLI agent inherits ONLY this operational baseline + whatever it explicitly
+# declares — never the pool's full environment, which holds HF_KEY,
+# PERPLEXITY_API_KEY, and any other secret a sibling API agent needs. This is an
+# ALLOWLIST (not a denylist) so a NEW secret added to the pool's env is excluded
+# by default. The API-key-bearing agents are reach=API and run through
+# invoke_api/invoke_higgsfield (which read os.environ directly), so they are
+# UNAFFECTED; only claude/codex/agy CLIs are scrubbed. Those auth via $HOME login
+# AND/OR an env key, so each declares its OWN key in env_passthrough (registry) —
+# which lets it through while still dropping every sibling's secret. A deploy that
+# needs an extra var can also open a hole via $MYNDAIX_CLI_ENV_PASSTHROUGH, never
+# by source edit.
+_CLI_ENV_BASE = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
+    "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR", "TZ",
+    # TLS trust store for tools that make https calls (Node CLIs also honor NODE_EXTRA_CA_CERTS)
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    # proxy config — NON-secret; a corporate/MITM-proxy deploy fails TLS/connect without these
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    # config-dir relocation — claude/codex/agy auth lives under one of these if not default $HOME
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "CODEX_HOME", "CLAUDE_CONFIG_DIR", "GEMINI_CONFIG_DIR",
+)
+_CLI_ENV_PASSTHROUGH = "MYNDAIX_CLI_ENV_PASSTHROUGH"   # operator escape hatch: comma-separated extra var names
+
+
+def _cli_env(spec: AgentSpec) -> dict[str, str]:
+    """Build the scrubbed environment for a CLI-agent subprocess: the operational
+    baseline + the agent's own declared secret_ref + an operator-configured
+    passthrough list. Every other variable (every other secret) is dropped."""
+    allow = set(_CLI_ENV_BASE)
+    sr = spec.adapter.get("secret_ref")
+    if isinstance(sr, str) and sr:
+        allow.add(sr)
+    # env_passthrough is TRUSTED in-source roster data: an entry naming a sibling's secret
+    # (e.g. codex listing HF_KEY) would re-grant exactly what the scrub denies. Safe while the
+    # registry is code; if it ever loads from DB/config, validate entries against sibling
+    # secret names BEFORE this point — this function trusts whatever the spec declares.
+    declared = spec.adapter.get("env_passthrough") or []
+    if isinstance(declared, (list, tuple)):
+        allow.update(e for e in declared if isinstance(e, str) and e)
+    for extra in os.environ.get(_CLI_ENV_PASSTHROUGH, "").split(","):
+        extra = extra.strip()
+        if extra:
+            allow.add(extra)
+    return {k: v for k, v in os.environ.items() if k in allow}
+
 # Higgsfield polling constants
 _HF_POLL_INTERVAL_S = 2
 _HF_POLL_RETRY_MAX = 3
@@ -64,6 +112,7 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=job.worktree_path or None,
+            env=_cli_env(spec),      # scrubbed allowlist: no inherited secrets (P2 containment)
             start_new_session=True,  # own process group -> killpg reaches every child
         )
     except (FileNotFoundError, PermissionError, NotADirectoryError, OSError) as e:

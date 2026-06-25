@@ -94,3 +94,44 @@ Fill in three things (and get them right — a background process is unforgiving
 Stop it with `launchctl unload ~/Library/LaunchAgents/ai.myndaix.runtime.plist`. Logs go to
 `.runtime.log`. The launchd service runs agents non-interactively, so each agent CLI must be
 authenticated in a way a background process can read (an env API key or a cached token).
+
+## `mxr` (durable) vs direct `codex exec` / `agy -p` (raw)
+
+Same underlying agent CLI, two different jobs:
+
+- **`mxr <agent>` — the durable path.** Goes through the Postgres ledger: the job/attempt is
+  recorded, leased, heartbeated, crash-recovered, and the reply delivered via the outbox. Use it
+  for **anything that must survive a crash, be retried, or be auditable** — pipeline steps,
+  builds, the orchestrator's reviews.
+- **Direct `codex exec …` / `agy -p …` — the raw path.** A one-shot CLI call: no ledger, no
+  lease, no retry, no record — you read the output and it's gone. Use it for a **quick one-off**
+  (an ad-hoc review/check) where durability doesn't matter.
+
+Decision rule: *does this need to be remembered/recovered?* No → direct CLI. Yes → `mxr`.
+
+Gotchas:
+- **`agy` (Oracle / Gemini — it replaced the retired `gemini` CLI) must be run with `< /dev/null`**
+  or it hangs on inherited stdin (0% CPU, no output): `agy -p "<prompt>" < /dev/null`.
+- `codex exec`/`agy` are allowlisted, so an interactive Claude Code session can call them directly;
+  `mxr` from inside an *auto-mode* agent session is classifier-gated — trigger durable work via a
+  **human or a hook** (e.g. the orchestrator below), not the agent.
+
+## Orchestrator: review-on-push (optional layer)
+
+`orchestrator/play-review.sh` turns the runtime into autonomous code review: install it as a
+**`pre-push` hook** and every `git push` is reviewed by the team, verdict delivered to you — no
+terminal needed.
+
+- **Flow:** push → (detached; never blocks the push) live canary → review (`kilabz`) → triage
+  (`lobster` → fix-list or the exact token `PLAY_PASS`) → deliver to
+  **`~/.myndaix/bridge/inbox/jefe/` + a one-way iMessage** (`PLAY_IMESSAGE_TO`). Reviews any
+  branch (`refs/heads/*`); a new branch diffs vs `merge-base(main, tip)`.
+- **Install** (from the repo root):
+  ```bash
+  ln -sf "$(git rev-parse --show-toplevel)/orchestrator/play-review.sh" "$(git rev-parse --git-path hooks)/pre-push"
+  ```
+- **Config (env):** `PLAY_DAILY_CAP` (default 50) · `PLAY_IMESSAGE_TO` (empty disables the ping).
+- **Test:** `bash orchestrator/test.sh` (stubbed agents — no real dispatch).
+- **Why a hook:** *your* `git push` is the trigger (a non-Claude originator), so it dispatches the
+  durable `mxr` reviews an auto-mode agent can't trigger itself. Verdicts go only to the human
+  `jefe/` inbox (no agent watches it) — the merge stays your call. Design: `docs/orchestrator-design.md`.

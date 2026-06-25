@@ -21,8 +21,10 @@ class AgentSpec(BaseModel):
     model: str
     role: str
     profile: Profile = Profile()
-    # adapter is intentionally a dict: cli {argv, prompt_channel} | api {endpoint, secret_ref, model}
-    # (validated by the runner's adapter layer, not the spine)
+    # adapter is intentionally a dict: cli {argv, prompt_channel, env_passthrough?} |
+    # api {endpoint, secret_ref, model} (validated by the runner's adapter layer, not the spine).
+    # env_passthrough (cli): env vars THIS agent is allowed to inherit through the P2 scrub —
+    # its own auth key(s) only. Everything else (sibling agents' secrets) is dropped. See runner._cli_env.
     adapter: dict[str, Any]
 
     @field_validator("agent_id")
@@ -38,28 +40,43 @@ class AgentSpec(BaseModel):
 
 # v1 seed roster (data - expected to change). See DESIGN.md S5.
 V1_ROSTER: list[AgentSpec] = [
+    # CLI agents declare env_passthrough = their OWN auth key only (the rest of the pool's
+    # env — incl. sibling agents' secrets — is scrubbed by runner._cli_env). claude/codex/agy
+    # also accept $HOME login; declaring the key keeps env-auth deploys working too.
     AgentSpec(agent_id="lobster", reach=Reach.CLI, authority=Authority.CONTROLLER,
               model="opus", role="orchestration/judgment",
               adapter={"kind": "cli", "argv": ["claude", "-p", "--output-format", "text"],
-                       "prompt_channel": "stdin"}),
+                       "prompt_channel": "stdin", "env_passthrough": ["ANTHROPIC_API_KEY"]}),
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
-              adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin"}),
+              adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
+                       "env_passthrough": ["ANTHROPIC_API_KEY"]}),
     AgentSpec(agent_id="mini", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="claude", role="pipeline builder",
-              adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin"}),
+              adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
+                       "env_passthrough": ["ANTHROPIC_API_KEY"]}),
     AgentSpec(agent_id="kilabz", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gpt-5.5", role="code reviewer (read-only)",
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
-                       "--skip-git-repo-check"], "prompt_channel": "stdin"}),
+                       "--skip-git-repo-check"], "prompt_channel": "stdin",
+                       "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="gpt-5.5", role="builder/debugger",
-              adapter={"kind": "cli", "argv": ["codex", "exec", "--skip-git-repo-check"],
-                       "prompt_channel": "stdin"}),
+              # --sandbox workspace-write: codex's own seatbelt (P2) — writes scoped to the
+              # worktree cwd (+ tmp); executed-command network egress is restricted ONLY if the
+              # host ~/.codex config hasn't re-enabled it, so treat egress as best-effort, NOT
+              # guaranteed. Per design §7 the sandbox is weak; the human merge gate is the real
+              # backstop (PR-4 should pass `-c sandbox_workspace_write.network_access=false`
+              # explicitly + verify). The env-scrub still denies this process every secret it
+              # didn't declare, regardless of sandbox config.
+              adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "workspace-write",
+                       "--skip-git-repo-check"], "prompt_channel": "stdin",
+                       "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="oracle", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gemini-3.1-pro", role="reviewer/vision",
               # `agy` is the Gemini CLI (the standalone gemini-cli individual tier was retired)
-              adapter={"kind": "cli", "argv": ["agy", "-p"], "prompt_channel": "arg"}),
+              adapter={"kind": "cli", "argv": ["agy", "-p"], "prompt_channel": "arg",
+                       "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]}),
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
               model="sonar-pro+claude", role="research (read-only)",
               profile=Profile(cost_budget=5.0),

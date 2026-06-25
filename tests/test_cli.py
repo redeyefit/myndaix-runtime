@@ -11,8 +11,10 @@ def _capture_submit():
     (captured_dict, restore_fn)."""
     captured: dict = {}
 
-    async def fake_submit(agent, task, *, context=None, timeout_s=180.0):
-        captured.update(agent=agent, task=task, context=context)
+    async def fake_submit(agent, task, *, context=None, repo_id=None,
+                          base_ref=None, timeout_s=180.0):
+        captured.update(agent=agent, task=task, context=context,
+                        repo_id=repo_id, base_ref=base_ref)
         return 0
 
     orig = cli.submit
@@ -48,6 +50,27 @@ def test_cli_image_only_omits_application_key():
     try:
         rc = cli.main(["higgsfield", "spin", "--image", "http://example.com/a.png"])
         assert rc == 0 and captured["context"] == {"image_url": "http://example.com/a.png"}
+    finally:
+        restore()
+
+
+def test_cli_repo_and_base_ref_thread_through():
+    captured, restore = _capture_submit()
+    try:
+        rc = cli.main(["kilabz", "review this", "--repo", "fieldvision",
+                       "--base-ref", "abc123"])
+        assert rc == 0
+        assert captured["repo_id"] == "fieldvision" and captured["base_ref"] == "abc123"
+    finally:
+        restore()
+
+
+def test_cli_no_scope_flags_are_none():
+    # omitted -> None -> NULL repo_id -> cap-exempt (never a shared bucket)
+    captured, restore = _capture_submit()
+    try:
+        rc = cli.main(["recon", "what is rust"])
+        assert rc == 0 and captured["repo_id"] is None and captured["base_ref"] is None
     finally:
         restore()
 

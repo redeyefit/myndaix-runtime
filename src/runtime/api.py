@@ -128,8 +128,14 @@ class SubmitIn(BaseModel):
     to_agent: str = Field(min_length=1, max_length=100)
     prompt: str = Field(min_length=1, max_length=_MAX_BODY)
     context: dict[str, Any] = Field(default_factory=dict)
+    # workspace scope: repo bucket (per-repo concurrency) + the git ref the work anchors
+    # to. Both optional; omitted repo_id -> NULL -> cap-exempt. Bounded like all text in.
+    repo_id: Optional[str] = Field(default=None, max_length=200)
+    base_ref: Optional[str] = Field(default=None, max_length=200)
 
     _strip_nul = field_validator("to_agent", "prompt")(_no_nul)
+    _strip_nul_scope = field_validator("repo_id", "base_ref")(
+        lambda v: v if v is None else _no_nul(v))
 
     @field_validator("context")
     @classmethod
@@ -234,7 +240,8 @@ def create_app(ledger: Optional[PostgresLedger] = None, *,
     async def submit(req: SubmitIn, p: Principal = Depends(_principal),
                      led: PostgresLedger = Depends(_ledger)):
         jid = await led.submit_job(to_agent=req.to_agent, prompt=req.prompt,
-                                   context=req.context, created_by=_API_NS + p.id)
+                                   context=req.context, created_by=_API_NS + p.id,
+                                   repo_id=req.repo_id, base_ref=req.base_ref)
         return JobOut(job_id=str(jid))
 
     @app.get("/jobs/{job_id}", response_model=JobStatusOut)

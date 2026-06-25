@@ -36,27 +36,43 @@ log = logging.getLogger("runtime.pool")
 class WorkerPool:
     def __init__(self, ledger, *, size: int = 4, poll_s: float = 0.02,
                  janitor_interval_s: float = 0.2,
-                 heartbeat_interval_s: Optional[float] = None):
+                 heartbeat_interval_s: Optional[float] = None,
+                 worktree_sweep_interval_s: float = 300.0,
+                 reconcile_interval_s: float = 45.0):
         self.ledger = ledger
         self.size = size
         self.poll_s = poll_s                      # idle worker re-poll delay
         self.janitor_interval_s = janitor_interval_s
         self.heartbeat_interval_s = heartbeat_interval_s
-        # a heartbeat must beat well within the lease window or it's defeated (the
-        # lease expires before the first ping and the agent runs orphaned).
+        self.worktree_sweep_interval_s = worktree_sweep_interval_s  # slow GC cadence (PR-1c)
+        self.reconcile_interval_s = reconcile_interval_s  # slow per-repo cap reconcile (PR-2)
+        # Heartbeat contract (design M4) — two DISTINCT quantities:
+        #  (a) HEARTBEAT_SECONDS (the ledger's lease-EXTEND amount) must be >= LEASE_SECONDS
+        #      so a single ping fully renews the window, never SHRINKS it; and
+        #  (b) heartbeat_interval_s (THIS pool's FIRING cadence) must be <= lease/3 so
+        #      >= ~3 pings land per window and one slow/dropped ping can't orphan a live job.
         lease = getattr(ledger, "LEASE_SECONDS", None)
-        if heartbeat_interval_s and lease and heartbeat_interval_s > lease / 2:
+        extend = getattr(ledger, "HEARTBEAT_SECONDS", None)
+        if lease and extend is not None and extend < lease:
             raise ValueError(
-                f"heartbeat_interval_s={heartbeat_interval_s} too large for a {lease}s "
-                "lease; use <= LEASE_SECONDS/2 so a heartbeat fires before expiry")
+                f"HEARTBEAT_SECONDS={extend} (lease extend) must be >= LEASE_SECONDS={lease}: "
+                "a heartbeat that extends by less than the lease window can't keep a job alive")
+        if heartbeat_interval_s and lease and heartbeat_interval_s > lease / 3:
+            raise ValueError(
+                f"heartbeat_interval_s={heartbeat_interval_s} too large for a {lease}s lease; "
+                "fire at <= LEASE_SECONDS/3 so >= ~3 heartbeats land before expiry")
         self.wm = WorkspaceManager()
         self.processed = 0                        # jobs this pool completed
         self.reclaimed = 0                        # leases the janitor reclaimed
+        self.worktrees_swept = 0                  # orphan worktrees GC'd by the janitor
         self.worker_faults = 0                    # caught worker errors (none fatal)
         self.truncated = False                    # set if run_until_idle hit the cap
+        self.reconciled = 0                       # repo_concurrency rows the janitor healed
         self._stop = asyncio.Event()
         self._inflight = 0
         self._last = 0.0
+        self._last_sweep = 0.0
+        self._last_reconcile = 0.0
         self._tasks: list = []
 
     def _touch(self) -> None:
@@ -118,7 +134,56 @@ class WorkerPool:
                 # a transient ledger error must NOT permanently disable reclaim
                 # (that would silently revoke the crash-recovery guarantee).
                 log.exception("pool janitor: reclaim_expired failed; continuing")
+            await self._maybe_sweep_worktrees()
+            await self._maybe_reconcile_cap()
             await asyncio.sleep(self.janitor_interval_s)
+
+    async def _maybe_sweep_worktrees(self) -> None:
+        """Slow-cadence GC of hard-crash orphan worktrees (PR-1c) — runs at most every
+        worktree_sweep_interval_s, off the same janitor loop. The blocking git/fs work
+        runs in an executor so it never stalls the event loop. Best-effort: a sweep
+        error never disables reclaim (the crash-recovery guarantee)."""
+        if not hasattr(self.ledger, "reapable_attempt_ids"):
+            return
+        now = time.monotonic()
+        if now - self._last_sweep < self.worktree_sweep_interval_s:
+            return
+        self._last_sweep = now
+        try:
+            # 'reapable' = attempts CLOSED for at least one lease — never an open or
+            # just-closed lease, so a worktree whose worker may still be writing is safe.
+            min_age = float(getattr(self.ledger, "LEASE_SECONDS", 600))
+            reapable = await self.ledger.reapable_attempt_ids(min_age)
+            n = await asyncio.get_running_loop().run_in_executor(
+                None, self.wm.sweep, reapable)
+            if n:
+                self.worktrees_swept += n
+                log.info("pool janitor: swept %d orphan worktree(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("pool janitor: worktree sweep failed; continuing")
+
+    async def _maybe_reconcile_cap(self) -> None:
+        """Slow-cadence reconcile of the per-repo cap counter (PR-2) — heals
+        repo_concurrency.active soft-cache drift back to truth, off the same janitor
+        loop. Best-effort + correctness-neutral: the hard COUNT under the rc lock is the
+        cap authority, so a reconcile error (or skipping it) never affects the cap, only
+        soft-filter fairness."""
+        if not hasattr(self.ledger, "reconcile_repo_concurrency"):
+            return
+        now = time.monotonic()
+        if now - self._last_reconcile < self.reconcile_interval_s:
+            return
+        self._last_reconcile = now
+        try:
+            n = await self.ledger.reconcile_repo_concurrency()
+            if n:
+                self.reconciled += n
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("pool janitor: cap reconcile failed; continuing")
 
     async def _shutdown(self, grace_s: float) -> None:
         self._stop.set()

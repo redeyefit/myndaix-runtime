@@ -92,7 +92,9 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
     worktree = None
     if spec and spec.authority is Authority.WORKSPACE_ACTOR and job.repo_id:
         wm = wm or WorkspaceManager()
-        worktree = wm.create(job.repo_id, job.base_ref or "HEAD")
+        # name the worktree by attempt_id so the janitor sweep can correlate a leftover
+        # dir to its (now-closed) attempt after a hard crash (PR-1c)
+        worktree = wm.create(job.repo_id, job.base_ref or "HEAD", str(attempt_id))
         job.worktree_path = worktree
 
     try:

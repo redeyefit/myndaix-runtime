@@ -22,7 +22,7 @@ from runtime.pool import WorkerPool
 DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 
-async def serve(size: int = 4) -> None:
+async def serve(size: int = 8) -> None:
     led = await PostgresLedger.connect(DSN)
     # Apply pending migrations BEFORE serving, so a deploy can never start workers
     # against a stale schema (the 2026-06-24 dispatch outage). Idempotent + advisory-
@@ -47,7 +47,8 @@ async def serve(size: int = 4) -> None:
 
 
 def main() -> None:
-    size = 4
+    size = 8                       # PR-3: pool=8 (the per-repo cap now keeps one repo
+                                   # from monopolizing all workers). Override with --size.
     if "--size" in sys.argv:
         size = int(sys.argv[sys.argv.index("--size") + 1])
     asyncio.run(serve(size))
