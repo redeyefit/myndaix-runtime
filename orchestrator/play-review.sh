@@ -23,7 +23,7 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 ORCH="$HOME/.myndaix/orchestrator"                 # all state OUTSIDE any repo
 RUNS="$ORCH/runs"; STATE="$ORCH/state"
 INBOX="$HOME/.myndaix/bridge/inbox/jefe"           # human-only, no agent watcher
-IMESSAGE_TO="${PLAY_IMESSAGE_TO:-makebeats24@icloud.com}"  # one-way review ping; set empty to disable
+IMESSAGE_TO="${PLAY_IMESSAGE_TO-makebeats24@icloud.com}"   # one-way review ping; PLAY_IMESSAGE_TO= (empty) disables, unset defaults
 TARGET_GLOB="refs/heads/*"                          # review pushes to ANY branch (skip tags/deletes)
 BASE_REF="main"                                     # a new branch's first push is diffed against this
 MAX_DIFF=65536                                      # ~64KB; bounded by the 300s review budget (tune with data)
@@ -40,7 +40,7 @@ EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 if [[ "${1:-}" != "--worker" ]]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$repo" ]] || exit 0                        # never abort a push by erroring
-  remote_name="${1:-}"                              # git passes the remote name as $1 to a pre-push hook
+  remote_url="${2:-}"                               # git passes remote name as $1, URL as $2; the URL handles pushurl/direct-URL pushes
   self="$repo/orchestrator/play-review.sh"
   [[ -x "$self" ]] || self="$0"
   while read -r localref localsha remoteref remotesha; do
@@ -54,7 +54,7 @@ if [[ "${1:-}" != "--worker" ]]; then
     else
       base="$EMPTY_TREE"                                    # no base ref / root commit → whole-tree diff
     fi
-    nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" "$remote_name" >/dev/null 2>&1 &
+    nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" "$remote_url" >/dev/null 2>&1 &
   done
   exit 0
 fi
@@ -62,7 +62,7 @@ fi
 # ===========================================================================
 # WORKER: canary -> review -> triage -> deliver. Bounded. Spine is the ledger.
 # ===========================================================================
-repo="$2"; base="$3"; tip="$4"; ref="$5"; remote="${6:-}"
+repo="$2"; base="$3"; tip="$4"; ref="$5"; remote_url="${6:-}"
 play="$(date +%Y%m%d%H%M%S)-$$"
 run="$RUNS/$play"
 mkdir -p "$run" "$STATE" "$INBOX"
@@ -112,9 +112,11 @@ call(){ # call <agent> <prompt> -> echo reply ; return 1 on fail/empty
   [[ "$rc" -eq 0 && -n "${out//[[:space:]]/}" ]]                            # success = rc0 AND non-empty
 }
 
-confirm_pushed(){ # did the push actually land on the remote? empty remote = manual/test run -> yes
-  [[ -z "$remote" ]] && return 0
-  git -C "$repo" ls-remote "$remote" 2>/dev/null | grep -q "^$tip"
+confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = manual/test run -> yes
+  [[ -z "$remote_url" ]] && return 0                # ls-remote scoped to $ref (not any ref); capture+compare avoids grep -q|pipefail SIGPIPE
+  local got
+  got="$(git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
+  [[ "$got" == "$tip" ]]
 }
 
 # dedupe ONLY a review that both delivered durably AND landed on the remote

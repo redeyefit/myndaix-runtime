@@ -25,7 +25,7 @@ case "$agent" in
   *) echo "stub:$agent" ;;
 esac
 STUB
-printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE/.local/bin/osascript"
+printf '%s\n' '#!/usr/bin/env bash' 'mkdir -p "$HOME/.myndaix" 2>/dev/null' 'echo called >> "$HOME/.myndaix/osascript-calls"' 'exit 0' > "$FAKE/.local/bin/osascript"
 chmod +x "$FAKE/.local/bin/mxr" "$FAKE/.local/bin/osascript"
 
 # --- a throwaway git repo with one real commit ---
@@ -64,6 +64,9 @@ echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock"; touch -t 20200101000
 echo "10. embedded-whitespace token is NOT a pass"; reset; STUB_TRIAGE="P L A Y _ P A S S" run; ck "spaced token -> NEEDS-FIX" "review NEEDS-FIX"
 echo "11. unconfirmed push is NOT deduped"; reset; STUB_TRIAGE="PLAY_PASS" run "/tmp/no-such-remote-$$"; ck "still delivers PASS" "review PASS"; cknofile "$STATE/done-$TIP" "unconfirmed push not marked done"
 echo "12. delivery failure is NOT deduped"; reset; mkdir -p "$INBOX"; chmod 000 "$INBOX"; STUB_TRIAGE="PLAY_PASS" run; chmod 755 "$INBOX"; cknofile "$STATE/done-$TIP" "lost delivery not marked done"
+echo "13. empty PLAY_IMESSAGE_TO disables the ping"; reset; PLAY_IMESSAGE_TO="" STUB_TRIAGE="PLAY_PASS" run; ck "still delivers PASS" "review PASS"; cknofile "$FAKE/.myndaix/osascript-calls" "no iMessage send when disabled"
+echo "14. same SHA on a DIFFERENT ref does not confirm"; reset; bare="$ROOT/bare.git"; git init -q --bare "$bare"; git -C "$REPO" push -q "$bare" "$TIP:refs/heads/other" 2>/dev/null; STUB_TRIAGE="PLAY_PASS" run "$bare"; cknofile "$STATE/done-$TIP" "tip on wrong ref not deduped"
+echo "15. SHA on the TARGET ref confirms"; reset; bare2="$ROOT/bare2.git"; git init -q --bare "$bare2"; git -C "$REPO" push -q "$bare2" "$TIP:refs/heads/main" 2>/dev/null; STUB_TRIAGE="PLAY_PASS" run "$bare2"; ckfile "$STATE/done-$TIP" "tip on target ref deduped"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
