@@ -63,9 +63,12 @@ V1_ROSTER: list[AgentSpec] = [
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="gpt-5.5", role="builder/debugger",
               # --sandbox workspace-write: codex's own seatbelt (P2) — writes scoped to the
-              # worktree cwd (+ tmp), network egress off by default. Stronger than raw
-              # sandbox-exec; the human merge gate (§7) is still the real backstop. The
-              # env-scrub above means this process never sees a sibling agent's secrets.
+              # worktree cwd (+ tmp); executed-command network egress is restricted ONLY if the
+              # host ~/.codex config hasn't re-enabled it, so treat egress as best-effort, NOT
+              # guaranteed. Per design §7 the sandbox is weak; the human merge gate is the real
+              # backstop (PR-4 should pass `-c sandbox_workspace_write.network_access=false`
+              # explicitly + verify). The env-scrub still denies this process every secret it
+              # didn't declare, regardless of sandbox config.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "workspace-write",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "env_passthrough": ["OPENAI_API_KEY"]}),

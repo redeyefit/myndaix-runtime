@@ -91,6 +91,26 @@ def test_cli_env_declared_secret_ref_passes_through():
         del os.environ["HF_KEY"]
 
 
+def test_cli_env_keeps_operational_vars():
+    """Non-secret operational vars (proxy, CA bundle, relocated config dir) survive the
+    scrub so a proxied / non-default-$HOME deploy doesn't brick the agents — while a
+    secret set alongside them is still dropped."""
+    import os
+    ops = {"HTTPS_PROXY": "http://proxy:8080", "NODE_EXTRA_CA_CERTS": "/etc/ca.pem",
+           "XDG_CONFIG_HOME": "/cfg", "CODEX_HOME": "/cfg/codex"}
+    for k, v in ops.items():
+        os.environ[k] = v
+    os.environ["HF_KEY"] = "secret"
+    try:
+        env = _printenv_run(_spec(["printenv"], "stdin"))
+        for k, v in ops.items():
+            assert f"{k}={v}" in env, k
+        assert "HF_KEY" not in env
+    finally:
+        for k in (*ops, "HF_KEY"):
+            del os.environ[k]
+
+
 def test_cli_env_per_agent_passthrough_list():
     """An agent may declare adapter['env_passthrough'] for non-secret vars it needs."""
     import os

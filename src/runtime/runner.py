@@ -40,7 +40,14 @@ _KILL_GRACE_S = 3
 _CLI_ENV_BASE = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG",
     "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR", "TZ",
-    "SSL_CERT_FILE", "SSL_CERT_DIR",        # TLS trust store for tools that make https calls
+    # TLS trust store for tools that make https calls (Node CLIs also honor NODE_EXTRA_CA_CERTS)
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    # proxy config — NON-secret; a corporate/MITM-proxy deploy fails TLS/connect without these
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    # config-dir relocation — claude/codex/agy auth lives under one of these if not default $HOME
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "CODEX_HOME", "CLAUDE_CONFIG_DIR", "GEMINI_CONFIG_DIR",
 )
 _CLI_ENV_PASSTHROUGH = "MYNDAIX_CLI_ENV_PASSTHROUGH"   # operator escape hatch: comma-separated extra var names
 
@@ -53,6 +60,10 @@ def _cli_env(spec: AgentSpec) -> dict[str, str]:
     sr = spec.adapter.get("secret_ref")
     if isinstance(sr, str) and sr:
         allow.add(sr)
+    # env_passthrough is TRUSTED in-source roster data: an entry naming a sibling's secret
+    # (e.g. codex listing HF_KEY) would re-grant exactly what the scrub denies. Safe while the
+    # registry is code; if it ever loads from DB/config, validate entries against sibling
+    # secret names BEFORE this point — this function trusts whatever the spec declares.
     declared = spec.adapter.get("env_passthrough") or []
     if isinstance(declared, (list, tuple)):
         allow.update(e for e in declared if isinstance(e, str) and e)
