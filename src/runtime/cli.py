@@ -25,6 +25,7 @@ DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 
 async def submit(agent: str, task: str, *, context: Optional[dict] = None,
+                 repo_id: Optional[str] = None, base_ref: Optional[str] = None,
                  timeout_s: float = 180.0) -> int:
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
@@ -37,8 +38,10 @@ async def submit(agent: str, task: str, *, context: Optional[dict] = None,
         env = TransportEnvelope(transport="cli", account="cli", sender_id="operator",
                                 reply_target="cli:operator", dedupe_key=str(uuid.uuid4()))
         event_id = await led.ingest_inbound(env, task)
+        # repo_id/base_ref scope the job to a repo bucket (omitted -> NULL -> cap-exempt)
         jid = await led.submit_job(to_agent=agent, prompt=task, context=context,
-                                   inbound_event_id=event_id, created_by="operator")
+                                   inbound_event_id=event_id, created_by="operator",
+                                   repo_id=repo_id, base_ref=base_ref)
         print(f"-> {agent}  (job {str(jid)[:8]})", file=sys.stderr, flush=True)
 
         deadline = time.monotonic() + timeout_s
@@ -93,8 +96,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="input image url (media agents, e.g. higgsfield image->video)")
     p.add_argument("--application", metavar="PATH",
                    help="override the agent's media application/model path")
+    p.add_argument("--repo", metavar="ID", dest="repo_id",
+                   help="repo bucket id for per-repo concurrency (omitted -> cap-exempt)")
+    p.add_argument("--base-ref", metavar="REF", dest="base_ref",
+                   help="base git ref/SHA the work is anchored to (e.g. the reviewed tip)")
     args = p.parse_args(argv)
-    return asyncio.run(submit(args.agent, args.task, context=_build_context(args)))
+    return asyncio.run(submit(args.agent, args.task, context=_build_context(args),
+                              repo_id=args.repo_id, base_ref=args.base_ref))
 
 
 if __name__ == "__main__":

@@ -141,6 +141,54 @@ async def test_jobs_accepts_and_persists_context():
         await led.close()
 
 
+async def test_jobs_accepts_and_persists_repo_scope():
+    """POST /jobs with repo_id/base_ref -> they survive to the leased Job (so the cap
+    in PR-2 can bucket by repo, and a fix chain can anchor to the reviewed SHA)."""
+    app, led = await _fresh_app()
+    c = _client(app)
+    try:
+        r = await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi",
+                                        "repo_id": "fieldvision", "base_ref": "deadbeef"})
+        assert r.status_code == 201, r.text
+        att = await led.lease_job("w1", [])
+        job = await led.get_attempt_job(att)
+        assert job is not None
+        assert job.repo_id == "fieldvision" and job.base_ref == "deadbeef"
+    finally:
+        await c.aclose()
+        await led.close()
+
+
+async def test_jobs_omitted_repo_scope_is_null():
+    """Omitted repo_id/base_ref -> NULL on the Job (cap-exempt, never a shared bucket)."""
+    app, led = await _fresh_app()
+    c = _client(app)
+    try:
+        r = await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi"})
+        assert r.status_code == 201, r.text
+        att = await led.lease_job("w1", [])
+        job = await led.get_attempt_job(att)
+        assert job is not None and job.repo_id is None and job.base_ref is None
+    finally:
+        await c.aclose()
+        await led.close()
+
+
+async def test_repo_scope_validation():
+    app, led = await _fresh_app()
+    c = _client(app)
+    try:
+        # NUL in repo_id/base_ref -> 422, not a Postgres 500 (like context/text fields)
+        assert (await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi",
+                "repo_id": "bad\x00nul"})).status_code == 422
+        # over-bound repo_id -> 422 (DoS guard)
+        assert (await c.post("/jobs", json={"to_agent": "api-echo", "prompt": "hi",
+                "base_ref": "x" * 300})).status_code == 422
+    finally:
+        await c.aclose()
+        await led.close()
+
+
 async def test_context_validation():
     app, led = await _fresh_app()
     c = _client(app)

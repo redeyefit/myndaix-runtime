@@ -16,6 +16,7 @@ mkdir -p "$FAKE/.local/bin"
 cat > "$FAKE/.local/bin/mxr" <<'STUB'
 #!/usr/bin/env bash
 agent="$1"; prompt="$2"
+printf '%s\t%s\n' "$agent" "$*" >> "$HOME/.myndaix/mxr-argv.log" 2>/dev/null || true   # PR-0a: record argv so the test can assert scope flags
 case "$prompt" in
   *READY*) [[ "${STUB_CANARY_FAIL:-}" == "$agent" ]] && exit 1; echo READY; exit 0 ;;
 esac
@@ -67,6 +68,12 @@ echo "12. delivery failure is NOT deduped"; reset; mkdir -p "$INBOX"; chmod 000 
 echo "13. empty PLAY_IMESSAGE_TO disables the ping"; reset; PLAY_IMESSAGE_TO="" STUB_TRIAGE="PLAY_PASS" run; ck "still delivers PASS" "review PASS"; cknofile "$FAKE/.myndaix/osascript-calls" "no iMessage send when disabled"
 echo "14. same SHA on a DIFFERENT ref does not confirm"; reset; bare="$ROOT/bare.git"; git init -q --bare "$bare"; git -C "$REPO" push -q "$bare" "$TIP:refs/heads/other" 2>/dev/null; STUB_TRIAGE="PLAY_PASS" run "$bare"; cknofile "$STATE/done-$TIP" "tip on wrong ref not deduped"
 echo "15. SHA on the TARGET ref confirms"; reset; bare2="$ROOT/bare2.git"; git init -q --bare "$bare2"; git -C "$REPO" push -q "$bare2" "$TIP:refs/heads/main" 2>/dev/null; STUB_TRIAGE="PLAY_PASS" run "$bare2"; ckfile "$STATE/done-$TIP" "tip on target ref deduped"
+
+echo "16. PR-0a: scope flags forwarded to mxr (repo bucket + reviewed SHA)"; reset; STUB_TRIAGE="PLAY_PASS" run
+  rid="$(basename "$REPO")"; log="$FAKE/.myndaix/mxr-argv.log"
+  nscoped="$(grep -c -- "--repo $rid --base-ref $TIP" "$log" 2>/dev/null || true)"; [[ "$nscoped" =~ ^[0-9]+$ ]] || nscoped=0
+  if [[ "$nscoped" -eq 2 ]]; then echo "  ok: review+triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 2 scoped mxr calls, got $nscoped"; FAIL=$((FAIL+1)); fi
+  if grep -q "READY.*--repo" "$log" 2>/dev/null; then echo "  FAIL: canary must stay cap-exempt"; FAIL=$((FAIL+1)); else echo "  ok: canary cap-exempt (no --repo)"; PASS=$((PASS+1)); fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
