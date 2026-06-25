@@ -41,16 +41,12 @@ play="$(date +%Y%m%d%H%M%S)-$$"
 run="$RUNS/$play"
 mkdir -p "$RUNS" "$STATE" "$INBOX"
 ( umask 077; mkdir -p "$run" )                          # 0700 run dir: holds the private patch copy
+RUN_CANON="$(cd "$run" && pwd -P)"                       # canonical: sandbox read-deny must match (C1)
 nonce="$(openssl rand -hex 16)"                          # DELIVERY fence — NEVER shown to codex
 prompt_nonce="$(openssl rand -hex 16)"                   # codex-input fence (codex sees this one only)
 verdict="UNVERIFIED"; reason=""; flags=""
-# Sandboxed execution (worktrees + scratch) MUST live OUTSIDE the read-denied $ORCH/$HOME/.myndaix
-# tree: git & friends traverse ANCESTOR dirs (repo discovery, realpath) and die if an ancestor is
-# read-denied ("Invalid path ... Operation not permitted"). The private patch + logs stay in $run
-# (under $ORCH, unreadable by the sandbox; the patch is applied by the trusted parent, not in-sandbox).
-EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")"
-trap 'rm -rf "$EXEC" 2>/dev/null || true' EXIT          # early-abort safety; replaced by cleanup() below
-SCRATCH_HOME="$EXEC/home"; SCRATCH_TMP="$EXEC/tmp"; mkdir -p "$SCRATCH_HOME" "$SCRATCH_TMP"
+# NOTE: $EXEC (sandboxed worktrees + scratch) is created AFTER fail_closed is defined and just
+# before the lock — see the "exec dir" block below. It must live OUTSIDE the read-denied tree.
 
 note(){ printf '[%s] [play-fix] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$run/play.log" 2>/dev/null || true; }
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }
@@ -107,6 +103,10 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
   # literal, NOT a subpath: containment (net-deny, real-FS write-deny, secret-read-deny) unchanged.
   prof="$prof(allow file-write* (literal \"/dev/null\"))"
   prof="$prof(deny file-read* (subpath \"$HOME/.myndaix\"))(deny file-read* (subpath \"$HOME/.ssh\"))(deny file-read* (subpath \"$HOME/.aws\"))(deny file-read* (subpath \"$HOME/.gnupg\"))(deny file-read* (subpath \"$HOME/.config\"))"
+  # The private patch (0400) lives in $run; chmod alone does NOT stop same-user sandboxed code from
+  # reading it — only this read-deny does. Deny $run explicitly (canonical) so it holds for ANY $ORCH,
+  # not just one under $HOME/.myndaix (codex C1). $run is never under $EXEC, so this can't block the test.
+  prof="$prof(deny file-read* (subpath \"$RUN_CANON\"))"
   set -m 2>/dev/null || true                            # each bg job gets its own process group
   ( cd "$cwd" && exec env -i PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
       HOME="$sh" TMPDIR="$st" PYTHONDONTWRITEBYTECODE=1 \
@@ -164,7 +164,12 @@ if [[ -n "$f2p_selector" ]]; then
   [[ "$f2p_selector" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "fail_to_pass selector has illegal characters"
   [[ "$f2p_selector" != /* ]] || fail_closed "fail_to_pass selector must be a relative in-repo path"
   [[ "$f2p_selector" != *..* ]] || fail_closed "fail_to_pass selector must not contain '..'"
-  git -C "$repo_path" cat-file -e "${base_sha}:${f2p_selector}" 2>/dev/null || fail_closed "fail_to_pass selector '$f2p_selector' is not a tracked file at base ${base_sha:0:8}"
+  [[ "$f2p_selector" != -* ]] || fail_closed "fail_to_pass selector must not start with '-' (would be parsed as a flag)"   # C3
+  # Existence is NOT enough: a tracked SYMLINK (mode 120000) or tree/gitlink could redirect the
+  # "proof" to a NON-test file the patch can then doctor without tripping the test-tamper gate
+  # (codex C2). Require a REGULAR blob at base.
+  f2p_mode="$(git -C "$repo_path" ls-tree "$base_sha" -- "$f2p_selector" 2>/dev/null | awk 'NR==1{print $1}')"
+  [[ "$f2p_mode" == "100644" || "$f2p_mode" == "100755" ]] || fail_closed "fail_to_pass selector '$f2p_selector' must be a regular tracked file at base ${base_sha:0:8} (got mode '${f2p_mode:-none}')"
   f2p_tmpl_json="$(jq -c --arg r "$repo_id" '.[$r].fail_to_pass_template // empty' "$REPOS_JSON")"
   [[ "$(printf '%s' "$f2p_tmpl_json" | jq -r 'type' 2>/dev/null)" == "array" ]] || fail_closed "fail_to_pass_template missing/not an array but a selector was supplied"
   [[ "$(printf '%s' "$f2p_tmpl_json" | jq '[.[] | select(. == "{TEST}")] | length')" == "1" ]] || fail_closed "fail_to_pass_template must contain exactly one {TEST} placeholder"
@@ -177,8 +182,28 @@ if ! mkdir "$lock" 2>/dev/null; then
   now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
   if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; mkdir "$lock" 2>/dev/null || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
 fi
-cleanup(){ for w in "$EXEC/verify-wt" "$EXEC/precheck-wt"; do [[ -e "$w" ]] && { git -C "$repo_path" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w"; }; done; git -C "$repo_path" worktree prune >/dev/null 2>&1 || true; rm -rf "$EXEC" "$lock" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+# exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
+# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined.
+EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")"
+trap 'rm -rf "$EXEC" 2>/dev/null || true' EXIT          # covers a validation abort; replaced once cleanup is set
+trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
+EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
+HOME_CANON="$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")"   # compare canonical-vs-canonical (symlinked HOME)
+case "$EXEC" in "$HOME_CANON/.myndaix"*|"$HOME_CANON/.ssh"*|"$HOME_CANON/.aws"*|"$HOME_CANON/.gnupg"*|"$HOME_CANON/.config"*) fail_closed "TMPDIR resolved under a read-denied path ($EXEC) — set TMPDIR elsewhere";; esac
+[[ "$EXEC" == /* && "$EXEC" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "exec dir path unsafe for the sandbox profile: $EXEC"
+[[ "$RUN_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "run dir path unsafe for the sandbox profile: $RUN_CANON"
+SCRATCH_HOME="$EXEC/home"; SCRATCH_TMP="$EXEC/tmp"; mkdir -p "$SCRATCH_HOME" "$SCRATCH_TMP"
+# untrusted patched code runs with write access to $EXEC and can chmod 000 / chflags uchg files to
+# sabotage cleanup (Oracle O3 DoS) — strip immutables + restore perms BEFORE removing.
+cleanup(){
+  chflags -R nouchg "$EXEC" >/dev/null 2>&1 || true
+  chmod -R u+rwX "$EXEC" >/dev/null 2>&1 || true
+  for w in "$EXEC/verify-wt" "$EXEC/precheck-wt"; do [[ -e "$w" ]] && { git -C "$repo_path" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w" 2>/dev/null || true; }; done
+  git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
+  rm -rf "$EXEC" "$lock" 2>/dev/null || true
+}
+trap cleanup EXIT                                       # full reap once we hold the lock + own $EXEC
+trap 'exit 143' INT TERM                                # signals route through EXIT -> cleanup, never resume (O2)
 find "$RUNS" -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev/null || true
 
 day="$STATE/count-$(date +%Y%m%d)"

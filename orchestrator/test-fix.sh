@@ -23,6 +23,7 @@ printf 'print("ok")\n' > "$REPO/test_other.py"
 # else PermissionError -> verify fails -> UNVERIFIED (regression test for the sandbox hardening)
 printf 'open("/dev/null","w").write("x")\nprint("ok")\n' > "$REPO/test_devnull.py"
 printf 'x = 1\n' > "$REPO/dummy.py"     # a tracked file to rename in the bypass test
+ln -s calc.py "$REPO/test_link.py"      # a tracked SYMLINK (mode 120000) for the C2 selector test
 git -C "$REPO" add -A
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm init
 BASE="$(git -C "$REPO" rev-parse HEAD)"
@@ -185,6 +186,17 @@ rm -f "$INBOX"/*.md 2>/dev/null || true
 HOME="$TMP" MYNDAIX_ORCH="$DENIED_ORCH" MYNDAIX_REPOS_JSON="$DENIED_ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
   MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
 check "read-denied run dir" REGRESSION_CHECK_ONLY
+
+echo "22. selector is a tracked SYMLINK -> ABORTED (codex C2: must be a regular blob)"
+run_sel fixture "$TMP/good.patch" "test_link.py"; check "selector symlink" ABORTED
+echo "23. selector starts with '-' -> ABORTED (codex C3: no flag injection)"
+run_sel fixture "$TMP/good.patch" "-rf"; check "selector leading-dash" ABORTED
+echo "24. TMPDIR under a read-denied path -> ABORTED (codex C4)"
+rm -f "$INBOX"/*.md 2>/dev/null || true
+BADTMP="$TMP/.myndaix/tmp"; mkdir -p "$BADTMP"
+HOME="$TMP" TMPDIR="$BADTMP" MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+check "TMPDIR under denied path" ABORTED
 
 echo
 echo "=== $pass passed, $fail failed ==="
