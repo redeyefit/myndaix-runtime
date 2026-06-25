@@ -68,6 +68,51 @@ async def test_pool_concurrent_exactly_once():
         await led.close()
 
 
+async def test_pool_cap_binds_at_size_8():
+    """PR-3 gate: with pool=8 > MAX_PER_REPO, the per-repo cap actually BINDS. A single
+    flooded repo never runs more than the cap of the 8 workers AT ONCE (sampled LIVE
+    during the drain, not just post-hoc), while a cold repo still drains (not starved).
+    This is what the cap buys that pool=4 (<= cap) couldn't exercise."""
+    _register()
+    led = await _fresh()
+    led.MAX_PER_REPO = 3
+    try:
+        for i in range(12):
+            await led.submit_job(to_agent="pool-slow", prompt=f"hot {i}", repo_id="hot")
+        for i in range(4):
+            await led.submit_job(to_agent="pool-slow", prompt=f"cold {i}", repo_id="cold")
+        pool = WorkerPool(led, size=8, janitor_interval_s=0.1)
+        await pool.start()
+        max_hot = 0
+        try:
+            for _ in range(500):                          # sample up to ~10s
+                async with led._pool.acquire() as con:
+                    hot_open = await con.fetchval(
+                        "SELECT count(*) FROM attempt a JOIN job j ON j.id=a.job_id "
+                        "WHERE a.status='open' AND j.repo_id='hot' "
+                        "AND j.status IN ('leased','running')")
+                    remaining = await con.fetchval(
+                        "SELECT count(*) FROM job WHERE status IN ('queued','leased','running')")
+                max_hot = max(max_hot, hot_open)
+                if remaining == 0:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await pool.stop()
+        assert max_hot <= 3, f"CAP BREACHED at pool=8: saw {max_hot} concurrent on 'hot' (max 3)"
+        assert max_hot >= 2, f"cap never engaged (only {max_hot} concurrent on 'hot') — pool not 8-wide?"
+        async with led._pool.acquire() as con:
+            done = await con.fetchval("SELECT count(*) FROM job WHERE status='done'")
+            cold_done = await con.fetchval(
+                "SELECT count(*) FROM job WHERE repo_id='cold' AND status='done'")
+            workers = await con.fetchval("SELECT count(DISTINCT worker_id) FROM attempt")
+        assert done == 16, f"not all jobs drained: {done}/16"
+        assert cold_done == 4, f"cold repo starved by the capped hot repo: {cold_done}/4 done"
+        assert workers > 3, f"pool didn't use >cap workers ({workers}) — the cap can't have bound"
+    finally:
+        await led.close()
+
+
 async def test_pool_recovers_crashed_worker():
     _register()
     led = await _fresh()
