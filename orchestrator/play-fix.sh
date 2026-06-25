@@ -44,7 +44,13 @@ mkdir -p "$RUNS" "$STATE" "$INBOX"
 nonce="$(openssl rand -hex 16)"                          # DELIVERY fence — NEVER shown to codex
 prompt_nonce="$(openssl rand -hex 16)"                   # codex-input fence (codex sees this one only)
 verdict="UNVERIFIED"; reason=""; flags=""
-SCRATCH_HOME="$run/home"; SCRATCH_TMP="$run/tmp"; mkdir -p "$SCRATCH_HOME" "$SCRATCH_TMP"
+# Sandboxed execution (worktrees + scratch) MUST live OUTSIDE the read-denied $ORCH/$HOME/.myndaix
+# tree: git & friends traverse ANCESTOR dirs (repo discovery, realpath) and die if an ancestor is
+# read-denied ("Invalid path ... Operation not permitted"). The private patch + logs stay in $run
+# (under $ORCH, unreadable by the sandbox; the patch is applied by the trusted parent, not in-sandbox).
+EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")"
+trap 'rm -rf "$EXEC" 2>/dev/null || true' EXIT          # early-abort safety; replaced by cleanup() below
+SCRATCH_HOME="$EXEC/home"; SCRATCH_TMP="$EXEC/tmp"; mkdir -p "$SCRATCH_HOME" "$SCRATCH_TMP"
 
 note(){ printf '[%s] [play-fix] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$run/play.log" 2>/dev/null || true; }
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }
@@ -96,6 +102,10 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
   local prof
   prof="(version 1)(allow default)(deny network*)(deny file-write*)"
   prof="$prof(allow file-write* (subpath \"$cwd\"))(allow file-write* (subpath \"$st\"))(allow file-write* (subpath \"$sh\"))"
+  # /dev/null discards writes (cannot exfil or mutate the FS) but tools fail hard without it
+  # (git, pytest, most CLIs open it) — without this the whole suite returns UNVERIFIED. Single
+  # literal, NOT a subpath: containment (net-deny, real-FS write-deny, secret-read-deny) unchanged.
+  prof="$prof(allow file-write* (literal \"/dev/null\"))"
   prof="$prof(deny file-read* (subpath \"$HOME/.myndaix\"))(deny file-read* (subpath \"$HOME/.ssh\"))(deny file-read* (subpath \"$HOME/.aws\"))(deny file-read* (subpath \"$HOME/.gnupg\"))(deny file-read* (subpath \"$HOME/.config\"))"
   set -m 2>/dev/null || true                            # each bg job gets its own process group
   ( cd "$cwd" && exec env -i PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
@@ -116,9 +126,9 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
 # ----------------------------------------------------------------------------
 # 1. args + trusted resolution (fail-closed)
 # ----------------------------------------------------------------------------
-[[ $# -eq 3 ]] || fail_closed "usage: play-fix.sh <repo_id> <base_sha> <fix-list-file>"
-repo_id="$1"; base_sha="$2"; fixlist_file="$3"
-note "start repo_id=$repo_id base_sha=$base_sha"
+[[ $# -ge 3 && $# -le 4 ]] || fail_closed "usage: play-fix.sh <repo_id> <base_sha> <fix-list-file> [<fail_to_pass-selector>]"
+repo_id="$1"; base_sha="$2"; fixlist_file="$3"; f2p_selector="${4:-}"
+note "start repo_id=$repo_id base_sha=$base_sha selector=${f2p_selector:-none}"
 
 command -v jq >/dev/null 2>&1 || fail_closed "jq required"
 # verify MUST run sandboxed — refuse the whole run up front if no sandbox (codex BLOCKER 1)
@@ -145,6 +155,21 @@ abs_argv(){ # abs_argv <json> -> JV[] ; fail_closed unless non-empty array w/ ab
 verify_argv_json="$(jq -c --arg r "$repo_id" '.[$r].verify // empty' "$REPOS_JSON")"
 build_argv_json="$(jq -c --arg r "$repo_id" '.[$r].build // empty' "$REPOS_JSON")"
 f2p_argv_json="$(jq -c --arg r "$repo_id" '.[$r].fail_to_pass // empty' "$REPOS_JSON")"
+# A per-fix fail_to_pass SELECTOR (4th arg) chooses WHICH existing test proves the bug. It can
+# never be an argv: it is a single in-repo path, substituted into the {TEST} slot of a TRUSTED
+# fail_to_pass_template from repos.json (interpreter/PYTHONPATH/flags stay operator-controlled).
+# Validated as a relative, traversal-free, metachar-free path that is a TRACKED file at base.
+# No selector -> static .fail_to_pass (fully back-compatible).
+if [[ -n "$f2p_selector" ]]; then
+  [[ "$f2p_selector" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "fail_to_pass selector has illegal characters"
+  [[ "$f2p_selector" != /* ]] || fail_closed "fail_to_pass selector must be a relative in-repo path"
+  [[ "$f2p_selector" != *..* ]] || fail_closed "fail_to_pass selector must not contain '..'"
+  git -C "$repo_path" cat-file -e "${base_sha}:${f2p_selector}" 2>/dev/null || fail_closed "fail_to_pass selector '$f2p_selector' is not a tracked file at base ${base_sha:0:8}"
+  f2p_tmpl_json="$(jq -c --arg r "$repo_id" '.[$r].fail_to_pass_template // empty' "$REPOS_JSON")"
+  [[ "$(printf '%s' "$f2p_tmpl_json" | jq -r 'type' 2>/dev/null)" == "array" ]] || fail_closed "fail_to_pass_template missing/not an array but a selector was supplied"
+  [[ "$(printf '%s' "$f2p_tmpl_json" | jq '[.[] | select(. == "{TEST}")] | length')" == "1" ]] || fail_closed "fail_to_pass_template must contain exactly one {TEST} placeholder"
+  f2p_argv_json="$(printf '%s' "$f2p_tmpl_json" | jq -c --arg t "$f2p_selector" 'map(if . == "{TEST}" then $t else . end)')"
+fi
 
 # --- global lock (one fix at a time), stale-reaped; trap reaps worktrees + bg children ---
 lock="$STATE/lock"
@@ -152,7 +177,7 @@ if ! mkdir "$lock" 2>/dev/null; then
   now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
   if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; mkdir "$lock" 2>/dev/null || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
 fi
-cleanup(){ for w in "$run/verify-wt" "$run/precheck-wt"; do [[ -e "$w" ]] && { git -C "$repo_path" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w"; }; done; git -C "$repo_path" worktree prune >/dev/null 2>&1 || true; rm -rf "$lock" 2>/dev/null || true; }
+cleanup(){ for w in "$EXEC/verify-wt" "$EXEC/precheck-wt"; do [[ -e "$w" ]] && { git -C "$repo_path" worktree remove --force "$w" >/dev/null 2>&1 || rm -rf "$w"; }; done; git -C "$repo_path" worktree prune >/dev/null 2>&1 || true; rm -rf "$EXEC" "$lock" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 find "$RUNS" -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev/null || true
 
@@ -212,7 +237,7 @@ note "patch sha256=$patch_sha"
 # ----------------------------------------------------------------------------
 # 3. patch-policy gate (BEFORE any execution) — NUL-safe exact paths
 # ----------------------------------------------------------------------------
-vwt="$run/verify-wt"
+vwt="$EXEC/verify-wt"
 git -C "$repo_path" worktree add --detach "$vwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create verify worktree"
 git -C "$vwt" clean -fdx >/dev/null 2>&1 || true
 
@@ -244,7 +269,7 @@ abs_argv "$verify_argv_json" verify; VERIFY=("${JV[@]}")
 abs_argv "$f2p_argv_json" fail_to_pass; F2P=("${JV[@]}")
 
 # clean-base precheck in a SEPARATE pristine worktree: target must FAIL on clean base
-pwt="$run/precheck-wt"
+pwt="$EXEC/precheck-wt"
 git -C "$repo_path" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
 if run_sandboxed "$pwt" "${F2P[@]}" >/dev/null 2>&1; then
   finish "UNVERIFIED" "fail_to_pass already passes on the clean base (flake or no real bug)" "$patch"
