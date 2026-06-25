@@ -71,10 +71,12 @@ V1_ROSTER: list[AgentSpec] = [
               # effort: a hardened ~/.codex could still override; the human merge gate remains the
               # real backstop). The env-scrub still denies this process every secret it didn't
               # declare, regardless of sandbox config.
+              # scratch_home: run under a throwaway HOME seeded with only codex's auth (PR-4
+              # fix-stage containment) so an injected fix-list can't read ~/.ssh/~/.aws/~/.myndaix.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "workspace-write",
                        "-c", "sandbox_workspace_write.network_access=false",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
-                       "env_passthrough": ["OPENAI_API_KEY"]}),
+                       "env_passthrough": ["OPENAI_API_KEY"], "scratch_home": True}),
     AgentSpec(agent_id="oracle", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gemini-3.1-pro", role="reviewer/vision",
               # `agy` is the Gemini CLI (the standalone gemini-cli individual tier was retired)

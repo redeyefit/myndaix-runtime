@@ -13,8 +13,10 @@ import asyncio
 import ipaddress
 import math
 import os
+import shutil
 import signal
 import socket
+import tempfile
 import time
 import urllib.parse
 from typing import Optional
@@ -73,6 +75,40 @@ def _cli_env(spec: AgentSpec) -> dict[str, str]:
             allow.add(extra)
     return {k: v for k, v in os.environ.items() if k in allow}
 
+
+# Files copied from the agent's real config dir into a scratch HOME (the auth material
+# it needs, and nothing else). codex authenticates via auth.json (ChatGPT login); the
+# env key alone does NOT auth (verified: 401), so we MUST seed it.
+_SCRATCH_HOME_SEED = {"codex": (".codex", ("auth.json", "config.toml"))}
+
+
+def _make_scratch_home(spec: AgentSpec, env: dict[str, str]) -> tuple[dict[str, str], Optional[str]]:
+    """For an agent declaring adapter.scratch_home, run it under a private throwaway HOME
+    seeded with ONLY its auth material — so a workspace-actor that writes code (codex fix
+    stage) can't read the operator's ~/.ssh, ~/.aws, ~/.myndaix, or other host dotfiles via
+    an injected fix-list. Returns (env, scratch_dir_to_cleanup_or_None). Falls back to the
+    unmodified env if the auth source is missing (auth would fail either way; don't half-break)."""
+    if not spec.adapter.get("scratch_home"):
+        return env, None
+    cfgdir, files = _SCRATCH_HOME_SEED.get(spec.agent_id, (None, ()))
+    real = os.environ.get("CODEX_HOME") if spec.agent_id == "codex" else None
+    real = real or (os.path.join(os.path.expanduser("~"), cfgdir) if cfgdir else None)
+    if not real or not os.path.isfile(os.path.join(real, files[0] if files else "")):
+        return env, None                       # no auth to seed -> leave env as-is (fail visibly later)
+    home = tempfile.mkdtemp(prefix="mdx-fixhome-")
+    dst = os.path.join(home, cfgdir)
+    os.makedirs(dst, mode=0o700, exist_ok=True)
+    for f in files:
+        src = os.path.join(real, f)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dst, f))
+    env = dict(env)
+    env["HOME"] = home
+    # force the agent to resolve its config under the scratch HOME, not a host override
+    for k in ("CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+        env.pop(k, None)
+    return env, home
+
 # Higgsfield polling constants
 _HF_POLL_INTERVAL_S = 2
 _HF_POLL_RETRY_MAX = 3
@@ -104,40 +140,48 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     else:
         stdin_data = job.prompt.encode()
 
+    # scratch HOME (fix-stage containment): a workspace-actor that WRITES code runs under a
+    # throwaway HOME seeded with only its auth, so an injected fix-list can't make it read the
+    # operator's ~/.ssh/~/.aws/~/.myndaix. No-op (scratch=None) for agents without the flag.
+    env, scratch = _make_scratch_home(spec, _cli_env(spec))
     started = time.monotonic()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=job.worktree_path or None,
-            env=_cli_env(spec),      # scrubbed allowlist: no inherited secrets (P2 containment)
-            start_new_session=True,  # own process group -> killpg reaches every child
-        )
-    except (FileNotFoundError, PermissionError, NotADirectoryError, OSError) as e:
-        # a misconfigured argv/cwd is a TERMINAL failure, NOT a crash - the worker
-        # must record it and stay alive (a poison job can't take down the fleet).
-        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                      text=f"spawn failed: {e}", ms=_ms(started))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=job.worktree_path or None,
+                env=env,                 # scrubbed allowlist (+ scratch HOME): no inherited secrets (P2)
+                start_new_session=True,  # own process group -> killpg reaches every child
+            )
+        except (FileNotFoundError, PermissionError, NotADirectoryError, OSError) as e:
+            # a misconfigured argv/cwd is a TERMINAL failure, NOT a crash - the worker
+            # must record it and stay alive (a poison job can't take down the fleet).
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                          text=f"spawn failed: {e}", ms=_ms(started))
 
-    comm = proc.communicate(stdin_data) if stdin_data is not None else proc.communicate()
-    try:
-        out, err = await asyncio.wait_for(comm, timeout=job.timeout_s)
-    except asyncio.TimeoutError:
-        _kill_group(proc.pid)
-        await _reap(proc)
-        return Result(
-            status=ResultStatus.TIMEOUT, error_class=ErrorClass.RETRYABLE,
-            text=f"timeout after {job.timeout_s}s", ms=_ms(started),
-        )
-    except asyncio.CancelledError:
-        # cancelled (lease lost mid-run / pool shutdown) -> kill the process group
-        # so no orphaned child keeps burning, then propagate. shield the reap so a
-        # SECOND cancellation can't interrupt the SIGKILL escalation in _reap.
-        _kill_group(proc.pid)
-        await asyncio.shield(_reap(proc))
-        raise
+        comm = proc.communicate(stdin_data) if stdin_data is not None else proc.communicate()
+        try:
+            out, err = await asyncio.wait_for(comm, timeout=job.timeout_s)
+        except asyncio.TimeoutError:
+            _kill_group(proc.pid)
+            await _reap(proc)
+            return Result(
+                status=ResultStatus.TIMEOUT, error_class=ErrorClass.RETRYABLE,
+                text=f"timeout after {job.timeout_s}s", ms=_ms(started),
+            )
+        except asyncio.CancelledError:
+            # cancelled (lease lost mid-run / pool shutdown) -> kill the process group
+            # so no orphaned child keeps burning, then propagate. shield the reap so a
+            # SECOND cancellation can't interrupt the SIGKILL escalation in _reap.
+            _kill_group(proc.pid)
+            await asyncio.shield(_reap(proc))
+            raise
+    finally:
+        if scratch:                      # the seeded auth copy is transient — always remove it
+            shutil.rmtree(scratch, ignore_errors=True)
 
     code = proc.returncode
     if code == 0:
