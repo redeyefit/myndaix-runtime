@@ -27,7 +27,7 @@ TARGET_GLOB="refs/heads/*"                          # review pushes to ANY branc
 BASE_REF="main"                                     # a new branch's first push is diffed against this
 MAX_DIFF=65536                                      # ~64KB; bounded by the 300s review budget (tune with data)
 ERR_CAP=1000000
-DAILY_CAP=20
+DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
 STALE=1800                                          # reap a lock older than 30 min (hung/killed worker)
 PRUNE_DAYS=14
 ZERO=0000000000000000000000000000000000000000
