@@ -2,7 +2,7 @@
 
 _North-star rung 4. v1 = the brain auto-merges **docs-only** PRs behind a hard gate. First removal of the human merge gate. Prior-art: `docs/automerge-research.md`. Status: **revised after a 34-agent adversarial design workflow (12 confirmed findings); awaiting Jefe prereq decisions + plan approval BEFORE any merge code ships.** Workflow result: `docs/reviews/automerge-design-v0.1-adversarial-workflow.md`._
 
-**Decisions locked (Jefe):** safe class = **docs-only**; target = **auto-merge green human-authored PRs** (brain gates+merges, never authors). Defaults: **OFF by default**, revertible, hard gate, no *code* auto-merge to the runtime.
+**Decisions locked (Jefe):** safe class = **docs-only**; target = **auto-merge green human-authored PRs** (brain gates+merges, never authors). Defaults: **OFF by default**, revertible, hard gate, no *code* auto-merge to the runtime. **v0.2 prereq decisions (2026-06-26):** (a) **add branch protection to `main`** requiring the `test` check — the brain merges *within* it (a real GitHub-side backstop behind our gate); (b) **author allowlist = `redeyefit` (Jefe) only** for v1; (c) gh-auth-for-launchd (file token / fine-grained PAT) is a deploy-time provisioning step (Jefe).
 
 ### v0.2 changelog — folded the adversarial workflow (12 confirmed; the design rests on a tiny set of must-be-perfect invariants)
 - **B1 atomic merge:** bare `gh pr merge --merge` can *enable deferred auto-merge / add to a merge queue* and exit 0 without merging the commit we judged. → use **`--match-head-commit H`** (server rejects if head moved), **refuse any base with a merge queue**, and **post-merge assert** `state==MERGED` (not `autoMergeRequest`/OPEN) else disable-auto + leave for human.
