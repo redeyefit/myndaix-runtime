@@ -13,6 +13,7 @@ Run:
         PYTHONPATH=src python3 tests/test_postgres_ledger.py
 """
 import asyncio
+import datetime as _dt
 import inspect
 import os
 
@@ -46,7 +47,7 @@ async def _truncate(led: PostgresLedger) -> None:
     async with led._pool.acquire() as con:
         await con.execute(
             "TRUNCATE inbound_event, job, attempt, attempt_log, outbound, dead_letter, "
-            "repo_concurrency RESTART IDENTITY CASCADE")
+            "repo_concurrency, review_cursor RESTART IDENTITY CASCADE")
 
 
 async def _expire_lease(led: PostgresLedger, attempt_id) -> None:
@@ -54,6 +55,14 @@ async def _expire_lease(led: PostgresLedger, attempt_id) -> None:
         await con.execute(
             "UPDATE attempt SET lease_expires_at = statement_timestamp() - interval '1 second' "
             "WHERE id = $1", attempt_id)
+
+
+async def _age_cursor(led: PostgresLedger, repo_id, ref) -> None:
+    """Push a cursor's updated_at an hour into the past so a stale-pending re-claim fires."""
+    async with led._pool.acquire() as con:
+        await con.execute(
+            "UPDATE review_cursor SET updated_at = now() - interval '1 hour' "
+            "WHERE repo_id = $1 AND ref = $2", repo_id, ref)
 
 
 # -- invariant 1: no double-lease ----------------------------------------------
@@ -467,6 +476,114 @@ async def test_submit_idempotent_on_inbound_event(led: PostgresLedger) -> None:
     async with led._pool.acquire() as con:
         n = await con.fetchval("SELECT count(*) FROM job WHERE inbound_event_id=$1", ev)
     assert n == 1, f"expected exactly 1 job per inbound_event, got {n}"
+
+
+def _utcnow() -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+# -- controller-loop cursor: baseline seeds once, then dispatch -> advance ------
+async def test_cursor_baseline_seed_and_advance(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "myndaix-runtime", "refs/heads/main", "a" * 40, "b" * 40
+    far_past = _utcnow() - _dt.timedelta(hours=1)
+
+    assert await led.upsert_baseline(R, REF, A) is True, "first sight must seed the baseline"
+    assert await led.upsert_baseline(R, REF, B) is False, "must NOT re-seed an existing cursor"
+    cur = await led.get_cursor(R, REF)
+    assert cur["baseline_sha"] == A and cur["reviewed_sha"] == A
+    assert cur["state"] == "baseline" and cur["pending_sha"] is None
+
+    # baseline head == reviewed -> claiming the SAME sha is refused (already reviewed)
+    assert await led.claim_dispatch(R, REF, A, far_past) is False, "no review of the baseline sha"
+    # HEAD advanced to B -> claim wins, marks in-flight
+    assert await led.claim_dispatch(R, REF, B, far_past) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["pending_sha"] == B and cur["state"] == "dispatching" and cur["attempts"] == 1
+    # a fresh same-head claim is refused (in flight)
+    assert await led.claim_dispatch(R, REF, B, far_past) is False, "in-flight head must not re-claim"
+    # delivery confirmed -> advance the cursor to B
+    assert await led.advance_cursor(R, REF, B) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["reviewed_sha"] == B and cur["pending_sha"] is None
+    assert cur["state"] == "delivered" and cur["attempts"] == 0
+    # advancing a head we didn't dispatch is a no-op
+    assert await led.advance_cursor(R, REF, "c" * 40) is False
+
+
+# -- controller-loop cursor: concurrent claims -> EXACTLY one winner -----------
+async def test_cursor_claim_is_single_winner(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "fieldvision", "refs/heads/main", "1" * 40, "2" * 40
+    far_past = _utcnow() - _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    # 8 connections race to claim the same advanced head; the cursor CAS must elect one.
+    results = await asyncio.gather(*[led.claim_dispatch(R, REF, B, far_past) for _ in range(8)])
+    assert sum(results) == 1, f"exactly one claim must win, got {sum(results)}"
+
+
+# -- controller-loop cursor: stale re-claim, then block, then a new head escapes
+async def test_cursor_stale_reclaim_and_block(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B, C = "repoX", "refs/heads/main", "1" * 40, "2" * 40, "3" * 40
+    await led.upsert_baseline(R, REF, A)
+
+    assert await led.claim_dispatch(R, REF, B, _utcnow()) is True  # attempt 1
+    # not stale yet -> a re-claim with a far-past cutoff is refused
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - _dt.timedelta(hours=1)) is False
+    # age it -> a stale same-head re-claim now fires and increments attempts
+    await _age_cursor(led, R, REF)
+    assert await led.claim_dispatch(R, REF, B, _utcnow()) is True
+    assert (await led.get_cursor(R, REF))["attempts"] == 2, "stale re-claim increments attempts"
+
+    # ceiling reached -> block (CAS: only fires for THIS pending head at the ceiling)
+    assert await led.mark_blocked(R, REF, B, 2) is True
+    assert await led.mark_blocked(R, REF, "9" * 40, 2) is False, "CAS must not block a different head"
+    await _age_cursor(led, R, REF)
+    assert await led.claim_dispatch(R, REF, B, _utcnow()) is False, "blocked head must not re-claim"
+    # but a NEW head escapes the block and resets attempts to 1
+    assert await led.claim_dispatch(R, REF, C, _utcnow()) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["pending_sha"] == C and cur["state"] == "dispatching" and cur["attempts"] == 1
+
+
+# -- controller-loop cursor: in-flight head is NOT superseded by a new head ----
+async def test_cursor_no_supersede_in_flight(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B, C = "repoY", "refs/heads/main", "1" * 40, "2" * 40, "3" * 40
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - _dt.timedelta(hours=1)) is True
+    # a NEW head C arrives while B is freshly in flight -> must NOT claim (wait for B)
+    assert await led.claim_dispatch(R, REF, C, _utcnow() - _dt.timedelta(hours=1)) is False
+    assert (await led.get_cursor(R, REF))["pending_sha"] == B, "pending must stay on the in-flight head"
+
+
+# -- controller-loop cursor: release_dispatch un-sticks a failed trigger -------
+async def test_release_dispatch(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoR", "refs/heads/main", "1" * 40, "2" * 40
+    hour = _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # attempt 1
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is False, "fresh in-flight -> no re-claim"
+    # a trigger failure releases the dispatch -> immediate re-claim, attempts climbs to the ceiling
+    assert await led.release_dispatch(R, REF, B) is True
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # attempt 2 (no 1h wait)
+    assert (await led.get_cursor(R, REF))["attempts"] == 2, "release preserves the attempt count"
+    # release only matches the pending + dispatching head
+    assert await led.release_dispatch(R, REF, "9" * 40) is False
+
+
+# -- controller-loop cursor: skip_to advances past an empty-diff head ----------
+async def test_skip_to(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoS", "refs/heads/main", "1" * 40, "2" * 40
+    await led.upsert_baseline(R, REF, A)
+    await led.claim_dispatch(R, REF, B, _utcnow() - _dt.timedelta(hours=1))  # pending=B
+    assert await led.skip_to(R, REF, B) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["reviewed_sha"] == B and cur["pending_sha"] is None and cur["state"] == "delivered"
+    assert await led.skip_to(R, REF, B) is False, "idempotent: no-op once reviewed == head"
 
 
 async def main() -> None:

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  controller-loop ("the brain") — proactive review scheduler. north-star rung 3.
+  Install (after the dry-run + manual-tick checks in docs/controller-loop-design.md §Runbook):
+    cp orchestrator/ai.myndaix.controller.plist.example ~/Library/LaunchAgents/ai.myndaix.controller.plist
+    launchctl load   ~/Library/LaunchAgents/ai.myndaix.controller.plist
+  Rollback (instant, one command):
+    launchctl unload ~/Library/LaunchAgents/ai.myndaix.controller.plist
+  Hourly + RunAtLoad mirrors the live ai.myndaix.fix-sweep agent. Edit the wrapper path
+  if your runtime checkout is elsewhere.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.myndaix.controller</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/stevenfernandez/code/active/myndaix-runtime/orchestrator/controller-tick.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/stevenfernandez/.myndaix/orchestrator/controller.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/stevenfernandez/.myndaix/orchestrator/controller.out</string>
+</dict>
+</plist>

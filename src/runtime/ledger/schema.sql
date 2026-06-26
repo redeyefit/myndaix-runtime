@@ -95,3 +95,21 @@ CREATE TABLE dead_letter (
     reason     text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- controller-loop ("the brain") cursor — the proactive review scheduler's only state
+-- (DESIGN v0.2 §2). A level-triggered reconciler tracks, per (repo, ref): the last SHA
+-- whose review DELIVERED (reviewed_sha, the cursor) and whether one is in flight
+-- (pending_sha). baseline_sha is the high-water mark seeded at first sight so a fresh
+-- repo is NOT whole-tree-reviewed. Existing DBs: migrations/0003_review_cursor.sql.
+CREATE TABLE review_cursor (
+    repo_id      text NOT NULL,
+    ref          text NOT NULL,
+    baseline_sha text NOT NULL,
+    reviewed_sha text NOT NULL,
+    pending_sha  text,
+    state        text NOT NULL DEFAULT 'baseline'
+        CHECK (state IN ('baseline','dispatching','delivered','blocked')),
+    attempts     int  NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (repo_id, ref)
+);

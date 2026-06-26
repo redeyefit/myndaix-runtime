@@ -155,7 +155,12 @@ mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$tip" 2>/dev/null |
 # docs/phase2-autonomous-fix-flip-design.md.
 # armed iff the per-push env knob is set OR the durable flag file exists (orchestrator/autofix-arm.sh
 # creates it after the pre-arm gates pass) — the flag survives shell restarts, so arming is "set once".
-autofix_armed(){ [[ "${PLAY_AUTOFIX:-0}" == "1" || -f "$ORCH/AUTOFIX_ENABLED" ]]; }
+# PLAY_DISABLE_AUTOFIX=1 is a HARD, fail-closed override that wins over BOTH the env knob
+# and the durable flag — the controller-loop ("the brain") sets it so a scheduled review
+# can NEVER auto-fix even on a box where autofix is armed (codex BLOCKER: arming is an OR on
+# the durable flag, so the controller stripping PLAY_AUTOFIX alone did not contain it).
+autofix_armed(){ [[ "${PLAY_DISABLE_AUTOFIX:-0}" == "1" ]] && return 1
+                 [[ "${PLAY_AUTOFIX:-0}" == "1" || -f "$ORCH/AUTOFIX_ENABLED" ]]; }
 autofix_fire(){
   autofix_armed || return 0
   [[ "${pushed:-0}" == "1" ]]       || { note autofix "skip: push not confirmed"; return 0; }
