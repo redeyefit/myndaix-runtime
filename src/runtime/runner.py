@@ -346,10 +346,15 @@ async def _hf_generate(client, *, base: str, application: str, key: str, prompt:
                       text=f"higgsfield submit ambiguous failure (fail-closed, no retry): {e}",
                       ms=_ms(started))
     if resp.status_code >= 300:   # accept any 2xx (200/201/202 async-queue 'Accepted')
-        ec = ErrorClass.RETRYABLE if resp.status_code >= 500 else ErrorClass.TERMINAL
-        return Result(status=ResultStatus.ERROR, error_class=ec, exit_code=resp.status_code,
-                      text=f"higgsfield submit {resp.status_code}: {resp.text[:300]}",
-                      ms=_ms(started))
+        # ANY non-2xx on the NON-IDEMPOTENT submit is charge-AMBIGUOUS, not safe-to-retry:
+        # a gateway 5xx (502/503/504) can be returned AFTER the queue accepted & charged the
+        # job, with the success lost in transit. So fail CLOSED for every code here - only the
+        # connect-error branch above is genuinely pre-send and safe to retry. (A retry of a
+        # RESPONDER would re-POST a fresh, un-deduplicated body -> double charge.)
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      exit_code=resp.status_code,
+                      text=f"higgsfield submit {resp.status_code} (fail-closed, no retry): "
+                           f"{resp.text[:300]}", ms=_ms(started))
     try:
         sub = resp.json()
         request_id = sub["request_id"]
@@ -400,7 +405,10 @@ async def _hf_generate(client, *, base: str, application: str, key: str, prompt:
                                   text="higgsfield completed but no video/image url",
                                   ms=_ms(started))
                 cost = data.get("cost")
-                if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+                # json.loads accepts Infinity/NaN tokens; a non-finite cost must not
+                # propagate (it would poison total_cost summing in the stitcher).
+                if isinstance(cost, bool) or not isinstance(cost, (int, float)) \
+                        or not math.isfinite(cost):
                     cost = None
                 return Result(status=ResultStatus.OK, text=url, artifact_ref=url,
                               cost=cost, ms=_ms(started))

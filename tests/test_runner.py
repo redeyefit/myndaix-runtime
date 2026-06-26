@@ -302,8 +302,9 @@ def test_higgsfield_submit_poll_completed():
 
 
 def test_higgsfield_submit_errors_and_terminal_states():
-    """401-on-submit -> terminal (no charge); 5xx-on-submit -> retryable (pre-charge,
-    safe); terminal status 'failed' -> terminal (Higgsfield refunds)."""
+    """401-on-submit -> terminal; 5xx-on-submit -> TERMINAL too (charge-ambiguous on a
+    non-idempotent POST: a gateway 5xx can land AFTER the queue charged, so fail closed,
+    never re-submit); terminal status 'failed' -> terminal (Higgsfield refunds)."""
     import os
 
     import httpx
@@ -317,7 +318,8 @@ def test_higgsfield_submit_errors_and_terminal_states():
 
         r = asyncio.run(runner.invoke_higgsfield(spec, job, transport=httpx.MockTransport(
             lambda req: httpx.Response(503, text="upstream"))))
-        assert r.error_class is ErrorClass.RETRYABLE  # nothing charged yet -> safe to retry
+        # 5xx submit is NOT safe to retry — it may have been received & charged.
+        assert r.error_class is ErrorClass.TERMINAL
 
         def failed(req):
             if req.method == "POST":

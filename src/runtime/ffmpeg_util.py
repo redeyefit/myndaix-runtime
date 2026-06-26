@@ -59,7 +59,10 @@ def clips_uniform(paths: Sequence[str]) -> bool:
     concat demuxer can stream-copy them losslessly with no re-encode."""
     if len(paths) < 2:
         return True
-    keys = ("codec_name", "width", "height", "pix_fmt", "sample_aspect_ratio", "time_base")
+    # include r_frame_rate: two clips can share time_base yet differ in real frame cadence
+    # (VFR / different fps), which the stream-copy concat would join into a glitchy result.
+    keys = ("codec_name", "width", "height", "pix_fmt", "sample_aspect_ratio",
+            "time_base", "r_frame_rate")
     sig0 = None
     for p in paths:
         s = probe(p)

@@ -14,7 +14,7 @@ This is **stage 4** of the larger pipeline (plan → keyframe → clip → stitc
 
 ## 3. Architecture
 - `_hf_generate()` (refactored out of `invoke_higgsfield`) is the ONE shared submit→poll primitive, holding the §5-A fail-closed charge-correctness contract. Both the single-clip agent and the stitcher call it. **motion_id / motion_strength / end_image_url** now flow through it (DoP camera presets + start/end anchoring).
-- `invoke_stitch` is ONE self-contained job (not N ledger sub-jobs) → all spend under one cost ceiling. **authority=WORKSPACE_ACTOR ⇒ never auto-retried** (a retry can't silently re-charge). A per-segment **manifest** in the workspace makes a manual re-run **resume** (skip rendered shots).
+- `invoke_stitch` is ONE self-contained job (not N ledger sub-jobs) → all spend under one cost ceiling. **authority=WORKSPACE_ACTOR ⇒ never auto-retried** (a retry can't silently re-charge). *Cross-run resume is **deferred to v2*** — the worker's per-attempt worktree is ephemeral, so in-workspace state can't survive a re-run; combined with never-auto-retried, an in-run manifest is dead weight (removed after review).
 - Inputs ride in `Job.context` (`shotlist`, `image_url`, `chain`, `end_card_url/path`, `application`); output URL → `Result.artifact_ref`. **No spine contract change.**
 
 ## 4. Data flow
@@ -24,9 +24,9 @@ mxr stitcher "<brand>" --shotlist shots.json [--end-card logo.png]
      for each shot i:
         start = shot.image_url  OR  prev last-frame (chain)  OR  job base image_url
         clip  = _hf_generate(prompt, start, motion_id, motion_strength, end_image_url)
-        download clip → seg_i.mp4 ; (chain) last_frame_png → upload → next start
-        manifest[i] = {clip, last_frame_url, cost}        # resumable
+        SSRF-guard artifact_ref → download clip → seg_i.mp4 ; (chain) last_frame_png → upload → next start
      ffmpeg concat(seg_*) [+ deterministic end-card clip] → final.mp4 → upload → artifact_ref
+     (loop is deadline-bounded; all I/O timeouts clamped to remaining budget)
 ```
 
 ## 5. ffmpeg layer (`ffmpeg_util.py`)
@@ -43,10 +43,10 @@ System ffmpeg only (no python-ffmpeg dep). args-as-list, never `shell=True`, syn
 - `HF_KEY` from env only. **SSRF** guard (in `_hf_generate`) on every URL handed to Higgsfield (image_url + end frames), incl. IPv4-mapped/private/link-local. ffmpeg runs on files we control with fixed argv. Workspace is scratch. Status/cancel URLs origin-pinned before the key is attached.
 
 ## 8. Decisions (LOCKED)
-Shot-list = single prompt OR per-shot list · chaining ON by default (`chain=false` for montage) · DoP-only v1 (model-agnostic via `application`; premium = later row) · resumable one-job (per-segment sub-jobs deferred to v2).
+Shot-list = single prompt OR per-shot list · chaining ON by default (`chain=false` for montage) · DoP-only v1 (model-agnostic via `application`; premium = later row) · one self-contained job (no auto-retry). End card is **URL-only** (`end_card_url`, SSRF-guarded); local `end_card_path` rejected (path-traversal). **Resume deferred to v2** (was removed after review — ephemeral worktree made it a false promise).
 
 ## 9. Tests (`tests/test_stitch.py`, all green)
-Mocked `_hf_generate`+ffmpeg: happy-path chaining+upload, partial-failure-returns-partial, max_segments-pre-spend reject, missing shotlist/key, **resume skips rendered**, motion_id-lands-in-body. Real-ffmpeg fixtures: concat + last_frame + image_to_clip. Full non-DB suite: 49 passing.
+Mocked `_hf_generate`+ffmpeg: happy-path chaining+upload, partial-failure-returns-partial, max_segments-pre-spend reject, missing shotlist/key, explicit-image-wins/skip-chaining, end-card SSRF rejected, motion_id-lands-in-body. Real-ffmpeg fixtures: concat + last_frame + image_to_clip. Full non-DB suite: 50 passing.
 
 ## 10. Deferred (NOT in v1, per YAGNI)
 LLM shot-planner (stage 1) · format/hook fan-out · Remotion animated overlays · premium model backends (fal/Seedance) · per-segment sub-job re-roll · global color-match pass.

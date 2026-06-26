@@ -6,20 +6,23 @@ ffmpeg-concat and apply a DETERMINISTIC brand layer (the HYBRID rule — AI for 
 b-roll, exact tools for the logo/end-card, because models can't render a logo pixel-exact).
 
 One self-contained job (NOT N ledger sub-jobs) so the whole spend sits under one cost
-ceiling. authority=WORKSPACE_ACTOR -> the worker NEVER auto-retries it, so a re-run can't
-silently re-charge; a per-segment manifest in the workspace makes a manual re-run RESUME
-(skip already-rendered shots) instead of regenerating. Partial failure returns the clips
-that DID succeed, concatenated — spend on good shots is never thrown away.
+ceiling. authority=WORKSPACE_ACTOR -> the worker NEVER auto-retries it, so a failed run is
+never silently re-charged. Partial failure returns the clips that DID succeed, concatenated
+— spend on good shots is never thrown away.
+
+NOTE (v1): there is no cross-run RESUME. The worker creates and destroys a fresh worktree
+per attempt, so any in-workspace state (clips, a manifest) does not survive between runs;
+combined with never-auto-retried, an in-run manifest would be dead weight. Idempotent resume
+(persisted clips keyed by a stable run id, skip-already-charged) is deferred to v2.
 
 Shot-list (job.context["shotlist"]) = ordered list of dicts:
   {prompt, motion_id?, motion_strength?, image_url?, end_image_url?, application?}
 Job-level context: image_url (base/first seed), chain (bool, default True), end_card_url
-(branded end card image to append), application (default model path via adapter).
+(branded end-card image URL to append — SSRF-guarded), application (default model path).
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import tempfile
 import time
@@ -34,7 +37,13 @@ from runtime.runner import (
 )
 
 _STITCH_MAX_SEGMENTS = 12      # cost guardrail: N shots x ~$0.13 — a runaway N is a $ DoS
-_HTTP_TIMEOUT_S = 120          # per clip download / frame+final upload
+_HTTP_TIMEOUT_CAP_S = 120      # ceiling on a single clip download / frame+final upload
+
+
+def _remaining(deadline: float) -> float:
+    """Budget-bounded I/O timeout: never exceed the overall job deadline, capped so one
+    slow transfer can't eat the whole budget, floored above 0 (httpx reads 0 as instant-fail)."""
+    return max(0.001, min(_HTTP_TIMEOUT_CAP_S, deadline - time.monotonic()))
 
 
 def _err(text: str, *, started: float, cost: Optional[float] = None,
@@ -44,38 +53,21 @@ def _err(text: str, *, started: float, cost: Optional[float] = None,
                   cost=cost or None, ms=_ms(started))
 
 
-def _load_manifest(path: str) -> dict:
-    try:
-        with open(path) as f:
-            m = json.load(f)
-        return m if isinstance(m, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_manifest(path: str, manifest: dict) -> None:
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(manifest, f)
-        os.replace(tmp, path)          # atomic
-    except OSError:
-        pass                           # manifest is an optimization; never fail the job over it
-
-
-async def _hf_upload(client, base: str, key: str, data: bytes, content_type: str) -> str:
+async def _hf_upload(client, base: str, key: str, data: bytes, content_type: str,
+                     deadline: float) -> str:
     """Replicate Higgsfield's two-step upload with raw httpx (no SDK dep):
     POST /files/generate-upload-url {content_type} -> {public_url, upload_url};
-    PUT the bytes to upload_url (presigned, no auth header); return public_url."""
+    PUT the bytes to upload_url (presigned, no auth header); return public_url.
+    Both calls are bounded by the remaining job budget."""
     r = await client.post(base.rstrip("/") + "/files/generate-upload-url",
                           headers={"Authorization": f"Key {key}",
                                    "Content-Type": "application/json"},
-                          json={"content_type": content_type}, timeout=_HTTP_TIMEOUT_S)
+                          json={"content_type": content_type}, timeout=_remaining(deadline))
     r.raise_for_status()
     j = r.json()
     public_url, upload_url = j["public_url"], j["upload_url"]
     pr = await client.put(upload_url, content=data,
-                          headers={"Content-Type": content_type}, timeout=_HTTP_TIMEOUT_S)
+                          headers={"Content-Type": content_type}, timeout=_remaining(deadline))
     pr.raise_for_status()
     return public_url
 
@@ -110,8 +102,6 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
     chain = job.context.get("chain", True)
     workdir = job.worktree_path or tempfile.mkdtemp(prefix="mdx-stitch-")
     os.makedirs(workdir, exist_ok=True)
-    manifest_path = os.path.join(workdir, "stitch_manifest.json")
-    manifest = _load_manifest(manifest_path)
 
     deadline = started + job.timeout_s
     poll_interval = _hf_float(a.get("poll_interval_s"), _HF_POLL_INTERVAL_S)
@@ -126,15 +116,10 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
 
     async with httpx.AsyncClient(transport=transport) as client:
         for i, shot in enumerate(shots):
+            if time.monotonic() >= deadline:
+                failed_at, fail_reason = i, f"job deadline ({job.timeout_s}s) exceeded before shot {i}"
+                break
             seg_path = os.path.join(workdir, f"seg_{i:03d}.mp4")
-            # RESUME: a prior run already rendered this segment -> reuse, don't re-charge.
-            cached = manifest.get(str(i))
-            if cached and os.path.isfile(cached.get("clip_path", "")):
-                clips.append(cached["clip_path"])
-                total_cost += cached.get("cost") or 0.0
-                prev_last_url = cached.get("last_frame_url") or prev_last_url
-                continue
-
             start_img = (shot.get("image_url")
                          or (prev_last_url if (chain and i > 0) else None)
                          or job.context.get("image_url"))
@@ -158,8 +143,13 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
                 break
             total_cost += res.cost or 0.0
 
+            # the artifact url is Higgsfield's, but guard it anyway — it's the one URL we
+            # FETCH, and 'SSRF-check every fetched URL' is the codebase invariant.
+            if await _reject_unsafe_url(res.artifact_ref):
+                failed_at, fail_reason = i, f"artifact_ref rejected (SSRF): {res.artifact_ref}"
+                break
             try:
-                dl = await client.get(res.artifact_ref, timeout=_HTTP_TIMEOUT_S)
+                dl = await client.get(res.artifact_ref, timeout=_remaining(deadline))
                 dl.raise_for_status()
                 with open(seg_path, "wb") as f:
                     f.write(dl.content)
@@ -176,13 +166,11 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
                     frame_png = os.path.join(workdir, f"frame_{i:03d}.png")
                     await asyncio.to_thread(fu.last_frame_png, seg_path, frame_png)
                     with open(frame_png, "rb") as f:
-                        last_url = await _hf_upload(client, base, key, f.read(), "image/png")
+                        last_url = await _hf_upload(client, base, key, f.read(),
+                                                    "image/png", deadline)
                 except Exception:   # noqa: BLE001 - chaining is best-effort; next shot falls back
                     last_url = None
             prev_last_url = last_url or prev_last_url
-            manifest[str(i)] = {"clip_path": seg_path, "last_frame_url": last_url,
-                                "cost": res.cost or 0.0}
-            _save_manifest(manifest_path, manifest)
 
         # -- assemble whatever succeeded --
         if not clips:
@@ -192,12 +180,12 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
         try:
             seq = list(clips)
             # HYBRID brand layer: append a deterministic end card (exact logo) if given.
-            end_card = await _resolve_end_card(client, job, workdir, clips[0])
+            end_card = await _resolve_end_card(client, job, workdir, clips[0], deadline)
             if end_card:
                 seq.append(end_card)
             await asyncio.to_thread(fu.concat, seq, final_path)
             with open(final_path, "rb") as f:
-                final_url = await _hf_upload(client, base, key, f.read(), "video/mp4")
+                final_url = await _hf_upload(client, base, key, f.read(), "video/mp4", deadline)
         except fu.FfmpegError as e:
             return _err(f"stitch assembly (ffmpeg) failed: {e}", started=started, cost=total_cost)
         except Exception as e:   # noqa: BLE001
@@ -213,29 +201,25 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
                   cost=total_cost or None, ms=_ms(started))
 
 
-async def _resolve_end_card(client, job: Job, workdir: str, ref_clip: str) -> Optional[str]:
-    """If the job supplies a branded end-card image (end_card_url to download, or
-    end_card_path local), render it into a static clip sized to match the first clip so it
-    concats uniformly. Returns the clip path, or None if no end card / on any failure
-    (the end card is optional polish, never a reason to fail the whole render)."""
+async def _resolve_end_card(client, job: Job, workdir: str, ref_clip: str,
+                            deadline: float) -> Optional[str]:
+    """If the job supplies a branded end-card image URL (end_card_url), download it
+    (SSRF-guarded) and render it into a static clip sized to match the first clip so it
+    concats uniformly. URL-only by design: a local end_card_path from untrusted job
+    context is a path-traversal/arbitrary-read risk, so it is NOT honored. Returns the
+    clip path, or None if no end card / on any failure (end card is optional polish)."""
     url = job.context.get("end_card_url")
-    path = job.context.get("end_card_path")
-    img = os.path.join(workdir, "endcard_src")
+    if not url:
+        return None
     try:
-        if url:
-            # SSRF guard: WE fetch this URL directly, so an attacker-controlled end_card_url
-            # could otherwise hit internal/loopback/link-local services. Same guard the
-            # generation path uses; reject before any request leaves the process.
-            if await _reject_unsafe_url(url):
-                return None
-            r = await client.get(url, timeout=_HTTP_TIMEOUT_S)
-            r.raise_for_status()
-            with open(img, "wb") as f:
-                f.write(r.content)
-        elif path and os.path.isfile(path):
-            img = path
-        else:
+        # WE fetch this URL directly -> SSRF guard (reject internal/loopback/link-local).
+        if await _reject_unsafe_url(url):
             return None
+        r = await client.get(url, timeout=_remaining(deadline))
+        r.raise_for_status()
+        img = os.path.join(workdir, "endcard_src")
+        with open(img, "wb") as f:
+            f.write(r.content)
         s = await asyncio.to_thread(fu.probe, ref_clip)
         size = (int(s["width"]), int(s["height"]))
         dur = _hf_float(job.context.get("end_card_seconds"), 2.0)

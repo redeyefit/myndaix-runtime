@@ -99,10 +99,10 @@ def _build_context(args: argparse.Namespace) -> dict:
             raise SystemExit(f"--shotlist: {e}")
     if getattr(args, "end_card", None):
         ec = args.end_card
-        if ec.startswith(("http://", "https://")):
-            ctx["end_card_url"] = ec
-        else:
-            ctx["end_card_path"] = ec
+        if not ec.startswith(("http://", "https://")):
+            raise SystemExit("--end-card must be an http(s) URL (local paths are not accepted; "
+                             "host the image or upload it first)")
+        ctx["end_card_url"] = ec
     return ctx
 
 
@@ -166,8 +166,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="DoP motion strength, 0.3 (subtle) to 1.0 (dramatic)")
     p.add_argument("--shotlist", metavar="PATH",
                    help="path to a JSON shot-list (stitcher): ordered list of shot objects")
-    p.add_argument("--end-card", metavar="PATH|URL", dest="end_card",
-                   help="branded end-card image to append (stitcher)")
+    p.add_argument("--end-card", metavar="URL", dest="end_card",
+                   help="branded end-card image URL to append (stitcher; http(s) only)")
     p.add_argument("--repo", metavar="ID", dest="repo_id",
                    help="repo bucket id for per-repo concurrency (omitted -> cap-exempt)")
     p.add_argument("--base-ref", metavar="REF", dest="base_ref",

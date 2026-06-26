@@ -89,8 +89,9 @@ def _ok_gen(calls, fail_at=None):
         if fail_at is not None and len(calls) - 1 == fail_at:
             return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                           text="gen boom")
-        return Result(status=ResultStatus.OK, text=f"https://cdn/clip{len(calls)}.mp4",
-                      artifact_ref=f"https://cdn/clip{len(calls)}.mp4", cost=0.13)
+        # use a resolvable host: the real invoke_stitch SSRF-guards artifact_ref before download
+        return Result(status=ResultStatus.OK, text=f"https://example.com/clip{len(calls)}.mp4",
+                      artifact_ref=f"https://example.com/clip{len(calls)}.mp4", cost=0.13)
     return gen
 
 
@@ -161,26 +162,31 @@ def test_stitch_missing_key_is_terminal(tmp_path, monkeypatch):
     assert "API key" in r.text
 
 
-def test_stitch_resume_skips_rendered_segments(tmp_path, monkeypatch):
-    """A pre-existing manifest pointing at an on-disk clip is reused (not re-charged)."""
+def test_stitch_explicit_image_wins_and_skips_chaining(tmp_path, monkeypatch):
+    """An explicit per-shot image_url overrides the chain; and when the NEXT shot brings
+    its own image, the current shot does NOT do a last-frame extract+upload (chain skipped)."""
     monkeypatch.setenv("HF_KEY", "kid:secret")
-    _patch_ffmpeg(monkeypatch)
-    # seed a manifest + a fake existing clip for shot 0
-    seg0 = os.path.join(str(tmp_path), "seg_000.mp4")
-    with open(seg0, "wb") as f:
-        f.write(b"EXISTING")
-    import json
-    with open(os.path.join(str(tmp_path), "stitch_manifest.json"), "w") as f:
-        json.dump({"0": {"clip_path": seg0, "last_frame_url": "https://cdn/cached.png",
-                         "cost": 0.13}}, f)
+    lf_calls = []
+
+    def fake_last_frame(video, out):
+        lf_calls.append(video); open(out, "wb").write(b"PNG"); return out
+
+    def fake_concat(paths, out, **kw):
+        open(out, "wb").write(b"MP4"); return out
+
+    monkeypatch.setattr(ffmpeg_util, "last_frame_png", fake_last_frame)
+    monkeypatch.setattr(ffmpeg_util, "concat", fake_concat)
     calls = []
     monkeypatch.setattr(runner_stitch, "_hf_generate", _ok_gen(calls))
-    shots = [{"prompt": "a", "image_url": "https://seed/0.png"}, {"prompt": "b"}]
+    shots = [{"prompt": "a", "image_url": "https://example.com/A.png"},
+             {"prompt": "b", "image_url": "https://example.com/B.png"},  # mid-list explicit
+             {"prompt": "c"}]
     r = asyncio.run(runner_stitch.invoke_stitch(_spec(), _job(shots, tmp_path),
                                                 transport=_mock_transport()))
     assert r.status is ResultStatus.OK, r.text
-    assert len(calls) == 1                 # only shot 1 generated; shot 0 resumed
-    assert calls[0]["image_url"] == "https://cdn/cached.png"   # chained off the cached last frame
+    assert calls[1]["image_url"] == "https://example.com/B.png"   # explicit beats chain
+    # shot 0 must NOT extract a last frame (shot 1 has its own image); shot 1 -> shot 2 DOES.
+    assert len(lf_calls) == 1                                     # only one chain hop (1->2)
 
 
 def test_stitch_end_card_ssrf_rejected(tmp_path, monkeypatch):
