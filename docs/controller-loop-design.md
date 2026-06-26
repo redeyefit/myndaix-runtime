@@ -152,13 +152,13 @@ Brain pipes `"<watch_ref> <head> <watch_ref> <reviewed_sha>"` + argv `origin <ur
 - **Knobs:** launchd interval (hourly), `MAX_DISPATCH_PER_TICK` (default 3), `MAX_CONTROLLER_DISPATCH_PER_DAY`, `MAX_ATTEMPTS` (default 3), lock TTL, `watch_ref` per repo.
 - **Rollback:** `launchctl unload` the controller agent — one command; the rest of the runtime is untouched. (The cursor table is inert without the controller.)
 
-## 8. Remaining gates for plan/Jefe
-1. **Scope grew** from "150-line stateless" to "~250 lines + a table + migration" — correctness demanded it (B4). Confirm OK before the implementation plan.
-2. **Cursor-advance signal** — confirm "advance only when `done-<sha>` marker exists" is the right confirmation source (vs a delivered review job query). Recommend done-marker (it's play-review's own ground truth for a delivered review).
-3. **Re-review v0.2?** — optional focused cross-family re-review of this revision, or proceed to the implementation plan. Recommend: proceed to plan (findings were convergent + concrete; a re-review of the *plan* + built code covers it).
+## 8. Gates — all RESOLVED (historical record; the controller is merged + deployed, see §8a)
+1. **Scope growth** (~250 lines + a table + migration, vs the original "150-line stateless") — APPROVED by Jefe; correctness demanded it (B4). Built as planned.
+2. **Cursor-advance signal** — RESOLVED to the `done-<sha>` marker (play-review's post-delivery ground truth), reached via the empty-remote-URL path. A ledger "delivered review job" query was tried (v0.4) then REVERTED (v0.5, codex B1: `mxr` marks a job done before play-review delivers the verdict, so it could advance on a partial review).
+3. **Re-review** — DONE, and then some: 3 serial cross-family rounds (codex + Oracle) + a 15-agent adversarial-sweep workflow, all findings folded (see the v0.2→v0.6 changelogs + `docs/reviews/`).
 
-## 8a. Runbook (deploy = atomic, dry-run-first)
-> **DEPLOYED LIVE 2026-06-26** on the MacBook (`ai.myndaix.controller`, hourly). Migration `0003` applied to prod `runtime`; trusted `play-review.sh` refreshed; first tick seeded `myndaix-runtime/main` baseline. Autofix stays OFF for this rung.
+## 8a. Runbook — the atomic, dry-run-first deploy procedure (EXECUTED 2026-06-26)
+> **DEPLOYED LIVE 2026-06-26** on the MacBook (`ai.myndaix.controller`, hourly): migration `0003` applied to prod `runtime`, trusted `play-review.sh` refreshed (has `PLAY_DISABLE_AUTOFIX`), plist installed + loaded, baseline seeded, and a full review cycle proven end-to-end (detect → review → verdict to `inbox/jefe` → cursor advanced). Autofix stays OFF for this rung. The steps below are that procedure, kept as the reference for re-deploy / other machines.
 
 Built artifacts: `src/runtime/controller.py` (`python -m runtime.controller tick`), `orchestrator/controller-tick.sh` (portable launchd wrapper), `orchestrator/ai.myndaix.controller.plist.example`, migration `0003_review_cursor` (auto-applied on serve boot).
 
