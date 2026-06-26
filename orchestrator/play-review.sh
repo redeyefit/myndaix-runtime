@@ -26,7 +26,9 @@ INBOX="$HOME/.myndaix/bridge/inbox/jefe"           # human-only, no agent watche
 IMESSAGE_TO="${PLAY_IMESSAGE_TO-}"                  # phone ping OFF by default (Jefe: no auto-texts); set PLAY_IMESSAGE_TO=addr to re-enable
 TARGET_GLOB="refs/heads/*"                          # review pushes to ANY branch (skip tags/deletes)
 BASE_REF="main"                                     # a new branch's first push is diffed against this
-MAX_DIFF=65536                                      # ~64KB; bounded by the 300s review budget (tune with data)
+MAX_DIFF="${PLAY_MAX_DIFF:-262144}"                 # 256KB default, tunable per-push: PLAY_MAX_DIFF=N git push. Over-cap
+                                                    # FAILS fast. The models eat the input fine; the real ceiling is the
+                                                    # ~300s/agent budget, so a giant push can still time out — split those.
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
 STALE=1800                                          # reap a lock older than 30 min (hung/killed worker)
