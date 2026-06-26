@@ -126,26 +126,14 @@ call(){ # call <agent> <prompt> [mxr-flags...] -> echo reply ; return 1 on fail/
 confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = manual/test run -> yes
   [[ -z "$remote_url" ]] && return 0                # ls-remote scoped to $ref (not any ref); capture+compare avoids grep -q|pipefail SIGPIPE
   local got
-  # bound the network call so a dead remote can't wedge the held review lock (codex+Oracle MAJOR):
-  # gtimeout if present, else a portable bg-sleep-kill (macOS has no `timeout`). Empty result -> not
-  # pushed -> safe (no fire, no done-marker; the next push re-evaluates).
-  if command -v gtimeout >/dev/null 2>&1; then
-    got="$(gtimeout "$LSREMOTE_TIMEOUT" git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
+  # bound the network call so a dead remote can't wedge the held review lock (codex+Oracle MAJOR).
+  # perl's alarm+exec REPLACES perl with git, so SIGALRM kills git ITSELF after N s — one process, no
+  # watchdog, no orphaned sleep, argv-form (injection-safe). perl ships on macOS+Linux; degrade to an
+  # unbounded call only if it's somehow absent. Empty result -> not pushed -> safe (no fire/no marker).
+  if command -v perl >/dev/null 2>&1; then
+    got="$(perl -e 'alarm shift; exec @ARGV or exit 127' "$LSREMOTE_TIMEOUT" git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
   else
-    # portable bounded call with process-GROUP kill (mirrors play-fix.sh run_sandboxed, :111-123):
-    # set -m puts each bg job in its OWN process group, so kill -TERM -$gp reaps git AND its ssh
-    # child, and reaping the watchdog's group leaves no orphaned sleep on the fast path (codex MAJOR).
-    local tf; tf="$(mktemp "${TMPDIR:-/tmp}/playrev-lsr.XXXXXX")"
-    set -m 2>/dev/null || true
-    ( git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null >"$tf" ) &
-    local gp=$!
-    ( sleep "$LSREMOTE_TIMEOUT"; kill -TERM -"$gp" 2>/dev/null ) &
-    local wd=$!
-    wait "$gp" 2>/dev/null || true
-    kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true   # reap watchdog + its sleep (whole group)
-    kill -KILL -"$gp" 2>/dev/null || true                                   # reap any lingering ls-remote/ssh group
-    set +m 2>/dev/null || true
-    got="$(awk '{print $1}' "$tf" 2>/dev/null || true)"; rm -f "$tf" 2>/dev/null || true
+    got="$(git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
   fi
   [[ "$got" == "$tip" ]]
 }
@@ -196,8 +184,10 @@ autofix_fire(){
   [[ "$fix_base" == "$tip" && "$fix_base" != "$base" ]] || { note autofix "skip: base/tip assertion"; return 0; }
   note autofix "fire: $repo_id base=${fix_base:0:8} fixer=$fixer"
   # detach with a WHITELISTED env (env -i) — strips LD_PRELOAD/BASH_ENV/GIT_EXTERNAL_DIFF and the
-  # MYNDAIX_FIX_* test seam inherited via nohup; play-fix self-establishes PATH + pool auth.
-  nohup env -i PATH="$PATH" HOME="$HOME" "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
+  # MYNDAIX_FIX_* test seam inherited via nohup. Pass a FIXED trusted PATH literal (NOT the inherited
+  # $PATH, Oracle MINOR) so a poisoned PATH can't redirect the fixer's `#!/usr/bin/env bash` shebang;
+  # play-fix self-establishes its full PATH + pool auth at :20.
+  nohup env -i PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" HOME="$HOME" "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
   return 0
 }
 
