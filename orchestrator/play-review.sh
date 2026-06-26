@@ -145,7 +145,12 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
 # captured ONCE in the main flow (never re-calls confirm_pushed — a 2nd ls-remote under the held
 # lock can wedge all reviews). pre-push fires before git confirms acceptance, so a rejected push
 # must stay re-reviewable.
-mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$tip" 2>/dev/null || true; }
+# PLAY_FORCE_DONE=1 (controller-loop "the brain") writes the marker on delivery REGARDLESS of the
+# still-the-remote-tip check: the controller's reviewed sha is ALREADY on the remote (it fetched it),
+# and confirm_pushed would suppress the marker whenever the branch advanced mid-review — wedging the
+# brain's cursor into re-reviewing forever (codex BLOCKER). It is the controller's ADVANCE signal.
+mark_done(){ { [[ "${PLAY_FORCE_DONE:-0}" == "1" || "${pushed:-0}" == "1" ]]; } \
+             && : > "$STATE/done-$tip" 2>/dev/null || true; }
 
 # autofix_fire — PLAY_AUTOFIX bridge: auto-trigger play-fix.sh on a NEEDS-FIX verdict. Fail-CLOSED:
 # every guard must pass or it no-ops (the always-present manual hint is the fallback). It NEVER

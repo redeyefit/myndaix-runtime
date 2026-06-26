@@ -136,21 +136,43 @@ async def test_done_marker_advances_cursor(led: PostgresLedger) -> None:
     assert len(records(seam)) == 1, "no extra dispatch once delivered + up to date"
 
 
-# -- the LEDGER advance signal works even with NO done-marker (branch moved, B2)
-async def test_ledger_delivered_advances_cursor(led: PostgresLedger) -> None:
+# -- a synchronous trigger failure releases the claim (no 1h stall) ------------
+async def test_trigger_failure_releases(led: PostgresLedger) -> None:
     await _truncate(led)
-    seam = fresh_seam("ledgeradv"); repo = make_repo("ledgeradv")
-    await C.process_repo(led, repo, [0])
+    fresh_seam("trigfail"); repo = make_repo("trigfail")
+    await C.process_repo(led, repo, [0])                 # baseline
     head2 = advance(repo, "c1")
-    await C.process_repo(led, repo, [0])                 # pending = head2, NO marker written
-    async with led._pool.acquire() as con:               # a delivered review job lands in the ledger
-        await con.execute(
-            "INSERT INTO job (id, root_id, created_by, to_agent, body, status, repo_id, base_ref) "
-            "VALUES (gen_random_uuid(), gen_random_uuid(), 'c', 'lobster', 'x', 'done', $1, $2)",
-            repo.repo_id, head2)
-    await C.process_repo(led, repo, [0])                 # advance via the ledger, not the marker
+    C.TEST_MODE = False; C.DISPATCH_OVERRIDE = ""        # force the REAL trigger path
+    C.PLAY_REVIEW = repo.path / "no-such-play-review.sh" # untrusted/missing -> trigger fails
+    try:
+        await C.process_repo(led, repo, [0])             # claims, trigger fails, releases
+    finally:
+        C.TEST_MODE = True
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
-    assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered"
+    assert cur["pending_sha"] == head2 and cur["state"] == "dispatching"
+    # released = updated_at forced stale -> a stale-cutoff re-claim fires immediately (no PENDING_STALE wait)
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=1)
+    assert await led.claim_dispatch(repo.repo_id, repo.watch_ref, head2, cutoff) is True
+
+
+# -- the flock is exclusive: a second holder cannot acquire it -----------------
+async def test_lock_is_exclusive(led: PostgresLedger) -> None:
+    import fcntl
+    C.LOCK = _TMP / "controller.lock"                    # don't touch the live orchestrator dir
+    assert C.acquire_lock() is True
+    fd2 = os.open(str(C.LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        raised = False
+        try:
+            fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raised = True
+        assert raised, "a second flock must NOT acquire the held lock"
+    finally:
+        os.close(fd2)
+    C.release_lock()
+    assert C.acquire_lock() is True, "lock is re-acquirable after release"
+    C.release_lock()
 
 
 # -- a new head while one is in flight WAITS (no supersede, Oracle B2) ---------

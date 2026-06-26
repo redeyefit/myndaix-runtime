@@ -4,6 +4,14 @@ _North-star rung 3. v1 = **proactive review scheduler**, a bounded level-trigger
 
 **Decisions locked (Jefe, 2026-06-25):** (1) trigger = **synthetic-stdin, zero-touch** (no edits to `play-review.sh`); (2) watch scope = **default branch only** (`refs/heads/main`); (3) cadence = **hourly**; (4) cross-family design review before code (done).
 
+### v0.4 changelog (folded the v0.3 RE-REVIEW — Oracle + codex, both NEEDS-REVISION; mostly regressions in v0.3's own hardening, several are simplifications)
+- **Lock → `fcntl.flock`** (Oracle B1/B2 + codex): the v0.3 rename/mtime/heartbeat lock was still racy (rename can't stop a 2nd stealer) and the heartbeat bumped a file, not the dir mtime that was checked. flock is kernel-atomic, auto-released on crash — deletes ALL the stale-reap/TTL/heartbeat code.
+- **git protocol allowlist via env** (Oracle M3 + codex B2): v0.3's `GIT_CONFIG_GLOBAL=/dev/null` + `credential.helper=` broke `insteadOf`/keychain auth. Replaced with `GIT_ALLOW_PROTOCOL=https:ssh:file` (env, inherited by play-review's `ls-remote` too) — blocks `ext::`/`fd::` everywhere WITHOUT nuking auth config. + `--no-recurse-submodules` on the fetch.
+- **`review_delivered` reverted** (codex B1): `mxr` marks a job `done` BEFORE play-review writes the inbox verdict, so the ledger signal could advance on a partial/aborted review. The cursor now advances ONLY on play-review's post-delivery `done-<sha>` marker, made branch-move-proof by a new `PLAY_FORCE_DONE=1` flag (2nd and final play-review edit) the controller sets (its reviewed sha is already on the remote, so the still-the-tip guard is needless for it).
+- **`release_dispatch`** (both): a synchronous trigger failure now force-stales the pending row so the next tick retries immediately (no 1h `PENDING_STALE` wait) while preserving `attempts` (the blocked ceiling still applies).
+- **Pending head pinned** (codex MAJOR): the in-flight head is anchored under `refs/myndaix/pending/<ref>` at dispatch (a later force-push overwrites the head-ref); advance refuses to move onto an unpinnable base.
+- Oracle/codex CONFIRMED sound: the cursor state machine, no-supersede, blocked-escape, no-stall, force-push-to-known-sha advance, and the autofix disable.
+
 ### v0.3 changelog (folded the BUILT-code cross-family review — Oracle + codex, both NEEDS-REVISION)
 - **codex B1 (autofix leak):** `autofix_armed` is an OR on the durable `AUTOFIX_ENABLED` flag, so stripping `PLAY_AUTOFIX` did NOT contain it. Fix = a one-line, fail-closed `PLAY_DISABLE_AUTOFIX=1` HARD override in `play-review.sh` (the ONLY edit there; not byte-zero-touch anymore), set by the controller's review env. test.sh +1 (test 31).
 - **codex B2 (branch-move re-review forever):** `done-<sha>` is suppressed when the branch moves mid-review → cursor never advances. Fix = advance from a LEDGER signal (`review_delivered` = a done review job stamped with `base_ref=head`), with the done-marker kept as a fallback.

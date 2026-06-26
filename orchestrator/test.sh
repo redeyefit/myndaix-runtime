@@ -164,5 +164,9 @@ echo "31. PLAY_DISABLE_AUTOFIX=1 HARD-overrides the durable flag (controller-loo
   env HOME="$FAKE" PLAY_DISABLE_AUTOFIX=1 PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
   cknofile "$FAKE/.myndaix/fixer-argv" "disable flag suppresses fire even with durable flag + PLAY_AUTOFIX"
 
+echo "32. PLAY_FORCE_DONE=1 marks done even when the push is unconfirmed (controller-loop, codex B2)"; reset
+  env HOME="$FAKE" PLAY_FORCE_DONE=1 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "/tmp/no-such-remote-$$" 2>"$ROOT/stderr"
+  ckfile "$STATE/done-$TIP" "force-done writes the marker despite unconfirmed remote"
+
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

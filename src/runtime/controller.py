@@ -33,15 +33,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import fcntl
 import json
 import os
 import re
-import shutil
-import socket
 import stat as _stat
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -56,13 +54,12 @@ ORCH = HOME / ".myndaix" / "orchestrator"
 STATE = ORCH / "state"
 REPOS_JSON = Path(os.environ.get("MYNDAIX_REPOS_JSON", str(ORCH / "repos.json")))
 PLAY_REVIEW = Path(os.environ.get("PLAY_SELF", str(ORCH / "play-review.sh")))
-LOCK = ORCH / "controller.lock"
+LOCK = ORCH / "controller.lock"                          # an flock'd FILE, not a dir
 
 DEFAULT_WATCH_REF = "refs/heads/main"
 MAX_DISPATCH_PER_TICK = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DISPATCH", "3"))
 MAX_DISPATCH_PER_DAY = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DAY", "20"))
 MAX_ATTEMPTS = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", "3"))
-LOCK_TTL = int(os.environ.get("MYNDAIX_CONTROLLER_LOCK_TTL", "900"))          # 15 min
 PENDING_STALE = int(os.environ.get("MYNDAIX_CONTROLLER_PENDING_STALE", "3600"))  # 1 h
 FETCH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_FETCH_TIMEOUT", "60"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
@@ -73,15 +70,15 @@ DISPATCH_OVERRIDE = os.environ.get("MYNDAIX_CONTROLLER_DISPATCH_OVERRIDE", "")
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._][A-Za-z0-9._/-]*$")
-# remote transports play-review's ls-remote may use. plain/unauth http:// and git://
-# are rejected (codex MINOR); "ext::"/"fd::" (and any "::") are arbitrary-exec RCE.
+# remote transports we accept. plain/unauth http:// and git:// are rejected; "ext::"/"fd::"
+# (and any "::") are arbitrary-exec RCE. The SAME set is enforced at the git layer via
+# GIT_ALLOW_PROTOCOL below, so an `insteadOf`/`protocol.ext.allow=always` config trick can't
+# rewrite a validated URL into ext:: — including inside play-review's own ls-remote.
 _URL_OK = ("https://", "ssh://", "file://", "git@")
-# command-line config that OVERRIDES repo/global config (a -c flag wins), so a poisoned
-# .git/config can't re-enable an exec transport, a credential helper, or submodule recursion.
-_GIT_HARDEN = [
-    "-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never",
-    "-c", "credential.helper=", "-c", "fetch.recurseSubmodules=false",
-]
+# env-level protocol allowlist (overrides config, inherited by play-review). Authenticated/local
+# only — NOT ext/fd (RCE) or git:// (plaintext). Preserves global insteadOf/credential helpers for
+# the ALLOWED transports (so private-repo auth keeps working — Oracle/codex: do NOT nuke git config).
+_GIT_ALLOW_PROTOCOL = "https:ssh:file"
 
 
 def log(msg: str) -> None:
@@ -105,14 +102,17 @@ def _ctl_reviewed_ref(ref: str) -> str:
     return f"refs/myndaix/reviewed/{_slug(ref)}"          # anchors the reviewed base against git gc
 
 
+def _ctl_pending_ref(ref: str) -> str:
+    return f"refs/myndaix/pending/{_slug(ref)}"           # anchors the in-flight head against gc (codex MAJOR)
+
+
 # -- minimal, allowlisted subprocess envs (build up, never inherit blindly) -----
 def _git_env() -> dict:
     env = {
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         "HOME": str(HOME),
         "GIT_TERMINAL_PROMPT": "0",                      # never block on a credential prompt
-        "GIT_CONFIG_NOSYSTEM": "1",                      # ignore /etc git config (url rewrites, helpers)
-        "GIT_CONFIG_GLOBAL": "/dev/null",                # ignore ~/.gitconfig too
+        "GIT_ALLOW_PROTOCOL": _GIT_ALLOW_PROTOCOL,       # block ext::/fd:: RCE (keeps auth config working)
     }
     for k in ("SSH_AUTH_SOCK", "TMPDIR", "LANG"):        # ssh remotes / tmp
         if os.environ.get(k):
@@ -123,15 +123,18 @@ def _git_env() -> dict:
 def _review_env() -> dict:
     # play-review.sh resets its own PATH and derives ORCH from HOME. It needs HOME +
     # MYNDAIX_DSN (so its `mxr` calls reach the ledger) + ssh auth for confirm_pushed.
-    # PLAY_SELF pins its worker to the validated trusted path (codex M7, no worktree
-    # fallback). PLAY_DISABLE_AUTOFIX hard-disables autofix (B1). PLAY_AUTOFIX is never set.
+    # PLAY_SELF pins its worker to the validated trusted path (codex M7, no worktree fallback).
+    # PLAY_DISABLE_AUTOFIX hard-disables autofix (B1). PLAY_FORCE_DONE makes its post-delivery
+    # done-marker branch-move-proof (B2). GIT_ALLOW_PROTOCOL hardens its ls-remote (codex B2).
     env = {
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         "HOME": str(HOME),
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": _GIT_ALLOW_PROTOCOL,
         "MYNDAIX_DSN": DSN,
         "PLAY_SELF": str(PLAY_REVIEW),
         "PLAY_DISABLE_AUTOFIX": "1",
+        "PLAY_FORCE_DONE": "1",
     }
     for k in ("SSH_AUTH_SOCK", "TMPDIR", "LANG"):
         if os.environ.get(k):
@@ -141,7 +144,7 @@ def _review_env() -> dict:
 
 def _git(repo: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", "-C", str(repo), *_GIT_HARDEN, *args],
+        ["git", "-C", str(repo), *args],
         capture_output=True, text=True, env=_git_env(), timeout=timeout, check=False,
     )
 
@@ -189,48 +192,42 @@ def load_config() -> list[Repo]:
     return repos
 
 
-# -- single-instance lock (atomic; mtime stale-reap via rename; heartbeat) -------
-def _stamp_lock() -> None:
-    try:
-        (LOCK / "meta").write_text(f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n")
-    except OSError:
-        pass
+# -- single-instance lock (kernel flock: atomic, auto-released on crash) ---------
+# flock replaces the old mkdir + mtime-reap + heartbeat machinery wholesale: the kernel
+# grants the lock to exactly one open fd and releases it automatically when the holder
+# exits or dies, so there is NO stale-reap race (Oracle BLOCKER) and NO need for a TTL or
+# heartbeat (codex/Oracle: writing LOCK/meta never bumped the dir mtime being checked). The
+# fd is held open in a module global for the tick's lifetime; release closes it.
+_LOCK_FD: Optional[int] = None
 
 
 def acquire_lock() -> bool:
+    global _LOCK_FD
     ORCH.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        LOCK.mkdir()
-    except FileExistsError:
-        age = time.time() - LOCK.stat().st_mtime
-        if age <= LOCK_TTL:
-            log(f"another tick holds the lock ({int(age)}s old) — exiting"); return False
-        # STEAL the stale lock atomically: rename (one winner) then reap. Two racing ticks
-        # can't both succeed — rename of an already-moved dir fails (Oracle BLOCKER: a
-        # plain rmtree->mkdir lets B delete A's fresh lock and both run).
-        log(f"reaping stale lock ({int(age)}s > {LOCK_TTL}s)")
-        stale = LOCK.with_name(f"{LOCK.name}.stale.{os.getpid()}")
-        try:
-            LOCK.rename(stale)
-        except OSError:
-            log("lost the reap race — exiting"); return False
-        shutil.rmtree(stale, ignore_errors=True)
-        try:
-            LOCK.mkdir()
-        except FileExistsError:
-            log("lost the reap race — exiting"); return False
-    _stamp_lock()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        log("another tick holds the lock — exiting"); return False
+    _LOCK_FD = fd
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()} {int(_dt.datetime.now().timestamp())}\n".encode())
+    except OSError:
+        pass
     return True
 
 
-def heartbeat_lock() -> None:
-    """Refresh the lock mtime so a long tick (many repos / slow DB) is never reaped as
-    stale by a later tick (codex M8). Cheap; called once per repo."""
-    _stamp_lock()
-
-
 def release_lock() -> None:
-    shutil.rmtree(LOCK, ignore_errors=True)
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        try:
+            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+            os.close(_LOCK_FD)
+        except OSError:
+            pass
+        _LOCK_FD = None
 
 
 # -- the trusted play-review.sh gate + the review trigger ----------------------
@@ -306,23 +303,27 @@ def _done(sha: str) -> bool:
     return (STATE / f"done-{sha}").exists()
 
 
-def _pin(repo: Repo, sha: str) -> None:
+def _pin(repo: Repo, refname: str, sha: str) -> bool:
     """Anchor a sha behind a controller-owned ref so git gc can't prune it (codex M4 /
-    Oracle MAJOR: a force-pushed-away reviewed_sha would else fail cat-file forever)."""
-    _git(repo.path, "update-ref", _ctl_reviewed_ref(repo.watch_ref), sha)
+    Oracle MAJOR: a force-pushed-away sha would else fail cat-file forever). Returns the
+    update-ref success so callers can refuse to advance onto an unpinnable object."""
+    return _git(repo.path, "update-ref", refname, sha).returncode == 0
 
 
 async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> None:
     rid, ref = repo.repo_id, repo.watch_ref
     cur = await led.get_cursor(rid, ref)
 
-    # advance pass: a prior dispatch whose review reached the ledger (or wrote done-<sha>)
-    # moves the cursor. The ledger signal is branch-move-proof (codex B2).
+    # advance pass: a prior dispatch whose review DELIVERED (play-review's post-delivery
+    # done-<sha> marker, made branch-move-proof by PLAY_FORCE_DONE) moves the cursor.
     if cur and cur["pending_sha"]:
         ps = cur["pending_sha"]
-        if await led.review_delivered(rid, ps) or _done(ps):
-            if await led.advance_cursor(rid, ref, ps):
-                _pin(repo, ps)
+        if _done(ps):
+            # anchor the new base against gc BEFORE advancing onto it; if the object is
+            # somehow gone, don't advance onto an unpinnable sha (would wedge cat-file).
+            if not _pin(repo, _ctl_reviewed_ref(ref), ps):
+                log(f"{rid}: cannot pin reviewed {ps[:8]} — not advancing")
+            elif await led.advance_cursor(rid, ref, ps):
                 log(f"{rid}: cursor advanced to {ps[:8]} (review delivered)")
             cur = await led.get_cursor(rid, ref)
 
@@ -331,8 +332,8 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
         return
 
     # observe: fetch into a controller-OWNED ref (no FETCH_HEAD race, gc-safe — codex M3/M4)
-    fr = _git(repo.path, "fetch", "--no-tags", "--quiet", "origin",
-              f"+{ref}:{_ctl_head_ref(ref)}", timeout=FETCH_TIMEOUT)
+    fr = _git(repo.path, "fetch", "--no-tags", "--no-recurse-submodules", "--quiet",
+              "origin", f"+{ref}:{_ctl_head_ref(ref)}", timeout=FETCH_TIMEOUT)
     if fr.returncode != 0:
         log(f"{rid}: fetch failed ({fr.stderr.strip()[:120]}) — skip this tick"); return
     hr = _git(repo.path, "rev-parse", _ctl_head_ref(ref))
@@ -345,7 +346,7 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
         if DRY_RUN:
             log(f"{rid}: DRY-RUN would seed baseline {head[:8]}"); return
         if await led.upsert_baseline(rid, ref, head):
-            _pin(repo, head)
+            _pin(repo, _ctl_reviewed_ref(ref), head)     # anchor the baseline base vs gc
             log(f"{rid}: seeded baseline {head[:8]} (not reviewed)")
         return
     if head == cur["reviewed_sha"]:
@@ -371,9 +372,15 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     stale_before = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=PENDING_STALE)
     if not await led.claim_dispatch(rid, ref, head, stale_before):
         log(f"{rid}: dispatch not claimed (in flight or blocked) — skip"); return
+    # anchor the in-flight head against gc: a later force-push overwrites the head ref while
+    # this sha is still pending, so without its own ref gc could prune it before advance (codex MAJOR).
+    _pin(repo, _ctl_pending_ref(ref), head)
     if trigger_review(repo, head, base, url):
         budget[0] += 1
         _charge_day()
+    else:                                                # FRONT failed -> un-stick now, don't wait out PENDING_STALE
+        await led.release_dispatch(rid, ref, head)
+        log(f"{rid}: released dispatch after trigger failure — will retry next tick")
 
 
 # -- daily dispatch budget (UTC-keyed file counter, mirrors play-review's cap) ---
@@ -411,7 +418,6 @@ async def tick() -> int:
         budget = [0]
         try:
             for repo in repos:
-                heartbeat_lock()                         # keep the lock fresh across a long tick (M8)
                 if not DRY_RUN and _day_count() >= MAX_DISPATCH_PER_DAY:
                     break
                 try:

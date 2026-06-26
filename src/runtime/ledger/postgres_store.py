@@ -911,20 +911,23 @@ class PostgresLedger:
                 repo_id, ref, head, stale_before)
         return row is not None
 
-    async def review_delivered(self, repo_id: str, base_ref: str) -> bool:
-        """True iff a review of `base_ref` (the reviewed tip) ran to completion in the
-        ledger — a done job stamped with this repo_id + base_ref. This is the controller's
-        ADVANCE signal: it is independent of play-review's done-<sha> file marker, which
-        is suppressed when the branch moves during the review (codex B2 — would re-review
-        forever). Canary jobs carry NULL base_ref, so only real review jobs match."""
+    async def release_dispatch(self, repo_id: str, ref: str, head: str) -> bool:
+        """Un-stick a dispatch whose trigger failed SYNCHRONOUSLY (missing/nonzero/timed-out
+        play-review FRONT): force the pending row stale so the NEXT tick re-dispatches
+        immediately instead of waiting out PENDING_STALE — while PRESERVING `attempts` so a
+        persistently-failing trigger still climbs to the blocked ceiling. Guarded on the
+        pending head + dispatching state. Returns True iff released."""
         async with self._pool.acquire() as con:
-            return await con.fetchval(
-                """SELECT EXISTS (SELECT 1 FROM job
-                       WHERE repo_id = $1 AND base_ref = $2 AND status = 'done')""",
-                repo_id, base_ref)
+            row = await con.fetchrow(
+                """UPDATE review_cursor SET updated_at = to_timestamp(0)
+                    WHERE repo_id = $1 AND ref = $2 AND pending_sha = $3
+                      AND state = 'dispatching'
+                    RETURNING repo_id""",
+                repo_id, ref, head)
+        return row is not None
 
     async def advance_cursor(self, repo_id: str, ref: str, head: str) -> bool:
-        """Advance the cursor once a review of `head` DELIVERED (review_delivered, or its
+        """Advance the cursor once a review of `head` DELIVERED (play-review's post-delivery
         done-<sha> marker). Guarded on pending_sha = head so it only ever advances the head
         we dispatched. Returns True iff advanced."""
         async with self._pool.acquire() as con:

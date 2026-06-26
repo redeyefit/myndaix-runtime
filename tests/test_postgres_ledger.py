@@ -558,22 +558,20 @@ async def test_cursor_no_supersede_in_flight(led: PostgresLedger) -> None:
     assert (await led.get_cursor(R, REF))["pending_sha"] == B, "pending must stay on the in-flight head"
 
 
-# -- controller-loop cursor: review_delivered reads a done review job ----------
-async def test_review_delivered_signal(led: PostgresLedger) -> None:
+# -- controller-loop cursor: release_dispatch un-sticks a failed trigger -------
+async def test_release_dispatch(led: PostgresLedger) -> None:
     await _truncate(led)
-    R, HEAD = "repoZ", "abc" + "0" * 37
-    assert await led.review_delivered(R, HEAD) is False
-    async with led._pool.acquire() as con:
-        # a canary-style job carries NULL base_ref -> must NOT signal delivery
-        await con.execute(
-            "INSERT INTO job (id, root_id, created_by, to_agent, body, status, repo_id, base_ref) "
-            "VALUES (gen_random_uuid(), gen_random_uuid(), 'c', 'kilabz', 'x', 'done', $1, NULL)", R)
-        assert await led.review_delivered(R, HEAD) is False
-        # a real review job (repo_id + base_ref=head, done) signals delivery
-        await con.execute(
-            "INSERT INTO job (id, root_id, created_by, to_agent, body, status, repo_id, base_ref) "
-            "VALUES (gen_random_uuid(), gen_random_uuid(), 'c', 'lobster', 'x', 'done', $1, $2)", R, HEAD)
-    assert await led.review_delivered(R, HEAD) is True
+    R, REF, A, B = "repoR", "refs/heads/main", "1" * 40, "2" * 40
+    hour = _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # attempt 1
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is False, "fresh in-flight -> no re-claim"
+    # a trigger failure releases the dispatch -> immediate re-claim, attempts climbs to the ceiling
+    assert await led.release_dispatch(R, REF, B) is True
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # attempt 2 (no 1h wait)
+    assert (await led.get_cursor(R, REF))["attempts"] == 2, "release preserves the attempt count"
+    # release only matches the pending + dispatching head
+    assert await led.release_dispatch(R, REF, "9" * 40) is False
 
 
 async def main() -> None:
