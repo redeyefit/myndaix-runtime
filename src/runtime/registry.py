@@ -97,6 +97,18 @@ V1_ROSTER: list[AgentSpec] = [
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
                        "application": "/higgsfield-ai/dop/lite"}),
+    # Stitcher: long video from a shot-list (generate per shot -> last-frame chain ->
+    # ffmpeg concat -> deterministic brand overlay). reach=API + adapter.kind 'stitch'
+    # routes to invoke_stitch. authority=WORKSPACE_ACTOR -> NEVER auto-retried (so the
+    # multi-segment spend is never silently re-charged); it does file I/O in a workspace.
+    AgentSpec(agent_id="stitcher", reach=Reach.API, authority=Authority.WORKSPACE_ACTOR,
+              model="dop-lite", role="long video via chained clips",
+              profile=Profile(timeout_s=1800, cost_budget=5.0),
+              adapter={"kind": "stitch",
+                       "base": "https://platform.higgsfield.ai",
+                       "secret_ref": "HF_KEY",
+                       "application": "/higgsfield-ai/dop/lite",
+                       "max_segments": 12}),
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}
