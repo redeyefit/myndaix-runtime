@@ -279,7 +279,9 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
 
     started = time.monotonic()
     deadline = started + job.timeout_s
-    async with httpx.AsyncClient(transport=transport) as client:
+    # follow_redirects=False: don't let a 30x bounce a request (carrying the HF key, or a
+    # guarded image_url) to an unintended host. httpx defaults to this; set it explicitly.
+    async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
         return await _hf_generate(
             client, base=base, application=application, key=key,
             prompt=job.prompt, image_url=image_url, started=started, deadline=deadline,

@@ -43,8 +43,9 @@ def _mock_transport():
         if u.endswith("/files/generate-upload-url"):
             state["n"] += 1
             n = state["n"]
+            # upload_url must resolve to a public host (now SSRF-guarded before PUT)
             return httpx.Response(200, json={"public_url": f"https://cdn/up{n}.png",
-                                             "upload_url": f"https://up.example/put{n}"})
+                                             "upload_url": f"https://example.com/put{n}"})
         if req.method == "PUT":
             return httpx.Response(200)
         if req.method == "GET":
@@ -221,6 +222,39 @@ def test_stitch_end_card_ssrf_rejected(tmp_path, monkeypatch):
     r = asyncio.run(runner_stitch.invoke_stitch(_spec(), job, transport=_mock_transport()))
     assert r.status is ResultStatus.OK, r.text          # render still succeeds
     assert i2c_calls == []                              # end card was NOT built (SSRF-rejected, never fetched)
+
+    # positive control: a SAFE end_card_url DOES get fetched + built (proves the guard isn't
+    # silently skipping every end card — the await-trap false-pass the review warned about).
+    i2c_calls.clear()
+    job2 = _job(shots, tmp_path, end_card_url="https://example.com/card.png")
+    r2 = asyncio.run(runner_stitch.invoke_stitch(_spec(), job2, transport=_mock_transport()))
+    assert r2.status is ResultStatus.OK, r2.text
+    assert len(i2c_calls) == 1                          # safe end card WAS built
+
+
+def test_hf_upload_rejects_internal_upload_url():
+    """_hf_upload must SSRF-guard the server-returned upload_url before the PUT — an
+    internal/link-local upload_url is rejected and NO PUT is made (Oracle P1)."""
+    import time
+    put_calls = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if str(req.url).endswith("/files/generate-upload-url"):
+            return httpx.Response(200, json={"public_url": "https://cdn.example/ok.png",
+                                             "upload_url": "http://169.254.169.254/put"})
+        if req.method == "PUT":
+            put_calls["n"] += 1
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            await runner_stitch._hf_upload(c, "https://platform.higgsfield.ai", "k:s",
+                                           b"data", "image/png", time.monotonic() + 60)
+
+    with pytest.raises(ValueError):
+        asyncio.run(run())
+    assert put_calls["n"] == 0   # rejected BEFORE any PUT left the process
 
 
 # -- motion_id wiring (invoke_higgsfield through the shared helper) ---------
