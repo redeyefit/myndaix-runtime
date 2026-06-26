@@ -278,7 +278,9 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
                       text="higgsfield job missing 'image_url' (required for image->video)")
 
     started = time.monotonic()
-    deadline = started + job.timeout_s
+    # PROFILE timeout, not job.timeout_s: the spine doesn't apply Profile.timeout_s when it
+    # builds the Job, so job.timeout_s is the dead 300s default. Read the source of truth.
+    deadline = started + spec.profile.timeout_s
     # follow_redirects=False: don't let a 30x bounce a request (carrying the HF key, or a
     # guarded image_url) to an unintended host. httpx defaults to this; set it explicitly.
     async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:

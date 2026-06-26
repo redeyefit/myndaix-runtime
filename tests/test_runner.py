@@ -6,7 +6,7 @@ import asyncio
 import uuid
 
 from runtime import runner
-from runtime.contracts import Authority, ErrorClass, Job, Reach, ResultStatus
+from runtime.contracts import Authority, ErrorClass, Job, Profile, Reach, ResultStatus
 from runtime.registry import AgentSpec
 
 
@@ -247,9 +247,12 @@ def _hf_spec(**adapter_over):
                # 0 keeps the poll loop instant in tests (real default is 2s)
                "poll_interval_s": 0, "poll_retry_backoff_s": 0}
     adapter.update(adapter_over)
+    # invoke_higgsfield now derives the deadline from spec.profile.timeout_s (NOT job.timeout_s,
+    # which the spine leaves at its dead 300s default). Use a short profile timeout so the
+    # timeout/cancel tests trigger fast; completion tests finish instantly via MockTransport.
     return AgentSpec(agent_id="higgsfield", reach=Reach.API,
                      authority=Authority.RESPONDER, model="dop-lite", role="video",
-                     adapter=adapter)
+                     profile=Profile(timeout_s=5), adapter=adapter)
 
 
 # image_url is a PUBLIC IP literal so the SSRF check passes without a DNS lookup.

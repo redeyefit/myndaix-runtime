@@ -103,7 +103,10 @@ V1_ROSTER: list[AgentSpec] = [
     # multi-segment spend is never silently re-charged); it does file I/O in a workspace.
     AgentSpec(agent_id="stitcher", reach=Reach.API, authority=Authority.WORKSPACE_ACTOR,
               model="dop-lite", role="long video via chained clips",
-              profile=Profile(timeout_s=1800, cost_budget=5.0),
+              # 2400s: 5 sequential ~3-4min DoP renders + downloads/chains + concat, with margin.
+              # NOTE: read via spec.profile.timeout_s in invoke_stitch — the spine's lease_job
+              # does NOT apply Profile.timeout_s to the Job (job.timeout_s stays the 300s default).
+              profile=Profile(timeout_s=2400, cost_budget=5.0),
               adapter={"kind": "stitch",
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
