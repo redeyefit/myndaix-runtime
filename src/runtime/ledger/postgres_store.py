@@ -940,6 +940,21 @@ class PostgresLedger:
                 repo_id, ref, head)
         return row is not None
 
+    async def skip_to(self, repo_id: str, ref: str, head: str) -> bool:
+        """Advance the cursor straight to `head` WITHOUT a review — used when base..head has
+        no net diff (an empty/revert-net-zero commit), which play-review would abort on and
+        never mark done, wedging the head to BLOCKED (workflow MAJOR). Clears any pending.
+        Guarded on reviewed_sha <> head so it is idempotent. Returns True iff advanced."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """UPDATE review_cursor
+                      SET reviewed_sha = $3, pending_sha = NULL,
+                          state = 'delivered', attempts = 0, updated_at = now()
+                    WHERE repo_id = $1 AND ref = $2 AND reviewed_sha <> $3
+                    RETURNING repo_id""",
+                repo_id, ref, head)
+        return row is not None
+
     async def mark_blocked(self, repo_id: str, ref: str, head: str, max_attempts: int) -> bool:
         """Sticky-block the current pending head after `max_attempts` failed dispatches.
         A CAS (codex M5): guarded on pending_sha = head AND attempts >= max_attempts AND

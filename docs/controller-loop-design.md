@@ -4,6 +4,17 @@ _North-star rung 3. v1 = **proactive review scheduler**, a bounded level-trigger
 
 **Decisions locked (Jefe, 2026-06-25):** (1) trigger = **synthetic-stdin, zero-touch** (no edits to `play-review.sh`); (2) watch scope = **default branch only** (`refs/heads/main`); (3) cadence = **hourly**; (4) cross-family design review before code (done).
 
+### v0.6 changelog (folded a 15-agent adversarial-sweep WORKFLOW — 6 confirmed findings the serial reviews missed, each skeptic-verified; 2 refuted)
+- **MAJOR — baseline seed ignored its pin result:** the first-sight seed pinned the base but didn't check the result (the advance/pending paths did). A failed pin could wedge cat-file. Now: pin first, seed only if it holds.
+- **MAJOR — non-object repos.json crashed the tick:** valid JSON that isn't an object (e.g. a top-level array) made `raw.items()` throw uncaught → controller silently disabled. Added an `isinstance(raw, dict)` fail-soft guard.
+- **MAJOR — empty-diff commit wedged to BLOCKED:** an empty/revert-net-zero commit on the watched ref makes play-review abort on the empty diff (no marker) → re-dispatch to the BLOCKED ceiling + false alert. Now the controller short-circuits `git diff --quiet base head` and advances the cursor past it (new `skip_to`).
+- **MINOR — daily-budget `break` skipped the free advance pass** for later repos. The daily gate now wraps ONLY the dispatch (inside process_repo), so the advance pass always runs.
+- **MINOR — stale `PLAY_FORCE_DONE` comment** reworded to the empty-URL mechanism.
+- **Completeness critic (coverage BLOCKER): the synthetic-stdin → done-marker → advance loop was never tested end-to-end.** Added `test_end_to_end_stub_play_review` (real subprocess into a thin stub play-review that writes the marker; asserts the stdin contract + the advance). Plus the daily-budget path is now tested.
+- Refuted by skeptics (correctly): a `stale_before` host-clock-vs-db-now skew; and "installed play-review predates PLAY_DISABLE_AUTOFIX" (a deploy step, not a code bug — see §8a).
+- Tests: controller 18/18, ledger 26/26, test.sh 43/43. Workflow result: `docs/reviews/controller-loop-final-verify-workflow.md`.
+- **Remaining live-only gap (for the dry-run, NOT a code fix):** SSH auth + env inheritance under launchd — the plist sets no `EnvironmentVariables`; the dry-run confirms whether `git fetch` over ssh works in the launchd context (else add `SSH_AUTH_SOCK`/use a deploy key or https token).
+
 ### v0.5 changelog (folded the v0.4 DELTA review — Oracle APPROVE-WITH-FIXES, codex NEEDS-REVISION; both cleared flock + GIT_ALLOW_PROTOCOL + release_dispatch as correct)
 - **`PLAY_FORCE_DONE` DELETED** (codex MAJOR — it was a public env bypass that could mark a rejected push done). The controller now passes an **empty remote URL** to play-review: `confirm_pushed` treats that as pushed (the existing manual-run path) and writes the post-delivery `done-<sha>` marker — no bypass flag, and **no `ls-remote`** runs. Net: play-review has just ONE controller edit again (`PLAY_DISABLE_AUTOFIX`).
 - **Pending-pin failure now fails safe** (codex MAJOR + Oracle MINOR, converged): if anchoring the in-flight head fails, the controller releases the claim and skips (no unanchored dispatch that gc could prune mid-review).

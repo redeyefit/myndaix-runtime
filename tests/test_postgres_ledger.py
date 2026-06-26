@@ -574,6 +574,18 @@ async def test_release_dispatch(led: PostgresLedger) -> None:
     assert await led.release_dispatch(R, REF, "9" * 40) is False
 
 
+# -- controller-loop cursor: skip_to advances past an empty-diff head ----------
+async def test_skip_to(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoS", "refs/heads/main", "1" * 40, "2" * 40
+    await led.upsert_baseline(R, REF, A)
+    await led.claim_dispatch(R, REF, B, _utcnow() - _dt.timedelta(hours=1))  # pending=B
+    assert await led.skip_to(R, REF, B) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["reviewed_sha"] == B and cur["pending_sha"] is None and cur["state"] == "delivered"
+    assert await led.skip_to(R, REF, B) is False, "idempotent: no-op once reviewed == head"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     # fresh schema for the run (schema.sql is plain CREATE, not IF NOT EXISTS)

@@ -57,6 +57,11 @@ def advance(repo: C.Repo, content: str) -> str:
     return g(repo.path, "rev-parse", "HEAD").stdout.strip()
 
 
+def advance_empty(repo: C.Repo) -> str:
+    g(repo.path, "commit", "-q", "--allow-empty", "-m", "empty"); g(repo.path, "push", "-q", "origin", "main")
+    return g(repo.path, "rev-parse", "HEAD").stdout.strip()
+
+
 def head_of(repo: C.Repo) -> str:
     return g(repo.path, "rev-parse", "HEAD").stdout.strip()
 
@@ -276,6 +281,71 @@ async def test_dispatch_override_requires_test_mode(led: PostgresLedger) -> None
     ok = C.trigger_review(repo, "a" * 40, "b" * 40)
     assert ok is False and records(seam) == [], "must refuse the override outside test mode"
     C.TEST_MODE = True
+
+
+# -- an empty-net-diff commit advances the cursor WITHOUT a review (workflow MAJOR) --
+async def test_empty_diff_advances_without_review(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("empty"); repo = make_repo("empty")
+    await C.process_repo(led, repo, [0])                 # baseline
+    head2 = advance_empty(repo)                          # empty commit -> base..head2 has no net diff
+    await C.process_repo(led, repo, [0])
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == head2 and cur["pending_sha"] is None, "empty diff must advance, not dispatch"
+    assert records(seam) == [], "an empty-diff head must NOT be dispatched (would wedge to BLOCKED)"
+
+
+# -- repos.json that is valid JSON but not an object fails soft (workflow MAJOR) --
+async def test_load_config_rejects_non_object(led: PostgresLedger) -> None:
+    cfgfile = _TMP / "repos-array.json"; cfgfile.write_text('["not", "an", "object"]')
+    C.REPOS_JSON = cfgfile
+    assert C.load_config() == [], "a non-object repos.json must yield [] (fail-soft), not crash"
+
+
+# -- daily budget stops NEW dispatch but the (free) advance pass still runs (workflow MINOR) --
+async def test_daily_budget_blocks_dispatch_not_advance(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("daycap"); repo = make_repo("daycap")
+    await C.process_repo(led, repo, [0])                 # baseline
+    head2 = advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch head2 (pending)
+    assert len(records(seam)) == 1
+    (C.STATE / f"done-{head2}").write_text("")           # head2 delivered
+    C.MAX_DISPATCH_PER_DAY = 0                            # exhaust the daily dispatch budget
+    head3 = advance(repo, "c2")                           # a new head arrives
+    await C.process_repo(led, repo, [0])                 # advance MUST run; dispatch MUST NOT
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == head2, "advance pass must run even with the daily budget exhausted"
+    assert len(records(seam)) == 1, "no NEW dispatch once the daily budget is exhausted"
+    C.MAX_DISPATCH_PER_DAY = 20
+
+
+# -- END-TO-END: real subprocess into a thin stub play-review -> done-marker -> advance --
+async def test_end_to_end_stub_play_review(led: PostgresLedger) -> None:
+    await _truncate(led)
+    fresh_seam("e2e"); repo = make_repo("e2e")
+    state = C.STATE
+    record = _TMP / "e2e-stub-stdin.txt"
+    stub = _TMP / "stub-play-review.sh"                  # trusted: regular file, owned by us, not group/world-writable
+    stub.write_text(
+        "#!/bin/bash\nread -r lr ls rr rs\n"
+        f'printf "%s|%s|%s|%s" "$lr" "$ls" "$rr" "$rs" > "{record}"\n'
+        f'mkdir -p "{state}"; printf x > "{state}/done-$ls"\nexit 0\n')
+    stub.chmod(0o755)
+    C.PLAY_REVIEW = stub
+    C.TEST_MODE = False; C.DISPATCH_OVERRIDE = ""         # exercise the REAL subprocess trigger path
+    try:
+        await C.process_repo(led, repo, [0])             # baseline
+        base = head_of(repo); head2 = advance(repo, "c1")
+        await C.process_repo(led, repo, [0])             # real dispatch -> stub writes done-<head2>
+        assert (state / f"done-{head2}").exists(), "controller must invoke play-review which writes the marker"
+        got = record.read_text().split("|")
+        assert got == ["refs/heads/main", head2, "refs/heads/main", base], f"synthetic-stdin contract: {got}"
+        await C.process_repo(led, repo, [0])             # advance pass consumes the marker
+        cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+        assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered", "end-to-end advance failed"
+    finally:
+        C.TEST_MODE = True
 
 
 async def main() -> None:

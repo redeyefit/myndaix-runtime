@@ -170,6 +170,8 @@ def load_config() -> list[Repo]:
         log(f"no repos.json at {REPOS_JSON} — nothing to watch"); return []
     except (json.JSONDecodeError, OSError) as e:
         log(f"repos.json unreadable ({e}) — skipping tick"); return []
+    if not isinstance(raw, dict):                        # valid JSON but not an object (e.g. a list)
+        log(f"repos.json is a {type(raw).__name__}, expected an object — skipping tick"); return []
 
     repos: list[Repo] = []
     seen: set[str] = set()
@@ -323,8 +325,10 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     rid, ref = repo.repo_id, repo.watch_ref
     cur = await led.get_cursor(rid, ref)
 
-    # advance pass: a prior dispatch whose review DELIVERED (play-review's post-delivery
-    # done-<sha> marker, made branch-move-proof by PLAY_FORCE_DONE) moves the cursor.
+    # advance pass: a prior dispatch whose review DELIVERED moves the cursor. The signal is
+    # play-review's post-delivery done-<sha> marker; the controller passes an empty remote URL
+    # so confirm_pushed treats the dispatch as pushed and writes the marker unconditionally
+    # (branch-move-proof) without ls-remote or a PLAY_FORCE_DONE bypass.
     if cur and cur["pending_sha"]:
         ps = cur["pending_sha"]
         if _done(ps):
@@ -354,12 +358,30 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     if cur is None:                                      # first sight (B2): seed, do NOT review
         if DRY_RUN:
             log(f"{rid}: DRY-RUN would seed baseline {head[:8]}"); return
+        # anchor the baseline base vs gc FIRST; only seed if the pin holds, else a later
+        # cat-file on an unpinned base could wedge (workflow MAJOR — matches the advance path).
+        if not _pin(repo, _ctl_reviewed_ref(ref), head):
+            log(f"{rid}: could not pin baseline {head[:8]} — not seeding this tick"); return
         if await led.upsert_baseline(rid, ref, head):
-            _pin(repo, _ctl_reviewed_ref(ref), head)     # anchor the baseline base vs gc
             log(f"{rid}: seeded baseline {head[:8]} (not reviewed)")
         return
     if head == cur["reviewed_sha"]:
         return                                           # up to date
+
+    base = cur["reviewed_sha"]                            # review reviewed_sha..head (never empty-tree)
+    if _git(repo.path, "cat-file", "-e", f"{head}^{{commit}}").returncode != 0 or \
+       _git(repo.path, "cat-file", "-e", f"{base}^{{commit}}").returncode != 0:
+        log(f"{rid}: head/base objects not present locally — skip"); return
+
+    # nothing-to-review short-circuit: base..head has no net diff (empty/revert-net-zero commit).
+    # play-review aborts on an empty diff and never marks done, so dispatching would re-try to the
+    # BLOCKED ceiling (workflow MAJOR). Advance straight past it instead.
+    if _git(repo.path, "diff", "--quiet", base, head).returncode == 0:
+        if DRY_RUN:
+            log(f"{rid}: DRY-RUN would skip empty-diff {head[:8]} (advance, no review)"); return
+        if _pin(repo, _ctl_reviewed_ref(ref), head) and await led.skip_to(rid, ref, head):
+            log(f"{rid}: no net diff {base[:8]}..{head[:8]} — advanced without review")
+        return
 
     # ceiling: stop chasing a head that has failed MAX_ATTEMPTS dispatches
     if cur["pending_sha"] == head and cur["attempts"] >= MAX_ATTEMPTS and cur["state"] != "blocked":
@@ -369,11 +391,8 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
 
     if budget[0] >= MAX_DISPATCH_PER_TICK:
         log(f"{rid}: per-tick dispatch budget reached — deferring {head[:8]} to next tick"); return
-
-    base = cur["reviewed_sha"]                            # review reviewed_sha..head (never empty-tree)
-    if _git(repo.path, "cat-file", "-e", f"{head}^{{commit}}").returncode != 0 or \
-       _git(repo.path, "cat-file", "-e", f"{base}^{{commit}}").returncode != 0:
-        log(f"{rid}: head/base objects not present locally — skip"); return
+    if not DRY_RUN and _day_count() >= MAX_DISPATCH_PER_DAY:  # daily gate wraps ONLY dispatch, so the
+        log(f"{rid}: daily dispatch budget reached — observing only"); return  # advance pass above always runs
 
     if DRY_RUN:
         log(f"{rid}: DRY-RUN would dispatch review {base[:8]}..{head[:8]}"); return
@@ -425,14 +444,12 @@ async def tick() -> int:
         return 0
     try:
         if not DRY_RUN and _day_count() >= MAX_DISPATCH_PER_DAY:
-            log(f"daily dispatch budget ({MAX_DISPATCH_PER_DAY}) reached — observing only")
+            log(f"daily dispatch budget ({MAX_DISPATCH_PER_DAY}) reached — advancing only, no new dispatches")
         led = await PostgresLedger.connect(DSN)
         budget = [0]
         try:
-            for repo in repos:
-                if not DRY_RUN and _day_count() >= MAX_DISPATCH_PER_DAY:
-                    break
-                try:
+            for repo in repos:                           # the daily gate lives INSIDE process_repo (wraps
+                try:                                     # only dispatch), so the free advance pass always runs
                     await process_repo(led, repo, budget)
                 except Exception as e:                   # one bad repo never sinks the tick
                     log(f"{repo.repo_id}: tick error {e!r}")
