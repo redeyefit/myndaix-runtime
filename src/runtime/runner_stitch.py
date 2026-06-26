@@ -37,7 +37,11 @@ from runtime.runner import (
 )
 
 _STITCH_MAX_SEGMENTS = 12      # cost guardrail: N shots x ~$0.13 — a runaway N is a $ DoS
-_HTTP_TIMEOUT_CAP_S = 120      # ceiling on a single clip download / frame+final upload
+_HTTP_TIMEOUT_CAP_S = 120      # ceiling on a single clip download / chained-frame upload (~MBs)
+# The FINAL upload is the concatenated video — the single biggest transfer (5 clips ≈ 90MB+).
+# 120s was too tight for it (a real run ReadTimeout'd here); dedicated, generous cap (still
+# deadline-bounded). ~90MB in 300s = ~2.4 Mbps, very conservative.
+_FINAL_UPLOAD_CAP_S = 300
 _MAX_CLIP_BYTES = 256 * 1024 * 1024     # DoP clips ~20MB; generous ceiling (OOM/disk DoS guard)
 _MAX_ENDCARD_BYTES = 32 * 1024 * 1024   # an end-card is an image
 
@@ -70,10 +74,11 @@ async def _download_capped(client, url: str, dest_path: str, max_bytes: int,
     return dest_path
 
 
-def _remaining(deadline: float) -> float:
-    """Budget-bounded I/O timeout: never exceed the overall job deadline, capped so one
-    slow transfer can't eat the whole budget, floored above 0 (httpx reads 0 as instant-fail)."""
-    return max(0.001, min(_HTTP_TIMEOUT_CAP_S, deadline - time.monotonic()))
+def _remaining(deadline: float, cap: float = _HTTP_TIMEOUT_CAP_S) -> float:
+    """Budget-bounded I/O timeout: never exceed the overall job deadline, capped (per-call) so
+    one slow transfer can't eat the whole budget, floored above 0 (httpx reads 0 as instant-fail).
+    `cap` lets the big final-video upload use a larger ceiling than small per-clip transfers."""
+    return max(0.001, min(cap, deadline - time.monotonic()))
 
 
 def _err(text: str, *, started: float, cost: Optional[float] = None,
@@ -84,15 +89,16 @@ def _err(text: str, *, started: float, cost: Optional[float] = None,
 
 
 async def _hf_upload(client, base: str, key: str, data: bytes, content_type: str,
-                     deadline: float) -> str:
+                     deadline: float, cap: float = _HTTP_TIMEOUT_CAP_S) -> str:
     """Replicate Higgsfield's two-step upload with raw httpx (no SDK dep):
     POST /files/generate-upload-url {content_type} -> {public_url, upload_url};
     PUT the bytes to upload_url (presigned, no auth header); return public_url.
-    Both calls are bounded by the remaining job budget."""
+    Both calls are bounded by the remaining job budget (per-call `cap` — larger for the
+    big final-video upload than for small chained-frame uploads)."""
     r = await client.post(base.rstrip("/") + "/files/generate-upload-url",
                           headers={"Authorization": f"Key {key}",
                                    "Content-Type": "application/json"},
-                          json={"content_type": content_type}, timeout=_remaining(deadline))
+                          json={"content_type": content_type}, timeout=_remaining(deadline, cap))
     r.raise_for_status()
     j = r.json()
     public_url, upload_url = j["public_url"], j["upload_url"]
@@ -102,7 +108,7 @@ async def _hf_upload(client, base: str, key: str, data: bytes, content_type: str
     if await _reject_unsafe_url(upload_url):
         raise ValueError(f"upload_url rejected (SSRF): {upload_url}")
     pr = await client.put(upload_url, content=data,
-                          headers={"Content-Type": content_type}, timeout=_remaining(deadline))
+                          headers={"Content-Type": content_type}, timeout=_remaining(deadline, cap))
     pr.raise_for_status()
     return public_url
 
@@ -223,7 +229,8 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
                 seq.append(end_card)
             await asyncio.to_thread(fu.concat, seq, final_path)
             with open(final_path, "rb") as f:
-                final_url = await _hf_upload(client, base, key, f.read(), "video/mp4", deadline)
+                final_url = await _hf_upload(client, base, key, f.read(), "video/mp4",
+                                             deadline, cap=_FINAL_UPLOAD_CAP_S)
         except fu.FfmpegError as e:
             return _err(f"stitch assembly (ffmpeg) failed: {e}", started=started, cost=total_cost)
         except Exception as e:   # noqa: BLE001
