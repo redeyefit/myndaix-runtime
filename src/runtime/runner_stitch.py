@@ -140,7 +140,11 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
     workdir = job.worktree_path or tempfile.mkdtemp(prefix="mdx-stitch-")
     os.makedirs(workdir, exist_ok=True)
 
-    deadline = started + job.timeout_s
+    # Use the agent's PROFILE timeout, not job.timeout_s: the spine's lease_job builds the
+    # Job without applying Profile.timeout_s, so job.timeout_s is the dead 300s default — far
+    # too short for 5 sequential renders. (Spine bug filed separately; this reads the source of
+    # truth directly.) spec.profile.timeout_s = 2400 for the stitcher.
+    deadline = started + spec.profile.timeout_s
     poll_interval = _hf_float(a.get("poll_interval_s"), _HF_POLL_INTERVAL_S)
     retry_backoff = _hf_float(a.get("poll_retry_backoff_s"), _HF_POLL_RETRY_BACKOFF_S)
     retry_max = _hf_int(a.get("poll_retry_max"), _HF_POLL_RETRY_MAX)
