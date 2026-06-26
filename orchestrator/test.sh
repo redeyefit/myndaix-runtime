@@ -89,7 +89,7 @@ echo "15. SHA on the TARGET ref confirms"; reset; bare2="$ROOT/bare2.git"; git i
 echo "16. PR-0a: scope flags forwarded to mxr (repo bucket + reviewed SHA)"; reset; STUB_TRIAGE="PLAY_PASS" run
   rid="$(basename "$REPO")"; log="$FAKE/.myndaix/mxr-argv.log"
   nscoped="$(grep -c -- "--repo $rid --base-ref $TIP" "$log" 2>/dev/null || true)"; [[ "$nscoped" =~ ^[0-9]+$ ]] || nscoped=0
-  if [[ "$nscoped" -eq 2 ]]; then echo "  ok: review+triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 2 scoped mxr calls, got $nscoped"; FAIL=$((FAIL+1)); fi
+  if [[ "$nscoped" -eq 3 ]]; then echo "  ok: kilabz+oracle reviews + triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 3 scoped mxr calls (kilabz+oracle+lobster), got $nscoped"; FAIL=$((FAIL+1)); fi
   if grep -q "READY.*--repo" "$log" 2>/dev/null; then echo "  FAIL: canary must stay cap-exempt"; FAIL=$((FAIL+1)); else echo "  ok: canary cap-exempt (no --repo)"; PASS=$((PASS+1)); fi
 
 echo "17. PR-1a: front re-execs the FIXED installed worker, not the worktree copy"; reset

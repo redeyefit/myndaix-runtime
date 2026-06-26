@@ -16,7 +16,8 @@
 set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-ORCH="${MYNDAIX_ORCH:-$HOME/.myndaix/orchestrator}"
+ORCH="$HOME/.myndaix/orchestrator"            # MUST match play-review.sh:23 EXACTLY — the worker reads the
+                                              # flag + re-execs from here; no MYNDAIX_ORCH override (codex MAJOR)
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"
 INBOX="${MYNDAIX_FIX_INBOX:-$HOME/.myndaix/bridge/inbox/jefe}"
 FLAG="$ORCH/AUTOFIX_ENABLED"
@@ -30,9 +31,9 @@ ok(){ printf '  \033[32m✓\033[0m %s\n' "$*"; }
 no(){ printf '  \033[31m✗\033[0m %s\n' "$*"; }
 warn(){ printf '  \033[33m!\033[0m %s\n' "$*"; }
 
-verify_one(){   # verify $ORCH/$1 exists, is executable, and matches the working-tree copy
+verify_one(){   # verify $ORCH/$1 is a real regular file (NOT a symlink), executable, matches the working tree
   local f="$1" a b
-  [[ -f "$ORCH/$f" ]] || { no "$f trusted install MISSING ($ORCH/$f)"; return 1; }
+  [[ -f "$ORCH/$f" && ! -L "$ORCH/$f" ]] || { no "$f trusted install MISSING or a SYMLINK ($ORCH/$f)"; return 1; }
   [[ -x "$ORCH/$f" ]] || { no "$f trusted install not executable"; return 1; }
   a="$(shasum -a 256 "$SELF_DIR/$f" | awk '{print $1}')"
   b="$(shasum -a 256 "$ORCH/$f"     | awk '{print $1}')"
@@ -69,12 +70,16 @@ case "$cmd" in
     ;;
   arm)
     say "arming the autonomous-fix flip — running pre-arm gates…"
+    rm -f "$FLAG"     # FAIL-CLOSED: disarm FIRST so any gate/deploy failure below leaves it OFF, never partially armed (codex BLOCKER)
     say "  [1/3] codex .git-write-vector probe (runs codex; ~30s)…"
     if bash "$PROBE" >/tmp/autofix-arm-probe.log 2>&1; then ok "probe PASS — seatbelt denies shared-.git writes"
     else no "probe FAILED — see /tmp/autofix-arm-probe.log. NOT arming."; exit 1; fi
-    say "  [2/3] deploying trusted worker + fixer into $ORCH…"
+    say "  [2/3] deploying trusted worker + fixer into $ORCH (atomic temp+rename)…"
     mkdir -p "$ORCH"
-    for f in "${INSTALLS[@]}"; do cp "$SELF_DIR/$f" "$ORCH/$f"; chmod 0755 "$ORCH/$f"; done
+    for f in "${INSTALLS[@]}"; do
+      cp "$SELF_DIR/$f" "$ORCH/.$f.tmp.$$"; chmod 0755 "$ORCH/.$f.tmp.$$"
+      mv -f "$ORCH/.$f.tmp.$$" "$ORCH/$f"      # atomic replace — clobbers any preexisting symlink (codex MAJOR)
+    done
     verify_all || { no "install verification failed — NOT arming."; exit 1; }
     say "  [3/3] invariants…"
     watcher_check || true
