@@ -158,6 +158,8 @@ Brain pipes `"<watch_ref> <head> <watch_ref> <reviewed_sha>"` + argv `origin <ur
 3. **Re-review v0.2?** — optional focused cross-family re-review of this revision, or proceed to the implementation plan. Recommend: proceed to plan (findings were convergent + concrete; a re-review of the *plan* + built code covers it).
 
 ## 8a. Runbook (deploy = atomic, dry-run-first)
+> **DEPLOYED LIVE 2026-06-26** on the MacBook (`ai.myndaix.controller`, hourly). Migration `0003` applied to prod `runtime`; trusted `play-review.sh` refreshed; first tick seeded `myndaix-runtime/main` baseline. Autofix stays OFF for this rung.
+
 Built artifacts: `src/runtime/controller.py` (`python -m runtime.controller tick`), `orchestrator/controller-tick.sh` (portable launchd wrapper), `orchestrator/ai.myndaix.controller.plist.example`, migration `0003_review_cursor` (auto-applied on serve boot).
 
 1. **Schema** — already live after any `serve` restart (auto-migrate). Or by hand: `psql "$MYNDAIX_DSN" -f src/runtime/ledger/migrations/0003_review_cursor.sql`.
