@@ -37,11 +37,7 @@ from runtime.runner import (
 )
 
 _STITCH_MAX_SEGMENTS = 12      # cost guardrail: N shots x ~$0.13 — a runaway N is a $ DoS
-_HTTP_TIMEOUT_CAP_S = 120      # ceiling on a single clip download / chained-frame upload (~MBs)
-# The FINAL upload is the concatenated video — the single biggest transfer (5 clips ≈ 90MB+).
-# 120s was too tight for it (a real run ReadTimeout'd here); dedicated, generous cap (still
-# deadline-bounded). ~90MB in 300s = ~2.4 Mbps, very conservative.
-_FINAL_UPLOAD_CAP_S = 300
+_HTTP_TIMEOUT_CAP_S = 120      # ceiling on a clip download / chained-frame upload (small, ~MBs)
 _MAX_CLIP_BYTES = 256 * 1024 * 1024     # DoP clips ~20MB; generous ceiling (OOM/disk DoS guard)
 _MAX_ENDCARD_BYTES = 32 * 1024 * 1024   # an end-card is an image
 
@@ -220,17 +216,20 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
         if not clips:
             return _err(f"stitch produced no clips (failed at shot {failed_at}: {fail_reason})",
                         started=started, cost=total_cost)
-        final_path = os.path.join(workdir, "final.mp4")
+        # Write the final video to a STABLE local dir. NOT uploaded: Higgsfield's upload
+        # endpoint is image/audio-only (rejects video/mp4 with 422), and this is a local-first
+        # runtime — the deliverable is a local file the operator opens. The worker's worktree is
+        # ephemeral (cleaned per-attempt), so the final mp4 must live OUTSIDE it.
+        out_dir = os.path.expanduser(os.environ.get("MDX_STITCH_OUT", "~/.myndaix/stitches"))
+        final_path = os.path.join(out_dir, f"stitch_{job.id}.mp4")
         try:
+            os.makedirs(out_dir, exist_ok=True)
             seq = list(clips)
             # HYBRID brand layer: append a deterministic end card (exact logo) if given.
             end_card = await _resolve_end_card(client, job, workdir, clips[0], deadline)
             if end_card:
                 seq.append(end_card)
             await asyncio.to_thread(fu.concat, seq, final_path)
-            with open(final_path, "rb") as f:
-                final_url = await _hf_upload(client, base, key, f.read(), "video/mp4",
-                                             deadline, cap=_FINAL_UPLOAD_CAP_S)
         except fu.FfmpegError as e:
             return _err(f"stitch assembly (ffmpeg) failed: {e}", started=started, cost=total_cost)
         except Exception as e:   # noqa: BLE001
@@ -238,11 +237,11 @@ async def invoke_stitch(spec: AgentSpec, job: Job, *, transport=None) -> Result:
                         started=started, cost=total_cost)
 
     if failed_at is not None:
-        # partial success: hand back the concatenated good shots + the failure reason.
+        # partial success: hand back the concatenated good shots (local path) + the reason.
         return _err(f"stitch PARTIAL {len(clips)}/{len(shots)} shots "
                     f"(failed at {failed_at}: {fail_reason})",
-                    started=started, cost=total_cost, artifact=final_url)
-    return Result(status=ResultStatus.OK, text=final_url, artifact_ref=final_url,
+                    started=started, cost=total_cost, artifact=final_path)
+    return Result(status=ResultStatus.OK, text=final_path, artifact_ref=final_path,
                   cost=total_cost or None, ms=_ms(started))
 
 
