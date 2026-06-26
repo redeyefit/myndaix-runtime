@@ -99,30 +99,32 @@ def _ok_gen(calls, fail_at=None):
 # -- tests -----------------------------------------------------------------
 def test_stitch_happy_path_chains_and_uploads(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_KEY", "kid:secret")
+    monkeypatch.setenv("MDX_STITCH_OUT", str(tmp_path / "out"))   # final mp4 -> temp, not ~/.myndaix
     _patch_ffmpeg(monkeypatch)
     calls = []
     monkeypatch.setattr(runner_stitch, "_hf_generate", _ok_gen(calls))
-    shots = [
+    job = _job([
         {"prompt": "open", "image_url": "https://seed/0.png", "motion_id": "M0"},
         {"prompt": "mid", "motion_id": "M1"},
         {"prompt": "close", "motion_id": "M2"},
-    ]
-    r = asyncio.run(runner_stitch.invoke_stitch(_spec(), _job(shots, tmp_path),
-                                                transport=_mock_transport()))
+    ], tmp_path)
+    r = asyncio.run(runner_stitch.invoke_stitch(_spec(), job, transport=_mock_transport()))
     assert r.status is ResultStatus.OK, r.text
     assert len(calls) == 3
     # shot 0 uses its explicit seed; shots 1 & 2 chain off the uploaded last frame
     assert calls[0]["image_url"] == "https://seed/0.png"
-    assert calls[1]["image_url"] == "https://cdn/up1.png"   # chained
+    assert calls[1]["image_url"] == "https://cdn/up1.png"   # chained (frame upload)
     assert calls[2]["image_url"] == "https://cdn/up2.png"   # chained
     assert calls[0]["motion_id"] == "M0"
-    # final = the last upload (video); cost summed across shots
-    assert r.artifact_ref == "https://cdn/up3.png"
+    # final = a LOCAL mp4 path (no video upload — Higgsfield upload is image/audio-only)
+    assert r.artifact_ref.endswith(f"stitch_{job.id}.mp4")
+    assert os.path.isfile(r.artifact_ref)
     assert r.cost == pytest.approx(0.39)
 
 
 def test_stitch_partial_failure_returns_what_succeeded(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_KEY", "kid:secret")
+    monkeypatch.setenv("MDX_STITCH_OUT", str(tmp_path / "out"))
     _patch_ffmpeg(monkeypatch)
     calls = []
     monkeypatch.setattr(runner_stitch, "_hf_generate", _ok_gen(calls, fail_at=1))  # 2nd shot fails
@@ -167,6 +169,7 @@ def test_stitch_explicit_image_wins_and_skips_chaining(tmp_path, monkeypatch):
     """An explicit per-shot image_url overrides the chain; and when the NEXT shot brings
     its own image, the current shot does NOT do a last-frame extract+upload (chain skipped)."""
     monkeypatch.setenv("HF_KEY", "kid:secret")
+    monkeypatch.setenv("MDX_STITCH_OUT", str(tmp_path / "out"))
     lf_calls = []
 
     def fake_last_frame(video, out):
@@ -194,6 +197,7 @@ def test_stitch_end_card_ssrf_rejected(tmp_path, monkeypatch):
     """An internal/loopback end_card_url is rejected by the SSRF guard BEFORE any fetch,
     and is silently skipped (the render still succeeds without the end card)."""
     monkeypatch.setenv("HF_KEY", "kid:secret")
+    monkeypatch.setenv("MDX_STITCH_OUT", str(tmp_path / "out"))
     calls = []
     monkeypatch.setattr(runner_stitch, "_hf_generate", _ok_gen(calls))
     # patch ffmpeg but record image_to_clip calls (proves the end card path ran or not)
