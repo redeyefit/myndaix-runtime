@@ -119,5 +119,15 @@ Brain pipes `"<watch_ref> <head> <watch_ref> <reviewed_sha>"` + argv `origin <ur
 2. **Cursor-advance signal** — confirm "advance only when `done-<sha>` marker exists" is the right confirmation source (vs a delivered review job query). Recommend done-marker (it's play-review's own ground truth for a delivered review).
 3. **Re-review v0.2?** — optional focused cross-family re-review of this revision, or proceed to the implementation plan. Recommend: proceed to plan (findings were convergent + concrete; a re-review of the *plan* + built code covers it).
 
+## 8a. Runbook (deploy = atomic, dry-run-first)
+Built artifacts: `src/runtime/controller.py` (`python -m runtime.controller tick`), `orchestrator/controller-tick.sh` (portable launchd wrapper), `orchestrator/ai.myndaix.controller.plist.example`, migration `0003_review_cursor` (auto-applied on serve boot).
+
+1. **Schema** — already live after any `serve` restart (auto-migrate). Or by hand: `psql "$MYNDAIX_DSN" -f src/runtime/ledger/migrations/0003_review_cursor.sql`.
+2. **Config** — ensure each watched repo is in `$ORCH/repos.json` (already the play-fix trusted map); optional `"watch_ref"` per repo (default `refs/heads/main`).
+3. **Dry-run** (writes nothing, dispatches nothing): `MYNDAIX_CONTROLLER_DRY_RUN=1 orchestrator/controller-tick.sh` → confirm it logs "would seed baseline" / "would dispatch" sensibly.
+4. **First real tick, no plist yet**: `orchestrator/controller-tick.sh` → seeds baselines (no review fired on first sight); verify `select * from review_cursor;`.
+5. **Second tick after a real push**: push a commit, run the wrapper again → confirm one review dispatched (`reviewed..head`), verdict lands in `inbox/jefe`, and a later tick advances the cursor (the `done-<sha>` marker).
+6. **Install** (this machine only): copy the plist to `~/Library/LaunchAgents/`, `launchctl load`. **Rollback** = `launchctl unload` (the cursor table is inert without the controller).
+
 ## 9. Climb position
 `orchestrator-v0` ✓ → phase2 human-gated fix + concurrency ✓ → **controller-loop (this) ← rung 3** → +learning (outcomes ledger plugs into `decide()`) → auto-merge one narrow class → widen → broad self-fixing → self-fixing its own code. This rung adds the decide-and-drive skeleton + the cursor; the learning rung reads outcomes into `decide()`; the auto-merge rung is the first time `decide()` may emit a merge — all on this same level-triggered frame + cursor.
