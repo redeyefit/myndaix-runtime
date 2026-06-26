@@ -130,11 +130,12 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
   # perl's alarm+exec REPLACES perl with git, so SIGALRM kills git ITSELF after N s — one process, no
   # watchdog, no orphaned sleep, argv-form (injection-safe). perl ships on macOS+Linux; degrade to an
   # unbounded call only if it's somehow absent. Empty result -> not pushed -> safe (no fire/no marker).
-  if command -v perl >/dev/null 2>&1; then
-    got="$(perl -e 'alarm shift; exec @ARGV or exit 127' "$LSREMOTE_TIMEOUT" git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
-  else
-    got="$(git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
-  fi
+  command -v perl >/dev/null 2>&1 || return 1            # no perl to bound the call -> FAIL CLOSED (treat
+  # as unconfirmed) rather than run an UNBOUNDED ls-remote that could wedge the held review lock (codex).
+  # perl ships on macOS+Linux, so this is defensive: a perl-less host just re-reviews (no dedup, no
+  # autofire) instead of risking a wedge. perl's alarm+exec REPLACES perl with git, so SIGALRM kills
+  # git itself after N s — one process, no watchdog/orphan, argv-form (injection-safe). Empty -> not pushed.
+  got="$(perl -e 'alarm shift; exec @ARGV or exit 127' "$LSREMOTE_TIMEOUT" git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
   [[ "$got" == "$tip" ]]
 }
 
