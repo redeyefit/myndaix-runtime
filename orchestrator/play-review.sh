@@ -151,8 +151,11 @@ mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$tip" 2>/dev/null |
 # play-fix never commits/pushes, and the codex builder's workspace-write seatbelt denies writes to
 # the shared .git for a non-tmp repo (verified by orchestrator/probe-git-write-vector.sh). Design:
 # docs/phase2-autonomous-fix-flip-design.md.
+# armed iff the per-push env knob is set OR the durable flag file exists (orchestrator/autofix-arm.sh
+# creates it after the pre-arm gates pass) — the flag survives shell restarts, so arming is "set once".
+autofix_armed(){ [[ "${PLAY_AUTOFIX:-0}" == "1" || -f "$ORCH/AUTOFIX_ENABLED" ]]; }
 autofix_fire(){
-  [[ "${PLAY_AUTOFIX:-0}" == "1" ]] || return 0
+  autofix_armed || return 0
   [[ "${pushed:-0}" == "1" ]]       || { note autofix "skip: push not confirmed"; return 0; }
   [[ -s "$run/fixlist.txt" ]]       || { note autofix "skip: empty fixlist"; return 0; }
   # repo MUST be configured fail_to_pass:null, else a 3-arg auto-fire could exceed the UNVERIFIED
@@ -269,7 +272,7 @@ else
   # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
   printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true
   autonote=""
-  [[ "${PLAY_AUTOFIX:-0}" == "1" ]] && autonote='
+  autofix_armed && autonote='
 
 (autofix armed: if eligible, an auto-fix attempt will follow as a SEPARATE inbox file — no extra ping)'
   if deliver "review NEEDS-FIX — $ref" "$triage
