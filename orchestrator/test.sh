@@ -89,7 +89,7 @@ echo "15. SHA on the TARGET ref confirms"; reset; bare2="$ROOT/bare2.git"; git i
 echo "16. PR-0a: scope flags forwarded to mxr (repo bucket + reviewed SHA)"; reset; STUB_TRIAGE="PLAY_PASS" run
   rid="$(basename "$REPO")"; log="$FAKE/.myndaix/mxr-argv.log"
   nscoped="$(grep -c -- "--repo $rid --base-ref $TIP" "$log" 2>/dev/null || true)"; [[ "$nscoped" =~ ^[0-9]+$ ]] || nscoped=0
-  if [[ "$nscoped" -eq 2 ]]; then echo "  ok: review+triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 2 scoped mxr calls, got $nscoped"; FAIL=$((FAIL+1)); fi
+  if [[ "$nscoped" -eq 3 ]]; then echo "  ok: kilabz+oracle reviews + triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 3 scoped mxr calls (kilabz+oracle+lobster), got $nscoped"; FAIL=$((FAIL+1)); fi
   if grep -q "READY.*--repo" "$log" 2>/dev/null; then echo "  FAIL: canary must stay cap-exempt"; FAIL=$((FAIL+1)); else echo "  ok: canary cap-exempt (no --repo)"; PASS=$((PASS+1)); fi
 
 echo "17. PR-1a: front re-execs the FIXED installed worker, not the worktree copy"; reset
@@ -146,6 +146,12 @@ echo "28. play-fix.sh is byte-identical to origin/main (frozen)"; reset
   if git -C "$rr" rev-parse --verify -q origin/main >/dev/null 2>&1; then
     if git -C "$rr" diff --quiet origin/main -- orchestrator/play-fix.sh; then echo "  ok: play-fix.sh unchanged vs origin/main"; PASS=$((PASS+1)); else echo "  FAIL: play-fix.sh modified by this branch"; FAIL=$((FAIL+1)); fi
   else echo "  skip: no origin/main to compare"; fi
+
+echo "30. durable flag-file enables auto-fire WITHOUT PLAY_AUTOFIX env"; reset; af_repos "$NULLCFG"
+  mkdir -p "$FAKE/.myndaix/orchestrator"; : > "$FAKE/.myndaix/orchestrator/AUTOFIX_ENABLED"
+  env HOME="$FAKE" PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null
+  if wait_fixer; then echo "  ok: flag-file armed -> fired"; PASS=$((PASS+1)); else echo "  FAIL: flag-file did not arm"; FAIL=$((FAIL+1)); fi
+  a2="$(sed -n 3p "$FAKE/.myndaix/fixer-argv" 2>/dev/null)"; [[ "$a2" == "$TIP" ]] && { echo "  ok: flag-file fire uses base=tip"; PASS=$((PASS+1)); } || { echo "  FAIL: flag-file fire arg2=$a2"; FAIL=$((FAIL+1)); }
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
