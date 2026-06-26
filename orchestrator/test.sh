@@ -74,8 +74,14 @@ echo "4. dedupe (2nd no-op)"; reset; STUB_TRIAGE="PLAY_PASS" run; before="$(ls "
   if [[ "$before" == "$after" ]]; then echo "  ok: 2nd run produced no new delivery"; PASS=$((PASS+1)); else echo "  FAIL: dedupe ($before -> $after)"; FAIL=$((FAIL+1)); fi
 echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"
 echo "6. corrupt counter (numeric guard)"; reset; mkdir -p "$STATE"; printf 'garbage' > "$STATE/count-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "survives corrupt counter" "review PASS"
-echo "7. oversize diff FAILs fast"; reset; head -c 70000 /dev/zero | tr '\0' 'x' > "$REPO/big.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm big; BIGTIP="$(git -C "$REPO" rev-parse HEAD)"
+echo "7. oversize diff FAILs fast (over the 256KB default cap)"; reset; head -c 300000 /dev/zero | tr '\0' 'x' > "$REPO/big.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm big; BIGTIP="$(git -C "$REPO" rev-parse HEAD)"
   env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$BIGTIP" refs/heads/main 2>/dev/null; ck "aborts oversize" "ABORTED — diff"
+  git -C "$REPO" reset -q --hard "$TIP"   # restore
+echo "7b. a ~100KB diff (over the OLD 64KB cap, under the new) now REVIEWS"; reset; head -c 100000 /dev/zero | tr '\0' 'y' > "$REPO/mid.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm mid; MIDTIP="$(git -C "$REPO" rev-parse HEAD)"
+  env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$MIDTIP" refs/heads/main 2>/dev/null; ck "100KB diff reviews (not aborted)" "review PASS"
+  git -C "$REPO" reset -q --hard "$TIP"   # restore
+echo "7c. PLAY_MAX_DIFF knob still caps (env override)"; reset; head -c 5000 /dev/zero | tr '\0' 'z' > "$REPO/small.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm small; SMTIP="$(git -C "$REPO" rev-parse HEAD)"
+  env HOME="$FAKE" PLAY_MAX_DIFF=1000 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$SMTIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF=1000 caps a 5KB diff" "ABORTED — diff"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 echo "8. contention records a visible skip"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"; ckfile "$STATE/SKIPPED-$TIP" "SKIPPED sentinel written"
 echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock"; touch -t 202001010000 "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "reaps stale lock + reviews" "review PASS"
