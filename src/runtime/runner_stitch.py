@@ -29,7 +29,7 @@ from runtime.contracts import ErrorClass, Job, Result, ResultStatus
 from runtime.registry import AgentSpec
 from runtime import ffmpeg_util as fu
 from runtime.runner import (
-    _hf_generate, _hf_float, _hf_int, _ms,
+    _hf_generate, _hf_float, _hf_int, _ms, _reject_unsafe_url,
     _HF_POLL_INTERVAL_S, _HF_POLL_RETRY_BACKOFF_S, _HF_POLL_RETRY_MAX,
 )
 
@@ -223,6 +223,11 @@ async def _resolve_end_card(client, job: Job, workdir: str, ref_clip: str) -> Op
     img = os.path.join(workdir, "endcard_src")
     try:
         if url:
+            # SSRF guard: WE fetch this URL directly, so an attacker-controlled end_card_url
+            # could otherwise hit internal/loopback/link-local services. Same guard the
+            # generation path uses; reject before any request leaves the process.
+            if await _reject_unsafe_url(url):
+                return None
             r = await client.get(url, timeout=_HTTP_TIMEOUT_S)
             r.raise_for_status()
             with open(img, "wb") as f:

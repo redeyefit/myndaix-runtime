@@ -183,6 +183,40 @@ def test_stitch_resume_skips_rendered_segments(tmp_path, monkeypatch):
     assert calls[0]["image_url"] == "https://cdn/cached.png"   # chained off the cached last frame
 
 
+def test_stitch_end_card_ssrf_rejected(tmp_path, monkeypatch):
+    """An internal/loopback end_card_url is rejected by the SSRF guard BEFORE any fetch,
+    and is silently skipped (the render still succeeds without the end card)."""
+    monkeypatch.setenv("HF_KEY", "kid:secret")
+    calls = []
+    monkeypatch.setattr(runner_stitch, "_hf_generate", _ok_gen(calls))
+    # patch ffmpeg but record image_to_clip calls (proves the end card path ran or not)
+    i2c_calls = []
+
+    def fake_last_frame(video, out):
+        open(out, "wb").write(b"PNG"); return out
+
+    def fake_concat(paths, out, **kw):
+        open(out, "wb").write(b"MP4"); return out
+
+    def fake_probe(p):
+        return {"width": "1080", "height": "1920", "codec_name": "h264",
+                "pix_fmt": "yuv420p", "sample_aspect_ratio": "1:1", "time_base": "1/30"}
+
+    def fake_img2clip(img, out, **kw):
+        i2c_calls.append(img); open(out, "wb").write(b"MP4"); return out
+
+    monkeypatch.setattr(ffmpeg_util, "last_frame_png", fake_last_frame)
+    monkeypatch.setattr(ffmpeg_util, "concat", fake_concat)
+    monkeypatch.setattr(ffmpeg_util, "probe", fake_probe)
+    monkeypatch.setattr(ffmpeg_util, "image_to_clip", fake_img2clip)
+
+    shots = [{"prompt": "a", "image_url": "https://example.com/0.png"}]
+    job = _job(shots, tmp_path, end_card_url="http://169.254.169.254/evil.png")  # AWS metadata IP
+    r = asyncio.run(runner_stitch.invoke_stitch(_spec(), job, transport=_mock_transport()))
+    assert r.status is ResultStatus.OK, r.text          # render still succeeds
+    assert i2c_calls == []                              # end card was NOT built (SSRF-rejected, never fetched)
+
+
 # -- motion_id wiring (invoke_higgsfield through the shared helper) ---------
 def test_motion_id_lands_in_submit_body(monkeypatch):
     from runtime import runner
