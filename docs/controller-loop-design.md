@@ -4,6 +4,12 @@ _North-star rung 3. v1 = **proactive review scheduler**, a bounded level-trigger
 
 **Decisions locked (Jefe, 2026-06-25):** (1) trigger = **synthetic-stdin, zero-touch** (no edits to `play-review.sh`); (2) watch scope = **default branch only** (`refs/heads/main`); (3) cadence = **hourly**; (4) cross-family design review before code (done).
 
+### v0.5 changelog (folded the v0.4 DELTA review — Oracle APPROVE-WITH-FIXES, codex NEEDS-REVISION; both cleared flock + GIT_ALLOW_PROTOCOL + release_dispatch as correct)
+- **`PLAY_FORCE_DONE` DELETED** (codex MAJOR — it was a public env bypass that could mark a rejected push done). The controller now passes an **empty remote URL** to play-review: `confirm_pushed` treats that as pushed (the existing manual-run path) and writes the post-delivery `done-<sha>` marker — no bypass flag, and **no `ls-remote`** runs. Net: play-review has just ONE controller edit again (`PLAY_DISABLE_AUTOFIX`).
+- **Pending-pin failure now fails safe** (codex MAJOR + Oracle MINOR, converged): if anchoring the in-flight head fails, the controller releases the claim and skips (no unanchored dispatch that gc could prune mid-review).
+- **Legacy lock-dir reaped** (codex MAJOR): a pre-v0.4 mkdir-style `controller.lock` directory is removed before the flock `os.open` (which would else raise `IsADirectoryError` forever). Defensive — the controller never shipped, so any such dir is a stale artifact.
+- Tests: controller 14/14 (+flock-exclusive, +legacy-dir-reap, +trigger-release), ledger 25/25, test.sh 43/43.
+
 ### v0.4 changelog (folded the v0.3 RE-REVIEW — Oracle + codex, both NEEDS-REVISION; mostly regressions in v0.3's own hardening, several are simplifications)
 - **Lock → `fcntl.flock`** (Oracle B1/B2 + codex): the v0.3 rename/mtime/heartbeat lock was still racy (rename can't stop a 2nd stealer) and the heartbeat bumped a file, not the dir mtime that was checked. flock is kernel-atomic, auto-released on crash — deletes ALL the stale-reap/TTL/heartbeat code.
 - **git protocol allowlist via env** (Oracle M3 + codex B2): v0.3's `GIT_CONFIG_GLOBAL=/dev/null` + `credential.helper=` broke `insteadOf`/keychain auth. Replaced with `GIT_ALLOW_PROTOCOL=https:ssh:file` (env, inherited by play-review's `ls-remote` too) — blocks `ext::`/`fd::` everywhere WITHOUT nuking auth config. + `--no-recurse-submodules` on the fetch.

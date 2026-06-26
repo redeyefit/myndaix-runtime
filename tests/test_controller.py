@@ -175,6 +175,17 @@ async def test_lock_is_exclusive(led: PostgresLedger) -> None:
     C.release_lock()
 
 
+# -- a legacy mkdir-style lock DIRECTORY is reaped, not a permanent crash ------
+async def test_legacy_lock_dir_is_reaped(led: PostgresLedger) -> None:
+    import fcntl
+    C.LOCK = _TMP / "controller.lock.legacy"
+    C.LOCK.mkdir(parents=True, exist_ok=True)            # simulate the pre-v0.4 dir lock
+    (C.LOCK / "pid").write_text("123")                   # non-empty -> needs rmtree, not rmdir
+    assert C.acquire_lock() is True, "must reap a legacy dir lock and acquire"
+    assert not C.LOCK.is_dir(), "legacy dir replaced by the flock file"
+    C.release_lock()
+
+
 # -- a new head while one is in flight WAITS (no supersede, Oracle B2) ---------
 async def test_new_head_waits_for_inflight(led: PostgresLedger) -> None:
     await _truncate(led)
@@ -262,7 +273,7 @@ async def test_remote_url_rejects_exec_transport(led: PostgresLedger) -> None:
 async def test_dispatch_override_requires_test_mode(led: PostgresLedger) -> None:
     seam = fresh_seam("guard"); repo = make_repo("guard")
     C.TEST_MODE = False                                  # override set, test-mode OFF
-    ok = C.trigger_review(repo, "a" * 40, "b" * 40, "https://x/y.git")
+    ok = C.trigger_review(repo, "a" * 40, "b" * 40)
     assert ok is False and records(seam) == [], "must refuse the override outside test mode"
     C.TEST_MODE = True
 

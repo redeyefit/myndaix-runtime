@@ -37,6 +37,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import stat as _stat
 import subprocess
 import sys
@@ -124,8 +125,10 @@ def _review_env() -> dict:
     # play-review.sh resets its own PATH and derives ORCH from HOME. It needs HOME +
     # MYNDAIX_DSN (so its `mxr` calls reach the ledger) + ssh auth for confirm_pushed.
     # PLAY_SELF pins its worker to the validated trusted path (codex M7, no worktree fallback).
-    # PLAY_DISABLE_AUTOFIX hard-disables autofix (B1). PLAY_FORCE_DONE makes its post-delivery
-    # done-marker branch-move-proof (B2). GIT_ALLOW_PROTOCOL hardens its ls-remote (codex B2).
+    # PLAY_DISABLE_AUTOFIX hard-disables autofix (B1). The controller passes an EMPTY remote URL
+    # to play-review (see trigger_review), so confirm_pushed treats the dispatch as pushed and
+    # writes the post-delivery done-<sha> marker WITHOUT a public PLAY_FORCE_DONE bypass and
+    # WITHOUT running ls-remote (codex MAJOR). GIT_ALLOW_PROTOCOL is belt-and-suspenders.
     env = {
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         "HOME": str(HOME),
@@ -134,7 +137,6 @@ def _review_env() -> dict:
         "MYNDAIX_DSN": DSN,
         "PLAY_SELF": str(PLAY_REVIEW),
         "PLAY_DISABLE_AUTOFIX": "1",
-        "PLAY_FORCE_DONE": "1",
     }
     for k in ("SSH_AUTH_SOCK", "TMPDIR", "LANG"):
         if os.environ.get(k):
@@ -204,6 +206,10 @@ _LOCK_FD: Optional[int] = None
 def acquire_lock() -> bool:
     global _LOCK_FD
     ORCH.mkdir(parents=True, exist_ok=True)
+    # a pre-v0.4 build used a mkdir-DIR lock at this path; os.open would raise IsADirectoryError
+    # forever. The old scheme is gone, so any dir here is a stale artifact — reap it (codex MAJOR).
+    if LOCK.is_dir():
+        log("reaping a legacy directory-style lock"); shutil.rmtree(LOCK, ignore_errors=True)
     fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -264,9 +270,12 @@ def remote_url(repo: Repo) -> Optional[str]:
     return url
 
 
-def trigger_review(repo: Repo, head: str, base: str, url: str) -> bool:
+def trigger_review(repo: Repo, head: str, base: str) -> bool:
     """Fire the review via synthetic-stdin into the trusted play-review.sh. Returns True
-    iff the trigger ran cleanly (or was recorded under the test seam)."""
+    iff the trigger ran cleanly (or was recorded under the test seam). We pass an EMPTY
+    remote URL: the dispatched sha is already on the remote (we fetched it), so play-review's
+    confirm_pushed treats it as pushed and writes its post-delivery done-marker — no public
+    force-done bypass, and no ls-remote network call (codex MAJOR)."""
     line = f"{repo.watch_ref} {head} {repo.watch_ref} {base}\n"
 
     if TEST_MODE and DISPATCH_OVERRIDE:                  # unit-test seam: record, don't run
@@ -284,7 +293,7 @@ def trigger_review(repo: Repo, head: str, base: str, url: str) -> bool:
         return False
     try:
         proc = subprocess.run(
-            [str(PLAY_REVIEW), "origin", url],
+            [str(PLAY_REVIEW), "origin", ""],            # empty URL -> confirm_pushed treats as pushed, no ls-remote
             input=line.encode(), cwd=str(repo.path), env=_review_env(),
             timeout=REVIEW_TIMEOUT, check=False,
         )                                                # FRONT detaches the worker + exits 0 fast
@@ -372,10 +381,13 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     stale_before = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=PENDING_STALE)
     if not await led.claim_dispatch(rid, ref, head, stale_before):
         log(f"{rid}: dispatch not claimed (in flight or blocked) — skip"); return
-    # anchor the in-flight head against gc: a later force-push overwrites the head ref while
-    # this sha is still pending, so without its own ref gc could prune it before advance (codex MAJOR).
-    _pin(repo, _ctl_pending_ref(ref), head)
-    if trigger_review(repo, head, base, url):
+    # anchor the in-flight head against gc BEFORE dispatch: a later force-push overwrites the head
+    # ref while this sha is still pending, so without its own ref gc could prune it before advance
+    # (codex MAJOR). If the anchor can't be written, do NOT dispatch unanchored — release + retry.
+    if not _pin(repo, _ctl_pending_ref(ref), head):
+        log(f"{rid}: could not pin pending {head[:8]} — releasing, will retry next tick")
+        await led.release_dispatch(rid, ref, head); return
+    if trigger_review(repo, head, base):
         budget[0] += 1
         _charge_day()
     else:                                                # FRONT failed -> un-stick now, don't wait out PENDING_STALE
