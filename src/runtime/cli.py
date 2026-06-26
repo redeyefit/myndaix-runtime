@@ -87,6 +87,22 @@ def _build_context(args: argparse.Namespace) -> dict:
         ctx["image_url"] = args.image
     if args.application is not None:
         ctx["application"] = args.application
+    if getattr(args, "motion_id", None) is not None:
+        ctx["motion_id"] = args.motion_id
+    if getattr(args, "motion_strength", None) is not None:
+        ctx["motion_strength"] = args.motion_strength
+    if getattr(args, "shotlist", None):
+        try:
+            with open(args.shotlist) as f:
+                ctx["shotlist"] = json.load(f)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"--shotlist: {e}")
+    if getattr(args, "end_card", None):
+        ec = args.end_card
+        if not ec.startswith(("http://", "https://")):
+            raise SystemExit("--end-card must be an http(s) URL (local paths are not accepted; "
+                             "host the image or upload it first)")
+        ctx["end_card_url"] = ec
     return ctx
 
 
@@ -144,6 +160,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="input image url (media agents, e.g. higgsfield image->video)")
     p.add_argument("--application", metavar="PATH",
                    help="override the agent's media application/model path")
+    p.add_argument("--motion-id", metavar="UUID", dest="motion_id",
+                   help="DoP camera-preset uuid (higgsfield/stitcher); see GET /v1/motions")
+    p.add_argument("--motion-strength", metavar="N", dest="motion_strength", type=float,
+                   help="DoP motion strength, 0.3 (subtle) to 1.0 (dramatic)")
+    p.add_argument("--shotlist", metavar="PATH",
+                   help="path to a JSON shot-list (stitcher): ordered list of shot objects")
+    p.add_argument("--end-card", metavar="URL", dest="end_card",
+                   help="branded end-card image URL to append (stitcher; http(s) only)")
     p.add_argument("--repo", metavar="ID", dest="repo_id",
                    help="repo bucket id for per-repo concurrency (omitted -> cap-exempt)")
     p.add_argument("--base-ref", metavar="REF", dest="base_ref",
