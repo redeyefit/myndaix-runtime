@@ -1,283 +1,269 @@
 # DESIGN: Autonomous-fix flip (Phase 2)
 
-_Mack + Jefe, 2026-06-25. Prior-art input: `docs/phase2-autonomous-fix-flip-research.md`.
-Synthesized via a judge-panel + 2 adversarial critics (workflow), then hardened against both
-critics' `needs-revision` findings. Goes to cross-family review (codex + Oracle) before any code._
+_Mack + Jefe, 2026-06-25. Prior-art input: `docs/phase2-autonomous-fix-flip-research.md`._
+
+_Process: synthesized via a judge-panel + 2 adversarial Claude critics (workflow), then
+cross-family reviewed by **codex** (read-the-repo) and **Oracle/Gemini** (inlined). Both returned
+NEEDS-REVISION with **complementary** blockers; all findings folded below. The headline Oracle
+BLOCKER (shared-`.git` write vector) was **empirically tested and CLOSED for the production
+config** — see Pre-ship gates §1 and `orchestrator/probe-git-write-vector.sh`._
 
 ## What — one paragraph
 Flip the existing **manual** `play-fix.sh` invocation into an **opt-in auto-trigger** by adding a
 small, fail-soft block to `play-review.sh`'s existing NEEDS-FIX else-branch (`play-review.sh:202-208`).
-When `PLAY_AUTOFIX=1`, after the NEEDS-FIX review is durably delivered to the jefe inbox and the push
-is confirmed landed, the branch writes the lobster fix-list (`$triage`) to the worker's own run dir and
+When `PLAY_AUTOFIX=1`, after the NEEDS-FIX review is durably delivered and the push is confirmed
+landed, the branch writes the lobster fix-list (`$triage`) to the worker's own run dir and
 `nohup`-**detaches** `play-fix.sh` with three args `(repo_id=$repo_id, base_sha=$tip,
-fixlist=$run/fixlist.txt)` — **no 4th-arg selector in v1**. Zero new scripts, zero changes to
-`play-fix.sh`, zero changes to the lobster prompt. The fix runs under play-fix's own independent
-lock/cap, caps at **UNVERIFIED** (`play-fix.sh:318`), and lands as a sanitized, policy-screened,
-human-apply diff in the inbox — byte-identical in actionability to a human typing the three args today.
-**The flip changes only WHO invokes play-fix, never how much the fix is trusted.** It auto-fires only on
-repos configured `fail_to_pass:null` and only through a **trusted installed** play-fix copy; both are
-enforced fail-closed (not merely documented). The selector path (which unlocks `REGRESSION_CHECK_ONLY`)
-is a documented, additive, separately-flagged follow-on — not built here.
+fixlist=$run/fixlist.txt)` — **no 4th-arg selector in v1**. Zero new scripts, **zero changes to
+`play-fix.sh`**, zero changes to the lobster prompt. The fix runs under play-fix's own lock/cap,
+caps at **UNVERIFIED** (`play-fix.sh:318`), and lands as a sanitized, policy-screened, human-apply
+diff in the inbox — byte-identical in actionability to a human typing the three args today. **The
+flip changes only WHO invokes play-fix, never how much the fix is trusted.** It fires only on repos
+configured `fail_to_pass:null`, only through a **trusted installed** play-fix copy, and only with a
+runtime-asserted `base_sha==$tip` — all enforced fail-closed. The selector path (which unlocks
+`REGRESSION_CHECK_ONLY`) is a documented, separately-flagged follow-on — not built here.
 
 ## Why — problem it solves, what fails without it
 Today a NEEDS-FIX verdict requires the operator to hand-type
-`play-fix.sh <repo_id> <40-hex-sha> <fixlist-file>` to get a candidate fix: locate the reviewed SHA,
-dump the triage to a file, run the tool. Without the flip, every fix is a manual round-trip, so in
-practice fixes get deferred and the review→fix loop never closes autonomously. The flip removes that
-keystroke for the common case while preserving every safety property of the manual path. It deliberately
-does **not** try to make fixes more trustworthy — **UNVERIFIED in, UNVERIFIED out** — because the honest
-value is "pre-draft the fix the operator would have requested anyway," not "trust the machine."
+`play-fix.sh <repo_id> <40-hex-sha> <fixlist-file>`: locate the reviewed SHA, dump triage to a file,
+run the tool. Every fix is a manual round-trip, so fixes get deferred and the review→fix loop never
+closes autonomously. The flip removes that keystroke for the common case while preserving every
+safety property of the manual path. It deliberately does **not** make fixes more trustworthy —
+**UNVERIFIED in, UNVERIFIED out** — because the honest value is "pre-draft the fix the operator
+would have requested anyway," not "trust the machine."
 
 ## Data Flow — input → process → output
 1. **Trigger source (existing):** push → pre-push hook → front detaches the worker (`:63`) → canary →
    kilabz review (`$review`, untrusted LLM) → lobster triage (`$triage`, untrusted LLM = the ordered
    fix-list) → PASS gate (`:196`). NEEDS-FIX is the **else** branch (`:202-208`). In scope: `$repo_id`
-   (basename, = repos.json key, `:72`), `$tip` (reviewed 40-hex SHA, `:71`), `$base` (range lower bound /
-   EMPTY_TREE sentinel — **never** used for the fix), `$ref`, `$run` (`$RUNS/$play`, `:75`), `$triage`,
-   `$review`, the global review lock `$STATE/lock` (held `:143`→EXIT trap `:153`).
-2. **Capture `confirm_pushed` ONCE (new):** compute `pushed=confirm_pushed; rc=$?` into a variable BEFORE
-   `mark_done`, and reuse that one value for both the done-marker decision and the fire gate. **Never call
-   `git ls-remote` a second time** — a slow/dead remote inside the held review lock would wedge ALL reviews
-   until the 1800s STALE reap (`:143-153`). `mark_done` is refactored to consume the captured value
-   instead of calling `confirm_pushed` again (`:133`).
-3. **Deliver the review first:** `deliver "review NEEDS-FIX — $ref" "<body>"` (`:85-102`); returns 1 on
-   durable-write failure (`:91`). The fire path runs only **after** this succeeds.
-4. **Build the body with an ALWAYS-present manual hint (new):** the NEEDS-FIX body always ends with a
-   copy-paste `play-fix.sh "$repo_id" "$tip" "$run/fixlist.txt"` hint (valid for `PRUNE_DAYS=14`; re-push
-   to regenerate after that). When armed AND the fire actually launches, the body additionally notes
-   *"an auto-fix attempt is running and will arrive as a SEPARATE inbox file (no extra ping)."* This closes
-   the armed-but-suppressed gap — every suppression path (below) still leaves the operator a working
-   manual fallback — and sets honest expectations for the silent second file (play-fix has **no** notifier).
+   (`:72`), `$tip` (reviewed 40-hex SHA, `:71`), `$base` (range lower bound / EMPTY_TREE sentinel —
+   **never** the fix base), `$ref`, `$run` (`:75`), `$triage`, `$review`, the global review lock
+   `$STATE/lock` (held `:143`→EXIT trap `:153`).
+2. **Capture `confirm_pushed` ONCE, `set -e`-safe (codex MAJOR):**
+   `if confirm_pushed; then pushed=1; else pushed=0; fi` BEFORE `mark_done`; reuse `$pushed` for both
+   the done-marker and the fire gate. A bare `confirm_pushed; rc=$?` would abort under `set -e` on the
+   expected-false path. **Never call `git ls-remote` twice** — a second call inside the held review lock
+   would risk wedging ALL reviews until the 1800s STALE reap. `mark_done` is refactored to consume
+   `$pushed`. The single `ls-remote` (`:127`) is additionally wrapped in a **portable timeout**
+   (`gtimeout` if present, else a bg-sleep-kill mirror of play-fix's pattern) so even the one call can't
+   hang the lock (Oracle MAJOR — pre-existing risk, hardened here).
+3. **Deliver the review first, `set -e`-safe:**
+   `if deliver "review NEEDS-FIX — $ref" "<body>"; then delivered=1; else delivered=0; fi` (`:85-102`).
+   The fire path runs only when `delivered=1`.
+4. **Body always carries a manual hint; the auto note is NEUTRAL (codex MAJOR ordering fix):** the
+   NEEDS-FIX body always ends with a copy-paste `play-fix.sh "$repo_id" "$tip" "$run/fixlist.txt"` hint
+   (valid for `PRUNE_DAYS=14`; re-push to regenerate). When `PLAY_AUTOFIX=1`, the body adds a **neutral
+   conditional** note — *"if armed and eligible, an auto-fix attempt will follow as a SEPARATE inbox
+   file (no extra ping)."* — NOT "is running" (we deliver before the gates resolve, so we cannot claim it
+   launched). This closes the armed-but-suppressed gap (every suppression path still leaves a working
+   manual fallback) and sets honest expectations for the silent second file (play-fix has **no** notifier).
 5. **Write the fix-list file (always, in NEEDS-FIX):**
-   `printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true` into the worker's exclusive
-   single-writer run dir (`$play = timestamp-$$`, no lock needed). The `|| true` (NOT `&&`) is load-bearing:
-   under `set -e` a redirection failure must not abort the already-delivered worker.
+   `printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true` (NOT `&&` — under `set -e` a
+   redirection failure must not abort the already-delivered worker).
 6. **Gate the fire — ALL conditions required (fail-closed):** fire iff —
-   `PLAY_AUTOFIX=1` **AND** `deliver` returned 0 **AND** `$pushed` is true (the captured value)
-   **AND** `repos.json .[$repo_id].fail_to_pass` resolves to JSON `null`
-   **AND** a **trusted** fixer is executable **AND** `fixlist.txt` is non-empty.
-   Any false condition → no fire; the always-present manual hint is the fallback.
-7. **`fail_to_pass:null` enforcement (new, fail-closed):**
-   `f2p="$(jq -r --arg r "$repo_id" '.[$r].fail_to_pass // "null"' "$REPOS_JSON" 2>/dev/null || echo ERR)"`;
-   fire only if `f2p == "null"`. Rationale: `play-fix.sh:158` reads `.fail_to_pass` **independently** of
-   the 4th-arg selector, so a repo with a static `.fail_to_pass` array would let a 3-arg auto-fire sail past
-   the UNVERIFIED ceiling (`:318`) into precheck/verify and reach `REGRESSION_CHECK_ONLY`/`TAMPERED` — an
-   autonomous high-trust outcome no human chose. Enforcing null makes the headline "UNVERIFIED in/out" claim
-   *true by construction*; to enable `REGRESSION_CHECK_ONLY` autonomously the operator must consciously adopt
-   the selector follow-on, not just edit a config. `jq` missing / repos.json unreadable → `ERR` → no fire.
-8. **Resolve fixer — TRUSTED INSTALL ONLY on the auto path (new, fail-closed):**
-   `fixer="${PLAY_FIX_SELF:-$ORCH/play-fix.sh}"; [[ -x "$fixer" ]] || { <suppress fire>; }`. **No fallback
-   to `$repo/orchestrator/play-fix.sh`** for the autonomous path. An attacker-controlled push to the repo
-   modifies exactly that worktree copy, and `play-fix.sh` runs **unsandboxed** (it is the thing that *builds*
-   the sandbox), so an auto-trigger must never exec the worktree copy. (The *manual* hint still points at the
-   in-repo path — acceptable because a human is in the loop and chose to run it.) Mirrors and tightens the
-   `$self` defense-in-depth at `:49-51`.
-9. **Detach with a scrubbed env (new):**
-   `nohup env -u MYNDAIX_FIX_TEST_MODE -u MYNDAIX_FIX_PATCH_OVERRIDE "$fixer" "$repo_id" "$tip" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &`.
-   **base_sha=$tip, NEVER $base** (pinned with an inline comment — see Edge Cases). `nohup` inherits the
-   push-time env, so the two test-seam vars are stripped to deny a stray `MYNDAIX_FIX_TEST_MODE=1` +
-   `MYNDAIX_FIX_PATCH_OVERRIDE` (operator misconfig) from turning every auto-fire into a cap-skipping,
-   fixed-override run. (play-fix already fail-closes a lone override without TEST_MODE at `:248-249`; the
-   scrub removes the both-set hazard too.) stdin←`/dev/null` avoids the recorded agy/codex inherited-stdin hang.
-10. **Output (unchanged play-fix contract):** detached play-fix takes its own `fix-state/lock` (`:188-192`),
-    charges its own `PLAY_FIX_DAILY_CAP` (`:28/:236`), self-establishes PATH + codex-pool auth
-    (`:20/:251-252`), runs codex + sandboxed verify, and writes a sanitized diff + one verdict line
-    (`NO_FIX|UNVERIFIED|TAMPERED|REGRESSION_CHECK_ONLY|ABORTED`) to the jefe inbox (`:55-64`). With three
-    args + `fail_to_pass:null`, it finishes **UNVERIFIED** before verify even runs (`:318`). It **never
-    commits, never pushes.**
+   `PLAY_AUTOFIX=1` **AND** `delivered=1` **AND** `pushed=1`
+   **AND** the `fail_to_pass:null` check passes (step 7)
+   **AND** the trusted fixer resolves + is executable (step 8)
+   **AND** the runtime base assertion passes (step 9)
+   **AND** `fixlist.txt` is non-empty. Any false condition → no fire; the manual hint is the fallback.
+7. **`fail_to_pass:null` enforcement — `jq -e`, genuinely fail-closed (codex BLOCKER):**
+   `jq -e --arg r "$repo_id" 'has($r) and (.[$r] | has("fail_to_pass")) and (.[$r].fail_to_pass == null)' "$REPOS_JSON" >/dev/null 2>&1`
+   — the earlier `.[$r].fail_to_pass // "null"` was **fail-OPEN** (missing key, missing field, JSON
+   `false`, and string `"null"` all passed). This form fires only when the repo key exists, has the
+   field, and it is explicit JSON `null`. Rationale: `play-fix.sh:158` reads `.fail_to_pass`
+   **independently** of the 4th-arg selector, so a static array would let a 3-arg auto-fire sail past the
+   UNVERIFIED ceiling (`:318`) into precheck/verify and reach `REGRESSION_CHECK_ONLY`/`TAMPERED` — an
+   autonomous high-trust outcome no human chose. Enforcing null makes "UNVERIFIED in/out" true by
+   construction. (Decision: keep this gate; do NOT add a `--max-verdict` flag to the frozen play-fix.sh
+   for v1 — see Product decision.)
+8. **Resolve fixer — TRUSTED INSTALL ONLY on the auto path (codex MAJOR + Oracle):**
+   production auto path uses **`$ORCH/play-fix.sh` only**; if not executable → suppress fire. **No
+   fallback to `$repo/orchestrator/play-fix.sh`** — an attacker-controlled push modifies exactly that
+   worktree copy, and `play-fix.sh` is the thing that *builds* the sandbox (`:93-125`), so running an
+   attacker copy is unsandboxed RCE. `PLAY_FIX_SELF` is honored **only under a test-mode flag**
+   (`PLAY_AUTOFIX_TEST_MODE=1`), mirroring play-fix's own `MYNDAIX_FIX_TEST_MODE` double-gate, and is
+   rejected if it canonicalizes under `$repo`. Deploy gate (pre-ship §2) shasum-pins `$ORCH/play-fix.sh`
+   to the reviewed `orchestrator/play-fix.sh`.
+9. **Runtime base assertion, then detach with a whitelisted env (codex MAJOR + Oracle MINOR):**
+   `fix_base="$tip"; [[ "$fix_base" == "$tip" && "$fix_base" != "$base" ]] || <suppress fire>` — for an
+   **incremental push `$base` is also a real commit**, so play-fix's existence gates (`:142-143`) do NOT
+   distinguish it from `$tip`; a mis-wire would silently fix the wrong base. The assertion + the
+   inline comment + the test (arg2==$tip) together guard this load-bearing wire. Then:
+   `nohup env -i PATH="$PATH" HOME="$HOME" "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &`.
+   The **`env -i` whitelist** (Oracle MINOR) is strictly safer than a 2-var blacklist — it strips
+   `LD_PRELOAD`, `BASH_ENV`, `GIT_EXTERNAL_DIFF`, the `MYNDAIX_FIX_TEST_MODE`/`_PATCH_OVERRIDE` test-seam,
+   and everything else inherited through `nohup` — passing only what play-fix needs (it self-establishes
+   the rest at `:20/:251-252`). stdin←`/dev/null` avoids the recorded agy/codex inherited-stdin hang.
+10. **Output (unchanged play-fix contract):** detached play-fix takes its own `fix-state/lock`
+    (`:188-192`), charges its own `PLAY_FIX_DAILY_CAP` (`:28/:236`), self-establishes PATH + codex-pool
+    auth (`:20/:251-252`), runs codex (builder net=false, see §Pre-ship) + sandboxed verify, and writes a
+    sanitized diff + one verdict line (`NO_FIX|UNVERIFIED|TAMPERED|REGRESSION_CHECK_ONLY|ABORTED`) to the
+    jefe inbox (`:55-64`). With three args + `fail_to_pass:null`, it finishes **UNVERIFIED** before verify
+    runs (`:318`). It **never commits, never pushes.**
 
 ## Idempotency & loop-immunity
-**No new marker.** The earlier draft's `fix-fired-$tip` is **dropped** — it was redundant with the existing
-`done-$tip`. Mechanism: the worker checks `done-$tip` at `:160` (after acquiring `state/lock`) and exits
-early on a re-review; `mark_done` writes `done-$tip` iff `$pushed` is true; the fire gate requires the same
-captured `$pushed`. So the fire and the done-marker are written under one condition, and the global review
-lock (`:143-153`) serializes workers — a re-pushed identical tip hits the `:160` early-exit (or `contention()`)
-and cannot double-fire. Latest-SHA-wins falls out for free (distinct tip per push). Dropping the marker also
-drops a prune branch and the "load-bearing keep-it-under-the-lock" ceremony.
+**No new marker.** The earlier draft's `fix-fired-$tip` is **dropped** as redundant with `done-$tip`
+(both Claude critics + codex agreed). Mechanism: the worker checks `done-$tip` at `:160` (after
+acquiring `state/lock`) and exits early on a re-review; `mark_done` writes `done-$tip` iff `$pushed`;
+the fire gate requires the same captured `$pushed`. So the fire and the done-marker share one condition,
+and the global review lock (`:143-153`) serializes workers — a re-pushed identical tip hits the `:160`
+early-exit (or `contention()`) and cannot double-fire. Latest-SHA-wins falls out for free.
 
-**One residual (accepted):** the `:160` dedup and the fire both live under the *current* single global review
-lock. If a future PR makes review locks *per-repo* (PR-2 territory), workers for *different* repos could run
-the branch concurrently — but `done-$tip` is keyed on the globally-unique tip SHA, so per-repo locking does
-not reintroduce a double-fire for the *same* tip. Noted so a future editor re-checks this if the lock scope changes.
-
-**Loop immunity — the proof must reach past play-fix's own lines.** play-fix's only durable output is the
-jefe inbox markdown (`:55-64`; INBOX is human-only — *no agent watcher may ever be added there*, pinned as a
-load-bearing comment). play-fix itself never commits/pushes. play-review fires **only on push**. So the cycle
-is closed **at play-fix's boundary**. BUT play-fix delegates code generation to **codex running unsandboxed in
-a linked worktree of `repo_path`** (`play-fix.sh:263`, `mxr codex --repo`), and that worktree shares `.git`
-(so `origin` is configured). An injected fix-list could try to make codex `git push` (which would re-enter
-play-review's pre-push hook) or call out to exfil. The loop/exfil immunity therefore depends on the **codex
-builder running with network disabled** (registry `net=false`, per the runtime config). **This is a pre-ship
-verification gate (below), not an assumption** — the proof rests on the codex sandbox, not on play-fix.sh's
-literal lines. Any future change that gives the codex builder network, or that makes play-fix auto-commit/
-auto-apply, re-opens the loop and is disqualified.
+**Loop immunity — proven past play-fix's own lines, then EMPIRICALLY verified.** play-fix's only durable
+output is the jefe inbox markdown (`:55-64`; INBOX is human-only — *no agent watcher may ever be added
+there*, a load-bearing invariant). play-fix itself never commits/pushes, and play-review fires only on
+push. The remaining hazard (Oracle BLOCKER): play-fix delegates code generation to **codex running in a
+linked worktree** (`workspace.py:56`) that shares the live repo's `.git` (config + hooks), so an injected
+fix-list could try to plant `.git/hooks/pre-push` or set `core.sshCommand` → RCE on the operator's next
+git action, bypassing `net=false`. **This was tested** (`orchestrator/probe-git-write-vector.sh`): codex's
+`workspace-write` seatbelt confines writes to `{workdir, /tmp, $TMPDIR}` and **denied** all three
+shared-`.git` writes (`Operation not permitted`) when the repo lives outside `/tmp` — which is the
+production case (`~/code/active/myndaix-runtime/.git`). So the vector is **closed for the production
+config**, with one precise condition promoted to a pre-ship gate: **the armed repo must not be under
+`/tmp` or `$TMPDIR`**. Any future change that auto-commits/auto-applies, gives the codex builder network,
+or relocates a repo under `/tmp`, re-opens the loop and is disqualified.
 
 ## Selector contract — v1 derives NO selector
 The bridge passes exactly 3 args. The lobster triage prompt (`:190`) emits free-text prose plus the
-exact-match `PLAY_PASS` sentinel — there is no parseable selector token today, so the minimal change parses
-nothing and adds no untrusted-text parser. With no selector + `fail_to_pass:null`, play-fix caps at
-**UNVERIFIED** (`:317-318`) before verify runs. This deliberately forfeits only `REGRESSION_CHECK_ONLY`, which
-"found-by-reading" findings (the majority of kilabz output) cannot reach anyway — play-fix is forbidden from
-authoring a red test (TAMPER_RE `:34/:308/:349`).
+exact-match `PLAY_PASS` sentinel — no parseable selector token exists, so the minimal change parses
+nothing. With no selector + `fail_to_pass:null`, play-fix caps at **UNVERIFIED** (`:317-318`). This
+forfeits only `REGRESSION_CHECK_ONLY`, which "found-by-reading" findings cannot reach anyway (play-fix is
+forbidden from authoring a red test, TAMPER_RE `:34/:308/:349`).
 
-**Follow-on (NOT built; pointer only):** a separately-flagged `PLAY_AUTOFIX_SELECTOR` extractor could, when
-lobster names an existing already-red test, append one `PLAY_F2P: <relative/test/path>` line, parse it with an
-anchored first-match regex behind a testable boundary (never inlined into the hot path), strip it from both the
-human body and the codex fix-list, and pass it as a single positional 4th arg. play-fix's existing 11-check gate
-(`:164-185`) is the sole authority — the bridge pre-trusts nothing; the worst a valid-but-malicious selector can
-do is name another existing tracked test, which self-limits to UNVERIFIED via the fail-on-clean-base precheck
-(`:324-326`). It ships only after the safe UNVERIFIED path is proven, with an offline injection-test harness.
-(Note for that work: play-review's `clean()` strips C0 but **not** CR `\015`; the extractor must anchor/strip CR itself.)
+**Follow-on (NOT built; pointer):** a separately-flagged `PLAY_AUTOFIX_SELECTOR` could, when lobster names
+an existing already-red test, emit one `PLAY_F2P: <path>` line, parse it behind a testable boundary
+(anchored first-match regex; note play-review's `clean()` strips C0 but **not** CR `\015`, so the
+extractor must strip CR itself), strip it from body+fixlist, and pass it as a single positional 4th arg.
+play-fix's existing 11-check gate (`:164-185`) is the sole authority; worst case a valid selector names
+another existing test → still UNVERIFIED via the fail-on-clean-base precheck (`:324-326`). Ships only
+after the safe path is proven, with an offline injection-test harness.
 
 ## Product decision — REGRESSION_CHECK_ONLY surfacing + no-selector auto-trigger
-**(1) REGRESSION_CHECK_ONLY stays plain human-apply — surface, never auto-action.** Unanimous across all three
-judges. It must NOT auto-apply or auto-merge (disqualifying — breaks loop immunity and the honest-minimal
-contract; play-fix has no PASS verdict and labels it "a regression signal, NOT a guarantee," `:357`). Surfacing
-is already free: play-fix stamps the verdict into the inbox **filename + markdown subject** ("# fix
-REGRESSION_CHECK_ONLY — <repo>", `:56-58`) so the operator can see/grep/sort by verdict. **Do not build a
-ranker, queue, or priority layer** — the verdict line IS the sort key. **Honest caveat:** play-fix has **no**
-iMessage/desktop notifier (unlike play-review's `deliver`, `:95-100`) — the fix verdict lands as a *silent*
-second inbox file. The NEEDS-FIX review (which *does* ping) pre-announces it (step 4), so the silent file is
-expected, not a blind spot. In v1 this verdict is unreachable anyway (no selector + enforced null).
+**(1) REGRESSION_CHECK_ONLY stays plain human-apply — surface, never auto-action.** Unanimous (3 judges).
+It must NOT auto-apply/auto-merge (disqualifying; play-fix has no PASS verdict and labels it "a regression
+signal, NOT a guarantee," `:357`). Surfacing is free: play-fix stamps the verdict into the inbox filename +
+markdown subject (`:56-58`) — the verdict line IS the sort key. **No ranker/queue/priority layer.**
+**Honest caveat:** play-fix has **no** notifier (unlike play-review's `deliver`, `:95-100`) — the fix
+verdict lands as a *silent* second inbox file; the NEEDS-FIX review (which *does* ping) pre-announces it
+(step 4). In v1 this verdict is unreachable anyway (no selector + enforced null).
 
-**(2) No-selector auto-trigger: YES, fire on every NEEDS-FIX — but default-OFF (`PLAY_AUTOFIX=0`).** Unanimous
-for v1. Even at the UNVERIFIED ceiling, play-fix pre-drafts a patch-policy-gated, secret-scanned candidate diff
-that removes the manual keystroke — the faithful realization of "change WHO invokes play-fix." Honest because
-UNVERIFIED is identical to the manual 3-arg outcome. The over-firing concern is resolved by operator-gating
-(off-by-default), not by refusing to fire.
+**(2) Fire on every NEEDS-FIX, default-OFF (`PLAY_AUTOFIX=0`).** Unanimous. Even at UNVERIFIED, play-fix
+pre-drafts a policy-gated, secret-scanned candidate diff — the faithful realization of "change WHO invokes
+play-fix." Honest because UNVERIFIED equals the manual 3-arg outcome. Over-firing is resolved by
+operator-gating (off-by-default), not by refusing to fire.
 
-**Future selector-mode default (recorded, one line):** when the follow-on lands, add an operator-configurable
-mode `PLAY_FIX_AUTO=selector|all|off`; ship with `all` initially (don't make the flip near-inert on an
-unreliable LLM token), recommend `selector` as steady-state if observed auto-fire volume creates cap/compute
-pressure. v1 is unaffected (no selector mechanism exists yet).
+**Decision on Oracle's `--max-verdict` proposal — DEFERRED (keep `fail_to_pass:null` gate).** Oracle argued
+the null requirement excludes repos that use a static `fail_to_pass` for high-trust *manual* fixes, and
+proposed a `--max-verdict=UNVERIFIED` flag on play-fix. Rejected for v1: it adds a new code path through the
+most security-critical, most-reviewed file for **zero current benefit** (the only armed repo,
+myndaix-runtime, is already `fail_to_pass:null`); excluded repos can still be fixed manually. Recorded as
+the deliberate universalizer to build *if/when* a static-`fail_to_pass` repo is ever onboarded to auto-fire.
+A future operator-configurable `PLAY_FIX_AUTO=selector|all|off` mode is likewise deferred.
 
 ## Edge Cases
-- **`$triage` > MAX_FIXLIST (64KB):** play-fix fails closed → ABORTED (`:145`); review already delivered; no
-  re-fire (done-$tip). Clean abort, never truncation.
-- **Rapid pushes of distinct tips:** each tip fires once; play-fix's `fix-state/lock` serializes the actual
-  fixes, so a 2nd concurrent fire ABORTS "another fix is running" (`:189-191`). Honest caveat: under a burst a
-  stale earlier tip's fix may complete while the latest ABORTs — operator re-runs the latest via the manual hint.
-  No debouncer (latest-SHA-wins + the lock suffice).
-- **Push rejected by remote (`$pushed` false):** no fire (don't draft a fix for code that didn't land);
-  `done-$tip` also not written; re-push re-evaluates. Manual hint still delivered.
-- **Inbox write of NEEDS-FIX fails (`:91`):** `deliver` returns 1 → fire suppressed; worker doesn't mark done;
-  retries next push.
-- **`fail_to_pass` non-null in repos.json:** fire suppressed (step 7); review + manual hint delivered. Prevents
-  a silent ceiling-lift on the autonomous path.
-- **No trusted `$ORCH/play-fix.sh` (or `PLAY_FIX_SELF`):** auto fire suppressed (step 8); review + manual hint
-  delivered. The auto path NEVER execs the worktree copy.
-- **`PLAY_FIX_DAILY_CAP` (20) exhausted:** extra fires → ABORTED (`:236`), fail-safe. Shared with manual (see NOT built).
-- **`repo_id` (basename) ≠ repos.json key:** the `fail_to_pass` lookup (step 7) returns `null`→ wait, returns
-  empty→`"null"` default → would *pass* the null check, but play-fix then fails closed on the path lookup
-  (`:138-140`, empty path → ABORTED). Net: never a wrong-repo fix. **Operator keeps key = dir basename**
-  (documented prerequisite). *(Reviewer note: confirm the `// "null"` default can't mask a genuinely
-  misconfigured repo into firing — it can't cause a wrong fix, but it does spend a fire that immediately ABORTs;
-  acceptable, flagged.)*
-- **base_sha mis-wire trap:** for a **new/root branch** `$base` is EMPTY_TREE and fails play-fix's 40-hex gate
-  (`:142-143`) → ABORTED. **For an incremental push `$base` is a real parent commit** — both gates would pass and
-  play-fix would silently fix the WRONG (parent) base. There is **no runtime gate** distinguishing `$tip` from
-  `$base` here; protection = `base_sha=$tip` pinned with an inline comment **and** a hard test.sh assertion
-  (arg2 == $tip). This is the single most important code-review focus.
-- **Marker/dedup pruned at 14 days then same tip re-reviewed:** one duplicate fire (fresh codex attempt on an
-  old SHA). Rare, fail-safe, wasted compute only.
-- **Crash mid-fire (after done-marker, before play-fix output):** that tip is "done" until the 14-day prune;
-  recover via empty-commit re-push → new tip. Two-phase provisional claim deliberately not built (solo machine).
+- **`$triage` > MAX_FIXLIST (64KB):** play-fix fails closed → ABORTED (`:145`); review delivered; no
+  re-fire (done-$tip). Never truncation.
+- **Rapid pushes of distinct tips:** each tip fires once; play-fix's `fix-state/lock` serializes the
+  fixes, so a 2nd concurrent fire ABORTS "another fix is running" (`:189-191`). A stale earlier tip's fix
+  may finish while the latest ABORTs — operator re-runs the latest via the hint. No debouncer.
+- **`$pushed=0` (remote rejected / ls-remote timed out):** no fire; `done-$tip` not written; re-push
+  re-evaluates. Manual hint still delivered.
+- **`delivered=0` (inbox write failed `:91`):** fire suppressed; worker doesn't mark done; retries next push.
+- **`fail_to_pass` non-null OR repo not in repos.json:** fire suppressed (step 7, `jq -e` fail-closed);
+  review + manual hint delivered. No wrong-repo fire and no silent ceiling-lift.
+- **No trusted `$ORCH/play-fix.sh`:** auto fire suppressed (step 8); review + hint delivered. The auto
+  path NEVER execs the worktree copy.
+- **`base != tip` somehow (mis-wire/refactor):** runtime assertion suppresses fire (step 9).
+- **`PLAY_FIX_DAILY_CAP` (20) exhausted:** extra fires → ABORTED (`:236`), fail-safe. Shared with manual.
+- **Marker pruned at 14 days then same tip re-reviewed:** one duplicate fire (codex attempt on an old SHA).
+  Rare, fail-safe, wasted compute only.
+- **Crash mid-fire (after done-marker, before play-fix output):** that tip is "done" until the 14-day
+  prune; recover via empty-commit re-push → new tip. Two-phase claim deliberately not built (solo machine).
 
 ## Security Surface
-- **Untrusted `$triage`** (lobster LLM over a possibly-injected diff): written verbatim to `$run/fixlist.txt`
-  and passed only as a **file-path arg** — never parsed/interpolated by the bridge in v1. play-fix re-reads it
-  as DATA, enforces MAX_FIXLIST fail-closed, and fences it to codex with its own nonce (`:91/:257-260`). Not
-  deriving a selector removes the only new untrusted-text-parsing surface in v1.
-- **Marker/dedup filenames** embed `$tip`, a 40-hex SHA re-validated by play-fix (`:142`) — no shell metachars.
-- **`repo_id`** is a basename used only as a repos.json lookup key; the worktree path comes solely from trusted
-  repos.json `.path`; a mismatch fails closed (`:138-140`).
-- **Trusted-install-only fixer (step 8)** closes the "attacker's pushed worktree copy runs unsandboxed" vector
-  on the auto path. Deploy prerequisite: `cp orchestrator/play-fix.sh "$ORCH/play-fix.sh"` (re-copy on update).
-- **Env-scrubbed detach (step 9):** `env -u MYNDAIX_FIX_TEST_MODE -u MYNDAIX_FIX_PATCH_OVERRIDE` strips the
-  inherited test-seam so a misconfigured push env can't downgrade an auto-fire to a cap-skipping override run.
-- **`PLAY_AUTOFIX` default `0`:** installing the updated play-review.sh does **not** silently spend codex budget;
-  arming is explicit; rollback = unset one env knob. (A per-push env var matches the existing
-  `PLAY_DAILY_CAP`/`PLAY_SELF`/`PLAY_IMESSAGE_TO` convention.)
-- **Bounded cost-DoS (accepted):** forced-NEEDS-FIX pushes can drive up to `PLAY_FIX_DAILY_CAP=20` codex submits/
-  day; bounded, fail-safe, operator-gated by the off-by-default flag. The attacker cannot pre-create a
-  suppressing marker (`$STATE` is outside the repo).
+- **Untrusted `$triage`:** written verbatim to `$run/fixlist.txt`, passed only as a **file-path arg** —
+  never parsed/interpolated by the bridge in v1. play-fix re-reads it as DATA, MAX_FIXLIST fail-closed,
+  nonce-fenced to codex (`:91/:257-260`).
+- **`jq -e` fail-closed gate** (step 7) closes the fail-open config hole.
+- **Trusted-install-only fixer + `env -i` whitelist** (steps 8-9) close the attacker-worktree-copy and
+  inherited-env vectors on the unsandboxed auto path.
+- **Runtime base assertion** (step 9) closes the wrong-base wire.
+- **Marker/dedup filenames** embed `$tip`, re-validated 40-hex by play-fix (`:142`) — no shell metachars.
+- **`repo_id`** is a basename lookup key; the worktree path comes from trusted repos.json `.path`; a
+  mismatch fails closed (`:138-140`).
+- **`PLAY_AUTOFIX` default `0`:** installing the updated play-review.sh spends nothing; arming is explicit;
+  rollback = unset one env knob.
+- **Bounded cost-DoS (accepted):** forced-NEEDS-FIX pushes can drive ≤`PLAY_FIX_DAILY_CAP=20` codex
+  submits/day; bounded, fail-safe, off-by-default. `$STATE` is outside the repo (no marker pre-seeding).
 - **Exfil:** verify runs sandboxed (`deny network*`, `:100`); inbox is human-only; patch is `clean()`'d +
-  `SECRET_RE`-redacted + body-withheld on a secret hit (`:62/:76-78`). Residual: `SECRET_RE` is a crude
-  signature list, and the **codex-submit stage's network is the real boundary** — see the pre-ship gate.
-- **Loop immunity** is the core security property; its proof depends on the codex builder having no network
-  and play-fix never pushing (pre-ship gate).
+  `SECRET_RE`-redacted + withheld on a secret hit (`:62/:76-78`). The codex-submit stage is `net=false`
+  (pre-ship §1).
+- **Loop immunity** — empirically verified seatbelt confinement (see Idempotency & loop-immunity).
 
 ## Pre-ship verification gates (must pass before arming `PLAY_AUTOFIX=1`)
-1. **Codex builder has NO network and NO push capability.** Verify against the live runtime that the codex
-   builder spec runs `net=false` and that the linked fix worktree cannot `git push` (network-denied). The
-   loop-immunity and exfil proofs rest on this, not on play-fix.sh's own lines. If unconfirmed → do NOT arm.
-2. **Trusted install present:** `$ORCH/play-fix.sh` exists, is executable, and is byte-identical to the
-   reviewed `orchestrator/play-fix.sh` (`shasum -a 256`).
-3. **Repos to be armed are `fail_to_pass:null`** in the live repos.json (the enforcement also checks this at
-   fire time; verify the config too).
+1. **Codex builder confined + net=false (VERIFIED for prod).** `orchestrator/probe-git-write-vector.sh`
+   PASSED: `workspace-write` confines writes to `{workdir,/tmp,$TMPDIR}` and denies shared-`.git` writes.
+   **Condition:** the armed repo's path must NOT be under `/tmp` or `$TMPDIR`. Re-run the probe if the
+   codex CLI or its config changes. (myndaix-runtime: `/Users/stevenfernandez/code/active/...` — passes.)
+2. **Trusted install present + pinned:** `$ORCH/play-fix.sh` exists, is executable, and `shasum -a 256`
+   matches the reviewed `orchestrator/play-fix.sh`. Deploy step: `cp orchestrator/play-fix.sh "$ORCH/play-fix.sh"`.
+3. **Armed repos are `fail_to_pass:null`** in the live repos.json (enforced at fire time too).
 4. **No agent watcher on `inbox/jefe/`** (loop-immunity invariant).
 
 ## Files
 **Created:**
-- `docs/phase2-autonomous-fix-flip-design.md` — this DESIGN doc (already written; cross-family reviewed before coding).
-- `docs/phase2-autonomous-fix-flip-research.md` — prior-art brief (already written).
+- `docs/phase2-autonomous-fix-flip-design.md` — this DESIGN (cross-family reviewed).
+- `docs/phase2-autonomous-fix-flip-research.md` — prior-art brief.
+- `orchestrator/probe-git-write-vector.sh` — the reproducible pre-arm gate (§1); proves codex's seatbelt
+  denies shared-`.git` writes for a non-tmp repo. Not a unit test — an occasional/deploy-time gate.
 
 **Modified:**
-- `orchestrator/play-review.sh` — the ONLY runtime code change. Define `REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"`;
-  capture `confirm_pushed` once and refactor `mark_done` to reuse it; restructure the NEEDS-FIX else-branch
-  (`:202-208`): always write `$run/fixlist.txt` (set-e-safe), always append the manual hint, deliver, set
-  `done-$tip`; then the fail-closed fire gate (PLAY_AUTOFIX + `$pushed` + `fail_to_pass:null` + trusted-fixer-x
-  + non-empty fixlist), env-scrubbed `nohup` with `base_sha=$tip`. All other lines unchanged; `play-fix.sh`
+- `orchestrator/play-review.sh` — the ONLY runtime code change. Define
+  `REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"`; wrap `confirm_pushed`'s `ls-remote` in a portable
+  timeout; capture `confirm_pushed`/`deliver` `set -e`-safe and reuse; restructure the NEEDS-FIX branch
+  (`:202-208`): always write `$run/fixlist.txt`, always append the manual hint + neutral auto note, deliver,
+  set `done-$tip`; then the fail-closed fire gate (PLAY_AUTOFIX + `$pushed` + `jq -e fail_to_pass:null` +
+  trusted-fixer-x + runtime `base==tip` + non-empty fixlist), `env -i`-whitelisted `nohup`. `play-fix.sh`
   and the lobster prompt are **byte-for-byte unchanged**.
-- `orchestrator/test.sh` — add smoke cases (hard, blocking assertions; stub fixer via `PLAY_FIX_SELF`, no real
-  codex): (a) writes `$run/fixlist.txt`; (b) invokes fixer with **arg2 == $tip** (NOT `$base`) and **exactly 3
-  args**; (c) fires at most once per tip across two same-tip runs; (d) does NOT fire when `confirm_pushed` is
-  false (force via a non-empty bogus `remote_url` whose `ls-remote` ref ≠ tip — empty url returns true at
-  `:125`); (e) does NOT fire on `fail_to_pass` non-null; (f) does NOT fire when no trusted install is present
-  (never resolves to `$repo/orchestrator/play-fix.sh`); (g) PASS branch never writes fixlist/never fires; (h)
-  armed-but-suppressed still emits the manual hint; (i) `PLAY_AUTOFIX` unset/0 → manual hint present, no fire;
-  (j) `shasum` guard that `orchestrator/play-fix.sh` is unchanged by this PR.
+- `orchestrator/test.sh` — add hard, blocking smoke cases (stub fixer via `PLAY_FIX_SELF` under
+  `PLAY_AUTOFIX_TEST_MODE=1`, no real codex): (a) writes `$run/fixlist.txt`; (b) fixer arg2 == $tip (NOT
+  $base) and exactly 3 args; (c) fires ≤once per tip across two same-tip runs; (d) no fire when
+  `confirm_pushed` false (force via a bogus non-empty `remote_url` whose `ls-remote` ref ≠ tip); (e) no fire
+  on `fail_to_pass` non-null / missing key; (f) no fire with no trusted install (never resolves to
+  `$repo/orchestrator/play-fix.sh`); (g) PASS branch never writes fixlist / never fires; (h) armed-but-
+  suppressed still emits the manual hint; (i) `PLAY_AUTOFIX` unset/0 → hint present, no fire; (j) `shasum`
+  guard that `orchestrator/play-fix.sh` is unchanged by this PR.
 
 ## Dependencies
-**Depends on:** merged `play-fix.sh` (signature `:130-131`, 40-hex base gate `:142-143`, `.fail_to_pass` read
-`:158`, selector gate `:164-185`, fixlist cap `:144-145`, UNVERIFIED ceiling `:318`, `fix-state/lock`
-`:188-192`, own daily cap `:28`, override double-gate `:248-249`); `play-review.sh` primitives
-(`confirm_pushed:124-128`, `mark_done:133`, run dir `:75`, `deliver:85-102`, global lock `:143-153`,
-`done-$tip:160`, `-type f` prune `:157`, nohup idiom `:63`, `$self` resolution `:49-51`); `repos.json`
-(key=basename, absolute `.path`, `.fail_to_pass`); `jq`; the `mxr` wrapper → launchd codex pool
-(`ai.myndaix.runtime`) running the codex builder **net=false**.
-**Depended on by:** nothing programmatic — output is human-read inbox markdown. The (future) selector follow-on
-depends on this branch's structure + repos.json `fail_to_pass_template`.
+**Depends on:** merged `play-fix.sh` (signature `:130-131`, base gate `:142-143`, `.fail_to_pass` read
+`:158`, fixlist cap `:144-145`, UNVERIFIED ceiling `:318`, `fix-state/lock` `:188-192`, daily cap `:28`,
+sandbox builder `:93-125`); `play-review.sh` primitives (`confirm_pushed:124-128`, `mark_done:133`, run dir
+`:75`, `deliver:85-102`, global lock `:143-153`, `done-$tip:160`, prune `:157`, nohup `:63`); `repos.json`
+(key=basename, absolute `.path`, `.fail_to_pass`); `jq`; the runtime codex builder spec
+(`registry.py:76` — `workspace-write` + `network_access=false`); `gtimeout` optional.
+**Depended on by:** nothing programmatic — output is human-read inbox markdown.
 
 ## Deliberately NOT built
-- **No selector extraction / no `PLAY_F2P` prompt clause in v1** — lobster prompt untouched; forfeits
-  `REGRESSION_CHECK_ONLY` (caps at UNVERIFIED). Riskiest surface deferred behind its own flag + injection harness.
-- **No auto-apply / auto-merge / auto-commit** — preserves the honest-minimal contract and loop immunity (disqualifying).
-- **No new PASS verdict.**
-- **No new script, daemon, queue, Postgres row, or launchd service** — inline in an existing branch, existing idioms.
-- **No inbox ranker / priority layer** — verdict-in-subject is the sort key.
-- **No debounce window** — latest-SHA-wins + play-fix's lock.
-- **No auto-retry** — one fire per tip; the human is the retry decision.
-- **No separate auto-fire daily cap in v1** — shares `PLAY_FIX_DAILY_CAP=20` (over-cap fails safe). A
-  `PLAY_AUTOFIX_DAILY_CAP` is shelved, to be built only if auto volume starves manual runs.
-- **No dedicated `fix-fired-$tip` marker** — redundant with `done-$tip` once `confirm_pushed` is captured once.
-- **No two-phase provisional claim / EXIT-trap rollback** — rare crash-mid-fire window accepted (re-push recovers).
-- **No worktree-copy fixer fallback on the auto path** — trusted install only (manual path keeps the in-repo hint).
-- **Zero changes to `play-fix.sh` and the lobster prompt** — the gate, sandbox, caps, lock, verdicts are already the authority.
+- No selector extraction / `PLAY_F2P` clause in v1 (lobster prompt untouched; forfeits REGRESSION_CHECK_ONLY).
+- No auto-apply / auto-merge / auto-commit (disqualifying — preserves the contract + loop immunity).
+- No new PASS verdict.
+- No new script (except the probe gate), daemon, queue, Postgres row, or launchd service.
+- No `--max-verdict` flag on play-fix.sh / no other change to the frozen file (deferred — see Product decision).
+- No inbox ranker / priority layer.
+- No debounce window; no auto-retry; no separate auto-fire daily cap (shares `PLAY_FIX_DAILY_CAP`).
+- No `fix-fired-$tip` marker (redundant with `done-$tip`).
+- No two-phase provisional claim / EXIT-trap rollback.
+- No worktree-copy fixer fallback on the auto path (trusted install only).
+- No runner change to detach/clone the codex worktree (the probe shows the seatbelt already confines writes
+  for non-tmp repos; revisit only if the probe ever FAILs).
 
-## Open questions for cross-family review (codex / Oracle stress-test)
-1. **Codex-builder network (the deepest one):** is the codex builder genuinely `net=false` and push-incapable in
-   the linked fix worktree? The whole loop-immunity/exfil story depends on it. How do we *assert* this in CI/deploy?
-2. **`base_sha=$tip` vs `$base`:** for an incremental push both are real commits and no runtime gate distinguishes
-   them — is the inline comment + test assertion enough, or do we want a defensive runtime check (e.g. assert the
-   passed base equals `$tip`)?
-3. **Capture-once `confirm_pushed`:** confirm the refactor removes the second `ls-remote` and that no path can
-   wedge the held review lock; is the un-timeout'd first `ls-remote` (pre-existing) acceptable, or wrap it?
-4. **`fail_to_pass:null` enforcement:** is fire-time `jq` of repos.json the right place, and does the
-   `// "null"` default correctly fail-closed for a missing/misconfigured repo (it spends an ABORT fire — ok?)?
-5. **Trusted-install-only fixer:** is fail-closed-to-`$ORCH/play-fix.sh` correct, and is the `shasum`
-   byte-identity check the right deploy gate?
-6. **Env-scrub completeness:** are `MYNDAIX_FIX_TEST_MODE` + `MYNDAIX_FIX_PATCH_OVERRIDE` the only env vars worth
-   stripping on the nohup, or should we pass a minimal allowlisted env instead?
-7. **Surfacing honesty:** is "the NEEDS-FIX ping pre-announces a silent second inbox file" an acceptable v1 UX, or
-   does the fix verdict need its own ping?
+## Open questions for the re-review (on the BUILT code)
+1. **Portable `ls-remote` timeout:** is the `gtimeout`-or-bg-kill wrapper correct and does it leave no
+   orphan on the timeout path?
+2. **`jq -e` semantics:** confirm it returns non-zero (suppresses fire) for missing key, missing field,
+   `false`, and string `"null"`, and zero only for explicit JSON `null`.
+3. **`env -i` whitelist sufficiency:** does play-fix reach the codex pool + write the inbox with only
+   `PATH`/`HOME` passed, or is another var needed (e.g. `LOGNAME`/`USER` for osascript)?
+4. **Runtime base assertion:** is `base==tip && base!=tip-of-range` the right invariant, including the
+   new/root-branch EMPTY_TREE case?
+5. **Test seam:** is `PLAY_AUTOFIX_TEST_MODE`-gating of `PLAY_FIX_SELF` a tight enough production lockout?

@@ -31,6 +31,8 @@ ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
 STALE=1800                                          # reap a lock older than 30 min (hung/killed worker)
 PRUNE_DAYS=14
+REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
+LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
 ZERO=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
@@ -124,13 +126,67 @@ call(){ # call <agent> <prompt> [mxr-flags...] -> echo reply ; return 1 on fail/
 confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = manual/test run -> yes
   [[ -z "$remote_url" ]] && return 0                # ls-remote scoped to $ref (not any ref); capture+compare avoids grep -q|pipefail SIGPIPE
   local got
-  got="$(git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
+  # bound the network call so a dead remote can't wedge the held review lock (codex+Oracle MAJOR):
+  # gtimeout if present, else a portable bg-sleep-kill (macOS has no `timeout`). Empty result -> not
+  # pushed -> safe (no fire, no done-marker; the next push re-evaluates).
+  if command -v gtimeout >/dev/null 2>&1; then
+    got="$(gtimeout "$LSREMOTE_TIMEOUT" git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
+  else
+    local tf; tf="$(mktemp "${TMPDIR:-/tmp}/playrev-lsr.XXXXXX")"
+    ( git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null >"$tf" ) &
+    local gp=$!
+    ( sleep "$LSREMOTE_TIMEOUT"; kill -TERM "$gp" 2>/dev/null ) &
+    local wd=$!
+    wait "$gp" 2>/dev/null || true
+    kill -KILL "$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
+    got="$(awk '{print $1}' "$tf" 2>/dev/null || true)"; rm -f "$tf" 2>/dev/null || true
+  fi
   [[ "$got" == "$tip" ]]
 }
 
-# dedupe ONLY a review that both delivered durably AND landed on the remote
-# (pre-push fires before git confirms acceptance — a rejected push must stay re-reviewable)
-mark_done(){ confirm_pushed && : > "$STATE/done-$tip" 2>/dev/null || true; }
+# dedupe ONLY a review that both delivered durably AND landed on the remote. Uses the push state
+# captured ONCE in the main flow (never re-calls confirm_pushed — a 2nd ls-remote under the held
+# lock can wedge all reviews). pre-push fires before git confirms acceptance, so a rejected push
+# must stay re-reviewable.
+mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$tip" 2>/dev/null || true; }
+
+# autofix_fire — PLAY_AUTOFIX bridge: auto-trigger play-fix.sh on a NEEDS-FIX verdict. Fail-CLOSED:
+# every guard must pass or it no-ops (the always-present manual hint is the fallback). It NEVER
+# auto-applies or auto-merges — play-fix writes a human-apply diff to the jefe inbox. Loop-immune:
+# play-fix never commits/pushes, and the codex builder's workspace-write seatbelt denies writes to
+# the shared .git for a non-tmp repo (verified by orchestrator/probe-git-write-vector.sh). Design:
+# docs/phase2-autonomous-fix-flip-design.md.
+autofix_fire(){
+  [[ "${PLAY_AUTOFIX:-0}" == "1" ]] || return 0
+  [[ "${pushed:-0}" == "1" ]]       || { note autofix "skip: push not confirmed"; return 0; }
+  [[ -s "$run/fixlist.txt" ]]       || { note autofix "skip: empty fixlist"; return 0; }
+  # repo MUST be configured fail_to_pass:null, else a 3-arg auto-fire could exceed the UNVERIFIED
+  # ceiling (play-fix reads .fail_to_pass independent of the selector). jq -e is genuinely fail-closed:
+  # missing key, missing field, false, or the string "null" all suppress the fire.
+  jq -e --arg r "$repo_id" 'has($r) and (.[$r]|has("fail_to_pass")) and (.[$r].fail_to_pass==null)' \
+     "$REPOS_JSON" >/dev/null 2>&1 || { note autofix "skip: $repo_id not fail_to_pass:null"; return 0; }
+  # TRUSTED INSTALL ONLY on the auto path: the worktree copy is attacker-writable AND play-fix runs
+  # unsandboxed (it builds the sandbox). PLAY_FIX_SELF honored only under the test seam; reject any
+  # fixer resolving under $repo.
+  local fixer="$ORCH/play-fix.sh"
+  [[ "${PLAY_AUTOFIX_TEST_MODE:-}" == "1" && -n "${PLAY_FIX_SELF:-}" ]] && fixer="$PLAY_FIX_SELF"
+  # reject any fixer resolving UNDER $repo (an attacker-writable path). canonicalize BOTH sides —
+  # on macOS $repo may be /tmp/... while pwd -P yields /private/tmp/..., so a one-sided compare misses.
+  local _fdir _rdir
+  _fdir="$(cd "$(dirname "$fixer")" 2>/dev/null && pwd -P || true)/"
+  _rdir="$(cd "$repo" 2>/dev/null && pwd -P || true)/"
+  case "$_fdir" in "$_rdir"*) note autofix "skip: fixer resolves under repo"; return 0;; esac
+  [[ -x "$fixer" ]] || { note autofix "skip: no trusted fixer at $fixer"; return 0; }
+  # base_sha MUST be the reviewed tip, never the range lower bound — both are real commits on an
+  # incremental push, so play-fix's existence gate can't catch a mis-wire. Runtime assertion + test.
+  local fix_base="$tip"
+  [[ "$fix_base" == "$tip" && "$fix_base" != "$base" ]] || { note autofix "skip: base/tip assertion"; return 0; }
+  note autofix "fire: $repo_id base=${fix_base:0:8} fixer=$fixer"
+  # detach with a WHITELISTED env (env -i) — strips LD_PRELOAD/BASH_ENV/GIT_EXTERNAL_DIFF and the
+  # MYNDAIX_FIX_* test seam inherited via nohup; play-fix self-establishes PATH + pool auth.
+  nohup env -i PATH="$PATH" HOME="$HOME" "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
+  return 0
+}
 
 contention(){ # lock held by a live worker: record the skip (NEVER silent), then exit
   : > "$STATE/SKIPPED-$tip" 2>/dev/null || true
@@ -192,6 +248,10 @@ triage="$(call lobster "OBJECTIVE: turn the review into an ordered fix-list. If 
 $(fence kilabz-review "$review")" "${scope[@]}")" \
   || abort triage "lobster failed/empty/timeout (job id in $run/lobster.err)"
 
+# --- capture push state ONCE (set -e-safe): reused by mark_done AND the autofix fire gate; never
+#     call confirm_pushed twice (a 2nd ls-remote under the held lock can wedge all reviews) ---
+if confirm_pushed; then pushed=1; else pushed=0; fi
+
 # --- gate: PASS iff trimmed == EXACTLY PLAY_PASS (no forgeable substring) ---
 if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimmed match — no embedded-space forgery
   note done clean-pass
@@ -201,8 +261,20 @@ if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimme
 $review" && mark_done || true
 else
   note done needs-fix
-  deliver "review NEEDS-FIX — $ref" "$triage
+  # always stage the fix-list (single-writer run dir) + a copy-paste manual hint. The auto note is
+  # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
+  printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true
+  autonote=""
+  [[ "${PLAY_AUTOFIX:-0}" == "1" ]] && autonote='
+
+(autofix armed: if eligible, an auto-fix attempt will follow as a SEPARATE inbox file — no extra ping)'
+  if deliver "review NEEDS-FIX — $ref" "$triage
 
 --- full review ---
-$review" && mark_done || true
+$review
+
+--- to fix: play-fix.sh \"$repo_id\" \"$tip\" \"$run/fixlist.txt\"$autonote"; then
+    mark_done
+    autofix_fire        # fail-closed gate; no-ops unless every guard holds. NEVER auto-applies.
+  fi
 fi
