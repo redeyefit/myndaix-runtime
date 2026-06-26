@@ -849,3 +849,85 @@ class PostgresLedger:
         """Cheap queue-depth probe for a pool's idle detection."""
         async with self._pool.acquire() as con:
             return await con.fetchval("SELECT count(*) FROM job WHERE status = 'queued'")
+
+    # ---- controller-loop ("the brain") cursor (DESIGN v0.2 §2) -------------
+    # The proactive review scheduler's only state. Each verb is one status-guarded
+    # CAS returning whether THIS caller won the transition — same discipline as the
+    # job state machine above, so the single-instance lock is belt-and-suspenders,
+    # not the sole guard against a double dispatch.
+    async def get_cursor(self, repo_id: str, ref: str) -> Optional[dict]:
+        """The (repo_id, ref) cursor row as a plain dict, or None if unseen.
+        `updated_at` is left as a datetime so the controller can compare it to its
+        stale-pending cutoff."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """SELECT repo_id, ref, baseline_sha, reviewed_sha, pending_sha,
+                          state, attempts, updated_at
+                     FROM review_cursor WHERE repo_id = $1 AND ref = $2""",
+                repo_id, ref)
+        return dict(row) if row is not None else None
+
+    async def upsert_baseline(self, repo_id: str, ref: str, head: str) -> bool:
+        """Seed the high-water mark at first sight: baseline=reviewed=head, NOT
+        reviewed (B2 — avoids the whole-tree diff blow-up). INSERT ... ON CONFLICT
+        DO NOTHING, so it only ever seeds an ABSENT cursor; returns True iff seeded."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """INSERT INTO review_cursor
+                       (repo_id, ref, baseline_sha, reviewed_sha, pending_sha, state, attempts)
+                   VALUES ($1, $2, $3, $3, NULL, 'baseline', 0)
+                   ON CONFLICT (repo_id, ref) DO NOTHING
+                   RETURNING repo_id""",
+                repo_id, ref, head)
+        return row is not None
+
+    async def claim_dispatch(
+        self, repo_id: str, ref: str, head: str, stale_before: _dt.datetime
+    ) -> bool:
+        """The dedup GATE: atomically claim `head` for dispatch. Returns True iff THIS
+        caller won the slot (then it may invoke the review). The WHERE refuses to claim
+        a head that is already reviewed, already blocked for that same head, or freshly
+        in flight — but DOES re-claim a same-head pending older than `stale_before` (a
+        dead dispatch) and always claims a NEW head. attempts resets to 1 on a new head,
+        increments on a stale re-claim, so the blocked ceiling counts only the current
+        head's tries."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """UPDATE review_cursor
+                      SET pending_sha = $3,
+                          state = 'dispatching',
+                          attempts = CASE WHEN pending_sha IS DISTINCT FROM $3
+                                          THEN 1 ELSE attempts + 1 END,
+                          updated_at = now()
+                    WHERE repo_id = $1 AND ref = $2
+                      AND reviewed_sha <> $3
+                      AND NOT (state = 'blocked' AND pending_sha = $3)
+                      AND (pending_sha IS DISTINCT FROM $3 OR updated_at < $4)
+                    RETURNING repo_id""",
+                repo_id, ref, head, stale_before)
+        return row is not None
+
+    async def advance_cursor(self, repo_id: str, ref: str, head: str) -> bool:
+        """Advance the cursor after a review of `head` DELIVERED (its done-<sha> marker
+        exists). Guarded on pending_sha = head so it only ever advances the head we
+        dispatched. Returns True iff advanced."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """UPDATE review_cursor
+                      SET reviewed_sha = $3, pending_sha = NULL,
+                          state = 'delivered', attempts = 0, updated_at = now()
+                    WHERE repo_id = $1 AND ref = $2 AND pending_sha = $3
+                    RETURNING repo_id""",
+                repo_id, ref, head)
+        return row is not None
+
+    async def mark_blocked(self, repo_id: str, ref: str) -> bool:
+        """Sticky-block the current pending head after MAX_ATTEMPTS failed dispatches.
+        A later NEW head escapes it (claim_dispatch resets on a distinct head). Returns
+        True iff a row was marked."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """UPDATE review_cursor SET state = 'blocked', updated_at = now()
+                    WHERE repo_id = $1 AND ref = $2 RETURNING repo_id""",
+                repo_id, ref)
+        return row is not None
