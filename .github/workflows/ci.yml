@@ -38,12 +38,19 @@ jobs:
           python-version: "3.12"
 
       - name: Install
-        run: pip install -e .
+        run: pip install -e ".[dev]"          # dev extra brings pytest (+ pytest-asyncio)
 
       - name: Run all test suites
         run: |
           set -e
+          # Two test styles coexist: most suites are standalone (a `__main__` runner that
+          # drives async via asyncio.run); test_stitch.py is pytest-style (fixtures/marks, no
+          # runner). Route by the presence of a `__main__` block so each runs the right way —
+          # running a pytest-style file as a bare script collects nothing and errors on import.
           for t in tests/test_*.py; do
-            echo "== $t =="
-            python "$t"
+            if grep -q '^if __name__' "$t"; then
+              echo "== python $t =="; python "$t"
+            else
+              echo "== pytest $t =="; python -m pytest -q "$t"
+            fi
           done
