@@ -159,5 +159,10 @@ echo "30. durable flag-file enables auto-fire WITHOUT PLAY_AUTOFIX env"; reset; 
   if wait_fixer; then echo "  ok: flag-file armed -> fired"; PASS=$((PASS+1)); else echo "  FAIL: flag-file did not arm"; FAIL=$((FAIL+1)); fi
   a2="$(sed -n 3p "$FAKE/.myndaix/fixer-argv" 2>/dev/null)"; [[ "$a2" == "$TIP" ]] && { echo "  ok: flag-file fire uses base=tip"; PASS=$((PASS+1)); } || { echo "  FAIL: flag-file fire arg2=$a2"; FAIL=$((FAIL+1)); }
 
+echo "31. PLAY_DISABLE_AUTOFIX=1 HARD-overrides the durable flag (controller-loop, codex BLOCKER)"; reset; af_repos "$NULLCFG"
+  mkdir -p "$FAKE/.myndaix/orchestrator"; : > "$FAKE/.myndaix/orchestrator/AUTOFIX_ENABLED"
+  env HOME="$FAKE" PLAY_DISABLE_AUTOFIX=1 PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "disable flag suppresses fire even with durable flag + PLAY_AUTOFIX"
+
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

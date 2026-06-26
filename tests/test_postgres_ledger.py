@@ -536,14 +536,44 @@ async def test_cursor_stale_reclaim_and_block(led: PostgresLedger) -> None:
     assert await led.claim_dispatch(R, REF, B, _utcnow()) is True
     assert (await led.get_cursor(R, REF))["attempts"] == 2, "stale re-claim increments attempts"
 
-    # ceiling reached -> block; a stale re-claim of the SAME head is then refused
-    assert await led.mark_blocked(R, REF) is True
+    # ceiling reached -> block (CAS: only fires for THIS pending head at the ceiling)
+    assert await led.mark_blocked(R, REF, B, 2) is True
+    assert await led.mark_blocked(R, REF, "9" * 40, 2) is False, "CAS must not block a different head"
     await _age_cursor(led, R, REF)
     assert await led.claim_dispatch(R, REF, B, _utcnow()) is False, "blocked head must not re-claim"
     # but a NEW head escapes the block and resets attempts to 1
     assert await led.claim_dispatch(R, REF, C, _utcnow()) is True
     cur = await led.get_cursor(R, REF)
     assert cur["pending_sha"] == C and cur["state"] == "dispatching" and cur["attempts"] == 1
+
+
+# -- controller-loop cursor: in-flight head is NOT superseded by a new head ----
+async def test_cursor_no_supersede_in_flight(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B, C = "repoY", "refs/heads/main", "1" * 40, "2" * 40, "3" * 40
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - _dt.timedelta(hours=1)) is True
+    # a NEW head C arrives while B is freshly in flight -> must NOT claim (wait for B)
+    assert await led.claim_dispatch(R, REF, C, _utcnow() - _dt.timedelta(hours=1)) is False
+    assert (await led.get_cursor(R, REF))["pending_sha"] == B, "pending must stay on the in-flight head"
+
+
+# -- controller-loop cursor: review_delivered reads a done review job ----------
+async def test_review_delivered_signal(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, HEAD = "repoZ", "abc" + "0" * 37
+    assert await led.review_delivered(R, HEAD) is False
+    async with led._pool.acquire() as con:
+        # a canary-style job carries NULL base_ref -> must NOT signal delivery
+        await con.execute(
+            "INSERT INTO job (id, root_id, created_by, to_agent, body, status, repo_id, base_ref) "
+            "VALUES (gen_random_uuid(), gen_random_uuid(), 'c', 'kilabz', 'x', 'done', $1, NULL)", R)
+        assert await led.review_delivered(R, HEAD) is False
+        # a real review job (repo_id + base_ref=head, done) signals delivery
+        await con.execute(
+            "INSERT INTO job (id, root_id, created_by, to_agent, body, status, repo_id, base_ref) "
+            "VALUES (gen_random_uuid(), gen_random_uuid(), 'c', 'lobster', 'x', 'done', $1, $2)", R, HEAD)
+    assert await led.review_delivered(R, HEAD) is True
 
 
 async def main() -> None:

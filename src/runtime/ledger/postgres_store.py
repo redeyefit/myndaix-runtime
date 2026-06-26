@@ -902,15 +902,31 @@ class PostgresLedger:
                     WHERE repo_id = $1 AND ref = $2
                       AND reviewed_sha <> $3
                       AND NOT (state = 'blocked' AND pending_sha = $3)
-                      AND (pending_sha IS DISTINCT FROM $3 OR updated_at < $4)
+                      -- claim ONLY when idle, escaping a block, or re-claiming a dead
+                      -- (stale) dispatch. A fresh in-flight head is NOT superseded — we
+                      -- wait for it to deliver, then review the union next tick (Oracle
+                      -- B2: superseding abandons the prior head's delivery + wastes a run).
+                      AND (pending_sha IS NULL OR state = 'blocked' OR updated_at < $4)
                     RETURNING repo_id""",
                 repo_id, ref, head, stale_before)
         return row is not None
 
+    async def review_delivered(self, repo_id: str, base_ref: str) -> bool:
+        """True iff a review of `base_ref` (the reviewed tip) ran to completion in the
+        ledger — a done job stamped with this repo_id + base_ref. This is the controller's
+        ADVANCE signal: it is independent of play-review's done-<sha> file marker, which
+        is suppressed when the branch moves during the review (codex B2 — would re-review
+        forever). Canary jobs carry NULL base_ref, so only real review jobs match."""
+        async with self._pool.acquire() as con:
+            return await con.fetchval(
+                """SELECT EXISTS (SELECT 1 FROM job
+                       WHERE repo_id = $1 AND base_ref = $2 AND status = 'done')""",
+                repo_id, base_ref)
+
     async def advance_cursor(self, repo_id: str, ref: str, head: str) -> bool:
-        """Advance the cursor after a review of `head` DELIVERED (its done-<sha> marker
-        exists). Guarded on pending_sha = head so it only ever advances the head we
-        dispatched. Returns True iff advanced."""
+        """Advance the cursor once a review of `head` DELIVERED (review_delivered, or its
+        done-<sha> marker). Guarded on pending_sha = head so it only ever advances the head
+        we dispatched. Returns True iff advanced."""
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
                 """UPDATE review_cursor
@@ -921,13 +937,17 @@ class PostgresLedger:
                 repo_id, ref, head)
         return row is not None
 
-    async def mark_blocked(self, repo_id: str, ref: str) -> bool:
-        """Sticky-block the current pending head after MAX_ATTEMPTS failed dispatches.
-        A later NEW head escapes it (claim_dispatch resets on a distinct head). Returns
-        True iff a row was marked."""
+    async def mark_blocked(self, repo_id: str, ref: str, head: str, max_attempts: int) -> bool:
+        """Sticky-block the current pending head after `max_attempts` failed dispatches.
+        A CAS (codex M5): guarded on pending_sha = head AND attempts >= max_attempts AND
+        state = 'dispatching', so it can NEVER clobber a concurrent new-head claim into
+        'blocked' off a stale read. A later NEW head escapes it (claim_dispatch resets on
+        a distinct head). Returns True iff this caller blocked the row."""
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
                 """UPDATE review_cursor SET state = 'blocked', updated_at = now()
-                    WHERE repo_id = $1 AND ref = $2 RETURNING repo_id""",
-                repo_id, ref)
+                    WHERE repo_id = $1 AND ref = $2 AND pending_sha = $3
+                      AND attempts >= $4 AND state = 'dispatching'
+                    RETURNING repo_id""",
+                repo_id, ref, head, max_attempts)
         return row is not None

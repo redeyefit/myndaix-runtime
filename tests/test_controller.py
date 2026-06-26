@@ -45,7 +45,7 @@ def make_repo(name: str) -> C.Repo:
     g(work, "config", "user.email", "t@t"); g(work, "config", "user.name", "t")
     (work / "f.txt").write_text("0\n")
     g(work, "add", "-A"); g(work, "commit", "-q", "-m", "c0")
-    g(work, "remote", "add", "origin", str(bare))
+    g(work, "remote", "add", "origin", f"file://{bare}")  # file:// = an allowed transport
     g(work, "push", "-q", "-u", "origin", "main")
     return C.Repo(name, work, "refs/heads/main")
 
@@ -121,19 +121,48 @@ async def test_inflight_is_not_redispatched(led: PostgresLedger) -> None:
     assert len(records(seam)) == 1, "an in-flight head must not re-dispatch"
 
 
-# -- a delivered review (done-<sha>) advances the cursor ----------------------
+# -- a delivered review (done-<sha> marker) advances the cursor ---------------
 async def test_done_marker_advances_cursor(led: PostgresLedger) -> None:
     await _truncate(led)
     seam = fresh_seam("done"); repo = make_repo("done")
     await C.process_repo(led, repo, [0])
     head2 = advance(repo, "c1")
     await C.process_repo(led, repo, [0])                 # pending = head2
-    (C.STATE / f"done-{head2}").write_text("")           # play-review "delivered"
+    (C.STATE / f"done-{head2}").write_text("")           # play-review "delivered" (marker)
     await C.process_repo(led, repo, [0])                 # advance pass picks it up
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["reviewed_sha"] == head2 and cur["pending_sha"] is None
     assert cur["state"] == "delivered"
     assert len(records(seam)) == 1, "no extra dispatch once delivered + up to date"
+
+
+# -- the LEDGER advance signal works even with NO done-marker (branch moved, B2)
+async def test_ledger_delivered_advances_cursor(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("ledgeradv"); repo = make_repo("ledgeradv")
+    await C.process_repo(led, repo, [0])
+    head2 = advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # pending = head2, NO marker written
+    async with led._pool.acquire() as con:               # a delivered review job lands in the ledger
+        await con.execute(
+            "INSERT INTO job (id, root_id, created_by, to_agent, body, status, repo_id, base_ref) "
+            "VALUES (gen_random_uuid(), gen_random_uuid(), 'c', 'lobster', 'x', 'done', $1, $2)",
+            repo.repo_id, head2)
+    await C.process_repo(led, repo, [0])                 # advance via the ledger, not the marker
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered"
+
+
+# -- a new head while one is in flight WAITS (no supersede, Oracle B2) ---------
+async def test_new_head_waits_for_inflight(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("wait"); repo = make_repo("wait")
+    await C.process_repo(led, repo, [0])
+    advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch head2 (in flight)
+    advance(repo, "c2")                                  # head3 arrives before head2 delivered
+    await C.process_repo(led, repo, [0])                 # must NOT dispatch head3
+    assert len(records(seam)) == 1, "an in-flight head must not be superseded by a new head"
 
 
 # -- a fetch failure skips the repo, never crashes, never seeds ----------------
@@ -200,16 +229,18 @@ async def test_load_config_dedup_and_validation(led: PostgresLedger) -> None:
 async def test_remote_url_rejects_exec_transport(led: PostgresLedger) -> None:
     repo = make_repo("url")
     g(repo.path, "remote", "set-url", "origin", "ext::sh -c whoami")
-    assert C._remote_url(repo) is None, "ext:: transport must be rejected"
+    assert C.remote_url(repo) is None, "ext:: transport must be rejected"
+    g(repo.path, "remote", "set-url", "origin", "git://anon/x.git")
+    assert C.remote_url(repo) is None, "plain git:// transport must be rejected"
     g(repo.path, "remote", "set-url", "origin", "https://github.com/x/y.git")
-    assert C._remote_url(repo) == "https://github.com/x/y.git"
+    assert C.remote_url(repo) == "https://github.com/x/y.git"
 
 
 # -- the test seam fails closed if armed without TEST_MODE ---------------------
 async def test_dispatch_override_requires_test_mode(led: PostgresLedger) -> None:
     seam = fresh_seam("guard"); repo = make_repo("guard")
     C.TEST_MODE = False                                  # override set, test-mode OFF
-    ok = C.trigger_review(repo, "a" * 40, "b" * 40)
+    ok = C.trigger_review(repo, "a" * 40, "b" * 40, "https://x/y.git")
     assert ok is False and records(seam) == [], "must refuse the override outside test mode"
     C.TEST_MODE = True
 

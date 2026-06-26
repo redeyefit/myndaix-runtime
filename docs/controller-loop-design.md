@@ -4,6 +4,19 @@ _North-star rung 3. v1 = **proactive review scheduler**, a bounded level-trigger
 
 **Decisions locked (Jefe, 2026-06-25):** (1) trigger = **synthetic-stdin, zero-touch** (no edits to `play-review.sh`); (2) watch scope = **default branch only** (`refs/heads/main`); (3) cadence = **hourly**; (4) cross-family design review before code (done).
 
+### v0.3 changelog (folded the BUILT-code cross-family review — Oracle + codex, both NEEDS-REVISION)
+- **codex B1 (autofix leak):** `autofix_armed` is an OR on the durable `AUTOFIX_ENABLED` flag, so stripping `PLAY_AUTOFIX` did NOT contain it. Fix = a one-line, fail-closed `PLAY_DISABLE_AUTOFIX=1` HARD override in `play-review.sh` (the ONLY edit there; not byte-zero-touch anymore), set by the controller's review env. test.sh +1 (test 31).
+- **codex B2 (branch-move re-review forever):** `done-<sha>` is suppressed when the branch moves mid-review → cursor never advances. Fix = advance from a LEDGER signal (`review_delivered` = a done review job stamped with `base_ref=head`), with the done-marker kept as a fallback.
+- **codex M1/M2 (git not sandboxed):** validate the remote URL BEFORE fetch; run all git with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, and `-c protocol.ext.allow=never -c protocol.fd.allow=never -c credential.helper= -c fetch.recurseSubmodules=false` (a `-c` flag overrides a poisoned repo config).
+- **codex M3/M4 + Oracle MAJOR (FETCH_HEAD race + gc wedge):** fetch into a controller-OWNED ref `refs/myndaix/controller/<ref>` and resolve THAT (not the shared FETCH_HEAD); pin `reviewed_sha` behind `refs/myndaix/reviewed/<ref>` so gc never prunes the diff base.
+- **codex M5 (mark_blocked not a CAS):** guarded `WHERE pending_sha=head AND attempts>=max AND state='dispatching'`.
+- **codex M6 (ORCH mismatch):** `ORCH` is no longer env-overridable — hardcoded to `$HOME/.myndaix/orchestrator` to match play-review.
+- **codex M7 (worktree-copy exec):** controller sets `PLAY_SELF` to the validated path so play-review's FRONT can't fall back to an untrusted worktree copy.
+- **codex M8 (lock vs long tick):** heartbeat the lock mtime per repo so a slow tick is never reaped live.
+- **Oracle B1 (lock-reap race):** steal a stale lock via atomic `rename` (not `rmtree`→`mkdir`).
+- **Oracle B2 (overlapping reviews):** `claim_dispatch` no longer supersedes a fresh in-flight head — it waits, then reviews the union next tick.
+- **Minors:** trigger checks play-review's exit code before charging budget; UTC-keyed daily budget; URL allowlist tightened to https/ssh/file/git@ (dropped http/git); cursor states are `baseline|dispatching|delivered|blocked` (no `running`).
+
 ### v0.2 changelog (folded review findings)
 - **B4 (codex):** dropped the "pure stateless" model — added a durable **`review_cursor`** table (the accurate last-reviewed signal + dedup key + bootstrap state). State lives in the ledger (litmus-green).
 - **B1 / G1 (both):** brain **`git fetch`es** the watched ref before dispatch (fetch is a `.git` write, not read-only).
@@ -34,7 +47,7 @@ review_cursor(
   baseline_sha text,          -- HEAD at first sight (bootstrap high-water mark)
   reviewed_sha text,          -- last SHA whose review DELIVERED (advances only on success)
   pending_sha  text,          -- SHA currently dispatched/in-flight (NULL when idle)
-  state        text,          -- baseline | dispatching | running | delivered | blocked
+  state        text,          -- baseline | dispatching | delivered | blocked
   attempts     int,           -- consecutive failed dispatches for the current pending_sha
   updated_at   timestamptz,
   PRIMARY KEY (repo_id, ref)
