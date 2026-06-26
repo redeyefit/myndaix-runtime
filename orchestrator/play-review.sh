@@ -132,13 +132,19 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
   if command -v gtimeout >/dev/null 2>&1; then
     got="$(gtimeout "$LSREMOTE_TIMEOUT" git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null | awk '{print $1}')"
   else
+    # portable bounded call with process-GROUP kill (mirrors play-fix.sh run_sandboxed, :111-123):
+    # set -m puts each bg job in its OWN process group, so kill -TERM -$gp reaps git AND its ssh
+    # child, and reaping the watchdog's group leaves no orphaned sleep on the fast path (codex MAJOR).
     local tf; tf="$(mktemp "${TMPDIR:-/tmp}/playrev-lsr.XXXXXX")"
+    set -m 2>/dev/null || true
     ( git -C "$repo" ls-remote "$remote_url" "$ref" 2>/dev/null >"$tf" ) &
     local gp=$!
-    ( sleep "$LSREMOTE_TIMEOUT"; kill -TERM "$gp" 2>/dev/null ) &
+    ( sleep "$LSREMOTE_TIMEOUT"; kill -TERM -"$gp" 2>/dev/null ) &
     local wd=$!
     wait "$gp" 2>/dev/null || true
-    kill -KILL "$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
+    kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true   # reap watchdog + its sleep (whole group)
+    kill -KILL -"$gp" 2>/dev/null || true                                   # reap any lingering ls-remote/ssh group
+    set +m 2>/dev/null || true
     got="$(awk '{print $1}' "$tf" 2>/dev/null || true)"; rm -f "$tf" 2>/dev/null || true
   fi
   [[ "$got" == "$tip" ]]
@@ -170,13 +176,20 @@ autofix_fire(){
   # fixer resolving under $repo.
   local fixer="$ORCH/play-fix.sh"
   [[ "${PLAY_AUTOFIX_TEST_MODE:-}" == "1" && -n "${PLAY_FIX_SELF:-}" ]] && fixer="$PLAY_FIX_SELF"
-  # reject any fixer resolving UNDER $repo (an attacker-writable path). canonicalize BOTH sides —
-  # on macOS $repo may be /tmp/... while pwd -P yields /private/tmp/..., so a one-sided compare misses.
-  local _fdir _rdir
-  _fdir="$(cd "$(dirname "$fixer")" 2>/dev/null && pwd -P || true)/"
+  # the fixer must be a real regular file, NOT a symlink — else a symlinked $ORCH/play-fix.sh ->
+  # $repo/orchestrator/play-fix.sh would run attacker-controlled, UNSANDBOXED code (codex BLOCKER).
+  # Reject a symlinked fixer, canonicalize the dir (pwd -P resolves dir-component symlinks too),
+  # reject anything resolving UNDER $repo (canonicalize BOTH sides — macOS /tmp vs /private/tmp),
+  # then exec the CANONICAL path.
+  [[ -L "$fixer" ]] && { note autofix "skip: fixer is a symlink"; return 0; }
+  local _fdir _fbn _rdir
+  _fdir="$(cd "$(dirname "$fixer")" 2>/dev/null && pwd -P || true)"
+  _fbn="$(basename "$fixer")"
   _rdir="$(cd "$repo" 2>/dev/null && pwd -P || true)/"
-  case "$_fdir" in "$_rdir"*) note autofix "skip: fixer resolves under repo"; return 0;; esac
-  [[ -x "$fixer" ]] || { note autofix "skip: no trusted fixer at $fixer"; return 0; }
+  [[ -n "$_fdir" ]] || { note autofix "skip: fixer dir unresolved"; return 0; }
+  case "$_fdir/" in "$_rdir"*) note autofix "skip: fixer resolves under repo"; return 0;; esac
+  fixer="$_fdir/$_fbn"
+  [[ -f "$fixer" && ! -L "$fixer" && -x "$fixer" ]] || { note autofix "skip: no trusted regular fixer at $fixer"; return 0; }
   # base_sha MUST be the reviewed tip, never the range lower bound — both are real commits on an
   # incremental push, so play-fix's existence gate can't catch a mis-wire. Runtime assertion + test.
   local fix_base="$tip"

@@ -137,6 +137,10 @@ echo "26. armed-but-suppressed still delivers the manual hint"; reset; af_repos 
   cknofile "$FAKE/.myndaix/fixer-argv" "suppressed -> no fire"
 echo "27. PLAY_AUTOFIX unset -> no fire, hint present"; reset; af_repos "$NULLCFG"; STUB_TRIAGE="1. fix it" run; settle
   ck "manual hint present" "to fix: play-fix.sh"; cknofile "$FAKE/.myndaix/fixer-argv" "not armed -> no fire"
+echo "29. reject a SYMLINKED fixer (codex BLOCKER: symlink -> in-repo copy)"; reset; af_repos "$NULLCFG"
+  ln -sf "$FIXER" "$ROOT/link-fixer.sh"
+  env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$ROOT/link-fixer.sh" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "symlinked fixer rejected -> no fire"; rm -f "$ROOT/link-fixer.sh"
 echo "28. play-fix.sh is byte-identical to origin/main (frozen)"; reset
   rr="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
   if git -C "$rr" rev-parse --verify -q origin/main >/dev/null 2>&1; then
