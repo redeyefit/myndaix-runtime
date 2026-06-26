@@ -38,9 +38,26 @@ TIP="$(git -C "$REPO" rev-parse HEAD)"
 EMPTY=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 INBOX="$FAKE/.myndaix/bridge/inbox/jefe"
 STATE="$FAKE/.myndaix/orchestrator/state"
+REPOS_JSON="$FAKE/.myndaix/orchestrator/repos.json"   # PLAY_AUTOFIX gate reads this
+RUNS="$FAKE/.myndaix/orchestrator/runs"
+
+# --- recording stub fixer, OUTSIDE the repo (the auto path rejects in-repo fixers). Records its
+#     argv (overwrite) AND appends a per-call marker so we can assert fire-count. ---
+FIXER="$ROOT/fake-play-fix.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'mkdir -p "$HOME/.myndaix" 2>/dev/null' \
+  'printf "%s\n" "$#" "$@" > "$HOME/.myndaix/fixer-argv"' \
+  'printf x >> "$HOME/.myndaix/fixer-calls"' 'exit 0' > "$FIXER"
+chmod +x "$FIXER"
+NULLCFG="$(printf '{"%s":{"path":"%s","fail_to_pass":null}}' "$(basename "$REPO")" "$REPO")"
 
 reset(){ rm -rf "$FAKE/.myndaix"; }
 run(){ env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "${1:-}" 2>"$ROOT/stderr"; }
+# armed run: PLAY_AUTOFIX on, test-seam fixer wired
+run_af(){ env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" \
+            bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "${1:-}" 2>"$ROOT/stderr"; }
+af_repos(){ mkdir -p "$(dirname "$REPOS_JSON")"; printf '%s' "$1" > "$REPOS_JSON"; }
+wait_fixer(){ local i; for i in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
+settle(){ sleep 0.6; }   # let a (possible) detached fire either land or prove absent
 latest(){ ls -t "$INBOX"/*.md 2>/dev/null | head -1; }
 ck(){ # ck <label> <substr> <file-or-empty>
   local f="${3:-$(latest)}"
@@ -87,6 +104,48 @@ echo "17. PR-1a: front re-execs the FIXED installed worker, not the worktree cop
   if [[ -f "$FAKE/.myndaix/which-self" ]] && grep -q "/.myndaix/orchestrator/play-review.sh" "$FAKE/.myndaix/which-self"; then
     echo "  ok: worker re-exec'd the fixed install path"; PASS=$((PASS+1))
   else echo "  FAIL: worker did not re-exec the fixed path"; FAIL=$((FAIL+1)); fi
+
+# ====================== PLAY_AUTOFIX flip (autonomous-fix trigger) ======================
+echo "18. autofix fires with base_sha=TIP and exactly 3 args"; reset; af_repos "$NULLCFG"; STUB_TRIAGE="1. fix it" run_af
+  if wait_fixer; then
+    nargs="$(sed -n 1p "$FAKE/.myndaix/fixer-argv")"; a2="$(sed -n 3p "$FAKE/.myndaix/fixer-argv")"
+    [[ "$nargs" == "3" ]] && { echo "  ok: exactly 3 args"; PASS=$((PASS+1)); } || { echo "  FAIL: argc=$nargs"; FAIL=$((FAIL+1)); }
+    [[ "$a2" == "$TIP" ]] && { echo "  ok: arg2 == tip"; PASS=$((PASS+1)); } || { echo "  FAIL: arg2=$a2 want $TIP"; FAIL=$((FAIL+1)); }
+    [[ "$a2" != "$EMPTY" ]] && { echo "  ok: arg2 != base"; PASS=$((PASS+1)); } || { echo "  FAIL: arg2 is base"; FAIL=$((FAIL+1)); }
+  else echo "  FAIL: fixer never fired"; FAIL=$((FAIL+3)); fi
+echo "19. autofix fires at most once per tip"; reset; af_repos "$NULLCFG"; STUB_TRIAGE="1. fix it" run_af; wait_fixer; STUB_TRIAGE="1. fix it" run_af; settle
+  ncalls="$(wc -c < "$FAKE/.myndaix/fixer-calls" 2>/dev/null | tr -d ' ')"; [[ "$ncalls" =~ ^[0-9]+$ ]] || ncalls=0
+  [[ "$ncalls" == "1" ]] && { echo "  ok: fired once across 2 same-tip runs"; PASS=$((PASS+1)); } || { echo "  FAIL: fired $ncalls times"; FAIL=$((FAIL+1)); }
+echo "20. no fire when push unconfirmed"; reset; af_repos "$NULLCFG"; STUB_TRIAGE="1. fix it" run_af "/tmp/no-such-remote-$$"; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "unconfirmed push -> no auto-fire"
+echo "21. no fire when fail_to_pass non-null"; reset; af_repos "$(printf '{"%s":{"path":"%s","fail_to_pass":["x"]}}' "$(basename "$REPO")" "$REPO")"; STUB_TRIAGE="1. fix it" run_af; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "static fail_to_pass -> no auto-fire"
+echo "22. no fire when repo key missing"; reset; af_repos '{}'; STUB_TRIAGE="1. fix it" run_af; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "untracked repo -> no auto-fire"
+echo "23. no fire with no trusted install"; reset; af_repos "$NULLCFG"
+  env HOME="$FAKE" PLAY_AUTOFIX=1 STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "no \$ORCH/play-fix.sh -> no auto-fire"
+echo "24. reject a fixer resolving under the repo"; reset; af_repos "$NULLCFG"
+  inrepo="$REPO/evil-play-fix.sh"; printf '%s\n' '#!/usr/bin/env bash' 'printf x >> "$HOME/.myndaix/fixer-calls"' 'exit 0' > "$inrepo"; chmod +x "$inrepo"
+  env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$inrepo" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
+  cknofile "$FAKE/.myndaix/fixer-calls" "in-repo fixer rejected -> no fire"; rm -f "$inrepo"
+echo "25. PASS branch never auto-fires nor writes fixlist"; reset; af_repos "$NULLCFG"; STUB_TRIAGE="PLAY_PASS" run_af; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "PASS -> no auto-fire"
+  if ls "$RUNS"/*/fixlist.txt >/dev/null 2>&1; then echo "  FAIL: PASS wrote fixlist.txt"; FAIL=$((FAIL+1)); else echo "  ok: PASS wrote no fixlist"; PASS=$((PASS+1)); fi
+echo "26. armed-but-suppressed still delivers the manual hint"; reset; af_repos "$(printf '{"%s":{"path":"%s","fail_to_pass":["x"]}}' "$(basename "$REPO")" "$REPO")"; STUB_TRIAGE="1. fix it" run_af; settle
+  ck "manual hint present despite suppressed fire" "to fix: play-fix.sh"
+  cknofile "$FAKE/.myndaix/fixer-argv" "suppressed -> no fire"
+echo "27. PLAY_AUTOFIX unset -> no fire, hint present"; reset; af_repos "$NULLCFG"; STUB_TRIAGE="1. fix it" run; settle
+  ck "manual hint present" "to fix: play-fix.sh"; cknofile "$FAKE/.myndaix/fixer-argv" "not armed -> no fire"
+echo "29. reject a SYMLINKED fixer (codex BLOCKER: symlink -> in-repo copy)"; reset; af_repos "$NULLCFG"
+  ln -sf "$FIXER" "$ROOT/link-fixer.sh"
+  env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$ROOT/link-fixer.sh" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "symlinked fixer rejected -> no fire"; rm -f "$ROOT/link-fixer.sh"
+echo "28. play-fix.sh is byte-identical to origin/main (frozen)"; reset
+  rr="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+  if git -C "$rr" rev-parse --verify -q origin/main >/dev/null 2>&1; then
+    if git -C "$rr" diff --quiet origin/main -- orchestrator/play-fix.sh; then echo "  ok: play-fix.sh unchanged vs origin/main"; PASS=$((PASS+1)); else echo "  FAIL: play-fix.sh modified by this branch"; FAIL=$((FAIL+1)); fi
+  else echo "  skip: no origin/main to compare"; fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
