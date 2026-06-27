@@ -263,4 +263,4 @@ src/runtime/
 tests/                       75 tests across 9 suites
 ```
 
-> North-star progress: the controller-loop ("the brain") is live; the docs-only auto-merge gate (rung 4) is built and under deploy. See `docs/controller-loop-design.md` and `docs/automerge-design.md`.
+> North-star autonomy rungs are documented in `docs/controller-loop-design.md` (the proactive review scheduler) and `docs/automerge-design.md` (the docs-only auto-merge gate).
