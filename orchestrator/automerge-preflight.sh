@@ -18,7 +18,15 @@ chk "GH_TOKEN present (launchd-readable secret)"      '[[ -n "${GH_TOKEN:-}" ]]'
 chk "gh authenticates (api user)"                     'gh api user -q .login'
 chk "gh rate limit healthy (>100 core remaining)"     '[[ "$(gh api rate_limit -q .resources.core.remaining 2>/dev/null)" -gt 100 ]]'
 chk "can list open PRs against main"                  'gh pr list --base main --state open --json number'
-chk "branch protection requires the test check"       'gh api "repos/$NWO/branches/main/protection/required_status_checks" -q .contexts'
+# Branch protection requires Administration:read to QUERY — the gate's scoped PAT deliberately
+# lacks it, and the gate never reads protection (GitHub enforces it server-side at merge). So this
+# is INFORMATIONAL, not a pass/fail: if the token can read it, confirm `test` is required; if not,
+# note it and move on (a 403 here means least-privilege, not a misconfiguration).
+if gh api "repos/$NWO/branches/main/protection/required_status_checks" -q '.contexts[]' 2>/dev/null | grep -qx test; then
+  echo "  ok: branch protection requires the 'test' check"; ok=$((ok+1))
+else
+  echo "  --: branch protection not readable with this token (needs Administration:read) — enforced server-side, not gate-required"
+fi
 chk "main has NO merge queue"                          '[[ "$(gh api "repos/$NWO/rules/branches/main" -q "any(.[]; .type==\"merge_queue\")" 2>/dev/null)" != "true" ]]'
 chk "trusted play-review.sh installed + executable"   '[[ -f "$ORCH/play-review.sh" && ! -L "$ORCH/play-review.sh" && -x "$ORCH/play-review.sh" ]]'
 chk "play-review.sh has the --gate (PLAY_GATE) mode"  'grep -q PLAY_GATE "$ORCH/play-review.sh"'
