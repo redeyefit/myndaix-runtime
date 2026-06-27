@@ -47,7 +47,7 @@ async def _truncate(led: PostgresLedger) -> None:
     async with led._pool.acquire() as con:
         await con.execute(
             "TRUNCATE inbound_event, job, attempt, attempt_log, outbound, dead_letter, "
-            "repo_concurrency, review_cursor RESTART IDENTITY CASCADE")
+            "repo_concurrency, review_cursor, automerge_seen RESTART IDENTITY CASCADE")
 
 
 async def _expire_lease(led: PostgresLedger, attempt_id) -> None:
@@ -584,6 +584,24 @@ async def test_skip_to(led: PostgresLedger) -> None:
     cur = await led.get_cursor(R, REF)
     assert cur["reviewed_sha"] == B and cur["pending_sha"] is None and cur["state"] == "delivered"
     assert await led.skip_to(R, REF, B) is False, "idempotent: no-op once reviewed == head"
+
+
+# -- automerge gate: per-(PR,head) decision dedup ------------------------------
+async def test_automerge_seen(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, A, B = "myndaix-runtime", "a" * 40, "b" * 40
+    assert await led.automerge_decision(R, 42, A) is None, "unseen head -> None"
+    await led.record_automerge(R, 42, A, "skipped", "CI pending")
+    assert await led.automerge_decision(R, 42, A) == "skipped"
+    assert await led.automerge_decision(R, 42, B) is None, "a new head is a fresh row (re-evaluate)"
+    await led.record_automerge(R, 42, A, "merged", None)            # upsert overwrites for the same head
+    assert await led.automerge_decision(R, 42, A) == "merged"
+    raised = False
+    try:
+        await led.record_automerge(R, 42, B, "bogus")              # DB CHECK rejects bad decisions
+    except asyncpg.PostgresError:
+        raised = True
+    assert raised, "the decision CHECK must reject an invalid value"
 
 
 async def main() -> None:
