@@ -1,63 +1,64 @@
-# Auto-merge (docs-only PR-gate) — DESIGN v0.2
+# Auto-merge (docs-only PR-gate) — DESIGN v0.3
 
-_North-star rung 4. v1 = the brain auto-merges **docs-only** PRs behind a hard gate. First removal of the human merge gate. Prior-art: `docs/automerge-research.md`. Status: **revised after a 34-agent adversarial design workflow (12 confirmed findings); awaiting Jefe prereq decisions + plan approval BEFORE any merge code ships.** Workflow result: `docs/reviews/automerge-design-v0.1-adversarial-workflow.md`._
+_North-star rung 4. v1 = the brain auto-merges **docs-only** PRs behind a hard gate. First removal of the human merge gate. Prior-art: `docs/automerge-research.md`. Reviewed: 34-agent adversarial workflow (`docs/reviews/automerge-design-v0.1-adversarial-workflow.md`) + cross-family v0.2 (codex NEEDS-REVISION, Oracle APPROVE-WITH-FIXES). Status: **hardened; for Jefe plan approval + deploy-prereq provisioning, then build (built code gets its own review).**_
 
-**Decisions locked (Jefe):** safe class = **docs-only**; target = **auto-merge green human-authored PRs** (brain gates+merges, never authors). Defaults: **OFF by default**, revertible, hard gate, no *code* auto-merge to the runtime. **v0.2 prereq decisions (2026-06-26):** (a) **add branch protection to `main`** requiring the `test` check — the brain merges *within* it (a real GitHub-side backstop behind our gate); (b) **author allowlist = `redeyefit` (Jefe) only** for v1; (c) gh-auth-for-launchd (file token / fine-grained PAT) is a deploy-time provisioning step (Jefe).
+**Decisions locked (Jefe):** safe class = docs-only · target = green human-authored PRs (brain gates+merges, never authors) · OFF by default · revertible · no *code* auto-merge to the runtime · **branch protection on `main` requires the `test` CHECK only (NOT human reviews — so the brain merges on green CI without needing to *approve*, sidestepping the self-approval/bot-identity problem)** · **author allowlist = `redeyefit` only**.
 
-### v0.2 changelog — folded the adversarial workflow (12 confirmed; the design rests on a tiny set of must-be-perfect invariants)
-- **B1 atomic merge:** bare `gh pr merge --merge` can *enable deferred auto-merge / add to a merge queue* and exit 0 without merging the commit we judged. → use **`--match-head-commit H`** (server rejects if head moved), **refuse any base with a merge queue**, and **post-merge assert** `state==MERGED` (not `autoMergeRequest`/OPEN) else disable-auto + leave for human.
-- **B2 one pinned SHA:** read `headRefOid` → `H` ONCE; thread `H` through every gate; read CI for *that commit*; merge with `--match-head-commit H`. Closes the read-then-merge TOCTOU at the API layer.
-- **B3 real PASS signal:** play-review's `done-<sha>` marker means *delivered*, not *passed* (written for NEEDS-FIX too, and shared with the controller). → a **synchronous `play-review --gate` mode** that runs inline and writes `$STATE/verdict-<H>` = exactly `PASS` | `NEEDS-FIX`, exit 0 ONLY on PASS. Abort/canary-fail/skip/contention/oracle-down/timeout = **NOT PASS** (fail-closed).
-- **B4 one pinned range:** the diff-class gate and the review must judge the SAME content. → both use `R = merge-base(origin/main, H)...H`; drive play-review with that exact base..tip (don't let its FRONT recompute the base).
-- **B5 docs aren't always inert:** a `*.md` that is an **agent-instruction file** (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `**/rules/*.md`, a skill `.md`, anything the runtime/agents read as instructions) is executed-as-a-prompt. → a **path DENYLIST** overrides the `.md` allowlist.
-- **MAJORs folded:** `mergeStateStatus==CLEAN` (not just `mergeable`); defensive `statusCheckRollup` parse (ALL `test` entries SUCCESS, reject zero/running, handle CheckRun+StatusContext); `git diff --raw -z -M` as the SOLE diff source with mode validation (reject `120000` symlink / `160000` gitlink / mode→exec); **author allowlist** (trusted-sender model) + per-author caps vs flooding; if branch protection requires reviews, assert `reviewDecision==APPROVED` (don't trust an admin-token `gh merge` to fail closed); fetch+pin H locally before diffing.
+### Core reframe (codex + Oracle converged): the DIFF-CLASS GATE is the security boundary; the LLM review is a QUALITY gate
+A PR diff is attacker-controlled text; an LLM can be prompt-injected into emitting "PASS". That is acceptable **only because** the mechanical diff-class gate (§3) has already proven the change is docs-only and not an instruction file — so the worst a forged PASS can merge is a wrong *sentence*, instantly revertible. Security rests on the un-foolable mechanical gate, never on the LLM.
 
-## 0. PREREQUISITES (environmental — need Jefe; some are BLOCKERs to a working deploy)
-1. **`gh` auth under launchd** — on this box `gh`'s token is in the **macOS keyring**, which a launchd agent **cannot read**. The job MUST authenticate via a file-based token or a dedicated **fine-grained PAT** (scopes: `repo` on the target repos, `read:org` if needed) exported to the agent's env from a `chmod 600` secret. Until this is provisioned, the gate can't talk to GitHub from launchd. _(Jefe action.)_
-2. **Branch protection on `main`** — `main` currently has **NO** branch protection, so there is **NO GitHub-side backstop** behind the brain's gate; the diff-class gate is the *only* thing between a bad merge and `main`. Recommend Jefe **add branch protection** (require the `test` check; optionally require 1 review) as a defense-in-depth layer — then the brain merges *within* it. _(Jefe decision: add protection, or accept the gate as sole backstop.)_
-3. **Author allowlist** — to stop a flood of trivial docs PRs draining the daily cap, only auto-merge PRs whose author is in an explicit trusted allowlist (mirrors the bridge trusted-sender model). _(Jefe: who's trusted — likely just `redeyefit`/Jefe for v1.)_
+### v0.3 changelog — folded the cross-family v0.2 review
+- **Merge mechanic:** prefer REST `PUT /repos/{o}/{r}/pulls/{n}/merge` with `sha:H` (structured `{merged, sha}`) OR `gh pr merge --match-head-commit H`; **merge-queue preflight** via the rules API (`gh api repos/{o}/{r}/rules/branches/main --jq 'any(.[]; .type=="merge_queue")'`) → fail closed if queued (`--match-head-commit` does NOT bypass a queue); after merge assert `{merged:true, sha set}` else leave for human.
+- **Pin BOTH base and head:** `M = baseRefOid` (pinned once), `H = headRefOid`, `B = merge-base(M,H)`, and use `B..H` for diff-class AND review AND merge. Re-query `headRefOid==H` (+ `baseRefOid==M`, `CLEAN`/`BEHIND`, no queue, checks green) immediately before merge.
+- **`play-review --gate` real CLI contract** (§4): `--gate <repo> <B> <H> <ref> <run-id> <verdict-path>`, runs **inline**, **Oracle REQUIRED** (not best-effort on this path), every abort/canary/skip/contention/timeout → **nonzero**, never writes `done-*`, never fires autofix, writes to a fresh `0700` run dir owned by the tick, and the verdict file is **structured + validated** `{run_id, base:B, head:H, verdict:PASS|NEEDS-FIX}` (not bare `verdict-<H>` — stale/replay-prone).
+- **Diff-class precision:** handle **deletions** (`D`: dest mode `000000` + old `100644` = OK — else docs can never be removed); reject `100755` **outright**; `--no-ext-diff`; scrub the git env (like `controller._git_env`); **denylist checks BOTH rename sides**.
+- **CI parse:** `gh api --paginate` (the `test` check may be on page 2); match the **exact check identity** (name + workflow/app), reject duplicate ambiguous providers, reject if zero/any-running.
+- **`mergeStateStatus` ∈ {CLEAN, BEHIND}** (strict CLEAN rejects PRs main has advanced past — friction with no safety gain; BEHIND still merges).
+- **Don't infinite-retry:** record NEEDS-FIX/abort outcomes in `automerge_seen` keyed to `H`; skip until the head changes (saves API budget, the controller-loop lesson).
+- **Author-allowlist boundary documented:** a trusted author CAN push third-party commits to their own PR branch — allowlisting `redeyefit` trusts them not to. Known boundary.
+- **Reject cross-repo/fork PRs for v1** (a fork head is more-untrusted + the fetch differs).
 
-## 1. What it does (unchanged intent, hardened mechanics)
-A bounded, non-Claude (launchd, hourly) sibling of the controller-loop. Each tick: list open PRs against `main`; for each, pin one SHA `H`, run the hard gate; only if ALL pass, atomically merge at `H`. Off by default, revertible, capped.
+## 0. PREREQUISITES (Jefe; deploy-blockers)
+1. **Dedicated `gh` token for launchd** — the keyring token is unreadable by launchd. Provision a **fine-grained PAT** (NOT classic `repo`) with exactly: *Contents: read/write, Pull requests: read/write, Checks: read, Metadata: read* on `redeyefit/myndaix-runtime`, exported from a `chmod 600` secret into the agent env (`GH_TOKEN`). A **bot identity** is only needed if reviews are ever required (we require the check only, so the author's-or-a-PAT works).
+2. **Branch protection on `main`** — require the `test` status check (NOT reviews). The brain merges within it.
+3. **Review pipeline under launchd** — the gate runs `play-review --gate` → `mxr` → kilabz (codex) + **oracle (agy, now REQUIRED)** + lobster. All three must auth under the automerge launchd env (agy was just re-authed; codex/claude via HOME). Same env-passthrough discipline as the controller.
+4. **Rate-limit preflight** — check `gh api rate_limit`; fail closed below a threshold.
 
-## 2. The gate (single pinned `H` + range `R`; ALL must pass, else leave for human)
-For an open PR `#n`: read `H = headRefOid` ONCE; `git fetch` `H` by sha into an automerge-owned ref + pin vs gc; `R = merge-base(origin/main, H)...H`.
-1. **State** — `mergeStateStatus == CLEAN` (folds in conflicts/behind/blocked/draft); author ∈ allowlist; base is `main` and the base branch has **no merge queue**.
-2. **Docs-only diff-class** (§3) over `R`.
-3. **CI green for `H`** — read checks for the commit `H` specifically (`gh api repos/{o}/{r}/commits/{H}/check-runs` + status); **every** `test` entry COMPLETED+SUCCESS; reject if zero `test` entries or any still running/failing.
-4. **Review PASS** — `play-review --gate` over `R` writes `$STATE/verdict-<H>`; merge iff it is exactly `PASS` (produced by THIS tick, keyed to `H`+base). Anything else (NEEDS-FIX/abort/skip/timeout/oracle-down) = no merge.
-5. **Branch-protection** — if `main` requires reviews, assert PR `reviewDecision == APPROVED`.
-6. **Bounds** — `AUTOMERGE_ENABLED` flag present; under per-tick + per-day + per-author caps; not DRY-RUN.
-7. **Atomic merge** — `gh pr merge #n --merge --match-head-commit H`; then re-query and assert `state==MERGED` (`mergedAt` + `mergeCommit` set). If instead `autoMergeRequest != null` or still OPEN → `gh pr merge #n --disable-auto`, log loudly, leave for human.
+## 1. What it does
+Bounded, non-Claude (launchd, hourly) sibling of the controller. Each tick: list open same-repo PRs against `main`; per PR pin `M`/`H`, fetch `refs/pull/<n>/head` into an owned ref + assert `==H`; run the gate; only if ALL pass, merge atomically at `H`. Off by default, capped, revertible.
 
-## 3. The docs-only diff-class gate (load-bearing; un-gameable)
-- **Sole source:** `git diff --raw -z -M base...H` (NUL-delimited; `gh --json files` is forbidden — it can't see rename old-sides or modes).
-- **Every** entry must satisfy ALL: destination mode is a regular blob `100644` (or `100755` only if exec is allowed — recommend reject `100755`), **path ends in `.md`** (case-insensitive guarded; reject homoglyph/trailing-dot/space), AND for a rename/copy the **old side also ends in `.md`**.
-- **Reject** on: any non-`.md` path (either side) · mode `120000` (symlink) · `160000` (gitlink/submodule) · mode→executable · empty changeset · a path on the **DENYLIST** below.
-- **DENYLIST (overrides the `.md` allowlist — route to human):** `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `COPILOT*.md`, `.cursorrules`, any `**/rules/*.md`, `SECURITY*.md`, `CODEOWNERS`, anything under `.github/`, and any `.md` the runtime/agents read as instructions (maintained list).
-- Computed over the SAME `R` the review judges and the merge integrates.
+## 2. The gate (pinned `M`+`H`, range `B..H`; ALL pass else human)
+0. **Scope:** PR open, base `main`, **not a fork** (head repo == base repo); author ∈ allowlist.
+1. **State:** `mergeStateStatus ∈ {CLEAN, BEHIND}`; base branch has **no merge queue** (rules API).
+2. **Docs-only diff-class** (§3) over `B..H`.
+3. **CI green for `H`:** `gh api --paginate` check-runs + statuses for commit `H`; the exact `test` check COMPLETED+SUCCESS; reject zero/running/failing/ambiguous.
+4. **Review PASS:** `play-review --gate` (§4) → validated structured verdict `{run_id,B,H,PASS}` produced by THIS tick. Anything else → no merge + record in `automerge_seen`.
+5. **Bounds:** `AUTOMERGE_ENABLED` flag · per-tick + per-day + per-author caps · not DRY-RUN.
+6. **Atomic merge:** REST `PUT pulls/{n}/merge {sha:H, merge_method:merge}` (409 if head moved) [or `gh pr merge --match-head-commit H`]; assert `{merged:true}`; on queue/auto-enabled/OPEN → disable-auto, log, human.
 
-## 4. The review gate — new synchronous `play-review --gate` mode
-play-review today detaches + writes a `done-<sha>` "delivered" marker (shared with the controller, set for NEEDS-FIX too) — **unusable as a PASS signal.** Add a `--gate` mode: runs the review **inline** (no detach), over an explicit `base..tip = R`, and writes `$STATE/verdict-<H>` containing exactly `PASS` or `NEEDS-FIX`, exit 0 only on PASS. Canary-fail / diff-cap / contention / oracle-unavailable / any abort → write nothing-or-`NEEDS-FIX` and exit non-zero (the automerge job treats absence-or-not-PASS as fail-closed). This is the 3rd, additive play-review edit (a new mode; the hook path is byte-unchanged).
+## 3. Docs-only diff-class gate (the security boundary; un-gameable)
+- **Sole source:** `git diff --raw -z -M --no-ext-diff B..H` (scrubbed env). `gh --json files` forbidden (no rename old-side / modes).
+- **Each entry must satisfy:** path ends `.md` (case + homoglyph guarded) on **every** side; mode is `100644` (reject `100755`, `120000` symlink, `160000` gitlink); a delete (`D`, dest `000000`) is OK only if the old path was a `.md` `100644`. Empty changeset → reject.
+- **DENYLIST (overrides `.md`, checked on BOTH rename sides → human):** `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `COPILOT*.md`, `.cursorrules`, `CODEOWNERS`, `SECURITY*.md`, `**/rules/*.md`, `**/skills/**/*.md`, `**/prompts/**/*.md`, `**/.agents/**`, `.claude/**`, `.codex/**`, `.cursor/**`, `.github/**` — anything read as live instruction/config. **v1-conservative add:** design/spec/operational docs the team treats as ground truth (`DESIGN.md`, `docs/*-design.md`, `*-spec.md`, `docs/OPERATING.md`) → human until trust is established (this repo's docs are mostly these; auto-merge is deliberately near-inert here at first — we're proving the *machinery* safely, not chasing volume).
 
-## 5. Safety pillars (north-star) — post-hardening
-1. **Verify un-gameable:** `git diff --raw` mode+extension+denylist gate · per-commit CI · a real synchronous PASS · atomic `--match-head-commit` merge. The diff-class gate is THE backstop (no branch protection today).
-2. **Bounded blast radius:** docs-only minus agent-instruction files; per-tick/day/author caps; author allowlist; uncertain → human.
-3. **Instant rollback:** revertible merge commit; flag-off halts; DRY-RUN first; merge-queue refused so we never arm a deferred merge we can't revert.
-4. **Learning IS safety — DEFERRED:** hard-coded single class; log every merge loudly; widening waits for the outcomes ledger.
-5. **Self-runtime:** docs exempt EXCEPT the instruction-doc denylist (so a `CLAUDE.md`/rules change to the runtime never auto-merges); CODE never auto-merges to the runtime.
+## 4. Review gate — `play-review --gate` (new synchronous mode)
+A real CLI mode (parsed BEFORE the FRONT/`--worker` branch): `--gate <repo> <B> <H> <ref> <run_id> <verdict_path>`. Runs the review **inline** over explicit `B..H`; **Oracle required**; writes ONLY a structured JSON verdict `{run_id,base,head,verdict}` to a fresh `0700` dir; exit 0 iff verdict==PASS. Canary-fail / diff-cap / contention / oracle-or-pool-down / timeout / injection-uncertain → `NEEDS-FIX` or nonzero (fail-closed). Never writes `done-*`, never fires autofix. The automerge tick validates run_id+B+H match what it asked for (anti-stale/replay). The hook path is byte-unchanged (additive mode).
+
+## 5. Safety pillars (post-hardening)
+1. **Un-gameable verify:** the mechanical diff-class gate (§3) IS the security boundary; CI-per-commit + a fail-closed structured review are quality/defense layers; atomic head+base-pinned merge.
+2. **Bounded blast radius:** docs-only minus instruction/ground-truth docs · same-repo only · per-tick/day/author caps · uncertain → human · worst forged-PASS case = a revertible sentence.
+3. **Instant rollback:** revertible merge commit · flag-off halts · DRY-RUN first · never arm a deferred/queued merge.
+4. **Learning deferred:** hard-coded class; log loudly; widen only with the outcomes ledger.
+5. **Self-runtime:** docs exempt EXCEPT the instruction/ground-truth denylist; code never auto-merges to the runtime.
 
 ## 6. Security surface
-Untrusted = the PR diff + author. Docs can't execute, but can carry *content* read later as instructions → the denylist (§3) + the review gate. Validate all `gh`/git output (SHA `^[0-9a-f]{40}$`, PR int, ref allowlist); array subprocess, never `shell=True`. The merge is the privileged action — 7-deep gate, atomic head-match, capped, flag-gated, MERGED-asserted. gh token from a `chmod 600` secret (prereq 0.1), not committed. Trigger = launchd (classifier-clean). No `--admin`, no force, no merge-queue.
+Untrusted = PR diff + author (+ third-party commits a trusted author may push — known boundary). Docs can't execute; instruction-doc denylist blocks the read-as-prompt path. Validate all gh/git output; array subprocess, never shell; scrub git env. The merge is the privileged action — fork-rejected, head+base-pinned, queue-refused, MERGED-asserted, capped, flag-gated, fine-grained-PAT-scoped. Trigger = launchd (classifier-clean).
 
 ## 7. Components & footprint
-- **New:** `src/runtime/automerge.py` (~250–300 lines now: list → pin H → 7-gate → atomic merge → assert) + `python -m runtime.automerge tick`; `play-review.sh --gate` mode (additive); `orchestrator/automerge-tick.sh` + plist example; `automerge_seen(repo, pr, head, decision)` table + migration `0004`; `tests/test_automerge.py` (the §3 gate adversarial truth-table: symlink/gitlink/rename/denylist/mode/homoglyph; CI-parse; merge-queue refusal; head-mismatch; fail-closed review) + a `test.sh` live check (`gh auth status` from launchd context, e2e DRY-RUN on a throwaway docs PR).
-- **Reused:** play-review (now with `--gate`), the controller's lock/cap/flag/DRY-RUN patterns, `gh`, the ledger.
-- **Knobs:** `AUTOMERGE_ENABLED` (durable, OFF) · `MAX_AUTOMERGE_PER_TICK` (1) · `_PER_DAY` (3) · `_PER_AUTHOR_DAY` (1) · author allowlist · DRY-RUN · the doc allow/deny lists.
+- **New:** `src/runtime/automerge.py` (~300 lines: list → fetch+pin → 7-gate → atomic merge → assert); `python -m runtime.automerge tick`; `play-review.sh --gate` mode (additive); `orchestrator/automerge-tick.sh` + plist; `automerge_seen(repo,pr,head,decision,ts)` + migration `0004`; `tests/test_automerge.py` (diff-class adversarial truth-table: symlink/gitlink/rename-both-sides/denylist/mode/delete/homoglyph; CI pagination+identity; merge-queue refusal; fork reject; head/base-mismatch; fail-closed review) + `test.sh` live checks (gh auth+rate from launchd context; e2e DRY-RUN on a throwaway docs PR).
+- **Reused:** play-review (`--gate`), controller lock/cap/flag/DRY-RUN + `_git_env` scrub, gh, ledger.
+- **Knobs:** `AUTOMERGE_ENABLED` (OFF) · `MAX_AUTOMERGE_PER_TICK` 1 · `_PER_DAY` 3 · `_PER_AUTHOR_DAY` 1 · author allowlist · DRY-RUN · allow/deny lists.
 - **Rollback:** `launchctl unload`; `git revert` any merge.
 
-## 8. Decisions for Jefe (prereqs + scope)
-1. **gh auth for launchd** (§0.1) — provision a file token / fine-grained PAT? (BLOCKER to a working deploy.)
-2. **Branch protection on `main`** (§0.2) — add it (recommended), or accept the gate as the sole backstop?
-3. **Author allowlist** (§0.3) — who? (recommend: just Jefe/`redeyefit` for v1.)
-4. Proceed to the implementation plan on this hardened design, or one more cross-family pass on v0.2 first?
+## 8. Status / next
+Design hardened through a 34-agent workflow + 2 cross-family rounds; remaining items are implementation-contract precision (verdict freshness, merge-queue/rules API, base pinning, denylist specifics, env prereqs) best verified against real code. **Recommend: proceed to the implementation plan → build → built-code cross-family review**, with the §0 prereqs provisioned by Jefe before the live deploy. Deferred: code/test/lockfile classes, self-fix auto-merge, evidence-based widening (the learning rung).
