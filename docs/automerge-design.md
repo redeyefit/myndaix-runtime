@@ -60,7 +60,5 @@ Untrusted = PR diff + author (+ third-party commits a trusted author may push �
 - **Knobs:** `AUTOMERGE_ENABLED` (OFF) · `MAX_AUTOMERGE_PER_TICK` 1 · `_PER_DAY` 3 · `_PER_AUTHOR_DAY` 1 · author allowlist · DRY-RUN · allow/deny lists.
 - **Rollback:** `launchctl unload`; `git revert` any merge.
 
-> **2026-06-27:** code merged to `main` (PR #22); branch protection on `main` now requires the `test` check. Not yet armed — pending the launchd PAT + a dry-run.
-
 ## 8. Status / next
 Design hardened through a 34-agent workflow + 2 cross-family rounds; remaining items are implementation-contract precision (verdict freshness, merge-queue/rules API, base pinning, denylist specifics, env prereqs) best verified against real code. **Recommend: proceed to the implementation plan → build → built-code cross-family review**, with the §0 prereqs provisioned by Jefe before the live deploy. Deferred: code/test/lockfile classes, self-fix auto-merge, evidence-based widening (the learning rung).

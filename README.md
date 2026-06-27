@@ -262,3 +262,5 @@ src/runtime/
     terminal.py              C3 terminal transport (dumb pipe over the ledger)
 tests/                       75 tests across 9 suites
 ```
+
+> North-star progress: the controller-loop ("the brain") is live; the docs-only auto-merge gate (rung 4) is built and under deploy. See `docs/controller-loop-design.md` and `docs/automerge-design.md`.
