@@ -36,15 +36,25 @@ def test_classify_rejects_nondoc_and_modes():
     bad = [
         ("non-.md", [entry("M", "100644", "100644", "src/x.py")]),
         ("empty diff", []),
-        ("symlink mode", [entry("A", "000000", "120000", "link.md")]),
-        ("gitlink/submodule", [entry("A", "000000", "160000", "sub.md")]),
-        ("executable .md", [entry("M", "100644", "100755", "run.md")]),
+        ("symlink new mode", [entry("A", "000000", "120000", "link.md")]),
+        ("gitlink/submodule new mode", [entry("A", "000000", "160000", "sub.md")]),
+        ("executable new mode", [entry("M", "100644", "100755", "run.md")]),
         ("rename code->md (old side .py)", [entry("R100", "100644", "100644", "evil.py", "evil.md")]),
         ("rename md->code (new side .py)", [entry("R100", "100644", "100644", "a.md", "evil.py")]),
-        ("delete with non-doc old", [entry("D", "100755", "000000", "x.md")]),
+        ("delete with non-doc old mode", [entry("D", "100755", "000000", "x.md")]),
         ("no extension", [entry("M", "100644", "100644", "Makefile")]),
-        ("uppercase .MD (homoglyph/case strict)", [entry("M", "100644", "100644", "READ.MD")]),
+        ("uppercase .MD (case strict)", [entry("M", "100644", "100644", "READ.MD")]),
         ("trailing dot .md.", [entry("M", "100644", "100644", "x.md.")]),
+        # codex BLOCKER: validating only the NEW mode let these through —
+        ("typechange T from symlink->md", [entry("T", "120000", "100644", "link.md")]),
+        ("typechange T from exec->md", [entry("T", "100755", "100644", "run.md")]),
+        ("copy C from a symlink old side", [entry("C100", "120000", "100644", "old.md", "new.md")]),
+        ("modify with symlink OLD mode", [entry("M", "120000", "100644", "x.md")]),
+        ("modify with gitlink OLD mode", [entry("M", "160000", "100644", "x.md")]),
+        ("unknown status X", [entry("X", "100644", "100644", "x.md")]),
+        ("unmerged status U", [entry("U", "100644", "100644", "x.md")]),
+        ("add with non-zero old mode", [entry("A", "100644", "100644", "x.md")]),
+        ("delete with non-zero new mode", [entry("D", "100644", "100644", "x.md")]),
     ]
     for label, entries in bad:
         ok(not A.classify_diff(entries)[0], f"reject: {label}")
@@ -85,6 +95,23 @@ def test_parse_raw_z():
     out3 = b":100644 100644 aaa aaa R100\x00evil.py\x00evil.md\x00"
     ok(not A.classify_diff(A.parse_raw_z(out3))[0], "parsed code->md rename rejected")
     ok(A.parse_raw_z(b"") == [], "empty diff -> no entries")
+
+
+def test_parse_raw_z_is_strict():
+    # a strict parser RAISES on any anomaly (never silently skips a malformed entry)
+    def raises(out, label):
+        try:
+            A.parse_raw_z(out)
+            ok(False, f"should have raised: {label}")
+        except ValueError:
+            ok(True, f"raised on: {label}")
+    raises(b"garbage-not-an-info-line\x00", "non-info leading token")
+    raises(b":100644 100644 aaa bbb\x00x.md\x00", "info line with 4 fields")
+    raises(b":100644 100644 aaa bbb M\x00", "truncated: missing path")
+    raises(b":100644 100644 aaa aaa R100\x00only-one.md\x00", "rename missing second path")
+    raises(b":100644 100644 aaa bbb M\x00README.md\x00trailing-non-info\x00", "trailing non-info token")
+    # a malformed SECOND entry must raise (not be silently skipped after a safe first entry)
+    raises(b":100644 100644 a b M\x00ok.md\x00:100644 100644 c M\x00x.md\x00", "second info has 4 fields")
 
 
 def main():

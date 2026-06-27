@@ -120,7 +120,7 @@ deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits
 }
 
 abort(){ note "$1" "ABORT: $2"
-  gate && { write_verdict "NEEDS-FIX"; exit 1; }              # gate: any abort is fail-CLOSED (no merge)
+  gate && { write_verdict "ABORTED"; exit 2; }               # gate: abort = TRANSIENT (exit 2 -> retry), distinct from a real NEEDS-FIX (exit 1)
   deliver "review ABORTED — $1" "$2" || true; exit 0; }
 
 fence(){ # fence <label> <text> — nonce-gated on BOTH boundaries
@@ -221,7 +221,7 @@ autofix_fire(){
 contention(){ # lock held by a live worker: record the skip (NEVER silent), then exit
   : > "$STATE/SKIPPED-$tip" 2>/dev/null || true
   note contention "lock held; skipped $tip"
-  gate && { write_verdict "NEEDS-FIX"; exit 1; }              # gate: contention is fail-CLOSED (retry next tick)
+  gate && { write_verdict "ABORTED"; exit 2; }               # gate: contention = TRANSIENT (exit 2 -> retry next tick)
   deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. Re-push to retry (e.g. git commit --allow-empty -m retrigger && git push)." || true
   exit 0
 }

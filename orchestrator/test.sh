@@ -177,9 +177,9 @@ echo "32. GATE PASS -> structured verdict PASS, exit 0, no inbox/done (automerge
 echo "33. GATE NEEDS-FIX -> verdict NEEDS-FIX, exit 1"; reset; rm -f "$ROOT/verdict.json"
   STUB_TRIAGE="1. fix the subtraction" gate_run; ckexit $? 1 "gate NEEDS-FIX exits 1"
   ck "verdict says NEEDS-FIX" '"verdict":"NEEDS-FIX"' "$ROOT/verdict.json"
-echo "34. GATE requires Oracle -> oracle-down is fail-CLOSED (verdict NEEDS-FIX, exit 1)"; reset; rm -f "$ROOT/verdict.json"
-  STUB_CANARY_FAIL=oracle STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 1 "oracle-down under gate exits 1"
-  ck "fail-closed verdict" '"verdict":"NEEDS-FIX"' "$ROOT/verdict.json"
+echo "34. GATE requires Oracle -> oracle-down is TRANSIENT (verdict ABORTED, exit 2 -> retry, NOT a permanent NEEDS-FIX)"; reset; rm -f "$ROOT/verdict.json"
+  STUB_CANARY_FAIL=oracle STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "oracle-down under gate exits 2 (transient)"
+  ck "transient verdict (distinct from a real NEEDS-FIX)" '"verdict":"ABORTED"' "$ROOT/verdict.json"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
