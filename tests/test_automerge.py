@@ -55,6 +55,9 @@ def test_classify_rejects_nondoc_and_modes():
         ("unmerged status U", [entry("U", "100644", "100644", "x.md")]),
         ("add with non-zero old mode", [entry("A", "100644", "100644", "x.md")]),
         ("delete with non-zero new mode", [entry("D", "100644", "100644", "x.md")]),
+        ("malformed status A999 (strict grammar)", [entry("A999", "000000", "100644", "x.md")]),
+        ("malformed status Mfoo", [entry("Mfoo", "100644", "100644", "x.md")]),
+        ("malformed status R (no score)", [entry("Rx", "100644", "100644", "a.md", "b.md")]),
     ]
     for label, entries in bad:
         ok(not A.classify_diff(entries)[0], f"reject: {label}")

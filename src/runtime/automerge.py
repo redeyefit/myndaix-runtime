@@ -50,6 +50,7 @@ AUTHOR_ALLOWLIST = set(
     (os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit")).split(","))
 GH_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_GH_TIMEOUT", "30"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", "600"))
+REVIEW_MAX_DIFF = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF", "262144"))  # match play-review PLAY_MAX_DIFF
 RATE_FLOOR = int(os.environ.get("MYNDAIX_AUTOMERGE_RATE_FLOOR", "100"))
 
 DRY_RUN = os.environ.get("MYNDAIX_AUTOMERGE_DRY_RUN") == "1"
@@ -57,6 +58,9 @@ TEST_MODE = os.environ.get("MYNDAIX_AUTOMERGE_TEST_MODE") == "1"
 MERGE_OVERRIDE = os.environ.get("MYNDAIX_AUTOMERGE_MERGE_OVERRIDE", "")  # test seam: record, don't merge
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# strict git diff --raw status grammar: A/D/M bare; R/C with a 0-100 similarity score.
+# (st[:1] alone would accept junk like "A999" — codex MINOR.)
+_STATUS_RE = re.compile(r"^(A|D|M|R\d{1,3}|C\d{1,3})$")
 
 # Files that are NOT inert docs even though they end in .md — they are read as live
 # instructions/config by an agent/tool, or are operational ground truth (DESIGN v0.3 §3).
@@ -147,9 +151,9 @@ def classify_diff(entries: list[dict]) -> tuple[bool, str]:
         return False, "empty changeset"
     for e in entries:
         st, omode, nmode, paths = e["status"], e["omode"], e["nmode"], e["paths"]
-        code = st[:1]
-        if code not in ("A", "M", "D", "R", "C"):    # whitelist; reject T/U/X/B/anything else
+        if not _STATUS_RE.match(st):                  # strict grammar; reject T/U/X/B + malformed like A999
             return False, f"unsupported status {st!r}"
+        code = st[:1]
         for p in paths:                              # every path on every side must be an inert .md
             if not _doc_path(p):
                 return False, f"non-doc or denylisted path: {p!r}"
@@ -284,9 +288,11 @@ def _ci_green(repo: dict, head: str) -> Optional[bool]:
     RUNNING, or an unparseable/error result — TRANSIENT, retry next tick). `--paginate` with
     a per-line jq filter emits JSONL (one object per match across pages), parsed line-by-line
     (a `-q '[...]'` array wrap would emit one array PER PAGE and break json.loads — codex/Oracle)."""
+    # tojson emits null-safe JSONL (a string-interpolated `\(.conclusion)` crashes jq when a
+    # running check's conclusion is null — Oracle MAJOR). Parse line-by-line.
     r = subprocess.run(
         ["gh", "api", "--paginate", f"repos/{repo['nwo']}/commits/{head}/check-runs",
-         "-q", '.check_runs[] | select(.name=="test") | "\\(.status) \\(.conclusion)"'],
+         "-q", '.check_runs[] | select(.name=="test") | {status:.status, conclusion:.conclusion} | tojson'],
         cwd=str(repo["path"]), capture_output=True, text=True, env=_git_env(),
         timeout=GH_TIMEOUT, check=False)
     if r.returncode != 0:
@@ -295,11 +301,14 @@ def _ci_green(repo: dict, head: str) -> Optional[bool]:
     if not lines:
         log("  CI: no `test` check-run yet — transient (retry)"); return None
     for ln in lines:
-        status, _, conclusion = ln.partition(" ")
-        if status != "completed":
-            log(f"  CI: a `test` run is {status!r} — still running (retry)"); return None
-        if conclusion != "success":
-            log(f"  CI: a `test` run concluded {conclusion!r} — FAILED for this head"); return False
+        try:
+            run = json.loads(ln)
+        except json.JSONDecodeError:
+            log(f"  CI: unparseable check-run {ln!r} — transient (retry)"); return None
+        if run.get("status") != "completed":
+            log(f"  CI: a `test` run is {run.get('status')!r} — still running (retry)"); return None
+        if run.get("conclusion") != "success":
+            log(f"  CI: a `test` run concluded {run.get('conclusion')!r} — FAILED for this head"); return False
     return True
 
 
@@ -425,6 +434,14 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
     ok, why = classify_diff(entries)
     if not ok:
         return ("skipped", f"not docs-only: {why} — human")
+
+    # a docs diff over play-review's content cap would make the review ABORT (exit 2) every tick —
+    # head-terminal, so pre-cap it here and record a human skip (codex MAJOR mirror-wedge).
+    content = _git(repo["path"], "diff", "--no-ext-diff", f"{B}..{H}")
+    if content.returncode != 0:
+        log(f"PR#{n}: content diff failed — defer"); return None
+    if len(content.stdout) > REVIEW_MAX_DIFF:
+        return ("skipped", f"docs diff {len(content.stdout)}B over the {REVIEW_MAX_DIFF}B review cap — human")
 
     # gate 3: CI — True=green / False=failed(terminal) / None=pending(defer)
     ci = _ci_green(repo, H)
