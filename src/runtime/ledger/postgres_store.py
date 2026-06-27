@@ -850,6 +850,32 @@ class PostgresLedger:
         async with self._pool.acquire() as con:
             return await con.fetchval("SELECT count(*) FROM job WHERE status = 'queued'")
 
+    # ---- docs-only PR auto-merge gate (DESIGN v0.3 §4) ---------------------
+    async def automerge_decision(self, repo_id: str, pr_number: int, head_sha: str) -> Optional[str]:
+        """The terminal decision already recorded for this exact (repo, PR, head), or None
+        if unseen. The gate skips a (PR, head) it has already decided so it never re-reviews
+        the same head every tick; a new push (new head_sha) is a fresh row, so a re-pushed
+        PR is re-evaluated."""
+        async with self._pool.acquire() as con:
+            return await con.fetchval(
+                """SELECT decision FROM automerge_seen
+                    WHERE repo_id = $1 AND pr_number = $2 AND head_sha = $3""",
+                repo_id, pr_number, head_sha)
+
+    async def record_automerge(self, repo_id: str, pr_number: int, head_sha: str,
+                               decision: str, reason: Optional[str] = None) -> None:
+        """Record the terminal decision for (repo, PR, head). Idempotent UPSERT on the head
+        key (a re-evaluation of the same head overwrites the reason, e.g. a transient skip
+        that later merged). `decision` ∈ merged|needs_fix|skipped|error (DB-checked)."""
+        async with self._pool.acquire() as con:
+            await con.execute(
+                """INSERT INTO automerge_seen (repo_id, pr_number, head_sha, decision, reason)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (repo_id, pr_number, head_sha)
+                   DO UPDATE SET decision = EXCLUDED.decision, reason = EXCLUDED.reason,
+                                 decided_at = now()""",
+                repo_id, pr_number, head_sha, decision, reason)
+
     # ---- controller-loop ("the brain") cursor (DESIGN v0.2 §2) -------------
     # The proactive review scheduler's only state. Each verb is one status-guarded
     # CAS returning whether THIS caller won the transition — same discipline as the

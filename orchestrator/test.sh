@@ -66,6 +66,10 @@ ck(){ # ck <label> <substr> <file-or-empty>
 }
 ckfile(){ if [[ -e "$1" ]]; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2 (missing $1)"; FAIL=$((FAIL+1)); fi; }
 cknofile(){ if [[ ! -e "$1" ]]; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2 (exists $1)"; FAIL=$((FAIL+1)); fi; }
+ckexit(){ if [[ "$1" == "$2" ]]; then echo "  ok: $3"; PASS=$((PASS+1)); else echo "  FAIL: $3 (rc $1 != $2)"; FAIL=$((FAIL+1)); fi; }
+# gate-mode run: synchronous --worker with PLAY_GATE on; writes a structured verdict, no detach
+gate_run(){ env HOME="$FAKE" PLAY_GATE=1 PLAY_GATE_VERDICT="$ROOT/verdict.json" PLAY_GATE_RUN_ID=run123 \
+              bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>"$ROOT/stderr"; }
 
 echo "1. NEEDS-FIX path";    reset; STUB_TRIAGE="1. fix it" run; ck "delivers NEEDS-FIX" "review NEEDS-FIX"
 echo "2. clean PASS gate";   reset; STUB_TRIAGE="PLAY_PASS" run; ck "delivers PASS" "review PASS"
@@ -163,6 +167,19 @@ echo "31. PLAY_DISABLE_AUTOFIX=1 HARD-overrides the durable flag (controller-loo
   mkdir -p "$FAKE/.myndaix/orchestrator"; : > "$FAKE/.myndaix/orchestrator/AUTOFIX_ENABLED"
   env HOME="$FAKE" PLAY_DISABLE_AUTOFIX=1 PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
   cknofile "$FAKE/.myndaix/fixer-argv" "disable flag suppresses fire even with durable flag + PLAY_AUTOFIX"
+
+echo "32. GATE PASS -> structured verdict PASS, exit 0, no inbox/done (automerge gate)"; reset; rm -f "$ROOT/verdict.json"
+  STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 0 "gate PASS exits 0"
+  ck "verdict says PASS" '"verdict":"PASS"' "$ROOT/verdict.json"
+  ck "run_id+head threaded into verdict" '"run_id":"run123"' "$ROOT/verdict.json"
+  cknofile "$STATE/done-$TIP" "gate writes NO done marker"
+  if [[ -z "$(ls "$INBOX" 2>/dev/null)" ]]; then echo "  ok: gate delivers nothing to inbox"; PASS=$((PASS+1)); else echo "  FAIL: gate delivered to inbox"; FAIL=$((FAIL+1)); fi
+echo "33. GATE NEEDS-FIX -> verdict NEEDS-FIX, exit 1"; reset; rm -f "$ROOT/verdict.json"
+  STUB_TRIAGE="1. fix the subtraction" gate_run; ckexit $? 1 "gate NEEDS-FIX exits 1"
+  ck "verdict says NEEDS-FIX" '"verdict":"NEEDS-FIX"' "$ROOT/verdict.json"
+echo "34. GATE requires Oracle -> oracle-down is TRANSIENT (verdict ABORTED, exit 2 -> retry, NOT a permanent NEEDS-FIX)"; reset; rm -f "$ROOT/verdict.json"
+  STUB_CANARY_FAIL=oracle STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "oracle-down under gate exits 2 (transient)"
+  ck "transient verdict (distinct from a real NEEDS-FIX)" '"verdict":"ABORTED"' "$ROOT/verdict.json"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

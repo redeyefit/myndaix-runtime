@@ -113,3 +113,17 @@ CREATE TABLE review_cursor (
     updated_at   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (repo_id, ref)
 );
+
+-- docs-only PR auto-merge gate decision log (automerge DESIGN v0.3 §4). One row per
+-- (repo, PR, head sha) records the terminal decision so the hourly gate never re-reviews
+-- the same head; a new push = a new head = a new row. Existing DBs: migrations/0004_automerge_seen.sql.
+CREATE TABLE automerge_seen (
+    repo_id    text NOT NULL,
+    pr_number  int  NOT NULL CHECK (pr_number > 0),
+    head_sha   text NOT NULL,
+    decision   text NOT NULL
+        CHECK (decision IN ('merged','needs_fix','skipped','error')),
+    reason     text,
+    decided_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (repo_id, pr_number, head_sha)
+);
