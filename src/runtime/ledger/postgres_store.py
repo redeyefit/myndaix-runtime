@@ -162,7 +162,13 @@ class PostgresLedger:
         registry ever becomes I/O-backed, precompute the authority map OUTSIDE the
         transaction so no I/O happens under a lock."""
         try:
-            authority = registry.get(to_agent).authority
+            spec = registry.get(to_agent)
+            # a non-idempotent PAID supplier (its submit charges credits, no dedup) must NEVER
+            # auto-requeue on crash/lease-expiry — a re-submit would double-charge. It goes
+            # dead+surfaced regardless of authority (cross-family review CRITICAL).
+            if spec.adapter.get("non_idempotent"):
+                return False
+            authority = spec.authority
         except Exception:
             return False
         return authority in (Authority.RESPONDER, Authority.CONTROLLER)
@@ -659,7 +665,7 @@ class PostgresLedger:
                         repo_dec[r["repo_id"]] = repo_dec.get(r["repo_id"], 0) + 1
                     if not self._requeue_safe(r["to_agent"]):
                         dead.append(jid)
-                        dead_reasons[jid] = "lease expired; workspace_actor not auto-retried"
+                        dead_reasons[jid] = "lease expired; agent not auto-retried (non-requeue-safe)"
                         continue
                     n_att = await con.fetchval(
                         "SELECT count(*) FROM attempt WHERE job_id = $1", jid)
