@@ -23,6 +23,9 @@ esac
 case "$agent" in
   kilabz)  [[ -n "${STUB_KILABZ_FAIL:-}" ]] && exit 1; echo "${STUB_REVIEW:-bug: line 1 returns a-b}" ;;
   lobster) [[ -n "${STUB_LOBSTER_FAIL:-}" ]] && exit 1; echo "${STUB_TRIAGE:-1. fix the subtraction}" ;;
+  # `mxr skillselect ...` (+learning Step 4): default-OFF emits empty (models SKILLS_ENABLED
+  # absent). STUB_ARMED lets a test inject a canned (already-fenced) hint region.
+  skillselect) printf '%s' "${STUB_ARMED:-}" ;;
   *) echo "stub:$agent" ;;
 esac
 STUB
@@ -101,6 +104,14 @@ echo "16. PR-0a: scope flags forwarded to mxr (repo bucket + reviewed SHA)"; res
   nscoped="$(grep -c -- "--repo $rid --base-ref $TIP" "$log" 2>/dev/null || true)"; [[ "$nscoped" =~ ^[0-9]+$ ]] || nscoped=0
   if [[ "$nscoped" -eq 3 ]]; then echo "  ok: kilabz+oracle reviews + triage carry --repo + --base-ref"; PASS=$((PASS+1)); else echo "  FAIL: want 3 scoped mxr calls (kilabz+oracle+lobster), got $nscoped"; FAIL=$((FAIL+1)); fi
   if grep -q "READY.*--repo" "$log" 2>/dev/null; then echo "  FAIL: canary must stay cap-exempt"; FAIL=$((FAIL+1)); else echo "  ok: canary cap-exempt (no --repo)"; PASS=$((PASS+1)); fi
+
+echo "16b. +learning Step 4: hint injected into BOTH reviews only (not triage); skipped under gate"; reset
+  STUB_ARMED="$(printf '===BEGIN UNTRUSTED armed-skill nonce=z===\nARMEDHINT review-skill body\n===END UNTRUSTED nonce=z===')" STUB_TRIAGE="PLAY_PASS" run
+  alog="$FAKE/.myndaix/mxr-argv.log"
+  nhit="$(grep -c "ARMEDHINT" "$alog" 2>/dev/null || true)"; [[ "$nhit" =~ ^[0-9]+$ ]] || nhit=0
+  if [[ "$nhit" -eq 2 ]]; then echo "  ok: hint reaches exactly the kilabz + oracle prompts (not triage)"; PASS=$((PASS+1)); else echo "  FAIL: want hint in 2 review prompts, got $nhit (triage leak = 3)"; FAIL=$((FAIL+1)); fi
+  reset; STUB_ARMED="ARMEDGATE" gate_run >/dev/null 2>&1 || true
+  if grep -q "ARMEDGATE" "$FAKE/.myndaix/mxr-argv.log" 2>/dev/null; then echo "  FAIL: hint injected into the MERGE GATE (v0.3 §2 violation)"; FAIL=$((FAIL+1)); else echo "  ok: gate mode injects NO hint (the ! gate skip holds)"; PASS=$((PASS+1)); fi
 
 echo "17. PR-1a: front re-execs the FIXED installed worker, not the worktree copy"; reset
   mkdir -p "$FAKE/.myndaix/orchestrator"

@@ -151,6 +151,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         gargs = gp.parse_args(raw[1:])
         return asyncio.run(get_job(gargs.job_id))
 
+    # `mxr skillselect <repo_id> <changed-path>...` — the +learning rung READ path (build
+    # plan Step 4). Routed through mxr so it inherits the runtime venv + PYTHONPATH +
+    # MYNDAIX_DSN exactly like every other entry point (bare `python3 -m runtime.skillselect`
+    # would not resolve the package in play-review's hook env, and the package lives here
+    # regardless of which repo is under review). Special-cased ABOVE the flat agent/task
+    # parser, like `get`; skillselect fails OPEN to empty stdout. PLAY_NONCE/PLAY_ID/PLAY_GATE
+    # pass through the inherited env.
+    if raw and raw[0] == "skillselect":
+        from runtime import skillselect
+        return skillselect.main(["skillselect", *raw[1:]])
+
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')
