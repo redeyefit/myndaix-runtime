@@ -1,7 +1,10 @@
-# DESIGN — auto-capture rung v0.2 ("the proposer"): turn a recurring review lesson into a PROPOSED skill
+# DESIGN — auto-capture rung v0.3 ("the proposer"): turn a recurring review lesson into a PROPOSED skill
 
-**Status:** DRAFT for cross-family review (kilabz + oracle) BEFORE build. **v0.2 folds the Recon
-prior-art brief** (`docs/auto-capture-research.md`). Governing constraints: default OFF; **the
+**Status:** v0.3 — folds the **cross-family design review** (kilabz NEEDS-REVISION + oracle
+APPROVE-WITH-FIXES, jobs 3a00fb30 / 16867680). Both converged on a CRITICAL: a draft escaping
+`skills/` defeats the whole gate. The **REQUIRED SAFEGUARDS** section is now load-bearing — build
+none of the proposer until they're in. (v0.2 folded the Recon prior-art brief
+`docs/auto-capture-research.md`.) Governing constraints: default OFF; **the
 proposer NEVER promotes** (it only opens a PR — the existing human-merge-under-branch-protection
 gate is unchanged); fail-CLOSED; no LLM in any security decision.
 
@@ -20,8 +23,13 @@ Jefe just clicks merge (or closes it). **The agent remembers; the human decides.
 
 It does NOT auto-promote, auto-merge, or auto-inject anything. A proposal is an ordinary PR that
 lands in the EXISTING gate: `skills/` ∈ automerge `_DENY_DIRS` → routed to a human; the human merge
-under branch protection IS the promotion (controller stamps `provenance='promoted'`). So the worst
-a bad/injected proposal can do is be a PR Jefe rejects. The security boundary is unchanged.
+under branch protection IS the promotion (controller stamps `provenance='promoted'`).
+
+**CORRECTION (cross-family review, v0.3): "no new security boundary" was WRONG.** The proposer is a
+NEW untrusted repo-writer, and the "rides the gate" claim is only true if the draft CANNOT escape
+`skills/` into an auto-mergeable path. The safety now rests on the **REQUIRED SAFEGUARDS** below;
+without them the rung is FAIL-OPEN (oracle CRITICAL: `slug(rule_tag)` from LLM output → `rule:
+../../docs/x` → a `docs/` PR the automerge approves, bypassing Jefe entirely).
 
 ## Data flow (input → process → output)
 1. **Signal + TAG** — a play-review verdict is `NEEDS-FIX`. The reviewer prompts are extended (a
@@ -93,10 +101,60 @@ loop. Track `origin_repo` so a single poisoned repo can't concentrate the corpus
   heavy AST-clustering infra (DEFER until glob+tag proves insufficient). Keep enforcement
   deterministic.
 
-## Resolved (Recon) + remaining for the cross-family reviewers
-- **RESOLVED Q1 (recurrence key):** `rule:<tag>` PRIMARY, glob SECONDARY (above). Needs the small
-  play-review reviewer-prompt change to emit `rule:<slug>`.
-- **OPEN for review:** (a) thresholds (`MIN_RECUR=3`, `MAX_OPEN=3`, `1/day`) — eager/timid? (b)
-  proposer runs INLINE in the controller tick (leaning yes — fail-soft per-repo try/except, no new
-  cron) vs a separate launchd job? (c) how to reliably detect merge/close to call
-  `resolve_capture` (poll PR state in the controller tick, mirroring automerge's `gh pr view`).
+## REQUIRED SAFEGUARDS (cross-family review v0.3 — load-bearing; build none of the proposer without these)
+
+**S1 — Path isolation [CRITICAL, oracle+kilabz]. The whole "rides the gate" claim depends on this.**
+- `slug(rule_tag)` enforces `^[a-z0-9][a-z0-9-]{1,60}$`; reject dots, slashes, `..`, reserved
+  names, Unicode confusables. A bad slug DROPS the candidate (fail-closed), never a PR.
+- Before `gh pr create`, hard-assert the ONLY changed path is exactly `skills/<slug>/SKILL.md`
+  (absolute, begins with `skills/`, no `..`). A server-side deterministic check (own this in the
+  controller's promotion path + as a required CI check) REJECTS any auto-proposed PR touching
+  anything else (esp. `.github/**`, `docs/**`). Fail closed on diff-parse error.
+
+**S2 — Pre-merge injection containment [HIGH, kilabz].** An auto-drafted SKILL.md can hit a reviewer
+prompt as ordinary PR DIFF when its own PR is reviewed (before any merge).
+- skillselect MUST load ONLY `state='active' AND provenance='promoted'` from the indexed
+  default-branch table — NEVER a `proposed` row or a PR branch (already true; assert it in a test).
+- EXCLUDE `skills/**` + `auto-proposed` PRs from normal LLM review, OR review them with a hardened
+  "untrusted artifact" prompt that ignores all in-diff instructions. Don't let the proposal's own
+  review be the injection vector.
+
+**S3 — `rule_tag` is an ALLOWLISTED taxonomy, not free-form [HIGH, kilabz].** A reviewed repo can
+prompt-inject a reviewer into emitting arbitrary tags → manufactured recurrence / queue poisoning.
+- Reviewers pick from a FIXED, version-controlled tag set; an off-list tag is ignored (no candidate).
+- Recurrence requires MULTI-SIGNAL, not a raw count: **distinct commits + distinct authors (≥2) +
+  cross-family agreement** (BOTH kilabz and oracle emitted the tag) before `seen_count` advances.
+  Ignore capture signals from `skills/**` and auto-proposed branches.
+
+**S4 — Drafting is NOT a security boundary [HIGH, both].** Structured-from-LLM is still untrusted.
+- Prefer deterministic template text from the allowlisted tag's METADATA. Any LLM-summarized prose
+  is length-capped, has XML/HTML-like tags stripped (`<system>`, `</instruction>`), scanned, AND
+  carries a PR-body `> [!WARNING] auto-summarized from untrusted code — review for injection`.
+  `scan_injection` is a best-effort filter, NOT the boundary; the human merge is.
+
+**S5 — Restricted writer identity [HIGH, both].** A dedicated bot PAT/GitHub-App: `Contents:Write`
+scoped to `skill/auto/*` branches ONLY; NO merge, NO `workflow`/Actions write, NO secrets, NO
+`.github/**`, NOT in the automerge author-allowlist. Lock default workflow perms `read-all`; no
+`pull_request_target` consuming PR-controlled files.
+
+**S6 — Two-phase, idempotent proposal + explicit state machine [HIGH, both].**
+`new → accumulating → ready → proposing → proposed → promoted|declined|stale|error`. CAS
+`ready→proposing` and store the deterministic branch (`skill/auto/<slug>`) + `draft_sha` BEFORE any
+git/gh side effect; push branch; open PR; CAS `→proposed`. A retry checks the branch/PR by
+name+`draft_sha` before creating another (no dup PRs on a crash between `gh pr create` and the DB
+write). Recovery sweep reaps stale `proposing` rows + orphan branches.
+
+**S7 — Separate launchd job, not inline [MED, oracle resolves open-Q].** Run as `ai.myndaix.proposer`
+polling `capture_candidate` independently — GitHub API latency/secondary-limits must NOT stall the
+controller tick. Fail-soft in isolation.
+
+**S8 — Anti-wedge / anti-fatigue [MED, oracle+kilabz].** TTL on auto-PRs (auto-close + mark
+`declined` after N days so a garbage flood can't permanently occupy the `MAX_OPEN` slots). Keep
+repo-local skills repo-local unless cross-repo recurrence is proven. Periodic human curation/prune.
+
+## Decisions + still-open (post-review)
+- **RESOLVED:** recurrence = allowlisted `rule:<tag>` + multi-signal (S3); proposer = separate
+  launchd job (S7); proposal = two-phase idempotent (S6).
+- **STILL OPEN (small):** thresholds (`MIN_RECUR`, `MAX_OPEN`, TTL days, author-count); whether v1
+  even needs LLM drafting or can ship deterministic-template-only (safer; lean toward template-only
+  for v1 and defer LLM summarization).
