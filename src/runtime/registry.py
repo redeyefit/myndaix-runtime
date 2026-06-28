@@ -79,8 +79,14 @@ V1_ROSTER: list[AgentSpec] = [
                        "env_passthrough": ["OPENAI_API_KEY"], "scratch_home": True}),
     AgentSpec(agent_id="oracle", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gemini-3.1-pro", role="reviewer/vision",
-              # `agy` is the Gemini CLI (the standalone gemini-cli individual tier was retired)
-              adapter={"kind": "cli", "argv": ["agy", "-p"], "prompt_channel": "arg",
+              # `agy` is the Gemini CLI (the standalone gemini-cli individual tier was retired).
+              # PIN --model: the bare `agy -p` ran agy's DEFAULT (Gemini 3.5 Flash — fast but shallow),
+              # NOT the gemini-3.1-pro this spec declares. Passing the model the picker lists gives
+              # Oracle real review depth. (Debug-first 2026-06-28: the old "~50KB prompt -> empty"
+              # field note did NOT reproduce — agy returns correct output at 662KB, so there is no
+              # packet ceiling to engineer around; the only real handicap was the un-pinned model.)
+              adapter={"kind": "cli", "argv": ["agy", "--model", "Gemini 3.1 Pro (High)", "-p"],
+                       "prompt_channel": "arg",
                        "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]}),
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
               model="sonar-pro+claude", role="research (read-only)",
