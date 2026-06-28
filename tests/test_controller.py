@@ -30,6 +30,27 @@ C.DSN = DSN
 _TMP = Path(tempfile.mkdtemp(prefix="ctrl-test-"))
 _N = [0]
 
+# +learning indexer isolation: process_repo now calls _index_skills, which shells out to `gh`
+# and (fail-closed) alerts the human inbox. Stub gh + redirect the inbox to _TMP so NO test
+# hits real GitHub or the real ~/.myndaix inbox. Default = fully protected (so existing tests
+# index an empty corpus = a clean no-op); skill tests override C._gh_json per-test.
+_GH_PROT = {"required_pull_request_reviews": {}, "enforce_admins": {"enabled": True},
+            "allow_force_pushes": {"enabled": False}}
+
+
+def _make_gh(protected: bool = True, nwo: str = "o/r"):
+    def _gh(repo, *args, timeout=None):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": nwo}
+        if args and args[0] == "api":                # the branch-protection endpoint
+            return _GH_PROT if protected else None
+        return None
+    return _gh
+
+
+C.JEFE_INBOX = _TMP / "jefe"
+C._gh_json = _make_gh(True)
+
 
 def g(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
@@ -75,6 +96,8 @@ def fresh_seam(name: str) -> Path:
     C.DISPATCH_OVERRIDE = str(base / "dispatched.jsonl")
     C.DRY_RUN = False
     C.MAX_DISPATCH_PER_TICK = 3
+    C._gh_json = _make_gh(True)                          # reset to protected default (skill tests override)
+    C.JEFE_INBOX = _TMP / "jefe"
     return Path(C.DISPATCH_OVERRIDE)
 
 
@@ -346,6 +369,82 @@ async def test_end_to_end_stub_play_review(led: PostgresLedger) -> None:
         assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered", "end-to-end advance failed"
     finally:
         C.TEST_MODE = True
+
+
+# =====================================================================================
+# +learning rung: the controller skill indexer + branch-protection provenance (Step 5/7).
+# gh is stubbed (_make_gh) so the arm is exercised without a real GitHub; the jefe inbox is a
+# temp dir. Skills are read from the trusted fetched owned ref by process_repo's fetch.
+# =====================================================================================
+async def _truncate_skills(led: PostgresLedger) -> None:
+    async with led._pool.acquire() as con:
+        await con.execute("TRUNCATE skill, skill_use")
+
+
+def add_skill(repo: C.Repo, name: str, *, desc: str = "prefer fresh context for the write",
+              trigger: str = "src/*.swift", body: str = "When reviewing this diff, prefer X.") -> str:
+    """Commit + push a skills/<name>/SKILL.md to the repo's main (simulates a merged skill PR)."""
+    d = repo.path / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {desc}\npath_trigger: {trigger}\n---\n\n{body}\n")
+    g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", f"add skill {name}")
+    g(repo.path, "push", "-q", "origin", "main")
+    return head_of(repo)
+
+
+def _has_skill_alert(inbox: Path) -> bool:
+    return inbox.is_dir() and any("skills-controller" in p.name for p in inbox.glob("*.md"))
+
+
+async def test_skills_indexed_when_protected(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skidx"); repo = make_repo("skidx")
+    C.JEFE_INBOX = _TMP / "jefe-skidx"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "fresh-ctx", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                 # fetch owned ref -> index from it
+    assert not (C.STATE / "skills-blocked-skidx").exists(), "protected main -> no block flag"
+    assert (C.STATE / "skills-tree-skidx").exists(), "successful index writes the tree marker"
+    sel = await led.select_skills("skidx", ["src/ContentView.swift"])
+    assert len(sel["skills"]) == 1 and sel["skills"][0]["name"] == "fresh-ctx", f"indexed+selectable: {sel}"
+    assert not _has_skill_alert(C.JEFE_INBOX), "a clean index does not alert"
+
+
+async def test_skills_blocked_when_unprotected(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skblock"); repo = make_repo("skblock")
+    C.JEFE_INBOX = _TMP / "jefe-skblock"
+    C._gh_json = _make_gh(protected=False)               # main has no/weak protection
+    add_skill(repo, "foo")
+    await C.process_repo(led, repo, [0])
+    assert (C.STATE / "skills-blocked-skblock").exists(), "unprotected main -> fail-closed block flag"
+    assert (await led.select_skills("skblock", ["src/a.swift"]))["skills"] == [], "nothing indexed when blocked"
+    assert _has_skill_alert(C.JEFE_INBOX), "fail-closed block alerts jefe"
+
+
+async def test_skills_protection_downgrade_blocks_next_tick(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skdown"); repo = make_repo("skdown")
+    C.JEFE_INBOX = _TMP / "jefe-skdown"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "bar", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                 # indexed under protection
+    assert (await led.select_skills("skdown", ["src/a.swift"]))["skills"], "indexed while protected"
+    C._gh_json = _make_gh(protected=False)               # protection DROPS after indexing
+    await C.process_repo(led, repo, [0])                 # re-verified every tick -> must block now
+    assert (C.STATE / "skills-blocked-skdown").exists(), "a downgrade blocks the next tick (no grandfathering)"
+
+
+async def test_skills_lint_reject_alerts_not_indexed(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("sklint"); repo = make_repo("sklint")
+    C.JEFE_INBOX = _TMP / "jefe-sklint"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "toobroad", trigger="*")             # banned trigger -> lint fail-closed
+    await C.process_repo(led, repo, [0])
+    assert (await led.select_skills("sklint", ["any.py"]))["skills"] == [], "lint-rejected skill is not indexed"
+    assert _has_skill_alert(C.JEFE_INBOX), "a lint rejection alerts jefe"
 
 
 async def main() -> None:
