@@ -174,6 +174,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         from runtime import skillselect
         return skillselect.main(["skillselect", *raw[1:]])
 
+    # `mxr capture-record ...` — auto-capture INSTRUMENTATION (observe-only). Same routing
+    # rationale as skillselect (inherits venv/PYTHONPATH/DSN via mxr); fails OPEN, never blocks
+    # a review. Records cross-family-agreed rule:<tag> signals; never opens a PR (no proposer yet).
+    if raw and raw[0] == "capture-record":
+        from runtime import capturerecord
+        return capturerecord.main(["capture-record", *raw[1:]])
+
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')

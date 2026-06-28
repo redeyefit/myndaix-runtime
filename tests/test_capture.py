@@ -132,6 +132,35 @@ def test_render_fails_closed_on_bad_inputs():
        "injection framing is dropped (sanitized) or the draft is refused")
 
 
+def test_parse_rule_tags():
+    txt = "Some finding.\nrule:fail-open\nblah rule:toctou-race blah (inline, not a signal)\nrule: missing-file-lock \nrule:not-a-real-tag\nRULE:FAIL-OPEN"
+    tags = C.parse_rule_tags(txt)
+    ok("fail-open" in tags, "a clean rule: line is parsed")
+    ok("missing-file-lock" in tags, "surrounding spaces tolerated")
+    ok("fail-open" in C.parse_rule_tags("RULE:FAIL-OPEN"), "case-insensitive + normalized")
+    ok("toctou-race" not in tags, "an inline mid-sentence mention is NOT a signal (own-line only)")
+    ok("not-a-real-tag" not in tags, "off-list tag dropped (S3)")
+    ok(C.parse_rule_tags("") == set(), "empty text -> no tags")
+
+
+def test_agreed_tags_is_cross_family_intersection():
+    k = "rule:fail-open\nrule:toctou-race"
+    o = "rule:fail-open\nrule:missing-file-lock"
+    ok(C.agreed_tags(k, o) == ["fail-open"], "only the tag BOTH families emit advances recurrence")
+    ok(C.agreed_tags(k, "") == [], "oracle absent -> no agreement (fail-closed)")
+    ok(C.agreed_tags("rule:fail-open", "rule:fail-open") == ["fail-open"], "agreement -> the tag")
+    ok(C.agreed_tags("rule:fail-open\nrule:toctou-race", "rule:toctou-race\nrule:fail-open")
+       == ["fail-open", "toctou-race"], "result is sorted + deduped")
+
+
+def test_pick_glob_most_specific():
+    g = C.pick_glob(["src/runtime/ledger/migrations/0099_x.sql", "README.md"])
+    ok(g == "src/runtime/ledger/migrations/*.sql", "deepest path wins (most specific locality)")
+    ok(C.pick_glob([]) is None, "no paths -> None")
+    ok(C.pick_glob([""]) is None, "degenerate path -> None")
+    ok(not M.is_banned_trigger(C.pick_glob(["a/b.py"])), "result is always a usable trigger")
+
+
 def test_draft_hash_is_stable():
     md = C.render_skill_md("toctou-race", "toctou-race", "src/*.py", "w", "p",
                            finding_ids=["a"], origin_repo="r")

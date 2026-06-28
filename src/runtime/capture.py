@@ -21,6 +21,7 @@ __all__ = [
     "path_to_glob", "candidate_glob", "recurrence_ready", "reready_threshold",
     "skill_branch", "skill_path", "assert_only_skill_path",
     "sanitize_field", "render_skill_md", "draft_hash", "DEFAULTS",
+    "parse_rule_tags", "agreed_tags", "pick_glob",
 ]
 
 # ---- feature-flagged defaults (v0.4 — the proposer reads env + passes these in) -----------
@@ -216,3 +217,32 @@ def draft_hash(rendered: str) -> str:
     """sha256 of the rendered SKILL.md — pinned at CAS ready->proposing (S6) so a crash-retry can
     recognize an already-pushed branch/PR by content instead of opening a duplicate."""
     return hashlib.sha256(rendered.encode()).hexdigest()
+
+
+# ---- instrumentation: parse reviewer-emitted `rule:<tag>` lines + cross-family agreement --------
+_RULE_LINE = re.compile(r"(?mi)^[ \t]*rule:[ \t]*([a-z0-9][a-z0-9-]{1,60})[ \t]*$")
+
+
+def parse_rule_tags(text: str) -> set[str]:
+    """Extract the set of ALLOWLISTED rule_tags a reviewer emitted on their own `rule:<tag>` lines.
+    Off-list or malformed tags are dropped (S3). A line must be EXACTLY `rule:<tag>` (optional
+    surrounding spaces) so a tag mentioned mid-sentence in prose isn't mistaken for a signal."""
+    return {m.group(1).lower() for m in _RULE_LINE.finditer(text or "")
+            if is_allowed_tag(m.group(1))}
+
+
+def agreed_tags(kilabz_text: str, oracle_text: str) -> list[str]:
+    """The allowlisted rule_tags BOTH families emitted (cross-family agreement, S3) — the only tags
+    that may advance recurrence. Sorted for determinism. If either review is missing/absent (e.g.
+    oracle unavailable), the intersection is empty (fail-closed: no agreement possible)."""
+    return sorted(parse_rule_tags(kilabz_text) & parse_rule_tags(oracle_text))
+
+
+def pick_glob(paths: list[str]) -> str | None:
+    """The single MOST-SPECIFIC usable path-glob across the changed files — the secondary locality
+    hint a proposed skill carries as its path_trigger. None if no path yields a usable (non-banned)
+    glob. Deterministic on ties (specificity desc, then the glob string)."""
+    globs = {g for p in (paths or []) if (g := candidate_glob(p))}
+    if not globs:
+        return None
+    return max(sorted(globs), key=skillmatch.specificity)
