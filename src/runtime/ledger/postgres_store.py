@@ -363,14 +363,29 @@ class PostgresLedger:
         """Internal: the Job a worker should run after leasing (the Protocol's
         lease_job returns only an id; a worker needs the prompt/repo to run).
         Returns None if the lease is no longer valid (attempt closed / job
-        cancelled or reclaimed) so the worker skips running already-discarded work."""
+        cancelled or reclaimed) so the worker skips running already-discarded work.
+
+        LOCKING OWNERSHIP GATE (cross-family review): this is the worker's last DB read
+        before _invoke (which, for a paid supplier, performs a NON-IDEMPOTENT charging POST).
+        A plain non-locking read could observe a freshly-`leased` row in the gap BETWEEN a
+        concurrent cancel()'s stmt-1 (close attempt) and stmt-2 (flip job dead), then invoke +
+        charge after cancel was already in progress. Taking FOR UPDATE on attempt THEN job —
+        the SAME canonical order cancel/fail/complete use, so no ABBA deadlock — serializes this
+        check with cancel/reclaim: a cancelled/closed job is now reliably seen as None here. (The
+        irreducible residual is a cancel that commits AFTER this locked read releases but before
+        the HTTP submit lands — a network TOCTOU no DB state can close; bounded by the paid
+        agent's non_idempotent flag to at most one surfaced charge.)"""
         async with self._pool.acquire() as con:
-            row = await con.fetchrow(
-                """SELECT j.id, j.to_agent, j.body, j.context, j.repo_id, j.base_ref,
-                          j.base_sha, j.worktree_path
-                     FROM job j JOIN attempt a ON a.job_id = j.id
-                    WHERE a.id = $1 AND a.status = 'open'
-                      AND j.status IN ('leased','running')""", attempt_id)
+            async with con.transaction():
+                a = await con.fetchrow(
+                    "SELECT job_id FROM attempt WHERE id = $1 AND status = 'open' FOR UPDATE",
+                    attempt_id)
+                if a is None:
+                    return None
+                row = await con.fetchrow(
+                    """SELECT id, to_agent, body, context, repo_id, base_ref, base_sha, worktree_path
+                         FROM job WHERE id = $1 AND status IN ('leased','running') FOR UPDATE""",
+                    a["job_id"])
         if row is None:
             return None
         return Job(id=row["id"], to_agent=row["to_agent"], prompt=row["body"],
