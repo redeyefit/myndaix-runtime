@@ -118,6 +118,11 @@ def main(argv: list) -> int:
         log("CAPTURE_ENABLED absent — instrumentation OFF; no-op"); return 0
     if not _REPO_ID_RE.match(a.repo_id) or ".." in a.repo_id:
         log(f"unsafe repo_id {a.repo_id!r} — no-op"); return 0
+    # never learn from a diff that touches the corpus itself: pick_glob collapses a mixed diff to
+    # ONE glob, so the per-glob skills/ reject in record_capture can miss a mixed push (cross-family
+    # MAJOR). Fail-closed on ANY skills/ path here, with the full path context.
+    if any(p.startswith("skills/") for p in a.paths):
+        log("a changed path is under skills/** — no self-capture; no-op"); return 0
 
     tags = capture.agreed_tags(a.kilabz, a.oracle)   # allowlisted ∩ both families (S3, fail-closed)
     if not tags:

@@ -379,14 +379,6 @@ $review" && mark_done || true
 else
   gate && { note done gate-needs-fix; write_verdict "NEEDS-FIX"; exit 1; }   # automerge gate: structured NEEDS-FIX
   note done needs-fix
-  # auto-capture instrumentation (observe-only): record the rule:<tag> signals BOTH families agreed
-  # on. The python no-ops unless $ORCH/CAPTURE_ENABLED, intersects+allowlists the tags itself, and
-  # NEVER opens a PR (no proposer yet). Best-effort + fail-open: it must not delay or break delivery.
-  if [[ -f "$ORCH/CAPTURE_ENABLED" ]]; then
-    cap_author="$(git -C "$repo" log -1 --format='%ae' "$tip" 2>/dev/null || echo unknown)"
-    mxr capture-record "$repo_id" "$tip" "$play" "$cap_author" \
-      --kilabz "$review" --oracle "$oracle_review" -- ${changed[@]+"${changed[@]}"} >/dev/null 2>&1 || true
-  fi
   # always stage the fix-list (single-writer run dir) + a copy-paste manual hint. The auto note is
   # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
   printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true
@@ -402,5 +394,14 @@ $review
 --- to fix: play-fix.sh \"$repo_id\" \"$tip\" \"$run/fixlist.txt\"$autonote"; then
     mark_done
     autofix_fire        # fail-closed gate; no-ops unless every guard holds. NEVER auto-applies.
+  fi
+  # auto-capture instrumentation (observe-only) — runs AFTER delivery so a stalled call can never
+  # delay the verdict (cross-family MAJOR). Records the rule:<tag> signals BOTH families agreed on;
+  # the python no-ops unless $ORCH/CAPTURE_ENABLED, fails closed on any skills/** path + mixed diff,
+  # and NEVER opens a PR (no proposer yet). Skip the auto-proposal branches. Best-effort + fail-open.
+  if [[ -f "$ORCH/CAPTURE_ENABLED" && "$ref" != *skill/auto/* ]]; then
+    cap_author="$(git -C "$repo" log -1 --format='%ae' "$tip" 2>/dev/null || echo unknown)"
+    mxr capture-record "$repo_id" "$tip" "$play" "$cap_author" \
+      --kilabz "$review" --oracle "$oracle_review" -- ${changed[@]+"${changed[@]}"} >/dev/null 2>&1 || true
   fi
 fi

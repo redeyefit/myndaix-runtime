@@ -107,9 +107,12 @@ def path_to_glob(path: str) -> str:
 
 def candidate_glob(path: str) -> str | None:
     """The path-glob for `path` IF usable as a skill trigger (skillmatch wouldn't BAN it), else
-    None. Fail-closed so auto-capture never proposes a trigger the promotion lint would reject."""
+    None. Fail-closed so auto-capture never proposes a trigger the promotion lint would reject.
+    Rejects any control char / newline (a `git diff -z` filename CAN contain newlines, and a glob
+    with a newline injected from a directory segment would forge extra SKILL.md frontmatter lines —
+    cross-family review CRITICAL)."""
     g = path_to_glob(path)
-    if not g or skillmatch.is_banned_trigger(g):
+    if not g or _CTRL.search(g) or "\n" in g or skillmatch.is_banned_trigger(g):
         return None
     return g
 
@@ -146,11 +149,13 @@ def assert_only_skill_path(changed_paths: list[str], s: str) -> bool:
     """True iff the ONLY changed path is EXACTLY skills/<slug>/SKILL.md (S1 — used both before
     `gh pr create` and as the server-side check on any auto-proposed PR). Fail-closed: empty list,
     any extra path, any `..`/absolute/backslash, or a slug mismatch all return False."""
+    if slug(s) != s:                      # an unsanitized slug invalidates the whole invariant
+        return False
     want = skill_path(s)
     if not changed_paths or len(changed_paths) != 1:
         return False
-    p = changed_paths[0].strip()
-    if p != want:
+    p = changed_paths[0]                   # NO strip: git reports the exact path; a trailing space
+    if p != want:                         # is a DIFFERENT file that would dodge path-based gates
         return False
     # redundant hardening (want is already literal): no traversal / absolute / backslash slips in
     if ".." in p.split("/") or p.startswith("/") or "\\" in p:
@@ -184,7 +189,8 @@ def render_skill_md(s: str, rule_tag: str, path_trigger: str,
     draft its own promotion gate would reject. NO raw reviewer comment text is pasted in."""
     if slug(s) != s or not is_allowed_tag(rule_tag):
         return None
-    if skillmatch.is_banned_trigger(path_trigger):
+    if (skillmatch.is_banned_trigger(path_trigger)
+            or "\n" in path_trigger or _CTRL.search(path_trigger)):  # belt vs frontmatter injection
         return None
     desc = sanitize_field(f"Recurring review finding: {rule_tag}", 60)
     wrong = sanitize_field(whats_wrong, 700) or "(no description captured)"

@@ -1160,12 +1160,14 @@ class PostgresLedger:
                     "SELECT state, decline_count, path_glob FROM capture_candidate WHERE fingerprint = $1",
                     fp)
                 state, decline = cand["state"], cand["decline_count"]
+                # a declined OR TTL-staled class re-fires only past the (higher) repropose floor;
+                # 'stale' MUST be re-readyable or a TTL-expired class wedges forever (cross-family).
                 eff_recur = (capture.reready_threshold(decline, min_recur=min_recur, mult=repropose_mult)
-                             if state == "declined" else min_recur)
+                             if state in ("declined", "stale") else min_recur)
                 ready = capture.recurrence_ready(
                     counts["commits"], counts["events"], counts["authors"],
                     min_recur=eff_recur, min_events=min_events, min_authors=min_authors)
-                if state in ("new", "accumulating", "declined") and ready:
+                if state in ("new", "accumulating", "declined", "stale") and ready:
                     await con.execute(
                         "UPDATE capture_candidate SET state = 'ready' WHERE fingerprint = $1", fp)
                     return {"fingerprint": fp, "repo_scope": repo_id, "rule_tag": rule_tag,
@@ -1179,13 +1181,28 @@ class PostgresLedger:
 
     async def claim_for_proposing(self, fingerprint: str, branch: str, draft_sha: str) -> bool:
         """CAS 'ready' -> 'proposing', pinning the deterministic branch + draft_sha BEFORE any
-        git/gh side effect (S6). Returns True iff this call won the claim — a concurrent proposer
-        tick gets False and must not also open a PR."""
+        git/gh side effect (S6). Stamps proposed_at as the 'in-flight since' time so a crash mid-
+        proposing can be reaped (reap_stuck_proposing). Returns True iff this call won the claim — a
+        concurrent proposer tick gets False and must not also open a PR."""
         row = await self._pool.fetchrow(
-            """UPDATE capture_candidate SET branch = $2, draft_sha = $3, state = 'proposing'
+            """UPDATE capture_candidate
+                   SET branch = $2, draft_sha = $3, state = 'proposing', proposed_at = now()
                 WHERE fingerprint = $1 AND state = 'ready'
                 RETURNING fingerprint""", fingerprint, branch, draft_sha)
         return row is not None
+
+    async def reap_stuck_proposing(self, timeout_minutes: int) -> int:
+        """S6 anti-wedge: a proposer that crashed AFTER claiming 'proposing' but BEFORE opening the
+        PR would occupy a MAX_OPEN slot forever (expire_stale_captures only touches 'proposed').
+        Release any 'proposing' row older than the timeout back to 'ready' (clearing the pinned
+        branch/draft_sha) so the next tick retries. Returns the count reaped."""
+        rows = await self._pool.fetch(
+            """UPDATE capture_candidate SET state = 'ready', branch = NULL, draft_sha = NULL
+                WHERE state = 'proposing'
+                  AND proposed_at IS NOT NULL
+                  AND proposed_at < now() - make_interval(mins => $1)
+                RETURNING fingerprint""", timeout_minutes)
+        return len(rows)
 
     async def mark_capture_proposed(self, fingerprint: str, pr_number: int) -> bool:
         """CAS 'proposing' -> 'proposed' once the PR is open (S6). Returns True iff transitioned."""

@@ -129,6 +129,37 @@ async def test_declined_reproposes_only_past_higher_floor(led):
     ok(r6 is not None and r6["decline_count"] == 1, "6th commit crosses the doubled floor -> re-ready")
 
 
+async def test_stale_class_re_accumulates(led):
+    # cross-family MAJOR: a TTL-staled class must NOT wedge — it has to be re-readyable.
+    await _truncate(led)
+    r = await _drive_to_ready(led)
+    fp = r["fingerprint"]
+    await led.claim_for_proposing(fp, "b", "s")
+    await led.mark_capture_proposed(fp, 55)
+    await led._pool.execute(
+        "UPDATE capture_candidate SET proposed_at = now() - interval '30 days' WHERE fingerprint=$1", fp)
+    await led.expire_stale_captures(14)
+    st = await led._pool.fetchval("SELECT state FROM capture_candidate WHERE fingerprint=$1", fp)
+    ok(st == "stale", "over-TTL proposal -> stale")
+    r2 = await sight(led, "repoA", "fail-open", "src/*.py", "c9", "e9", "a1")
+    ok(r2 is not None, "a stale class re-readies on a new sighting (no wedge)")
+
+
+async def test_reap_stuck_proposing_recovers_slot(led):
+    # cross-family MAJOR: a crash after ready->proposing must not occupy a MAX_OPEN slot forever.
+    await _truncate(led)
+    r = await _drive_to_ready(led)
+    fp = r["fingerprint"]
+    await led.claim_for_proposing(fp, "skill/auto/fail-open", "sha")
+    ok(await led.count_open_proposals() == 1, "proposing occupies a slot")
+    ok(await led.reap_stuck_proposing(60) == 0, "a fresh proposing row is NOT reaped")
+    await led._pool.execute(
+        "UPDATE capture_candidate SET proposed_at = now() - interval '120 minutes' WHERE fingerprint=$1", fp)
+    ok(await led.reap_stuck_proposing(60) == 1, "a stuck proposing row is reaped after the timeout")
+    ok(await led.count_open_proposals() == 0, "the slot is freed")
+    ok(await led.claim_for_proposing(fp, "b2", "s2") is True, "reaped class is re-claimable (back to ready)")
+
+
 async def test_resolve_bad_outcome_raises(led):
     await _truncate(led)
     r = await _drive_to_ready(led)

@@ -18,6 +18,24 @@
 -- and a class becomes `ready` only on distinct-commit + distinct-event + distinct-author thresholds.
 -- The glob is kept as SECONDARY locality (it becomes the proposed skill's path_trigger).
 
+-- HEAL a pre-ship v0.3 remnant: an early cut of THIS branch shipped a (repo, path-glob)-keyed
+-- capture_candidate with a seen_count column (and a serve re-migrate then created the v0.4
+-- capture_occurrence beside it — a broken MIXED state). migrate() re-runs every boot via CREATE IF
+-- NOT EXISTS, so the old table would silently survive and v0.4 inserts (rule_tag, ...) would crash.
+-- 0007 never reached main, so drop the remnant and let the v0.4 CREATE below apply cleanly. Guarded
+-- on the ABSENCE of the v0.4 rule_tag column → idempotent (after the heal it never fires again) and
+-- it NEVER drops a healthy v0.4 table, so it does NOT churn data on every boot (migration-append-only).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+              WHERE table_schema = 'public' AND table_name = 'capture_candidate')
+     AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = 'capture_candidate'
+                AND column_name = 'rule_tag') THEN
+    DROP TABLE IF EXISTS capture_occurrence, capture_candidate CASCADE;
+  END IF;
+END $$;
+
 -- The recurrence CLASS: one row per (repo, allowlisted rule_tag). S6 state machine.
 CREATE TABLE IF NOT EXISTS capture_candidate (
     fingerprint   text PRIMARY KEY,                 -- sha256(repo_scope \0 rule_tag): the class key
