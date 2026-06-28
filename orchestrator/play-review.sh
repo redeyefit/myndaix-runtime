@@ -276,20 +276,23 @@ gate || printf '%s' "$((n + 1))" > "$day"
 # rung is armed AND a skill matches. A hint is REFERENCE guidance for the reviewers, never an
 # instruction, and is NEVER injected into the merge GATE (v0.3 §2 — wrapped in `! gate`,
 # redundant with skillselect's own PLAY_GATE check).
-armed=""; changed=""; hint_intro=""
+armed=""; hint_intro=""; changed=()
 if ! gate; then
-  changed="$(git -C "$repo" diff --name-only "$base" "$tip" 2>/dev/null || true)"
+  # NUL-safe path list -> argv ARRAY. Unquoted `$changed` word-splitting (kilabz+oracle) mangled
+  # paths with spaces/newlines AND glob-expanded paths with */?/[ against the CWD; `git diff -z`
+  # + `read -d ''` keeps each path one intact argv element (bash-3.2-safe; no mapfile).
+  while IFS= read -r -d '' _p; do changed+=("$_p"); done \
+    < <(git -C "$repo" diff -z --name-only "$base" "$tip" 2>/dev/null || true)
   # mxr resolves the runtime venv + PYTHONPATH + MYNDAIX_DSN (a bare `python3 -m` would not in
-  # the hook env). PLAY_NONCE governs the fence skillselect emits; PLAY_ID is audit-only. The
-  # paths in $changed are git-controlled (trusted) → intentional word-split into argv.
-  [[ -n "$changed" ]] && armed="$(PLAY_NONCE="$nonce" PLAY_ID="$play" mxr skillselect "$repo_id" $changed 2>/dev/null || true)"
+  # the hook env). PLAY_NONCE governs the fence skillselect emits; PLAY_ID is audit-only.
+  [[ ${#changed[@]} -gt 0 ]] && armed="$(PLAY_NONCE="$nonce" PLAY_ID="$play" mxr skillselect "$repo_id" "${changed[@]}" 2>/dev/null || true)"
   # nonce-collision belt (plan Step 4 #5): a 128-bit nonce colliding with the untrusted diff is
   # astronomically unlikely, but would let the diff forge a fence boundary → regenerate once and
   # re-fence. skillselect already DROPS any skill body containing the nonce, and the only nonce
   # in $armed is skillselect's own fence markers, so $armed itself needs no collision check.
   if [[ "$diff" == *"$nonce"* ]]; then
     nonce="$(openssl rand -hex 16)"; armed=""
-    [[ -n "$changed" ]] && armed="$(PLAY_NONCE="$nonce" PLAY_ID="$play" mxr skillselect "$repo_id" $changed 2>/dev/null || true)"
+    [[ ${#changed[@]} -gt 0 ]] && armed="$(PLAY_NONCE="$nonce" PLAY_ID="$play" mxr skillselect "$repo_id" "${changed[@]}" 2>/dev/null || true)"
   fi
   # one TRUSTED sentence introducing the hints, added to the OBJECTIVE (above every fence) only
   # when hints exist — so we never reference a region that isn't there.

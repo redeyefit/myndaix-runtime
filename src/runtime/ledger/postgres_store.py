@@ -1023,10 +1023,10 @@ class PostgresLedger:
                                (name, description, body, body_sha, content_sha,
                                 repo_scope, path_trigger, provenance, state)
                            VALUES ($1,$2,$3,$4,$5,$6,$7,'promoted','active')
-                           ON CONFLICT (name) DO UPDATE
+                           ON CONFLICT (repo_scope, name) DO UPDATE
                                SET description = EXCLUDED.description, body = EXCLUDED.body,
                                    body_sha = EXCLUDED.body_sha, content_sha = EXCLUDED.content_sha,
-                                   repo_scope = EXCLUDED.repo_scope, path_trigger = EXCLUDED.path_trigger,
+                                   path_trigger = EXCLUDED.path_trigger,
                                    state = 'active'
                              WHERE skill.content_sha IS DISTINCT FROM EXCLUDED.content_sha
                            RETURNING name""",

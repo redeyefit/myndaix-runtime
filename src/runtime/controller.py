@@ -42,6 +42,7 @@ import shutil
 import stat as _stat
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -167,8 +168,14 @@ def _gh_json(repo: Path, *args: str, timeout: Optional[int] = None):
     for k in ("GH_TOKEN", "GITHUB_TOKEN"):
         if os.environ.get(k):
             env[k] = os.environ[k]
-    r = subprocess.run(["gh", *args], cwd=str(repo), capture_output=True, text=True,
-                       env=env, timeout=timeout or GH_TIMEOUT, check=False)
+    try:
+        r = subprocess.run(["gh", *args], cwd=str(repo), capture_output=True, text=True,
+                           env=env, timeout=timeout or GH_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError):
+        # a MISSING or HUNG gh binary must fail CLOSED for skills only (-> None ->
+        # _block_repo_skills), NEVER raise out of _index_skills and take down the review
+        # path that runs after it (kilabz HIGH). subprocess.SubprocessError covers TimeoutExpired.
+        return None
     if r.returncode != 0:
         return None
     try:
@@ -360,16 +367,30 @@ def _skill_tree_file(rid: str) -> Path:
     return STATE / f"skills-tree-{rid}"          # disposable change-detect tally (the skills/ tree sha)
 
 
+def _skill_taint_file(rid: str) -> Path:
+    return STATE / f"skills-taint-{rid}"         # debounces the "changed-while-blocked" alert (one per tainted tree)
+
+
+def _clear_taint(rid: str) -> None:
+    try:
+        _skill_taint_file(rid).unlink()
+    except OSError:
+        pass
+
+
 def _alert_jefe(subject: str, body: str) -> None:
     """Best-effort, atomic LOUD alert to the human inbox. Never raises (alerts must not sink a
-    tick). DRY_RUN-gated by callers."""
+    tick). DRY_RUN-gated by callers. The filename carries a random token, NOT just a 1-second
+    timestamp — two repos blocked in the same tick-second would otherwise os.replace to the SAME
+    path and silently destroy one alert (oracle MAJOR)."""
     try:
         JEFE_INBOX.mkdir(parents=True, exist_ok=True)
         ts = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        tok = uuid.uuid4().hex[:8]
         text = f"---\nfrom: controller\nto: jefe\ntype: alert\nsubject: {subject}\n---\n\n{body}\n"
-        tmp = JEFE_INBOX / f"{ts}-skills-controller.md.tmp"
+        tmp = JEFE_INBOX / f"{ts}-{tok}-skills-controller.md.tmp"
         tmp.write_text(text)
-        os.replace(tmp, JEFE_INBOX / f"{ts}-skills-controller.md")   # atomic; daemon skips the brief .tmp
+        os.replace(tmp, JEFE_INBOX / f"{ts}-{tok}-skills-controller.md")   # atomic; daemon skips the brief .tmp
     except OSError as e:
         log(f"jefe alert write failed ({e})")
 
@@ -388,16 +409,20 @@ def _block_repo_skills(rid: str, reason: str) -> None:
         log(f"{rid}: could not write skills block flag ({e})")
     _alert_jefe(f"review-skills BLOCKED for {rid}",
                 f"Skill selection is DISABLED for `{rid}` (fail-closed): {reason}\n\n"
-                f"No skills will be injected for this repo until `main` has full branch "
+                f"No skills will be injected for this repo until the WATCHED branch has full "
                 f"protection (required PR review + enforce admins + no force-push) and the next "
                 f"controller tick clears `{_skill_block_flag(rid).name}`.")
 
 
 def _branch_protection_ok(repo: Repo, nwo: str) -> bool:
-    """True iff `main` requires PR review, enforces admins (so NObody pushes directly), and
-    forbids force-push — the three conditions that make 'arrived via a human merge' unforgeable.
-    Any missing field, weakened setting, 404 (unprotected), or gh error -> False (fail-closed)."""
-    prot = _gh_json(repo.path, "api", f"repos/{nwo}/branches/main/protection")
+    """True iff the ACTUALLY WATCHED branch (repo.watch_ref) requires PR review, enforces admins
+    (so NObody pushes directly), and forbids force-push — the three conditions that make 'arrived
+    via a human merge' unforgeable. Verifying a hard-coded 'main' would let a repo configured to
+    watch refs/heads/dev promote skills from an UNPROTECTED branch while main stays protected
+    (kilabz HIGH) — skills are indexed from this same watched ref. Any missing field, weakened
+    setting, 404 (unprotected), or gh error -> False (fail-closed)."""
+    branch = repo.watch_ref[len("refs/heads/"):]     # _REF_RE guarantees the refs/heads/ prefix
+    prot = _gh_json(repo.path, "api", f"repos/{nwo}/branches/{branch}/protection")
     if not isinstance(prot, dict):
         return False                                 # 404 unprotected / no access / gh error
     req_pr = isinstance(prot.get("required_pull_request_reviews"), dict)
@@ -417,27 +442,62 @@ async def _index_skills(led: PostgresLedger, repo: Repo) -> None:
     if not isinstance(nwo, str) or "/" not in nwo:
         _block_repo_skills(rid, "cannot resolve nameWithOwner via gh (no remote/auth)"); return
 
-    # 2-3. branch protection is the arm — fail-closed on anything but a fully-protected main
+    # 2-3. branch protection (of the WATCHED branch) is the arm — fail-closed on anything but full
     if not _branch_protection_ok(repo, nwo):
-        _block_repo_skills(rid, "main branch protection missing/weak/unreadable "
+        _block_repo_skills(rid, "watched-branch protection missing/weak/unreadable "
                                 "(need required PR review + enforce admins + no force-push)"); return
 
-    # 4. protected: clear any stale block flag, then cheap change-detect on the skills/ tree sha
-    bf = _skill_block_flag(rid)
-    if bf.exists() and not DRY_RUN:
-        try:
-            bf.unlink(); log(f"{rid}: branch protection restored — cleared skills block flag")
-        except OSError:
-            pass
-    head_ref = _ctl_head_ref(ref)                    # read ONLY from the trusted fetched ref, never the worktree
+    # 4. compute the skills/ tree sha (read ONLY from the trusted fetched owned ref, never the
+    # worktree) + the last successfully-indexed tree sha.
+    head_ref = _ctl_head_ref(ref)
     tr = _git(repo.path, "rev-parse", f"{head_ref}:{SKILLS_DIR}")
     tree_sha = tr.stdout.strip() if tr.returncode == 0 else "none"   # "none" -> no skills/ dir on the ref
     try:
         prev = _skill_tree_file(rid).read_text().strip()
     except OSError:
         prev = ""
+
+    # 4b. block-flag handling with an anti-LAUNDER taint check (kilabz MEDIUM): if we were blocked
+    # (protection down/unreadable) and skills/ CHANGED while blocked, a skill could have been
+    # DIRECT-PUSHED during the unprotected window — clearing + indexing would launder it as
+    # 'promoted'. Stay blocked, require a HUMAN audit + manual re-arm. Auto-clear ONLY when nothing
+    # changed (a transient unreadable-protection blip) or there are no skills to launder.
+    bf = _skill_block_flag(rid)
+    if bf.exists():
+        if tree_sha != "none" and tree_sha != prev:
+            log(f"{rid}: protection restored but skills/ CHANGED while blocked — staying blocked "
+                f"(possible direct-push in the unprotected window; manual audit + re-arm)")
+            if not DRY_RUN:
+                tf = _skill_taint_file(rid)
+                try:
+                    was = tf.read_text().strip()
+                except OSError:
+                    was = ""
+                if was != tree_sha:                  # debounce: one alert per distinct tainted tree
+                    _alert_jefe(f"review-skills TAINTED for {rid}",
+                                f"`{rid}`: branch protection was restored, but skills/ CHANGED while "
+                                f"the repo was BLOCKED — a skill may have been direct-pushed during "
+                                f"the unprotected window. Selection stays DISABLED.\n\nAUDIT "
+                                f"`git log -p {ref} -- {SKILLS_DIR}/` for any change NOT from a "
+                                f"reviewed PR merge, revert anything suspect, then `rm {bf.name}` to "
+                                f"re-arm. The next tick re-indexes from the protected ref.")
+                    try:
+                        tf.write_text(tree_sha + "\n")
+                    except OSError:
+                        pass
+            return                                   # stay blocked — do NOT launder
+        if not DRY_RUN:                              # safe: no skills, or unchanged since last protected index
+            try:
+                bf.unlink(); log(f"{rid}: protection restored, skills/ unchanged — cleared block flag")
+            except OSError:
+                pass
+            _clear_taint(rid)
+    elif not DRY_RUN:
+        _clear_taint(rid)                            # not blocked -> any prior taint is resolved
+
+    # 4c. change-detect: skills/ unchanged since the last successful index -> nothing to do
     if tree_sha == prev and prev != "":
-        return                                       # skills/ unchanged since the last successful index
+        return
 
     # 5. read + lint each skills/<name>/SKILL.md from the owned ref (pure lint in skillmatch)
     skills: list[dict] = []
@@ -520,9 +580,13 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
         log(f"{rid}: could not resolve a valid HEAD sha — skip"); return
 
     # +learning rung (Step 5): verify provenance + (re)index skills/ from the just-fetched owned
-    # ref. Runs on EVERY tick regardless of cursor state (protection must be re-checked each poll);
-    # never gates the review path below (its failures are swallowed into a fail-closed block flag).
-    await _index_skills(led, repo)
+    # ref. Runs on EVERY tick regardless of cursor state (protection must be re-checked each poll).
+    # The indexer is OPTIONAL and must NEVER disrupt the review path below — any failure inside it
+    # (gh down/hung, DB hiccup, lint bug) is swallowed here so reviews keep running (kilabz HIGH).
+    try:
+        await _index_skills(led, repo)
+    except Exception as e:
+        log(f"{rid}: skill indexer error ({e!r}) — continuing with the review")
 
     # decide
     if cur is None:                                      # first sight (B2): seed, do NOT review

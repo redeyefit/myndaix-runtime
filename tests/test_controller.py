@@ -447,6 +447,68 @@ async def test_skills_lint_reject_alerts_not_indexed(led: PostgresLedger) -> Non
     assert _has_skill_alert(C.JEFE_INBOX), "a lint rejection alerts jefe"
 
 
+async def test_skills_taint_blocks_relaunder_after_window(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("sktaint"); repo = make_repo("sktaint")
+    C.JEFE_INBOX = _TMP / "jefe-sktaint"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "ok-skill", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                  # indexed under protection
+    assert (await led.select_skills("sktaint", ["src/a.swift"]))["skills"], "indexed while protected"
+    C._gh_json = _make_gh(protected=False)               # protection DROPS
+    add_skill(repo, "smuggled", trigger="src/*.swift")   # direct-push during the unprotected window
+    await C.process_repo(led, repo, [0])                  # protection down -> blocked, nothing indexed
+    assert (C.STATE / "skills-blocked-sktaint").exists(), "unprotected -> blocked"
+    C._gh_json = _make_gh(protected=True)                # protection RESTORED
+    await C.process_repo(led, repo, [0])                  # tree changed while blocked -> must STAY blocked
+    assert (C.STATE / "skills-blocked-sktaint").exists(), "tainted: stays blocked after a window change (no launder)"
+    assert (C.STATE / "skills-taint-sktaint").exists(), "taint marker written (debounces the alert)"
+    assert _has_skill_alert(C.JEFE_INBOX), "taint alerts jefe for a manual audit"
+    names = [s["name"] for s in (await led.select_skills("sktaint", ["src/a.swift"]))["skills"]]
+    assert "smuggled" not in names, "the window-pushed skill was NOT promoted while tainted"
+
+
+async def test_skills_transient_block_auto_clears(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skblip"); repo = make_repo("skblip")
+    C.JEFE_INBOX = _TMP / "jefe-skblip"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "stable", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                  # indexed
+    C._gh_json = _make_gh(protected=False)               # transient unreadable protection (a gh blip)
+    await C.process_repo(led, repo, [0])                  # blocked, but skills/ UNCHANGED
+    assert (C.STATE / "skills-blocked-skblip").exists(), "blip -> blocked"
+    C._gh_json = _make_gh(protected=True)                # readable again, nothing changed
+    await C.process_repo(led, repo, [0])
+    assert not (C.STATE / "skills-blocked-skblip").exists(), "transient blip + unchanged skills/ auto-clears (no manual audit)"
+
+
+async def test_gh_unavailable_blocks_skills_not_reviews(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    seam = fresh_seam("ghnone"); repo = make_repo("ghnone")
+    C.JEFE_INBOX = _TMP / "jefe-ghnone"
+    C._gh_json = lambda repo, *a, **k: None              # what the real _gh_json returns when gh is missing/hung
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # HEAD moved -> review MUST still dispatch
+    assert len(records(seam)) == 1, "gh unavailable must NOT block the review dispatch (skills fail closed alone)"
+    assert (C.STATE / "skills-blocked-ghnone").exists(), "gh unavailable -> fail-closed block flag for skills only"
+
+
+async def test_indexer_exception_never_sinks_review(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    seam = fresh_seam("idxboom"); repo = make_repo("idxboom")
+    C.JEFE_INBOX = _TMP / "jefe-idxboom"
+
+    def _boom(repo, *a, **k):
+        raise RuntimeError("indexer blew up")
+    C._gh_json = _boom                                   # any indexer exception, however deep
+    await C.process_repo(led, repo, [0])                 # seed
+    advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # indexer raises -> wrapper swallows -> review dispatches
+    assert len(records(seam)) == 1, "an indexer exception must never sink the review path"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

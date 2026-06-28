@@ -25,6 +25,7 @@ import hashlib
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 from runtime import skillmatch
@@ -85,8 +86,9 @@ def _alert_jefe(repo_id: str, drift: list[str], injected: list[str]) -> None:
     try:
         JEFE_INBOX.mkdir(parents=True, exist_ok=True)
         ts = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
-        body = (
-            "---\n"
+        tok = uuid.uuid4().hex[:8]            # NOT just a 1-second ts — concurrent same-repo-second
+        body = (                              # reviews would else os.replace to the SAME path and
+            "---\n"                           # silently destroy one alert (oracle MAJOR).
             "from: skillselect\nto: jefe\ntype: alert\n"
             f"subject: review-skill anomaly DROPPED ({repo_id})\n"
             "---\n\n"
@@ -97,8 +99,8 @@ def _alert_jefe(repo_id: str, drift: list[str], injected: list[str]) -> None:
             "These were NOT injected (fail-closed out of selection). A genuine review skill should\n"
             "never trip either check. Re-open the skill PR to re-promote a clean body, or revert it.\n"
         )
-        tmp = JEFE_INBOX / f"{ts}-skilldrift.md.tmp"
-        final = JEFE_INBOX / f"{ts}-skilldrift.md"
+        tmp = JEFE_INBOX / f"{ts}-{tok}-skilldrift.md.tmp"
+        final = JEFE_INBOX / f"{ts}-{tok}-skilldrift.md"
         tmp.write_text(body)
         os.replace(tmp, final)   # atomic publish; the daemon skips the brief .tmp
     except OSError as e:

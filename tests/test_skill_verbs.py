@@ -50,6 +50,24 @@ async def test_index_upsert_idempotent_and_drift(led):
     ok(r["upserted"] == 1, "changed content re-upserts only the drifted skill")
 
 
+async def test_same_name_isolated_across_repos(led):
+    # the CRITICAL bug both families flagged: a global `name` PK let repoB's skill clobber
+    # repoA's same-named skill on UPSERT. Composite (repo_scope, name) keeps them independent.
+    await _truncate(led)
+    await led.index_skills("repoA", [skill("shared", trigger="src/a.py", body="A-body")])
+    await led.index_skills("repoB", [skill("shared", trigger="src/b.py", body="B-body")])
+    async with led._pool.acquire() as con:
+        n = await con.fetchval("SELECT count(*) FROM skill WHERE name='shared'")
+    ok(n == 2, "same skill name coexists across repos (no PK collision)")
+    selA = await led.select_skills("repoA", ["src/a.py"])
+    selB = await led.select_skills("repoB", ["src/b.py"])
+    ok(len(selA["skills"]) == 1 and selA["skills"][0]["body"] == "A-body", "repoA keeps its own 'shared'")
+    ok(len(selB["skills"]) == 1 and selB["skills"][0]["body"] == "B-body", "repoB's 'shared' not clobbered")
+    r = await led.index_skills("repoB", [skill("shared", trigger="src/b.py", body="B-body")])
+    ok(r["archived_removed"] == 0, "repoB re-index does not archive repoA's rows (scoped)")
+    ok(len((await led.select_skills("repoA", ["src/a.py"]))["skills"]) == 1, "repoA intact after repoB re-index")
+
+
 async def test_index_archives_removed(led):
     await _truncate(led)
     await led.index_skills("repoA", [skill("a"), skill("b")])

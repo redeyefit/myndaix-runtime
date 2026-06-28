@@ -131,8 +131,10 @@ CREATE TABLE automerge_seen (
 -- +learning rung (review skills): cache + audit. Mirrors migrations/0005_skill.sql (fresh DBs
 -- get this; existing prod gets the migration on serve boot). The BODY lives here (the indexer
 -- reads it from a trusted merged ref); selection never rehashes disk.
+-- PK is (repo_scope, name): a skill name is unique PER REPO, not globally (kilabz+oracle:
+-- a global name PK lets two repos shipping the same skill slug collide on UPSERT).
 CREATE TABLE skill (
-    name         text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9._-]*$'),
+    name         text NOT NULL CHECK (name ~ '^[a-z0-9][a-z0-9._-]*$'),
     description  text NOT NULL CHECK (length(description) <= 60),
     body         text NOT NULL CHECK (length(body) <= 2048),
     body_sha     text NOT NULL,
@@ -142,7 +144,8 @@ CREATE TABLE skill (
     provenance   text NOT NULL DEFAULT 'promoted' CHECK (provenance IN ('promoted')),
     state        text NOT NULL DEFAULT 'active'   CHECK (state IN ('active','stale','archived')),
     last_used_at timestamptz,
-    created_at   timestamptz NOT NULL DEFAULT now()
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (repo_scope, name)
 );
 
 CREATE TABLE skill_use (
