@@ -111,7 +111,11 @@ Decision rule: *does this need to be remembered/recovered?* No → direct CLI. Y
 
 Gotchas:
 - **`agy` (Oracle / Gemini — it replaced the retired `gemini` CLI) must be run with `< /dev/null`**
-  or it hangs on inherited stdin (0% CPU, no output): `agy -p "<prompt>" < /dev/null`.
+  or it hangs on inherited stdin (0% CPU, no output). **ALWAYS pass `--model "Gemini 3.1 Pro (High)"`** —
+  a bare `agy -p` runs agy's DEFAULT (Gemini 3.5 Flash, fast but shallow: in testing it missed a real
+  race AND hallucinated a bug Pro got right). The pool's oracle adapter pins this; raw calls must too:
+  `agy --model "Gemini 3.1 Pro (High)" -p "<prompt>" < /dev/null`. (There is NO ~50KB prompt ceiling —
+  that old note was the stdin-hang misdiagnosed; agy returns correct output past 600KB.)
 - `codex exec`/`agy` are allowlisted, so an interactive Claude Code session can call them directly;
   `mxr` from inside an *auto-mode* agent session is classifier-gated — trigger durable work via a
   **human or a hook** (e.g. the orchestrator below), not the agent.
