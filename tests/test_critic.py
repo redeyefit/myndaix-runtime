@@ -107,6 +107,46 @@ def test_short_buffer_is_safe():
     ok(C.critic_generic(b"\x10\x20", W, H, hexes=HEXES)["status"] == "fail", "short buffer -> FAIL, no crash")
 
 
+_REF = [1.0] + [0.0] * 511                       # a 512-D reference unit embedding
+
+
+def _emb(sim):
+    """A 512-D unit vector whose cosine similarity to _REF is exactly `sim`."""
+    return [sim, (1.0 - sim * sim) ** 0.5] + [0.0] * 510
+
+
+def test_cosine_similarity():
+    ok(abs(C.cosine_similarity(_REF, _REF) - 1.0) < 1e-9, "identical -> 1.0")
+    ok(abs(C.cosine_similarity(_REF, _emb(0.4)) - 0.4) < 1e-9, "constructed similarity is exact")
+    ok(abs(C.cosine_similarity(_REF, [0.0, 1.0] + [0.0] * 510)) < 1e-9, "orthogonal -> 0")
+    raised = False
+    try:
+        C.cosine_similarity([1, 2], [1, 2, 3])
+    except ValueError:
+        raised = True
+    ok(raised, "mismatched length raises")
+
+
+def test_critic_persona_gate():
+    ok(C.critic_persona(None, _REF, 0.10)["status"] == "fail", "no face -> FAIL")
+    ok(C.critic_persona(_emb(0.9), _REF, 0.01)["status"] == "fail", "face too small (<0.04) -> FAIL")
+    ok(C.critic_persona(_emb(0.9), _REF, 0.10)["status"] == "pass", "strong match + ok face -> PASS")
+    warn = C.critic_persona(_emb(0.40), _REF, 0.10)
+    ok(warn["status"] == "warn", "borderline similarity (0.35-0.45) -> WARN")
+    ok(warn["metric"]["similarity"] == 0.4, "WARN surfaces the measured similarity")
+    ok(C.critic_persona(_emb(0.20), _REF, 0.10)["status"] == "fail", "low similarity (<0.35) -> FAIL drift")
+
+
+def test_embed_face_requires_insightface():
+    # the embedding path is behind an optional heavy dep; absent it, fail LOUD (never silently pass)
+    raised = False
+    try:
+        C.embed_face("/nonexistent.png")
+    except RuntimeError:
+        raised = True
+    ok(raised, "embed_face without InsightFace installed raises a clear RuntimeError")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

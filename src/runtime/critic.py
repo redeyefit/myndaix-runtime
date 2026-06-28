@@ -15,7 +15,8 @@ DESIGN: docs/MX_QUALITY_ORCHESTRATOR.md §6 + corollary 8.
 """
 from __future__ import annotations
 
-__all__ = ["parse_hex", "frame_stats", "critic_generic", "DEFAULTS"]
+__all__ = ["parse_hex", "frame_stats", "critic_generic", "DEFAULTS",
+           "cosine_similarity", "critic_persona", "embed_face", "PERSONA_DEFAULTS"]
 
 DEFAULTS = {
     "MIN_DISTINCT": 12,      # quantized (4-bit/chan) distinct colors below this = trivial/flat plate
@@ -120,3 +121,83 @@ def critic_generic(rgb: bytes, w: int, h: int, *, hexes: list[str],
                        "advisory heuristic — supplier must render NO text)")
     status = "warn" if reasons else "pass"
     return {"status": status, "metric": st, "reasons": reasons, "retry_hint": None}
+
+
+# ============================ persona / Soul-ID gate (v2 trigger) ===========================
+# A face-embedding identity gate for persona renders (e.g. "Agent Steve"): does the generated
+# plate actually show the brand persona, not a drifted face? Thresholds are cosine SIMILARITY on
+# 512-D ArcFace (buffalo_l) embeddings, per the Recon brief (more lenient than the design body's
+# distance guess; cosine distance = 1 - similarity). Calibrate on a labeled set before relying on it.
+# The GATE LOGIC below is pure + tested; the actual embedding (embed_face) is behind an OPTIONAL
+# InsightFace import — install `insightface onnxruntime` + seed reference stills to use it live.
+PERSONA_DEFAULTS = {
+    "SIM_PASS": 0.45,        # cosine similarity >= this -> same person (Recon: 0.35-0.45 "likely same")
+    "SIM_WARN": 0.35,        # [SIM_WARN, SIM_PASS) -> WARN (borderline); below -> FAIL (drifted)
+    "MIN_FACE_FRAC": 0.04,   # face_area/frame_area below this -> too small to trust identity (ABORT)
+}
+
+
+def cosine_similarity(a, b) -> float:
+    """Cosine similarity of two equal-length embedding vectors (pure; no numpy)."""
+    if not a or not b or len(a) != len(b):
+        raise ValueError("embeddings must be non-empty + equal length")
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def critic_persona(frame_embedding, ref_embedding, face_area_frac: float,
+                   *, cfg: dict | None = None) -> dict:
+    """Gate ONE persona plate frame against a reference embedding (mean of N canonical stills).
+    Pure: the caller supplies the embeddings (via embed_face). FAIL on no-face or too-small-face
+    (can't trust identity) or a similarity below the warn floor; WARN in the borderline band; PASS
+    above. Returns {status, metric, reasons}."""
+    c = {**PERSONA_DEFAULTS, **(cfg or {})}
+    if frame_embedding is None:
+        return {"status": "fail", "metric": {"face": False}, "reasons": ["no face detected on the plate"]}
+    if face_area_frac < c["MIN_FACE_FRAC"]:
+        return {"status": "fail", "metric": {"face_area_frac": round(face_area_frac, 4)},
+                "reasons": [f"face too small ({face_area_frac:.3f} < {c['MIN_FACE_FRAC']}) — "
+                            "can't trust identity"]}
+    sim = cosine_similarity(frame_embedding, ref_embedding)
+    m = {"similarity": round(sim, 4), "face_area_frac": round(face_area_frac, 4)}
+    if sim >= c["SIM_PASS"]:
+        return {"status": "pass", "metric": m, "reasons": []}
+    if sim >= c["SIM_WARN"]:
+        return {"status": "warn", "metric": m,
+                "reasons": [f"persona similarity {sim:.3f} in warn band "
+                            f"[{c['SIM_WARN']}, {c['SIM_PASS']})"]}
+    return {"status": "fail", "metric": m,
+            "reasons": [f"persona mismatch: similarity {sim:.3f} < {c['SIM_WARN']}"]}
+
+
+def embed_face(image_path: str):
+    """Largest-face 512-D ArcFace embedding + its area fraction, via InsightFace (buffalo_l).
+    Returns (embedding: list[float], face_area_frac: float), or (None, 0.0) if no face is found.
+    Raises RuntimeError if InsightFace/onnxruntime aren't installed (v2 dependency:
+    `pip install insightface onnxruntime`). NOT unit-tested here (heavy model + weights download);
+    the GATE LOGIC is covered via critic_persona with injected embeddings."""
+    try:
+        import cv2
+        import numpy as np
+        from insightface.app import FaceAnalysis
+    except ImportError as e:
+        raise RuntimeError("persona gate needs InsightFace + onnxruntime + opencv "
+                           "(pip install insightface onnxruntime opencv-python-headless)") from e
+    img = cv2.imread(image_path)
+    if img is None:
+        raise RuntimeError(f"could not read image: {image_path}")
+    app = FaceAnalysis(name="buffalo_l")
+    app.prepare(ctx_id=-1)                      # CPU
+    faces = app.get(img)
+    if not faces:
+        return None, 0.0
+    fh, fw = img.shape[:2]
+    frame_area = float(fh * fw) or 1.0
+    largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    x0, y0, x1, y1 = largest.bbox
+    area_frac = max(0.0, (x1 - x0) * (y1 - y0)) / frame_area
+    return [float(v) for v in largest.embedding], float(area_frac)
