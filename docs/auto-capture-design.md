@@ -1,6 +1,8 @@
 # DESIGN — auto-capture rung v0.3 ("the proposer"): turn a recurring review lesson into a PROPOSED skill
 
-**Status:** v0.3 — folds the **cross-family design review** (kilabz NEEDS-REVISION + oracle
+**Status:** v0.4 — recalibrates the S3 recurrence signal for solo-founder reality (drops the
+hard ≥2-authors gate; preserves anti-single-actor via distinct-commit + distinct-event + cross-family
+signals; author-count becomes a per-repo dial defaulting to 1). v0.3 folded the **cross-family design review** (kilabz NEEDS-REVISION + oracle
 APPROVE-WITH-FIXES, jobs 3a00fb30 / 16867680). Both converged on a CRITICAL: a draft escaping
 `skills/` defeats the whole gate. The **REQUIRED SAFEGUARDS** section is now load-bearing — build
 none of the proposer until they're in. (v0.2 folded the Recon prior-art brief
@@ -122,9 +124,17 @@ prompt as ordinary PR DIFF when its own PR is reviewed (before any merge).
 **S3 — `rule_tag` is an ALLOWLISTED taxonomy, not free-form [HIGH, kilabz].** A reviewed repo can
 prompt-inject a reviewer into emitting arbitrary tags → manufactured recurrence / queue poisoning.
 - Reviewers pick from a FIXED, version-controlled tag set; an off-list tag is ignored (no candidate).
-- Recurrence requires MULTI-SIGNAL, not a raw count: **distinct commits + distinct authors (≥2) +
-  cross-family agreement** (BOTH kilabz and oracle emitted the tag) before `seen_count` advances.
-  Ignore capture signals from `skills/**` and auto-proposed branches.
+- Recurrence requires MULTI-SIGNAL, not a raw count. `seen_count` advances for a `(repo, rule_tag)`
+  ONLY when ALL hold: (1) tag ∈ allowlist; (2) **cross-family agreement** — BOTH kilabz and oracle
+  emitted the tag (the strongest anti-injection signal); (3) ≥ `CAPTURE_MIN_RECUR` (default 3)
+  **distinct commit SHAs**; (4) across ≥ `CAPTURE_MIN_EVENTS` (default 2) **distinct review/push
+  events** (temporal independence — one push can't manufacture recurrence); (5) `CAPTURE_MIN_AUTHORS`
+  distinct authors — **per-repo configurable, default 1** (solo-founder reality; raise for untrusted
+  multi-author repos). Ignore capture signals from `skills/**` and auto-proposed branches.
+- **v0.4 RECALIBRATION (solo-founder):** v0.3 hard-required ≥2 authors — unsatisfiable for a solo
+  founder, so the rung would build and never fire. The anti-single-actor property ≥2-authors provided
+  is preserved by signals (3)+(4): a poisoned repo must fool BOTH families on ≥3 distinct commits
+  across ≥2 separate pushes with an allowlisted tag. Author-count survives as a per-repo dial.
 
 **S4 — Drafting is NOT a security boundary [HIGH, both].** Structured-from-LLM is still untrusted.
 - Prefer deterministic template text from the allowlisted tag's METADATA. Any LLM-summarized prose
@@ -155,6 +165,7 @@ repo-local skills repo-local unless cross-repo recurrence is proven. Periodic hu
 ## Decisions + still-open (post-review)
 - **RESOLVED:** recurrence = allowlisted `rule:<tag>` + multi-signal (S3); proposer = separate
   launchd job (S7); proposal = two-phase idempotent (S6).
-- **STILL OPEN (small):** thresholds (`MIN_RECUR`, `MAX_OPEN`, TTL days, author-count); whether v1
-  even needs LLM drafting or can ship deterministic-template-only (safer; lean toward template-only
-  for v1 and defer LLM summarization).
+- **RESOLVED (v0.4):** thresholds locked as feature-flagged defaults — `CAPTURE_MIN_RECUR=3`
+  (distinct commits), `CAPTURE_MIN_EVENTS=2` (distinct review/push events), `CAPTURE_MIN_AUTHORS=1`
+  (per-repo dial), `CAPTURE_MAX_OPEN=3`, `CAPTURE_TTL_DAYS=14`, `CAPTURE_REPROPOSE=2×MIN_RECUR`.
+  v1 ships **deterministic-template-only** drafting (no LLM summarization — safer per S4; defer LLM).
