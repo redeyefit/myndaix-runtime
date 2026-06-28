@@ -33,7 +33,10 @@ MAX_DIFF="${PLAY_MAX_DIFF:-262144}"                 # 256KB default, tunable per
                                                     # ~300s/agent budget, so a giant push can still time out — split those.
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
-STALE=1800                                          # reap a lock older than 30 min (hung/killed worker)
+STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 min. MUST exceed the worst-case
+                                                    # review runtime (canary + 3 review calls x REVIEW_CALL_TIMEOUT
+                                                    # 600s = ~1800s) so a slow-but-LIVE run isn't reaped mid-review
+                                                    # (kilabz: 1800 was = the worst case -> live-lock-reap race).
 PRUNE_DAYS=14
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
 LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
@@ -247,7 +250,11 @@ if ! mkdir "$lock" 2>/dev/null; then
   fi
 fi
 printf '%s' "$$" > "$lock/pid" 2>/dev/null || true
-trap 'rm -rf "$lock" 2>/dev/null || true' EXIT INT TERM
+# OWNERSHIP-checked release: only remove the lock if it is STILL ours. If a later worker reaped a
+# (wrongly) stale lock and took it over, our pid no longer matches $lock/pid, so our EXIT trap must
+# NOT delete the successor's lock (kilabz: the old unconditional rm let a reaped worker do exactly that).
+release_lock(){ [ "$(cat "$lock/pid" 2>/dev/null || echo none)" = "$$" ] && rm -rf "$lock" 2>/dev/null; return 0; }
+trap release_lock EXIT INT TERM
 
 # --- prune old state so a full disk can't silently wedge the gate ---
 find "$RUNS"  -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev/null || true
@@ -268,7 +275,9 @@ canary_agents=(kilabz lobster)
 if gate; then canary_agents+=(oracle); fi                    # gate: Oracle is REQUIRED, so canary it too
 note canary "${canary_agents[*]}"
 for a in "${canary_agents[@]}"; do
-  call "$a" "reply with exactly: READY" >/dev/null || abort canary "$a unreachable (codex/claude auth or pool down)"
+  # clamp MXR_TIMEOUT_S=180 EXPLICITLY (not by omission): a dead agent must be detected fast, even
+  # if the orchestrator was invoked with MXR_TIMEOUT_S already exported (oracle: omission inherits it).
+  MXR_TIMEOUT_S=180 call "$a" "reply with exactly: READY" >/dev/null || abort canary "$a unreachable (codex/claude auth or pool down)"
 done
 
 # --- diff the pushed range; over-cap = FAIL fast (don't feed a 300s timeout) ---

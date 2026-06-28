@@ -117,7 +117,7 @@ echo "16c. review-call mxr timeout: push reviews wait 600, canary stays fast, ga
   tlog="$FAKE/.myndaix/mxr-argv.log"
   if grep -q $'^kilabz\t600\t' "$tlog" && grep -q $'^oracle\t600\t' "$tlog" && grep -q $'^lobster\t600\t' "$tlog"; then
     echo "  ok: all 3 push review calls wait 600s"; PASS=$((PASS+1)); else echo "  FAIL: push review calls not bumped to 600"; FAIL=$((FAIL+1)); fi
-  if grep -q $'^kilabz\tunset\t' "$tlog"; then echo "  ok: canary keeps the fast default"; PASS=$((PASS+1)); else echo "  FAIL: canary timeout changed"; FAIL=$((FAIL+1)); fi
+  if grep -q $'^kilabz\t180\t' "$tlog" && ! grep -q $'^kilabz\tunset\t' "$tlog"; then echo "  ok: canary EXPLICITLY clamped to 180 (no ambient MXR_TIMEOUT_S inherit)"; PASS=$((PASS+1)); else echo "  FAIL: canary not clamped to 180"; FAIL=$((FAIL+1)); fi
   reset; gate_run >/dev/null 2>&1 || true; glog="$FAKE/.myndaix/mxr-argv.log"
   if grep -q $'^kilabz\t180\t' "$glog" && ! grep -q $'^kilabz\t600\t' "$glog"; then
     echo "  ok: gate review calls stay 180 (fit automerge total budget)"; PASS=$((PASS+1)); else echo "  FAIL: gate review-call timeout wrong"; FAIL=$((FAIL+1)); fi

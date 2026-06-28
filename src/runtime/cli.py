@@ -27,11 +27,19 @@ DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 async def submit(agent: str, task: str, *, context: Optional[dict] = None,
                  repo_id: Optional[str] = None, base_ref: Optional[str] = None,
-                 timeout_s: float = float(os.environ.get("MXR_TIMEOUT_S", "180"))) -> int:
-    # ^ the SYNC wait for the job to finish. Default 180s for interactive ops; the review path
-    #   (play-review) sets MXR_TIMEOUT_S higher so mxr doesn't abandon a slow review BEFORE the
-    #   agent's own ~300s exec cap — else the verdict only lands in the ledger, not inline. Read
-    #   from env at import (each mxr call is a fresh process), so the caller's env governs.
+                 timeout_s: Optional[float] = None) -> int:
+    # the SYNC wait for the job to finish. Default 180s for interactive ops; the review path
+    # (play-review) sets MXR_TIMEOUT_S higher so mxr doesn't abandon a slow review BEFORE the
+    # agent's own ~300s exec cap. Parsed HERE, not in the import-time default arg — an empty or
+    # malformed exported MXR_TIMEOUT_S would otherwise crash float() at import and take down the
+    # WHOLE cli, including `mxr get`/`mxr skillselect` that never submit a job (kilabz+oracle).
+    if timeout_s is None:
+        raw = os.environ.get("MXR_TIMEOUT_S") or ""
+        try:
+            timeout_s = float(raw) if raw else 180.0
+        except ValueError:
+            print(f"warning: invalid MXR_TIMEOUT_S={raw!r}, using 180", file=sys.stderr)
+            timeout_s = 180.0
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
         print(f"unknown agent '{agent}'. roster: {roster}", file=sys.stderr)

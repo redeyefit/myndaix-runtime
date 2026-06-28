@@ -593,6 +593,22 @@ async def test_indexer_exception_never_sinks_review(led: PostgresLedger) -> None
     assert len(records(seam)) == 1, "an indexer exception must never sink the review path"
 
 
+async def test_block_flag_write_failure_disarms_globally(led: PostgresLedger) -> None:
+    # if the block flag CANNOT be persisted, absence of the flag would leave selection enabled for
+    # a repo meant to be locked (oracle CRITICAL fail-open). Fail closed: remove SKILLS_ENABLED.
+    fresh_seam("blkfail")
+    C.JEFE_INBOX = _TMP / "jefe-blkfail"
+    saved = C.SKILLS_ENABLED
+    try:
+        C.SKILLS_ENABLED = _TMP / "SKILLS_ENABLED-blkfail"; C.SKILLS_ENABLED.write_text("")
+        # force the flag WRITE to fail: pre-create a DIRECTORY where the flag file would go
+        bf = C._skill_block_flag("blkfail"); bf.mkdir(parents=True, exist_ok=True)
+        C._block_repo_skills("blkfail", "protection unreadable")
+        assert not C.SKILLS_ENABLED.exists(), "a block-flag write failure must disarm SKILLS_ENABLED (fail-closed)"
+    finally:
+        C.SKILLS_ENABLED = saved
+
+
 async def test_tick_self_migrates_before_indexing(led: PostgresLedger) -> None:
     # the controller is a SEPARATE launchd job from serve; it must self-migrate so a deploy can't
     # tick it against a stale skill PK before serve reboots with 0006 (kilabz R3 Medium).

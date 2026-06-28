@@ -78,6 +78,7 @@ GH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_GH_TIMEOUT", "30"))
 SKILLS_DIR = "skills"
 SKILL_FILE = "SKILL.md"
 JEFE_INBOX = HOME / ".myndaix" / "bridge" / "inbox" / "jefe"
+SKILLS_ENABLED = ORCH / "SKILLS_ENABLED"             # the global arm; removed to fail-closed if a block can't persist
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._][A-Za-z0-9._/-]*$")
@@ -408,7 +409,20 @@ def _block_repo_skills(rid: str, reason: str) -> None:
         STATE.mkdir(parents=True, exist_ok=True)
         _skill_block_flag(rid).write_text(reason + "\n")
     except OSError as e:
-        log(f"{rid}: could not write skills block flag ({e})")
+        # the block flag IS the fail-closed control; if it can't be persisted (disk full / perms),
+        # its absence would leave selection ENABLED for a repo meant to be locked (oracle CRITICAL
+        # fail-open). Fail closed by DISARMING globally — unlink frees space so it survives a full
+        # disk, reliably stopping ALL injection until the human fixes the disk + re-arms.
+        log(f"{rid}: CANNOT persist skills block flag ({e}) — DISARMING globally (fail-closed)")
+        try:
+            SKILLS_ENABLED.unlink()
+        except OSError:
+            pass
+        _alert_jefe(f"review-skills DISARMED ({rid}: block-flag write failed)",
+                    f"Could not write `{_skill_block_flag(rid).name}` ({e}). To fail CLOSED, "
+                    f"`$ORCH/SKILLS_ENABLED` was removed — selection is now OFF for ALL repos. "
+                    f"Fix the disk/permissions issue, then `touch $ORCH/SKILLS_ENABLED` to re-arm.")
+        return
     if already_blocked:
         return                                           # an hourly re-block stays quiet (the flag already disables selection)
     _alert_jefe(f"review-skills BLOCKED for {rid}",
