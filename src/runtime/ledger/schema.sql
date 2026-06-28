@@ -156,3 +156,18 @@ CREATE TABLE skill_use (
     repo_scope  text NOT NULL,
     used_at     timestamptz NOT NULL DEFAULT now()
 );
+
+-- auto-capture rung (the proposer): deterministic recurrence counter. Mirrors
+-- migrations/0007_capture_candidate.sql. A (repo, path-glob) class whose seen_count crosses the
+-- threshold gets ONE proposed skill PR; the proposer never promotes.
+CREATE TABLE capture_candidate (
+    fingerprint  text PRIMARY KEY,
+    repo_scope   text NOT NULL,
+    path_glob    text NOT NULL,
+    seen_count   int  NOT NULL DEFAULT 1 CHECK (seen_count >= 1),
+    state        text NOT NULL DEFAULT 'candidate'
+                 CHECK (state IN ('candidate','proposed','promoted','declined')),
+    pr_number    int,
+    first_seen   timestamptz NOT NULL DEFAULT now(),
+    last_seen    timestamptz NOT NULL DEFAULT now()
+);
