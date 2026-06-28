@@ -16,12 +16,13 @@
 -- injected ONLY into push/controller reviews, NEVER a merge-gating (PLAY_GATE) review.
 -- Everything is reversible (archive-not-delete): prune flips `state`, never deletes a row/file.
 --   state: active -> stale -> archived  (by inactivity; reactivation = human re-arm only)
--- PK is (repo_scope, name), NOT name alone: a skill name is unique PER REPO, and selection is
--- per repo_scope. A global `name` PK would let two watched repos that each ship a
--- skills/<same-name>/SKILL.md collide on UPSERT — one repo silently steals/suppresses the
--- other's skill (kilabz HIGH).
+-- NOTE: this CREATE is the ORIGINAL (single-column `name` PK). The PK is corrected to the
+-- composite (repo_scope, name) by the APPEND-ONLY migration 0006_skill_pk.sql — never edit a
+-- shipped migration's CREATE in place (a DB that already ran this file would keep the old PK,
+-- since migrate() re-runs via CREATE TABLE IF NOT EXISTS). schema.sql (fresh DBs) carries the
+-- final composite PK directly. See 0006 for the why (cross-repo same-name collision).
 CREATE TABLE IF NOT EXISTS skill (
-    name         text NOT NULL CHECK (name ~ '^[a-z0-9][a-z0-9._-]*$'),
+    name         text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9._-]*$'),
     description  text NOT NULL CHECK (length(description) <= 60),
     body         text NOT NULL CHECK (length(body) <= 2048),
     body_sha     text NOT NULL,
@@ -31,8 +32,7 @@ CREATE TABLE IF NOT EXISTS skill (
     provenance   text NOT NULL DEFAULT 'promoted' CHECK (provenance IN ('promoted')),
     state        text NOT NULL DEFAULT 'active'   CHECK (state IN ('active','stale','archived')),
     last_used_at timestamptz,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (repo_scope, name)
+    created_at   timestamptz NOT NULL DEFAULT now()
 );
 
 -- Append-only audit: reconstructs every skill's influence on every review. No FK to

@@ -136,6 +136,43 @@ async def test_prune_transitions_no_reactivate(led):
     ok(st == "archived", "no reactivate-on-reuse (archived stays archived)")
 
 
+async def _pk_cols(led):
+    async with led._pool.acquire() as con:
+        return await con.fetchval("""
+            SELECT array_agg(a.attname ORDER BY array_position(c.conkey, a.attnum))
+              FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+             WHERE t.relname = 'skill' AND c.contype = 'p'""")
+
+
+async def test_zz_migrate_heals_skill_pk(led):
+    # A DB that ran the ORIGINAL single-column-PK 0005 keeps it (migrate re-runs CREATE TABLE IF
+    # NOT EXISTS, which never alters an existing table). The heal DO-block in 0005 must convert it
+    # to composite (repo_scope, name) on the next migrate() — else ON CONFLICT (repo_scope, name)
+    # raises 42P10 forever and the cross-repo collision fix silently never takes effect (fail-OPEN).
+    # (Adversarial-workflow MAJOR; named test_zz_* so it runs LAST — it rebuilds the skill table.)
+    async with led._pool.acquire() as con:
+        await con.execute("DROP TABLE IF EXISTS skill CASCADE")
+        await con.execute(
+            "CREATE TABLE skill (name text PRIMARY KEY, description text NOT NULL, "
+            "body text NOT NULL, body_sha text NOT NULL, content_sha text NOT NULL, "
+            "repo_scope text NOT NULL, path_trigger text NOT NULL, "
+            "provenance text NOT NULL DEFAULT 'promoted', state text NOT NULL DEFAULT 'active', "
+            "last_used_at timestamptz, created_at timestamptz NOT NULL DEFAULT now())")
+    ok(await _pk_cols(led) == ["name"], "precondition: single-column PK (the old schema)")
+    applied = await led.migrate()                        # the 0006 heal DO-block runs
+    ok("0006_skill_pk.sql" in applied, "0006 migration applied")
+    ok(await _pk_cols(led) == ["repo_scope", "name"], "migrate() heals to composite (repo_scope, name)")
+    await led.migrate()                                  # idempotent: second run is a clean no-op
+    ok(await _pk_cols(led) == ["repo_scope", "name"], "heal is idempotent")
+    # end-to-end: the cross-repo collision is now actually fixed on the healed table (no 42P10)
+    await led.index_skills("repoA", [skill("dup", body="A")])
+    await led.index_skills("repoB", [skill("dup", body="B")])
+    async with led._pool.acquire() as con:
+        n = await con.fetchval("SELECT count(*) FROM skill WHERE name='dup'")
+    ok(n == 2, "post-heal: same name coexists across repos (ON CONFLICT works)")
+
+
 async def main():
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

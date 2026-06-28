@@ -382,14 +382,15 @@ async def _truncate_skills(led: PostgresLedger) -> None:
 
 
 def add_skill(repo: C.Repo, name: str, *, desc: str = "prefer fresh context for the write",
-              trigger: str = "src/*.swift", body: str = "When reviewing this diff, prefer X.") -> str:
-    """Commit + push a skills/<name>/SKILL.md to the repo's main (simulates a merged skill PR)."""
+              trigger: str = "src/*.swift", body: str = "When reviewing this diff, prefer X.",
+              branch: str = "main") -> str:
+    """Commit + push a skills/<name>/SKILL.md to `branch` (simulates a merged skill PR)."""
     d = repo.path / "skills" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(
         f"---\nname: {name}\ndescription: {desc}\npath_trigger: {trigger}\n---\n\n{body}\n")
     g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", f"add skill {name}")
-    g(repo.path, "push", "-q", "origin", "main")
+    g(repo.path, "push", "-q", "origin", branch)
     return head_of(repo)
 
 
@@ -466,6 +467,85 @@ async def test_skills_taint_blocks_relaunder_after_window(led: PostgresLedger) -
     assert _has_skill_alert(C.JEFE_INBOX), "taint alerts jefe for a manual audit"
     names = [s["name"] for s in (await led.select_skills("sktaint", ["src/a.swift"]))["skills"]]
     assert "smuggled" not in names, "the window-pushed skill was NOT promoted while tainted"
+
+
+async def test_skills_protection_checks_watched_branch_not_main(led: PostgresLedger) -> None:
+    # pins the watch-ref fix: a repo watching refs/heads/dev must verify DEV's protection (and
+    # index from dev), NOT a hard-coded main. The gh mock here is protected for dev ONLY — the
+    # old hard-coded-main code would query main, get None, and block (this test would fail).
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skwatch"); base = make_repo("skwatch")
+    g(base.path, "checkout", "-q", "-b", "dev")
+    g(base.path, "push", "-q", "-u", "origin", "dev")
+    repo = C.Repo("skwatch", base.path, "refs/heads/dev")   # WATCH dev, not main
+    add_skill(repo, "devskill", trigger="src/*.swift", branch="dev")
+    C.JEFE_INBOX = _TMP / "jefe-skwatch"
+    queried: list = []
+
+    def _gh(repo_path, *args, timeout=None):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args and args[0] == "api":
+            queried.append(args[-1])
+            return _GH_PROT if "/branches/dev/protection" in args[-1] else None  # main -> unprotected
+        return None
+    C._gh_json = _gh
+    await C.process_repo(led, repo, [0])
+    assert any("/branches/dev/protection" in q for q in queried), f"must query the WATCHED branch (dev): {queried}"
+    assert not any("/branches/main/protection" in q for q in queried), "must NOT query a hard-coded main"
+    assert not (C.STATE / "skills-blocked-skwatch").exists(), "dev is protected -> not blocked"
+    assert (await led.select_skills("skwatch", ["src/x.swift"]))["skills"], "indexed from the watched branch"
+
+
+async def test_skills_slashed_watch_ref_is_url_encoded(led: PostgresLedger) -> None:
+    # a slashed branch (release/2026, allowed by _REF_RE) must be URL-encoded in the gh path, or
+    # the raw slash splits .../branches/release/2026/protection into extra segments -> 404 ->
+    # fail-closed indexing. The mock is protected ONLY for the ENCODED path (kilabz+oracle).
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skslash"); base = make_repo("skslash")
+    g(base.path, "checkout", "-q", "-b", "release/2026")
+    g(base.path, "push", "-q", "-u", "origin", "release/2026")
+    repo = C.Repo("skslash", base.path, "refs/heads/release/2026")
+    add_skill(repo, "relskill", trigger="src/*.swift", branch="release/2026")
+    C.JEFE_INBOX = _TMP / "jefe-skslash"
+    queried: list = []
+
+    def _gh(rp, *args, timeout=None):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args and args[0] == "api":
+            queried.append(args[-1])
+            return _GH_PROT if "branches/release%2F2026/protection" in args[-1] else None
+        return None
+    C._gh_json = _gh
+    await C.process_repo(led, repo, [0])
+    assert any("release%2F2026" in q for q in queried), f"slashed branch must be URL-encoded: {queried}"
+    assert not (C.STATE / "skills-blocked-skslash").exists(), "encoded protection lookup succeeds -> not blocked"
+    assert (await led.select_skills("skslash", ["src/x.swift"]))["skills"], "indexed from the slashed watched branch"
+
+
+async def test_skills_delete_while_blocked_is_tainted(led: PostgresLedger) -> None:
+    # deleting skills/ while blocked (tree -> 'none' from a real prior tree) archives all skills;
+    # it must ALSO taint, not auto-clear-and-launder the deletion (kilabz #3).
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skdel"); repo = make_repo("skdel")
+    C.JEFE_INBOX = _TMP / "jefe-skdel"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "doomed", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                 # indexed under protection
+    assert (await led.select_skills("skdel", ["src/a.swift"]))["skills"], "indexed while protected"
+    C._gh_json = _make_gh(protected=False)               # protection DROPS
+    g(repo.path, "rm", "-r", "-q", "skills")             # skills/ DELETED during the window
+    g(repo.path, "commit", "-q", "-m", "rm skills"); g(repo.path, "push", "-q", "origin", "main")
+    await C.process_repo(led, repo, [0])                 # blocked
+    assert (C.STATE / "skills-blocked-skdel").exists(), "unprotected -> blocked"
+    C._gh_json = _make_gh(protected=True)                # protection RESTORED
+    await C.process_repo(led, repo, [0])                 # tree -> 'none' while blocked -> MUST taint
+    assert (C.STATE / "skills-blocked-skdel").exists(), "delete-while-blocked stays blocked (not laundered)"
+    assert (C.STATE / "skills-taint-skdel").exists(), "delete-while-blocked taints"
+    async with led._pool.acquire() as con:
+        st = await con.fetchval("SELECT state FROM skill WHERE repo_scope='skdel' AND name='doomed'")
+    assert st == "active", "the existing skill was not silently archived by a laundered empty index"
 
 
 async def test_skills_transient_block_auto_clears(led: PostgresLedger) -> None:

@@ -45,6 +45,7 @@ import sys
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from runtime import skillmatch
 from runtime.ledger.postgres_store import PostgresLedger
@@ -422,7 +423,16 @@ def _branch_protection_ok(repo: Repo, nwo: str) -> bool:
     (kilabz HIGH) — skills are indexed from this same watched ref. Any missing field, weakened
     setting, 404 (unprotected), or gh error -> False (fail-closed)."""
     branch = repo.watch_ref[len("refs/heads/"):]     # _REF_RE guarantees the refs/heads/ prefix
-    prot = _gh_json(repo.path, "api", f"repos/{nwo}/branches/{branch}/protection")
+    # defense-in-depth before interpolating into the gh API path: _REF_RE is looser than git's
+    # own ref rules (it permits `..`/leading-dot), and though `git fetch` would reject such a ref
+    # earlier and repos.json is operator-trusted, refuse a traversing/empty branch here too.
+    if not branch or ".." in branch or branch.startswith(".") or "/." in branch:
+        return False
+    # URL-ENCODE the branch: a slashed name (release/2026, feature/x — allowed by _REF_RE) left
+    # raw would split the gh api path (.../branches/release/2026/protection) into extra segments
+    # -> 404 -> fail-CLOSED indexing for a perfectly valid watched branch (kilabz+oracle). quote()
+    # is a no-op for the common slashless `main`. (It also defangs any `..` between encoded slashes.)
+    prot = _gh_json(repo.path, "api", f"repos/{nwo}/branches/{quote(branch, safe='')}/protection")
     if not isinstance(prot, dict):
         return False                                 # 404 unprotected / no access / gh error
     req_pr = isinstance(prot.get("required_pull_request_reviews"), dict)
@@ -464,9 +474,14 @@ async def _index_skills(led: PostgresLedger, repo: Repo) -> None:
     # changed (a transient unreadable-protection blip) or there are no skills to launder.
     bf = _skill_block_flag(rid)
     if bf.exists():
-        if tree_sha != "none" and tree_sha != prev:
+        # a MEANINGFUL change while blocked = the tree differs from the last protected index,
+        # EXCEPT the trivial never-had-skills-still-none case. This INCLUDES a deletion of skills/
+        # (tree -> "none" from a real prior tree): a delete archives all skills and must also be
+        # audited (kilabz: the old `tree_sha != "none"` guard laundered a delete-while-blocked).
+        changed_while_blocked = (tree_sha != prev) and not (tree_sha == "none" and prev in ("", "none"))
+        if changed_while_blocked:
             log(f"{rid}: protection restored but skills/ CHANGED while blocked — staying blocked "
-                f"(possible direct-push in the unprotected window; manual audit + re-arm)")
+                f"(possible direct-push/delete in the unprotected window; manual audit + re-arm)")
             if not DRY_RUN:
                 tf = _skill_taint_file(rid)
                 try:
