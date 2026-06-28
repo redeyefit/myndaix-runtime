@@ -90,8 +90,8 @@ async def test_claim_propose_resolve_happy_path(led):
     ok(await led.claim_for_proposing(fp, "skill/auto/fail-open", "deadbeef") is True, "ready -> proposing (CAS)")
     ok(await led.claim_for_proposing(fp, "skill/auto/fail-open", "deadbeef") is False, "double-claim blocked")
     ok(await led.count_open_proposals() == 1, "a proposing class counts as open")
-    ok(await led.mark_capture_proposed(fp, 42) is True, "proposing -> proposed")
-    ok(await led.mark_capture_proposed(fp, 43) is False, "double-propose blocked by CAS")
+    ok(await led.mark_capture_proposed(fp, "skill/auto/fail-open", "deadbeef", 42) is True, "proposing -> proposed")
+    ok(await led.mark_capture_proposed(fp, "skill/auto/fail-open", "deadbeef", 43) is False, "double-propose blocked by CAS")
     ok(await led.resolve_capture(fp, "promoted") is True, "proposed -> promoted")
     ok(await led.count_open_proposals() == 0, "a promoted class is no longer open")
     ok(await led.resolve_capture(fp, "declined") is False, "resolve is a CAS from 'proposed' only")
@@ -109,8 +109,23 @@ async def test_release_proposing_recovers(led):
     r = await _drive_to_ready(led)
     fp = r["fingerprint"]
     await led.claim_for_proposing(fp, "skill/auto/fail-open", "sha")
-    ok(await led.release_proposing(fp) is True, "proposing -> ready (recovery after a pre-PR failure)")
+    ok(await led.release_proposing(fp, "skill/auto/fail-open", "sha") is True, "proposing -> ready (recovery)")
     ok(await led.claim_for_proposing(fp, "skill/auto/fail-open", "sha2") is True, "re-claimable after release")
+
+
+async def test_mark_release_fenced_on_claim_identity(led):
+    # cross-family: after reap releases A's claim and B re-claims, A's late mark/release must NOT
+    # clobber B's live claim (would orphan/duplicate PRs). Fence on (branch, draft_sha).
+    await _truncate(led)
+    fp = (await _drive_to_ready(led))["fingerprint"]
+    await led.claim_for_proposing(fp, "branchA", "shaA")
+    await led._pool.execute(
+        "UPDATE capture_candidate SET proposed_at = now() - interval '120 minutes' WHERE fingerprint=$1", fp)
+    await led.reap_stuck_proposing(60)                        # A's claim released -> ready
+    await led.claim_for_proposing(fp, "branchB", "shaB")      # B claims
+    ok(await led.mark_capture_proposed(fp, "branchA", "shaA", 1) is False, "A's stale mark is fenced out")
+    ok(await led.release_proposing(fp, "branchA", "shaA") is False, "A's stale release is fenced out")
+    ok(await led.mark_capture_proposed(fp, "branchB", "shaB", 2) is True, "B's real claim marks proposed")
 
 
 async def test_declined_reproposes_only_past_higher_floor(led):
@@ -118,7 +133,7 @@ async def test_declined_reproposes_only_past_higher_floor(led):
     r = await _drive_to_ready(led)
     fp = r["fingerprint"]
     await led.claim_for_proposing(fp, "b", "s")
-    await led.mark_capture_proposed(fp, 7)
+    await led.mark_capture_proposed(fp, "b", "s", 7)
     ok(await led.resolve_capture(fp, "declined") is True, "proposed -> declined")
     dc = await led._pool.fetchval("SELECT decline_count FROM capture_candidate WHERE fingerprint=$1", fp)
     ok(dc == 1, "decline_count incremented")
@@ -129,20 +144,46 @@ async def test_declined_reproposes_only_past_higher_floor(led):
     ok(r6 is not None and r6["decline_count"] == 1, "6th commit crosses the doubled floor -> re-ready")
 
 
-async def test_stale_class_re_accumulates(led):
-    # cross-family MAJOR: a TTL-staled class must NOT wedge — it has to be re-readyable.
+async def test_stale_class_re_accumulates_with_backoff(led):
+    # cross-family: a TTL-staled class must NOT wedge (re-readyable) but must respect the EXPONENTIAL
+    # backoff (decline_count++ on stale) — else it re-proposes on the very next sighting (CRITICAL).
     await _truncate(led)
-    r = await _drive_to_ready(led)
-    fp = r["fingerprint"]
+    fp = (await _drive_to_ready(led))["fingerprint"]      # 3 commits c1-c3
     await led.claim_for_proposing(fp, "b", "s")
-    await led.mark_capture_proposed(fp, 55)
+    await led.mark_capture_proposed(fp, "b", "s", 55)
     await led._pool.execute(
         "UPDATE capture_candidate SET proposed_at = now() - interval '30 days' WHERE fingerprint=$1", fp)
     await led.expire_stale_captures(14)
-    st = await led._pool.fetchval("SELECT state FROM capture_candidate WHERE fingerprint=$1", fp)
-    ok(st == "stale", "over-TTL proposal -> stale")
-    r2 = await sight(led, "repoA", "fail-open", "src/*.py", "c9", "e9", "a1")
-    ok(r2 is not None, "a stale class re-readies on a new sighting (no wedge)")
+    ok(await led._pool.fetchval("SELECT state FROM capture_candidate WHERE fingerprint=$1", fp) == "stale",
+       "over-TTL proposal -> stale")
+    # decline_count is now 1 -> floor = min_recur*2 = 6. It has 3 commits; the next 2 must NOT re-fire.
+    ok(await sight(led, "repoA", "fail-open", "src/*.py", "c4", "e3", "a1") is None, "4 commits < 6 floor")
+    ok(await sight(led, "repoA", "fail-open", "src/*.py", "c5", "e4", "a1") is None, "5 commits < 6 floor")
+    r6 = await sight(led, "repoA", "fail-open", "src/*.py", "c6", "e5", "a1")
+    ok(r6 is not None, "6th commit crosses the doubled floor -> re-ready (no wedge, with backoff)")
+
+
+async def test_zz_migration_heals_v03_remnant(led):
+    # cross-family suggestion: codify the guarded migration heal. Seed the pre-ship v0.3 shape, run
+    # migrate(), assert the v0.4 column appears (healed) and a re-run is idempotent.
+    async with led._pool.acquire() as con:
+        await con.execute("DROP TABLE IF EXISTS capture_occurrence, capture_candidate CASCADE")
+        await con.execute("""CREATE TABLE capture_candidate (
+            fingerprint text PRIMARY KEY, repo_scope text NOT NULL, path_glob text NOT NULL,
+            seen_count int NOT NULL DEFAULT 1, state text NOT NULL DEFAULT 'candidate',
+            pr_number int, first_seen timestamptz DEFAULT now(), last_seen timestamptz DEFAULT now())""")
+    has = await led._pool.fetchval(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name='capture_candidate' AND column_name='rule_tag'")
+    ok(has == 0, "seeded the v0.3 shape (no rule_tag)")
+    await led.migrate()
+    has = await led._pool.fetchval(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name='capture_candidate' AND column_name='rule_tag'")
+    ok(has == 1, "migrate() healed the v0.3 remnant to v0.4 (rule_tag present)")
+    await led._pool.execute(
+        "INSERT INTO capture_candidate(fingerprint,repo_scope,rule_tag) VALUES ('keep','r','fail-open')")
+    await led.migrate()                                     # re-run: must NOT drop the healthy table
+    kept = await led._pool.fetchval("SELECT count(*) FROM capture_candidate WHERE fingerprint='keep'")
+    ok(kept == 1, "re-running migrate() is idempotent — does not drop a healthy v0.4 table")
 
 
 async def test_reap_stuck_proposing_recovers_slot(led):
@@ -164,7 +205,7 @@ async def test_resolve_bad_outcome_raises(led):
     await _truncate(led)
     r = await _drive_to_ready(led)
     await led.claim_for_proposing(r["fingerprint"], "b", "s")
-    await led.mark_capture_proposed(r["fingerprint"], 9)
+    await led.mark_capture_proposed(r["fingerprint"], "b", "s", 9)
     raised = False
     try:
         await led.resolve_capture(r["fingerprint"], "garbage")
@@ -178,18 +219,20 @@ async def test_expire_stale_closes_abandoned_pr(led):
     r = await _drive_to_ready(led)
     fp = r["fingerprint"]
     await led.claim_for_proposing(fp, "b", "s")
-    await led.mark_capture_proposed(fp, 99)
+    await led.mark_capture_proposed(fp, "b", "s", 99)
     # backdate the proposal past the TTL
     await led._pool.execute(
         "UPDATE capture_candidate SET proposed_at = now() - interval '30 days' WHERE fingerprint=$1", fp)
     stale = await led.expire_stale_captures(14)
     ok(len(stale) == 1 and stale[0]["pr_number"] == 99, "an over-TTL proposal is returned for PR-close")
     ok(await led.count_open_proposals() == 0, "a stale class frees its MAX_OPEN slot (anti-wedge)")
+    dc = await led._pool.fetchval("SELECT decline_count FROM capture_candidate WHERE fingerprint=$1", fp)
+    ok(dc == 1, "staling increments decline_count (so re-accumulation respects the backoff floor)")
     # a fresh proposal is NOT expired
     await _truncate(led)
     r2 = await _drive_to_ready(led)
     await led.claim_for_proposing(r2["fingerprint"], "b", "s")
-    await led.mark_capture_proposed(r2["fingerprint"], 100)
+    await led.mark_capture_proposed(r2["fingerprint"], "b", "s", 100)
     ok(await led.expire_stale_captures(14) == [], "a fresh proposal is not expired")
 
 

@@ -59,6 +59,7 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,60}$")
 # reserved device/path names that must never become a directory segment
 _RESERVED = frozenset({"con", "prn", "aux", "nul", "com1", "lpt1", "skills", "auto", "."})
 _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,60}$")  # the wire form a reviewer may emit
+_RAW_CTRL = re.compile(r"[\x00-\x1f\x7f]")           # ALL C0 (incl. \t \n \r) + DEL — strictest
 
 
 def is_allowed_tag(rule_tag: str) -> bool:
@@ -110,9 +111,12 @@ def candidate_glob(path: str) -> str | None:
     None. Fail-closed so auto-capture never proposes a trigger the promotion lint would reject.
     Rejects any control char / newline (a `git diff -z` filename CAN contain newlines, and a glob
     with a newline injected from a directory segment would forge extra SKILL.md frontmatter lines —
-    cross-family review CRITICAL)."""
+    cross-family review CRITICAL). The check runs on the RAW path FIRST (before path_to_glob's
+    .strip() could normalize a leading/trailing control char away) and rejects tab too."""
+    if not path or _RAW_CTRL.search(path):       # any C0/DEL incl. \t \n \r, on the raw input
+        return None
     g = path_to_glob(path)
-    if not g or _CTRL.search(g) or "\n" in g or skillmatch.is_banned_trigger(g):
+    if not g or _RAW_CTRL.search(g) or skillmatch.is_banned_trigger(g):
         return None
     return g
 
@@ -189,8 +193,7 @@ def render_skill_md(s: str, rule_tag: str, path_trigger: str,
     draft its own promotion gate would reject. NO raw reviewer comment text is pasted in."""
     if slug(s) != s or not is_allowed_tag(rule_tag):
         return None
-    if (skillmatch.is_banned_trigger(path_trigger)
-            or "\n" in path_trigger or _CTRL.search(path_trigger)):  # belt vs frontmatter injection
+    if skillmatch.is_banned_trigger(path_trigger) or _RAW_CTRL.search(path_trigger):  # belt vs injection
         return None
     desc = sanitize_field(f"Recurring review finding: {rule_tag}", 60)
     wrong = sanitize_field(whats_wrong, 700) or "(no description captured)"

@@ -1204,21 +1204,26 @@ class PostgresLedger:
                 RETURNING fingerprint""", timeout_minutes)
         return len(rows)
 
-    async def mark_capture_proposed(self, fingerprint: str, pr_number: int) -> bool:
-        """CAS 'proposing' -> 'proposed' once the PR is open (S6). Returns True iff transitioned."""
+    async def mark_capture_proposed(self, fingerprint: str, branch: str, draft_sha: str,
+                                    pr_number: int) -> bool:
+        """CAS 'proposing' -> 'proposed' once the PR is open (S6). FENCED on the claim identity
+        (branch + draft_sha): after reap_stuck_proposing releases A's claim and B re-claims, A's
+        late mark won't match B's row, so A can't clobber B's live claim / double-open a PR
+        (cross-family race). Returns True iff THIS claim transitioned."""
         row = await self._pool.fetchrow(
-            """UPDATE capture_candidate SET state = 'proposed', pr_number = $2, proposed_at = now()
-                WHERE fingerprint = $1 AND state = 'proposing'
-                RETURNING fingerprint""", fingerprint, pr_number)
+            """UPDATE capture_candidate SET state = 'proposed', pr_number = $4, proposed_at = now()
+                WHERE fingerprint = $1 AND state = 'proposing' AND branch = $2 AND draft_sha = $3
+                RETURNING fingerprint""", fingerprint, branch, draft_sha, pr_number)
         return row is not None
 
-    async def release_proposing(self, fingerprint: str) -> bool:
+    async def release_proposing(self, fingerprint: str, branch: str, draft_sha: str) -> bool:
         """Recovery: a proposer claimed 'proposing' but failed BEFORE opening the PR. CAS back to
-        'ready' (clearing the pinned branch/draft_sha) so the next tick retries cleanly."""
+        'ready' (clearing the pinned branch/draft_sha). FENCED on the claim identity so a resumed A
+        can't release B's later claim (cross-family race). Returns True iff THIS claim released."""
         row = await self._pool.fetchrow(
             """UPDATE capture_candidate SET state = 'ready', branch = NULL, draft_sha = NULL
-                WHERE fingerprint = $1 AND state = 'proposing'
-                RETURNING fingerprint""", fingerprint)
+                WHERE fingerprint = $1 AND state = 'proposing' AND branch = $2 AND draft_sha = $3
+                RETURNING fingerprint""", fingerprint, branch, draft_sha)
         return row is not None
 
     async def resolve_capture(self, fingerprint: str, outcome: str) -> bool:
@@ -1249,11 +1254,24 @@ class PostgresLedger:
     async def expire_stale_captures(self, ttl_days: int) -> list[dict]:
         """S8 anti-wedge: mark any 'proposed' class whose PR has sat past the TTL as 'stale' and
         RETURN {fingerprint, pr_number} so the proposer can close the abandoned PR — a garbage flood
-        can't permanently occupy the MAX_OPEN slots. A stale class can later re-accumulate."""
+        can't permanently occupy the MAX_OPEN slots. INCREMENTS decline_count (so a re-accumulating
+        stale class re-fires only past the exponential repropose floor — without this it would
+        immediately re-ready on the next sighting, spam-proposing; cross-family CRITICAL) and clears
+        the proposal fields like a decline."""
+        # CTE captures the OLD pr_number (RETURNING would otherwise yield the cleared NULL) so the
+        # proposer can still close the abandoned PR, while we clear the proposal fields like a decline.
         rows = await self._pool.fetch(
-            """UPDATE capture_candidate SET state = 'stale'
-                WHERE state = 'proposed'
-                  AND proposed_at IS NOT NULL
-                  AND proposed_at < now() - make_interval(days => $1)
-                RETURNING fingerprint, pr_number""", ttl_days)
+            """WITH due AS (
+                   SELECT fingerprint, pr_number FROM capture_candidate
+                    WHERE state = 'proposed'
+                      AND proposed_at IS NOT NULL
+                      AND proposed_at < now() - make_interval(days => $1)
+                    FOR UPDATE
+               )
+               UPDATE capture_candidate c
+                   SET state = 'stale', decline_count = c.decline_count + 1,
+                       branch = NULL, draft_sha = NULL, pr_number = NULL, proposed_at = NULL
+                FROM due
+                WHERE c.fingerprint = due.fingerprint
+                RETURNING c.fingerprint, due.pr_number""", ttl_days)
         return [{"fingerprint": r["fingerprint"], "pr_number": r["pr_number"]} for r in rows]
