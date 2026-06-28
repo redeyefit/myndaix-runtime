@@ -697,6 +697,18 @@ async def tick() -> int:
         led = await PostgresLedger.connect(DSN)
         budget = [0]
         try:
+            # Self-migrate before any schema-dependent work (mirrors serve()'s auto-migrate-on-boot).
+            # The controller is a SEPARATE launchd job, so a deploy could tick it BEFORE serve has
+            # applied a new migration — e.g. 0006's skill-PK heal — which would make index_skills'
+            # ON CONFLICT hit a stale PK (kilabz R3). migrate() is advisory-locked + idempotent, so
+            # racing serve is safe. A migration FAILURE means a schema unsafe for EVERYTHING (not
+            # just skills) -> skip the whole tick fail-closed, like serve refusing to boot. Skipped
+            # under DRY_RUN (it writes).
+            if not DRY_RUN:
+                try:
+                    await led.migrate()
+                except Exception as e:
+                    log(f"migrate() failed ({e!r}) — skipping this tick (schema not safe)"); return 0
             for repo in repos:                           # the daily gate lives INSIDE process_repo (wraps
                 try:                                     # only dispatch), so the free advance pass always runs
                     await process_repo(led, repo, budget)

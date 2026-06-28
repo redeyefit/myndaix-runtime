@@ -589,6 +589,38 @@ async def test_indexer_exception_never_sinks_review(led: PostgresLedger) -> None
     assert len(records(seam)) == 1, "an indexer exception must never sink the review path"
 
 
+async def test_tick_self_migrates_before_indexing(led: PostgresLedger) -> None:
+    # the controller is a SEPARATE launchd job from serve; it must self-migrate so a deploy can't
+    # tick it against a stale skill PK before serve reboots with 0006 (kilabz R3 Medium).
+    await _truncate(led)
+    async with led._pool.acquire() as con:               # stale the skill schema: single-column PK
+        await con.execute("DROP TABLE IF EXISTS skill CASCADE")
+        await con.execute(
+            "CREATE TABLE skill (name text PRIMARY KEY, description text NOT NULL, body text "
+            "NOT NULL, body_sha text NOT NULL, content_sha text NOT NULL, repo_scope text NOT "
+            "NULL, path_trigger text NOT NULL, provenance text NOT NULL DEFAULT 'promoted', "
+            "state text NOT NULL DEFAULT 'active', last_used_at timestamptz, "
+            "created_at timestamptz NOT NULL DEFAULT now())")
+    saved = (C.REPOS_JSON, C.LOCK, C.STATE, C.DRY_RUN, C.JEFE_INBOX, C._gh_json)
+    try:
+        repo = make_repo("ticmig")
+        cfg = _TMP / "repos-ticmig.json"; cfg.write_text(json.dumps({"ticmig": {"path": str(repo.path)}}))
+        C.REPOS_JSON = cfg
+        C.LOCK = _TMP / "controller-ticmig.lock"
+        C.STATE = _TMP / "state-ticmig"; C.STATE.mkdir(parents=True, exist_ok=True)
+        C.JEFE_INBOX = _TMP / "jefe-ticmig"; C._gh_json = _make_gh(True); C.DRY_RUN = False
+        await C.tick()                                   # self-migrate runs before the repo loop
+        async with led._pool.acquire() as con:
+            cols = await con.fetchval(
+                "SELECT array_agg(a.attname ORDER BY array_position(c.conkey, a.attnum)) "
+                "FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid "
+                "JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=ANY(c.conkey) "
+                "WHERE t.relname='skill' AND c.contype='p'")
+        assert cols == ["repo_scope", "name"], f"tick must self-migrate the skill PK: {cols}"
+    finally:
+        C.REPOS_JSON, C.LOCK, C.STATE, C.DRY_RUN, C.JEFE_INBOX, C._gh_json = saved
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

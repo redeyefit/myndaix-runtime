@@ -3,7 +3,10 @@
 -- Idempotent (CREATE ... IF NOT EXISTS); re-run on every serve() boot behind the
 -- migrate() advisory lock. Inert until runtime.controller (indexer) + runtime.skillselect run.
 --
---   psql "$MYNDAIX_DSN" -f src/runtime/ledger/migrations/0005_skill.sql
+-- DO NOT apply this file ALONE: it creates the ORIGINAL single-column `name` PK; the composite
+-- (repo_scope, name) PK is applied by the APPEND-ONLY follow-up 0006_skill_pk.sql. Always run the
+-- WHOLE migration path (serve() auto-migrates on boot; the controller self-migrates each tick) —
+-- never a single migration file by hand.
 --
 -- WHY (learning-rung DESIGN v0.3, governing sections): a review skill is a
 -- skills/<name>/SKILL.md promoted ONLY by a human PR-merge under branch protection. On-disk
