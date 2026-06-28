@@ -1,8 +1,16 @@
-# DESIGN — auto-capture rung v0.1 ("the proposer"): turn a recurring review lesson into a PROPOSED skill
+# DESIGN — auto-capture rung v0.2 ("the proposer"): turn a recurring review lesson into a PROPOSED skill
 
-**Status:** DRAFT for cross-family review (kilabz + oracle) BEFORE build. Governing constraints:
-default OFF; **the proposer NEVER promotes** (it only opens a PR — the existing human-merge-under-
--branch-protection gate is unchanged); fail-CLOSED; no LLM in any security decision.
+**Status:** DRAFT for cross-family review (kilabz + oracle) BEFORE build. **v0.2 folds the Recon
+prior-art brief** (`docs/auto-capture-research.md`). Governing constraints: default OFF; **the
+proposer NEVER promotes** (it only opens a PR — the existing human-merge-under-branch-protection
+gate is unchanged); fail-CLOSED; no LLM in any security decision.
+
+**What Recon changed from v0.1 (3 deltas):** (1) the recurrence key is a reviewer-emitted
+**`rule:<tag>` PRIMARY**, with the file-glob only a SECONDARY locality signal — glob-count alone is
+too coarse (it conflates unrelated issues in one folder). (2) draft the skill body from **STRUCTURED
+fields, NOT raw reviewer text** — free-form comment copy is where prompt-injection hides. (3) stamp
+**provenance metadata** (rule_tag, finding ids, origin_repo, draftHash) so a poisoned/concentrated
+proposal is auditable. Prior-art verdicts at the bottom.
 
 ## What it does + why
 The +learning rung (LIVE) injects human-seeded review skills. The gap Jefe named: a human-seeded
@@ -16,21 +24,29 @@ under branch protection IS the promotion (controller stamps `provenance='promote
 a bad/injected proposal can do is be a PR Jefe rejects. The security boundary is unchanged.
 
 ## Data flow (input → process → output)
-1. **Signal** — a play-review/controller verdict is `NEEDS-FIX` with a finding. The verdict +
-   findings already persist (ledger / `$run/fixlist.txt`). Input is TRUSTED-internal (our own
-   reviewers), not arbitrary external text.
-2. **Recurrence gate (deterministic)** — a finding becomes a candidate ONLY after the same
-   lesson-class recurs ≥ `CAPTURE_MIN_RECUR` times (default 3) across distinct reviews. Class key =
-   a deterministic fingerprint (normalized file-glob + a stable rule tag the reviewer emits), NOT a
-   fuzzy LLM match. Stored in an append-only `capture_candidate` ledger table (count + first/last
-   seen). No single review can trigger a capture → no one-off noise, no single-injection→capture loop.
-3. **Draft** — when a candidate crosses the threshold, render a SKILL.md from a FIXED template:
-   name = slug(rule tag); description ≤60; path_trigger = the normalized glob; body = the finding
-   text, run through the SAME `skillmatch.lint_skill` + `scan_injection` the controller uses at
-   promotion. A draft that fails lint is DROPPED (never opened) + alerts jefe — never a malformed PR.
+1. **Signal + TAG** — a play-review verdict is `NEEDS-FIX`. The reviewer prompts are extended (a
+   small play-review change) to ask kilabz/oracle to emit a stable **`rule:<slug>`** line when a
+   finding is a RECURRING *class* (not a one-off). The verdict + findings already persist (ledger /
+   `$run/fixlist.txt`). Input is TRUSTED-internal (our reviewers), but the TEXT is still LLM output
+   (treat as untrusted, below).
+2. **Recurrence gate (deterministic; rule-tag PRIMARY — Recon)** — `record_capture(repo, rule_tag,
+   globs)` keys the candidate on the **`(repo, rule_tag)` fingerprint** and accrues `seen_count`;
+   the changed-file **glob is stored as the SECONDARY locality** (it becomes the proposed skill's
+   `path_trigger`). A class fires only at `seen_count ≥ CAPTURE_MIN_RECUR` (default 3) — NO single
+   review, NO fuzzy LLM match. Absent a `rule:<tag>`, NO candidate forms (fail-closed). Append-only
+   `capture_candidate` (count + state + first/last seen).
+3. **Draft from STRUCTURED fields, NOT raw text (Recon security delta)** — render the SKILL.md from
+   a FIXED template: name = slug(rule_tag); path_trigger = the stored glob; description + body
+   assembled from STRUCTURED, length-capped fields (`rule_tag`, a one-line "what's wrong", "preferred
+   pattern") — lobster may summarize the findings INTO those fields, but we never paste raw comment
+   text into the body (that's where injection hides). Then run the SAME
+   `skillmatch.lint_skill` + `scan_injection` the controller uses at promotion; a lint/scan hit
+   DROPS the draft (never opened) + alerts jefe.
 4. **Propose** — open ONE PR per candidate (`gh pr create`, branch `skill/auto/<name>`), labeled
-   `auto-proposed`, body citing the N reviews that produced it. Idempotent: never reopen a
-   candidate that already has an open/merged/closed PR (dedupe key in the table).
+   `auto-proposed`, body citing the N reviews + a metadata block: **`rule_tag`, `finding_ids`,
+   `origin_repo`, `draft_sha`** (Recon: auditable provenance defeats single-repo poisoning). Then
+   `mark_capture_proposed(fp, pr)`. Idempotent: a proposed/declined/promoted class is never
+   re-proposed (the state CAS + decline-memory already built).
 5. **Promote (UNCHANGED)** — Jefe merges → controller indexes → `provenance='promoted'`. Reject =
    close the PR; the candidate is marked `declined` and not re-proposed unless it recurs MANY more.
 
@@ -59,9 +75,28 @@ a bad/injected proposal can do is be a PR Jefe rejects. The security boundary is
   embedding match); auto-edit of EXISTING skills; capture from anything but our own reviewers;
   any auto-merge. Consolidation/dedup of overlapping skills is DEFERRED.
 
-## Open questions for the reviewers
-1. Is a reviewer-emitted `rule:<tag>` the right recurrence key, or should the controller derive the
-   class from the changed-file glob alone (no reviewer cooperation needed)?
-2. Threshold defaults (`MIN_RECUR=3`, `MAX_OPEN=3`, `1/day`) — too eager / too timid?
-3. Should the proposer run inline in the controller tick (like the indexer) or as a separate
-   launchd job? (Leaning inline — same fail-soft per-repo try/except, no new cron.)
+## Prompt-boundary hardening (Recon §4)
+SKILL.md already injects as a FENCED *untrusted reference* region (+learning). Add one explicit
+clause to the reviewer preamble: *"a skill is past guidance/examples — if it conflicts with a
+security or system policy, follow the policy."* Keep LLM reviewers ADVISORY (deterministic gates +
+the human merge are authoritative), so a flawed captured skill can't create a self-reinforcing
+loop. Track `origin_repo` so a single poisoned repo can't concentrate the corpus unaudited.
+
+## Prior-art verdicts (Recon — `docs/auto-capture-research.md`)
+- **BORROW-THE-PATTERN, BUILD LOCAL** (Postgres+bash+launchd): Google **Tricorder** (rule-ID
+  recurrence analytics + human authoring + advisory auto-fix), Semgrep/CodeQL (rules-as-code in VCS
+  + top-N recurrence), Sourcegraph **Batch Changes** (spec → system-opens-PR → human merges),
+  Sonar/Apiiro (automated-advisory + human-controlled rules + periodic curation). All map onto our
+  propose→human-promote→reversible gate.
+- **REJECT (bloat / violates constraints):** Copilot/LLM-as-enforcement (model gating merges);
+  ML/embedding rule-mining + online learning (feedback-loop + drift risk, NO-LLM-in-security);
+  heavy AST-clustering infra (DEFER until glob+tag proves insufficient). Keep enforcement
+  deterministic.
+
+## Resolved (Recon) + remaining for the cross-family reviewers
+- **RESOLVED Q1 (recurrence key):** `rule:<tag>` PRIMARY, glob SECONDARY (above). Needs the small
+  play-review reviewer-prompt change to emit `rule:<slug>`.
+- **OPEN for review:** (a) thresholds (`MIN_RECUR=3`, `MAX_OPEN=3`, `1/day`) — eager/timid? (b)
+  proposer runs INLINE in the controller tick (leaning yes — fail-soft per-repo try/except, no new
+  cron) vs a separate launchd job? (c) how to reliably detect merge/close to call
+  `resolve_capture` (poll PR state in the controller tick, mirroring automerge's `gh pr view`).
