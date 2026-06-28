@@ -604,6 +604,19 @@ async def test_automerge_seen(led: PostgresLedger) -> None:
     assert raised, "the decision CHECK must reject an invalid value"
 
 
+async def test_get_attempt_job_gate_rejects_cancelled(led: PostgresLedger) -> None:
+    # the worker's last DB read before the (paid) invoke is a LOCKING ownership gate: a cancelled
+    # job must read as None so the worker never reaches the charging adapter (cross-family review).
+    await _truncate(led)
+    jid = await led.submit_job(to_agent="higgsfield", prompt="paid")   # non_idempotent paid agent
+    att = await led.lease_job("w1", [])
+    job = await led.get_attempt_job(att)
+    assert job is not None and job.to_agent == "higgsfield", "leased paid job is fetchable pre-cancel"
+    await led.cancel(jid)
+    assert await led.get_attempt_job(att) is None, \
+        "after cancel the ownership gate returns None -> worker skips the paid invoke"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     # fresh schema for the run (schema.sql is plain CREATE, not IF NOT EXISTS)
