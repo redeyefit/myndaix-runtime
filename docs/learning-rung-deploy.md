@@ -16,10 +16,17 @@ The arm is unforgeable ONLY because every change on `main` arrived via a human-m
 A `MYNDAIX_CONTROLLER_DRY_RUN=1` tick today reports **SKILLS BLOCKED** for every repo because
 `main` is not yet fully protected. Set this on each watched repo (`gh` or the web UI):
 
-- **Require a pull request before merging** (≥1 approval is fine; the *requirement* is what counts).
+- **Require a pull request before merging** — but set **`required_approving_review_count: 0`**.
+  A required PR forbids DIRECT pushes (which is what the arm needs), while 0 required approvals
+  lets the **automerge** rung keep merging docs PRs on green CI without a human approval. ≥1
+  approval would break automerge — `_branch_protection_ok` only checks that
+  `required_pull_request_reviews` is present, NOT the approval count.
 - **Do not allow bypassing the above settings** → i.e. **enforce admins** (`enforce_admins.enabled = true`).
-  Without this a solo admin could push a skill directly, defeating the arm.
+  Without this a solo admin could push a skill directly, defeating the arm. (Trade-off: you must
+  then PR every change to main — but with 0 required approvals you can self-merge after CI is green.)
 - **Do not allow force pushes** (`allow_force_pushes.enabled = false`).
+- **Keep the existing `test` required status check** (the automerge CI gate) — the protection
+  PUT replaces the whole object, so preserve `required_status_checks.contexts = ["test"]`.
 
 Verify exactly what the controller checks:
 
