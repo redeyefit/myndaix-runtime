@@ -26,9 +26,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import uuid
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from runtime import critic
@@ -87,19 +89,55 @@ POLL_INTERVAL_S = 3.0
 NOMINAL_DURATION_S = 3.0     # DoP/lite nominal; not measured in v1
 
 
+# ---- brand LOCK resolution: a brand file (mx-engine owns it) > the built-in fallback -----------
+_BRAND_REQUIRED = ("hexes", "style", "lighting", "camera_lens", "film_stock")
+
+
+def load_brand(slug: str, brands_dir: Optional[str] = None) -> dict:
+    """Resolve a brand's LOCKS. If `brands_dir` (or $MX_BRANDS_DIR) is set, read
+    <brands_dir>/<slug>.json and require a `cinema` block (mx-engine owns the brand schema, design
+    Open Q1) — fail-closed so the LLM can never invent brand color. Hexes come from cinema.hexes or
+    are derived from palette.{bg,bg_card,accent}. With NO brands_dir, fall back to the built-in
+    BRAND_DEFAULTS so the orchestrator still runs standalone (CI / no mx-engine checkout)."""
+    slug = (slug or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,40}", slug):     # path-safety on the filename
+        raise ValueError(f"unsafe brand slug {slug!r}")
+    brands_dir = brands_dir or os.environ.get("MX_BRANDS_DIR")
+    if not brands_dir:
+        b = BRAND_DEFAULTS.get(slug)
+        if b is None:
+            raise ValueError(f"unknown brand {slug!r} and no --brands-dir/$MX_BRANDS_DIR — fail-closed")
+        return b
+    path = Path(brands_dir) / f"{slug}.json"
+    if not path.is_file():
+        raise ValueError(f"brand file not found: {path} — fail-closed")
+    raw = json.loads(path.read_text())
+    cinema = raw.get("cinema")
+    if not isinstance(cinema, dict) or not cinema:
+        raise ValueError(f"brand {slug!r} has no `cinema` block in {path} — fail-closed "
+                         f"(add cinema:{{style,lighting,camera_lens,film_stock,banned_tropes}})")
+    palette = raw.get("palette") or {}
+    hexes = cinema.get("hexes") or [palette.get(k) for k in ("bg", "bg_card", "accent")]
+    out = {"hexes": [h for h in hexes if h],
+           "style": cinema.get("style"), "lighting": cinema.get("lighting"),
+           "camera_lens": cinema.get("camera_lens"), "film_stock": cinema.get("film_stock"),
+           "banned_tropes": list(cinema.get("banned_tropes") or [])}
+    missing = [k for k in _BRAND_REQUIRED if not out.get(k)]
+    if missing:
+        raise ValueError(f"brand {slug!r} cinema block missing {missing} in {path} — fail-closed")
+    return out
+
+
 # ============================ stage 1: prompt-director (in-process) =========================
-def build_prompt(brief: str, brand: str) -> dict:
+def build_prompt(brief: str, brand: str, *, brands_dir: Optional[str] = None) -> dict:
     """Expand the brief into the labeled-block prompt. The ONLY free-text slot is Caption (the
-    brief); every brand slot is filled VERBATIM from the brand LOCKS. Fail-closed on an unknown
-    brand or a missing LOCK slot (design §4)."""
+    brief); every brand slot is filled VERBATIM from the resolved brand LOCKS (file or fallback).
+    Fail-closed on an unknown brand or a missing LOCK slot (design §4)."""
     brief = _sanitize_brief(brief)
     if not brief:
         raise ValueError("empty brief")
-    b = BRAND_DEFAULTS.get(brand)
-    if b is None:
-        raise ValueError(f"unknown brand {brand!r} (no LOCKS) — add a brand block; fail-closed")
-    required = ("hexes", "style", "lighting", "camera_lens", "film_stock", "banned_tropes")
-    missing = [k for k in required if not b.get(k)]
+    b = load_brand(brand, brands_dir)
+    missing = [k for k in _BRAND_REQUIRED if not b.get(k)]
     if missing:
         raise ValueError(f"brand {brand!r} missing LOCK slots {missing} — fail-closed")
     negatives = STANDING_NEGATIVES + list(b["banned_tropes"])
@@ -264,16 +302,16 @@ class OrchestratorDriver:
                   approve: ApproveFn, shot_id: str = "shot-01", role: str = "hero",
                   motion: Optional[str] = None, motion_strength: Optional[float] = None,
                   end_image_url: Optional[str] = None, repo_id: Optional[str] = None,
-                  max_retries: int = 2,
+                  max_retries: int = 2, brands_dir: Optional[str] = None,
                   supplier: Optional[SupplierFn] = None,
                   frame_grabber: Optional[FrameGrabber] = None) -> dict:
         supplier = supplier or self._supplier_ledger
         frame_grabber = frame_grabber or self._grab_frame
-        hexes = BRAND_DEFAULTS.get(brand, {}).get("hexes", [])
         max_retries = max(0, min(MAX_RETRIES_CAP, int(max_retries)))   # HARD cap on charged retries
 
         # stage 1 + 2 (free, in-process)
-        shot = build_prompt(brief, brand)
+        shot = build_prompt(brief, brand, brands_dir=brands_dir)
+        hexes = shot["locks"]["hexes"]               # resolved brand hexes (brand file or fallback)
         routed = route(shot, role=role, motion=motion, motion_strength=motion_strength)
         cost_est = estimate_cost(routed)
 
@@ -387,7 +425,7 @@ async def _amain(args) -> int:
             args.brief, brand=args.brand, image_url=args.image_url, approve=approve,
             shot_id=args.shot_id, role=args.role, motion=args.motion,
             motion_strength=args.motion_strength, end_image_url=args.end_image_url,
-            repo_id=args.repo)
+            repo_id=args.repo, brands_dir=args.brands_dir)
     finally:
         await drv.close()
     print(json.dumps(manifest, indent=2))
@@ -407,6 +445,9 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--motion-strength", dest="motion_strength", type=float, default=None)
     p.add_argument("--end-image-url", dest="end_image_url", default=None)
     p.add_argument("--repo", default=None, help="repo_id scope for the stage-3 job")
+    p.add_argument("--brands-dir", dest="brands_dir", default=None,
+                   help="dir of brand <slug>.json files (mx-engine/brands); requires a `cinema` "
+                        "block, fail-closed. Omit to use the built-in fallback. ($MX_BRANDS_DIR)")
     p.add_argument("--dsn", default=None, help="MYNDAIX_DSN override")
     p.add_argument("--yes", action="store_true", help="auto-approve the cost gate (non-interactive)")
     args = p.parse_args(argv)

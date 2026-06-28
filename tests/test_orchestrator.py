@@ -4,6 +4,9 @@ Proves: the loop produces a manifest, the cost gate blocks spend, the one-variab
 retry fires on a critic FAIL. Run: PYTHONPATH=src python3 tests/test_orchestrator.py
 """
 import asyncio
+import json
+import os
+import tempfile
 import uuid
 
 import runtime.orchestrator as O
@@ -225,6 +228,40 @@ def test_grab_frame_guards():
         except ValueError:
             raised = True
         ok(raised, f"_grab_frame rejects {why} ({ref})")
+
+
+def test_load_brand_from_file_and_fallback():
+    d = tempfile.mkdtemp()
+    json.dump({"palette": {"bg": "#111111", "bg_card": "#222222", "accent": "#33EE99"},
+               "cinema": {"style": "noir", "lighting": "hard light", "camera_lens": "50mm",
+                          "film_stock": "kodak", "banned_tropes": ["no x"]}},
+              open(os.path.join(d, "acme.json"), "w"))
+    b = O.load_brand("acme", d)
+    ok(b["hexes"] == ["#111111", "#222222", "#33EE99"], "hexes derived from palette bg/bg_card/accent")
+    ok(b["style"] == "noir" and b["camera_lens"] == "50mm", "cinema LOCKS loaded from the brand file")
+    s = O.build_prompt("a scene", "acme", brands_dir=d)
+    ok("#33EE99" in s["prompt"] and "noir" in s["prompt"], "build_prompt uses the brand file's cinema")
+    ok(O.load_brand("myndaix")["hexes"] == ["#0A0A0A", "#1A1D22", "#5AE0A0"],
+       "no brands_dir -> built-in fallback (standalone)")
+
+
+def test_load_brand_fail_closed():
+    d = tempfile.mkdtemp()
+    json.dump({"palette": {"bg": "#111"}}, open(os.path.join(d, "nocinema.json"), "w"))
+    for slug, why in [("nocinema", "file w/o cinema block"), ("absent", "missing file"),
+                      ("../etc", "unsafe slug (path traversal)")]:
+        raised = False
+        try:
+            O.load_brand(slug, d)
+        except (ValueError, OSError):
+            raised = True
+        ok(raised, f"load_brand fail-closed: {why}")
+    raised = False
+    try:
+        O.load_brand("totallyunknownbrand")        # no dir + not in BRAND_DEFAULTS
+    except ValueError:
+        raised = True
+    ok(raised, "unknown brand + no brands_dir -> fail-closed")
 
 
 def test_render_gate_shows_worst_case_cost():
