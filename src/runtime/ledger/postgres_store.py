@@ -41,7 +41,7 @@ from uuid import UUID
 
 import asyncpg
 
-from runtime import registry, skillmatch
+from runtime import capture, registry, skillmatch
 from runtime.contracts import (
     Authority, ErrorClass, Job, LostLease, Result, TransportEnvelope,
 )
@@ -1115,3 +1115,52 @@ class PostgresLedger:
                         RETURNING name""",
                     _dt.timedelta(days=self.SKILL_ARCHIVE_DAYS))
         return {"staled": len(staled), "archived": len(archived)}
+
+    # ---- auto-capture ("the proposer") — deterministic recurrence counter ---------------
+    # The trigger is pure-SQL counting; NO LLM decides recurrence. The proposer (controller) acts
+    # on what record_capture returns, opening a PR + flipping state via mark_proposed.
+    async def record_capture(self, repo_id: str, globs: list[str], threshold: int) -> list[dict]:
+        """A NEEDS-FIX review on `repo_id` touched files normalizing to `globs`. Bump the
+        recurrence count for each (idempotent UPSERT) and RETURN the candidates that JUST reached
+        `threshold` and are still 'candidate' (ready to propose). A class already proposed/promoted/
+        declined is still counted but NOT returned — so a declined class is never re-proposed, and
+        a proposed one isn't double-proposed. The caller dedupes further by flipping state."""
+        ready: list[dict] = []
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                for g in globs:
+                    fp = capture.fingerprint(repo_id, g)
+                    row = await con.fetchrow(
+                        """INSERT INTO capture_candidate (fingerprint, repo_scope, path_glob)
+                               VALUES ($1,$2,$3)
+                           ON CONFLICT (fingerprint) DO UPDATE
+                               SET seen_count = capture_candidate.seen_count + 1, last_seen = now()
+                           RETURNING seen_count, state""",
+                        fp, repo_id, g)
+                    if row["state"] == "candidate" and row["seen_count"] >= threshold:
+                        ready.append({"fingerprint": fp, "path_glob": g, "seen_count": row["seen_count"]})
+        return ready
+
+    async def mark_capture_proposed(self, fingerprint: str, pr_number: int) -> bool:
+        """Flip a candidate -> 'proposed' once its PR is open (status-guarded CAS: only from
+        'candidate', so a concurrent tick can't double-propose). Returns True iff this call made
+        the transition."""
+        row = await self._pool.fetchrow(
+            """UPDATE capture_candidate SET state = 'proposed', pr_number = $2
+                WHERE fingerprint = $1 AND state = 'candidate'
+                RETURNING fingerprint""",
+            fingerprint, pr_number)
+        return row is not None
+
+    async def resolve_capture(self, fingerprint: str, outcome: str) -> bool:
+        """Record the human's decision on a proposed candidate: 'promoted' (PR merged) or
+        'declined' (PR closed). CAS from 'proposed' only. A declined class stays remembered so
+        record_capture never re-proposes it."""
+        if outcome not in ("promoted", "declined"):
+            raise ValueError(f"resolve_capture: bad outcome {outcome!r}")
+        row = await self._pool.fetchrow(
+            """UPDATE capture_candidate SET state = $2
+                WHERE fingerprint = $1 AND state = 'proposed'
+                RETURNING fingerprint""",
+            fingerprint, outcome)
+        return row is not None
