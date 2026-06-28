@@ -127,3 +127,29 @@ CREATE TABLE automerge_seen (
     decided_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (repo_id, pr_number, head_sha)
 );
+
+-- +learning rung (review skills): cache + audit. Mirrors migrations/0005_skill.sql (fresh DBs
+-- get this; existing prod gets the migration on serve boot). The BODY lives here (the indexer
+-- reads it from a trusted merged ref); selection never rehashes disk.
+CREATE TABLE skill (
+    name         text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9._-]*$'),
+    description  text NOT NULL CHECK (length(description) <= 60),
+    body         text NOT NULL CHECK (length(body) <= 2048),
+    body_sha     text NOT NULL,
+    content_sha  text NOT NULL,
+    repo_scope   text NOT NULL,
+    path_trigger text NOT NULL,
+    provenance   text NOT NULL DEFAULT 'promoted' CHECK (provenance IN ('promoted')),
+    state        text NOT NULL DEFAULT 'active'   CHECK (state IN ('active','stale','archived')),
+    last_used_at timestamptz,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE skill_use (
+    id          uuid PRIMARY KEY,
+    review_play text NOT NULL,
+    skill_name  text NOT NULL,
+    body_sha    text NOT NULL,
+    repo_scope  text NOT NULL,
+    used_at     timestamptz NOT NULL DEFAULT now()
+);
