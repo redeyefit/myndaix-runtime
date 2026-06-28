@@ -665,7 +665,7 @@ class PostgresLedger:
                         repo_dec[r["repo_id"]] = repo_dec.get(r["repo_id"], 0) + 1
                     if not self._requeue_safe(r["to_agent"]):
                         dead.append(jid)
-                        dead_reasons[jid] = "lease expired; workspace_actor not auto-retried"
+                        dead_reasons[jid] = "lease expired; agent not auto-retried (non-requeue-safe)"
                         continue
                     n_att = await con.fetchval(
                         "SELECT count(*) FROM attempt WHERE job_id = $1", jid)

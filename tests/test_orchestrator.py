@@ -4,6 +4,7 @@ Proves: the loop produces a manifest, the cost gate blocks spend, the one-variab
 retry fires on a critic FAIL. Run: PYTHONPATH=src python3 tests/test_orchestrator.py
 """
 import asyncio
+import uuid
 
 import runtime.orchestrator as O
 
@@ -224,6 +225,64 @@ def test_grab_frame_guards():
         except ValueError:
             raised = True
         ok(raised, f"_grab_frame rejects {why} ({ref})")
+
+
+def test_render_gate_shows_worst_case_cost():
+    # the HUMAN-facing gate text (not just the plan dict) must show worst-case spend (round-2 fix)
+    plan = {"brief": "x", "brand": "myndaix", "shot_id": "s", "motion": "Dolly In",
+            "motion_strength": 0.5, "estimated_cost": 40, "max_attempts": 3,
+            "max_estimated_cost": 120, "image_url": "https://x"}
+    txt = O._render_gate(plan)
+    ok("120" in txt and "max_estimated_cost" in txt, "gate text shows worst-case credits")
+    ok("3" in txt and "up to 3 charged attempt" in txt.lower(), "gate text spells out worst-case attempts")
+
+
+class _FakeLedger:
+    def __init__(self):
+        self.cancelled = []
+
+    async def submit_job(self, **kw):
+        return uuid.uuid4()
+
+    async def get_status(self, jid):
+        return {"status": "queued"}        # never leases -> drives the queue timeout
+
+    async def cancel(self, jid):
+        self.cancelled.append(jid)
+
+
+def test_queue_timeout_cancels_job_no_later_charge():
+    # a stage-3 job stuck QUEUED past the grace must be CANCELLED before we return, so a worker
+    # can't lease + charge it after the caller saw the timeout (round-2 CRITICAL).
+    drv = O.OrchestratorDriver()
+    drv._led = _FakeLedger()
+    oq, op = O.QUEUE_GRACE_S, O.POLL_INTERVAL_S
+    O.QUEUE_GRACE_S, O.POLL_INTERVAL_S = 0.05, 0.01
+    try:
+        raised = False
+        try:
+            asyncio.run(drv._supplier_ledger({"prompt": "x", "cost_est": 40, "repo_id": None}, 600))
+        except TimeoutError:
+            raised = True
+        ok(raised, "queued-past-grace -> TimeoutError")
+        ok(len(drv._led.cancelled) == 1, "the still-queued paid job is CANCELLED (no later charge)")
+    finally:
+        O.QUEUE_GRACE_S, O.POLL_INTERVAL_S = oq, op
+
+
+def test_frame_grab_failure_preserves_paid_artifact():
+    # supplier SUCCEEDS (charged) but frame-grab fails -> keep the paid artifact_ref + cost
+    calls = []
+
+    async def bad_grab(ref):
+        raise RuntimeError("ffmpeg boom")
+    m = asyncio.run(O.OrchestratorDriver().run(
+        "neon city", image_url="https://res.cloudinary.com/x/seed.png", approve=lambda p: True,
+        supplier=_supplier(calls, cost=0.4, url="https://cdn.example/paid.mp4"), frame_grabber=bad_grab))
+    ok(m["status"] == "needs_human", "frame-grab fail after a paid render -> needs_human")
+    ok(m.get("plate_url") == "https://cdn.example/paid.mp4", "the PAID artifact url is preserved")
+    ok(m.get("cost") == 0.4, "the PAID cost is preserved (not discarded as 0.0)")
+    ok(len(calls) == 1, "no re-submit after a paid render")
 
 
 def test_requeue_safe_paid_agent_never_requeues():

@@ -205,8 +205,16 @@ class OrchestratorDriver:
             cap = render_cap if render_cap is not None else queue_cap
             if now >= cap:
                 where = "rendering" if render_cap is not None else "queued"
-                raise TimeoutError(f"stage-3 job {jid} stuck {where} past its deadline — "
-                                   f"recover via `mxr get {jid}` (it may have charged)")
+                # CANCEL before returning: a still-QUEUED job left alive would later lease + CHARGE
+                # after the caller already saw needs_human (cross-family CRITICAL). cancel() flips a
+                # queued/leased/running job -> dead; a leased one is best-effort (it may already have
+                # charged) but a queued one is reliably prevented.
+                try:
+                    await led.cancel(jid)
+                except Exception:                          # noqa: BLE001 — cancel is best-effort
+                    pass
+                raise TimeoutError(f"stage-3 job {jid} stuck {where} past its deadline — cancelled; "
+                                   f"recover via `mxr get {jid}` (a leased job may have charged)")
             await asyncio.sleep(POLL_INTERVAL_S)
         if st.get("status") != "done" or not st.get("artifact_ref"):
             err = next((a.get("text") for a in (st.get("attempts") or [])
@@ -228,7 +236,14 @@ class OrchestratorDriver:
         reason = await _reject_unsafe_url(plate_ref)
         if reason:
             raise ValueError(f"plate_ref rejected (SSRF): {reason}")
-        cmd = ["ffmpeg", "-v", "error", "-rw_timeout", "20000000", "-i", plate_ref,
+        # -protocol_whitelist blocks ffmpeg protocol-switching tricks (file/pipe/concat/gopher).
+        # RESIDUAL (accepted, codebase-wide): _reject_unsafe_url resolves the host once but ffmpeg
+        # re-fetches, so an https REDIRECT or DNS-rebind to an internal host is not fully closed —
+        # the SAME documented limitation _reject_unsafe_url carries for every image_url in the
+        # runner. v2 hardening = a shared fetch-to-temp helper (redirects off, resolved-IP pinned,
+        # byte cap) used everywhere, not a one-off here.
+        cmd = ["ffmpeg", "-v", "error", "-protocol_whitelist", "https,tls,tcp,crypto",
+               "-rw_timeout", "20000000", "-i", plate_ref,
                "-frames:v", "1", "-vf", f"scale={w}:{h}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -287,16 +302,27 @@ class OrchestratorDriver:
                    "cost_est": cost_est, "repo_id": repo_id}
             if end_image_url:
                 ctx["end_image_url"] = end_image_url
+            # A supplier/frame-grab failure is NOT a critic FAIL: do NOT re-run stage 3 (a re-submit
+            # of a non-idempotent paid supplier could double-charge). Record + surface to a human,
+            # never crash the driver (cross-family + workflow MAJOR). Split so that if the supplier
+            # SUCCEEDS (charged) but the downstream frame-grab/critic fails, the human still keeps
+            # the paid artifact_ref + cost (cross-family MAJOR — don't discard a paid plate).
             try:
                 sup = await supplier(ctx, deadline)
-                rgb, w, h = await frame_grabber(sup["artifact_ref"])
-            except Exception as e:                       # noqa: BLE001
-                # a supplier/frame-grab failure is NOT a critic FAIL: do NOT re-run stage 3 (a
-                # re-submit of a non-idempotent paid supplier could double-charge). Record + surface
-                # to a human with the context — never crash the driver (cross-family + workflow MAJOR).
+            except Exception as e:                       # noqa: BLE001 — supplier failed (no plate)
                 attempts.append({"motion_strength": ms, "cost": 0.0, "critic": "error",
-                                 "reasons": [f"{type(e).__name__}: {e}"]})
-                return {"status": "needs_human", "reason": f"stage-3/critic error: {e}",
+                                 "reasons": [f"supplier: {type(e).__name__}: {e}"]})
+                return {"status": "needs_human", "reason": f"stage-3 supplier error: {e}",
+                        "attempts": attempts, "plan": plan}
+            try:
+                rgb, w, h = await frame_grabber(sup["artifact_ref"])
+            except Exception as e:                       # noqa: BLE001 — paid plate, QC step failed
+                attempts.append({"motion_strength": ms, "cost": sup.get("cost") or cost_est,
+                                 "artifact_ref": sup.get("artifact_ref"), "job_id": sup.get("job_id"),
+                                 "critic": "error", "reasons": [f"frame-grab: {type(e).__name__}: {e}"]})
+                return {"status": "needs_human", "plate_url": sup.get("artifact_ref"),
+                        "cost": round(sup.get("cost") or cost_est, 4),
+                        "reason": f"stage-4 frame-grab failed (the plate WAS rendered + charged): {e}",
                         "attempts": attempts, "plan": plan}
             verdict = critic.critic_generic(rgb, w, h, hexes=hexes)
             attempts.append({"motion_strength": ms, "cost": sup.get("cost", 0.0),
@@ -331,11 +357,21 @@ class OrchestratorDriver:
 
 
 # ================================ CLI entrypoint ===========================================
+def _render_gate(plan: dict) -> str:
+    """The human-facing cost-gate text. MUST surface the WORST-CASE spend (max_attempts +
+    max_estimated_cost), NOT a single attempt, so the operator approves what can actually be
+    charged across the bounded retries (cross-family review CRITICAL)."""
+    keys = ("brief", "brand", "shot_id", "motion", "motion_strength",
+            "estimated_cost", "max_attempts", "max_estimated_cost", "image_url")
+    lines = ["=== MX QUALITY ORCHESTRATOR — COST GATE (no spend until you approve) ==="]
+    lines += [f"  {k:18}: {plan.get(k)}" for k in keys]
+    lines.append(f"  >> approving authorizes UP TO {plan.get('max_attempts')} charged attempt(s) "
+                 f"= up to {plan.get('max_estimated_cost')} credits (worst case incl. retries)")
+    return "\n".join(lines)
+
+
 def _interactive_approve(plan: dict) -> bool:
-    print("\n=== MX QUALITY ORCHESTRATOR — COST GATE (no spend until you approve) ===",
-          file=sys.stderr)
-    for k in ("brief", "brand", "shot_id", "motion", "motion_strength", "estimated_cost", "image_url"):
-        print(f"  {k:16}: {plan.get(k)}", file=sys.stderr)
+    print("\n" + _render_gate(plan), file=sys.stderr)
     try:
         ans = input("approve spend? [y/N] ").strip().lower()
     except EOFError:
