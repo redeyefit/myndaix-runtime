@@ -414,14 +414,25 @@ def _block_repo_skills(rid: str, reason: str) -> None:
         # fail-open). Fail closed by DISARMING globally — unlink frees space so it survives a full
         # disk, reliably stopping ALL injection until the human fixes the disk + re-arms.
         log(f"{rid}: CANNOT persist skills block flag ({e}) — DISARMING globally (fail-closed)")
+        disarmed = True
         try:
             SKILLS_ENABLED.unlink()
-        except OSError:
-            pass
-        _alert_jefe(f"review-skills DISARMED ({rid}: block-flag write failed)",
-                    f"Could not write `{_skill_block_flag(rid).name}` ({e}). To fail CLOSED, "
-                    f"`$ORCH/SKILLS_ENABLED` was removed — selection is now OFF for ALL repos. "
-                    f"Fix the disk/permissions issue, then `touch $ORCH/SKILLS_ENABLED` to re-arm.")
+        except FileNotFoundError:
+            pass                                         # already absent = already disarmed (success)
+        except OSError as ue:                            # could NOT remove it -> STILL armed -> STILL fail-open
+            disarmed = False
+            log(f"{rid}: COULD NOT remove SKILLS_ENABLED ({ue}) — selection may be FAIL-OPEN")
+        # the alert must reflect reality — never claim DISARMED if the unlink failed (kilabz R5)
+        if disarmed:
+            _alert_jefe(f"review-skills DISARMED ({rid}: block-flag write failed)",
+                        f"Could not write `{_skill_block_flag(rid).name}` ({e}). To fail CLOSED, "
+                        f"`$ORCH/SKILLS_ENABLED` was removed — selection is now OFF for ALL repos. "
+                        f"Fix the disk/permissions issue, then `touch $ORCH/SKILLS_ENABLED` to re-arm.")
+        else:
+            _alert_jefe(f"review-skills FAIL-OPEN ({rid}: could not disarm)",
+                        f"Could not write `{_skill_block_flag(rid).name}` ({e}) AND could not remove "
+                        f"`$ORCH/SKILLS_ENABLED` — selection may STILL be ON despite a repo that should "
+                        f"be blocked. MANUALLY `rm $ORCH/SKILLS_ENABLED` NOW, then fix the disk/perms.")
         return
     if already_blocked:
         return                                           # an hourly re-block stays quiet (the flag already disables selection)
