@@ -15,7 +15,8 @@ from __future__ import annotations
 import re
 from fnmatch import fnmatchcase
 
-__all__ = ["is_banned_trigger", "seg_match", "specificity", "scan_injection", "INJECTION_PATTERNS"]
+__all__ = ["is_banned_trigger", "seg_match", "specificity", "scan_injection", "INJECTION_PATTERNS",
+           "parse_skill_md", "lint_skill"]
 
 
 # ---- path-segment trigger matching (design v0.3 #6) ------------------------------------
@@ -90,3 +91,78 @@ def scan_injection(body: str) -> str | None:
         if pat.search(body):
             return name
     return None
+
+
+# ---- SKILL.md parse + lint (controller index-time promotion gate, design v0.3 #5) -------
+# Pure so the promotion lint is unit-testable without git/gh/DB (the controller does the I/O:
+# read the blob from the trusted owned ref, then call lint_skill). v1 skills are DESCRIPTIVE
+# TEXT ONLY: any executable-affordance frontmatter key is REJECTED (we never silently ignore a
+# declared capability — that would be a footgun), as is an over-cap/empty field, a banned
+# trigger, or an injection-framing body. The name is the DIRECTORY name (path-derived, not
+# artifact-controlled), so a forged frontmatter `name:` cannot impersonate another skill.
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_DESC_MAX = 60        # mirrors the DB CHECK length(description) <= 60 (characters)
+_BODY_MAX = 2048      # mirrors the DB CHECK length(body) <= 2048 (characters)
+_AFFORDANCE_KEYS = frozenset({
+    "allowed-tools", "allowed_tools", "tools", "scripts", "script", "support_files",
+    "support-files", "exec", "command", "commands", "run", "shell", "code",
+})
+
+
+def parse_skill_md(raw: str) -> dict | None:
+    """Split a SKILL.md into {"meta": {k: v}, "body": str}, or None if there is no well-formed
+    `---` frontmatter block. DUMB key:value parsing on purpose — NOT yaml.load (no arbitrary
+    object construction, no dependency). A frontmatter line with no `:` is malformed -> None."""
+    lines = raw.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return None
+    meta: dict[str, str] = {}
+    for ln in lines[1:end]:
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        if ":" not in ln:
+            return None
+        k, _, v = ln.partition(":")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":   # strip matched surrounding quotes
+            v = v[1:-1]
+        meta[k.strip().lower()] = v
+    body = "\n".join(lines[end + 1:]).strip()
+    return {"meta": meta, "body": body}
+
+
+def lint_skill(name: str, raw: str) -> tuple[dict | None, str]:
+    """Pure parse + lint of ONE SKILL.md. `name` is the directory name (unforgeable identity).
+    Returns (skill, "") ready for index_skills, or (None, reason) on a fail-closed rejection.
+    The returned skill has name/description/body/path_trigger; the caller stamps the shas and
+    the server stamps provenance='promoted' (never copied from the artifact)."""
+    if not _SKILL_NAME_RE.match(name):
+        return None, f"bad skill name {name!r} (need ^[a-z0-9][a-z0-9._-]*$)"
+    parsed = parse_skill_md(raw)
+    if parsed is None:
+        return None, "missing or malformed --- frontmatter ---"
+    meta, body = parsed["meta"], parsed["body"]
+    bad = sorted(k for k in meta if k in _AFFORDANCE_KEYS)
+    if bad:
+        return None, f"executable-affordance keys not allowed (v1 is text-only): {bad}"
+    if "name" in meta and meta["name"] != name:
+        return None, f"frontmatter name {meta['name']!r} != directory name {name!r}"
+    desc = meta.get("description", "")
+    if not desc:
+        return None, "description is required"
+    if len(desc) > _DESC_MAX:
+        return None, f"description over {_DESC_MAX} chars ({len(desc)})"
+    trig = meta.get("path_trigger", "")
+    if is_banned_trigger(trig):
+        return None, f"path_trigger {trig!r} is empty/too-broad (banned)"
+    if not body:
+        return None, "empty body"
+    if len(body) > _BODY_MAX:
+        return None, f"body over {_BODY_MAX} chars ({len(body)})"
+    inj = scan_injection(body)
+    if inj:
+        return None, f"injection-framing in body ({inj})"
+    return {"name": name, "description": desc, "body": body, "path_trigger": trig}, ""

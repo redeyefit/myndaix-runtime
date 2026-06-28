@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from runtime import skillmatch
 from runtime.ledger.postgres_store import PostgresLedger
 
 # -- config --------------------------------------------------------------------
@@ -68,6 +70,12 @@ REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
 DRY_RUN = os.environ.get("MYNDAIX_CONTROLLER_DRY_RUN") == "1"
 TEST_MODE = os.environ.get("MYNDAIX_CONTROLLER_TEST_MODE") == "1"
 DISPATCH_OVERRIDE = os.environ.get("MYNDAIX_CONTROLLER_DISPATCH_OVERRIDE", "")
+
+# -- +learning rung (skill indexer, build plan Step 5) -------------------------
+GH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_GH_TIMEOUT", "30"))
+SKILLS_DIR = "skills"
+SKILL_FILE = "SKILL.md"
+JEFE_INBOX = HOME / ".myndaix" / "bridge" / "inbox" / "jefe"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._][A-Za-z0-9._/-]*$")
@@ -149,6 +157,24 @@ def _git(repo: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProce
         ["git", "-C", str(repo), *args],
         capture_output=True, text=True, env=_git_env(), timeout=timeout, check=False,
     )
+
+
+def _gh_json(repo: Path, *args: str, timeout: Optional[int] = None):
+    """Run a gh command that prints JSON; return the parsed value or None on any failure
+    (non-zero exit / unparseable). argv, never shell (mirrors automerge.py:194). Adds the
+    GH token to _git_env so gh auths whether via keyring (HOME/.config/gh) or env token."""
+    env = _git_env()
+    for k in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    r = subprocess.run(["gh", *args], cwd=str(repo), capture_output=True, text=True,
+                       env=env, timeout=timeout or GH_TIMEOUT, check=False)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 # -- config --------------------------------------------------------------------
@@ -321,6 +347,145 @@ def _pin(repo: Repo, refname: str, sha: str) -> bool:
     return _git(repo.path, "update-ref", refname, sha).returncode == 0
 
 
+# -- +learning rung: skill indexer + branch-protection provenance (build plan Step 5) ---
+# Runs EVERY tick regardless of cursor state. The unforgeable arm: `skills/` is in automerge's
+# _DENY_DIRS, so any SKILL.md on main arrived via a HUMAN merge under branch protection ->
+# provenance='promoted'. Re-verified every poll; fail-CLOSED — missing/weak/unreadable
+# protection writes a per-repo block flag (read by skillselect) + alerts, indexes nothing.
+def _skill_block_flag(rid: str) -> Path:
+    return STATE / f"skills-blocked-{rid}"
+
+
+def _skill_tree_file(rid: str) -> Path:
+    return STATE / f"skills-tree-{rid}"          # disposable change-detect tally (the skills/ tree sha)
+
+
+def _alert_jefe(subject: str, body: str) -> None:
+    """Best-effort, atomic LOUD alert to the human inbox. Never raises (alerts must not sink a
+    tick). DRY_RUN-gated by callers."""
+    try:
+        JEFE_INBOX.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        text = f"---\nfrom: controller\nto: jefe\ntype: alert\nsubject: {subject}\n---\n\n{body}\n"
+        tmp = JEFE_INBOX / f"{ts}-skills-controller.md.tmp"
+        tmp.write_text(text)
+        os.replace(tmp, JEFE_INBOX / f"{ts}-skills-controller.md")   # atomic; daemon skips the brief .tmp
+    except OSError as e:
+        log(f"jefe alert write failed ({e})")
+
+
+def _block_repo_skills(rid: str, reason: str) -> None:
+    """Fail-closed: write the per-repo block flag (consumed by skillselect) + alert jefe. A
+    later protection downgrade can't grandfather an already-indexed skill — selection no-ops
+    the instant this flag exists. DRY_RUN logs only."""
+    log(f"{rid}: SKILLS BLOCKED — {reason}")
+    if DRY_RUN:
+        log(f"{rid}: DRY-RUN would write block flag + alert"); return
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        _skill_block_flag(rid).write_text(reason + "\n")
+    except OSError as e:
+        log(f"{rid}: could not write skills block flag ({e})")
+    _alert_jefe(f"review-skills BLOCKED for {rid}",
+                f"Skill selection is DISABLED for `{rid}` (fail-closed): {reason}\n\n"
+                f"No skills will be injected for this repo until `main` has full branch "
+                f"protection (required PR review + enforce admins + no force-push) and the next "
+                f"controller tick clears `{_skill_block_flag(rid).name}`.")
+
+
+def _branch_protection_ok(repo: Repo, nwo: str) -> bool:
+    """True iff `main` requires PR review, enforces admins (so NObody pushes directly), and
+    forbids force-push — the three conditions that make 'arrived via a human merge' unforgeable.
+    Any missing field, weakened setting, 404 (unprotected), or gh error -> False (fail-closed)."""
+    prot = _gh_json(repo.path, "api", f"repos/{nwo}/branches/main/protection")
+    if not isinstance(prot, dict):
+        return False                                 # 404 unprotected / no access / gh error
+    req_pr = isinstance(prot.get("required_pull_request_reviews"), dict)
+    admins = bool((prot.get("enforce_admins") or {}).get("enabled"))
+    no_force = not bool((prot.get("allow_force_pushes") or {}).get("enabled"))
+    return req_pr and admins and no_force
+
+
+async def _index_skills(led: PostgresLedger, repo: Repo) -> None:
+    """Verify provenance + (re)index the repo's skills/ from the TRUSTED fetched owned ref.
+    Wrapped by process_repo's per-repo try/except, so a failure here never sinks the tick."""
+    rid, ref = repo.repo_id, repo.watch_ref
+
+    # 1. resolve nameWithOwner (one gh call/tick) — needed for the protection endpoint
+    info = _gh_json(repo.path, "repo", "view", "--json", "nameWithOwner")
+    nwo = info.get("nameWithOwner") if isinstance(info, dict) else None
+    if not isinstance(nwo, str) or "/" not in nwo:
+        _block_repo_skills(rid, "cannot resolve nameWithOwner via gh (no remote/auth)"); return
+
+    # 2-3. branch protection is the arm — fail-closed on anything but a fully-protected main
+    if not _branch_protection_ok(repo, nwo):
+        _block_repo_skills(rid, "main branch protection missing/weak/unreadable "
+                                "(need required PR review + enforce admins + no force-push)"); return
+
+    # 4. protected: clear any stale block flag, then cheap change-detect on the skills/ tree sha
+    bf = _skill_block_flag(rid)
+    if bf.exists() and not DRY_RUN:
+        try:
+            bf.unlink(); log(f"{rid}: branch protection restored — cleared skills block flag")
+        except OSError:
+            pass
+    head_ref = _ctl_head_ref(ref)                    # read ONLY from the trusted fetched ref, never the worktree
+    tr = _git(repo.path, "rev-parse", f"{head_ref}:{SKILLS_DIR}")
+    tree_sha = tr.stdout.strip() if tr.returncode == 0 else "none"   # "none" -> no skills/ dir on the ref
+    try:
+        prev = _skill_tree_file(rid).read_text().strip()
+    except OSError:
+        prev = ""
+    if tree_sha == prev and prev != "":
+        return                                       # skills/ unchanged since the last successful index
+
+    # 5. read + lint each skills/<name>/SKILL.md from the owned ref (pure lint in skillmatch)
+    skills: list[dict] = []
+    rejects: list[tuple[str, str]] = []
+    if tree_sha != "none":
+        ls = _git(repo.path, "ls-tree", "-r", "--name-only", head_ref, "--", f"{SKILLS_DIR}/")
+        if ls.returncode != 0:
+            log(f"{rid}: ls-tree {SKILLS_DIR}/ failed — skip indexing this tick"); return
+        for p in ls.stdout.splitlines():
+            parts = p.strip().split("/")
+            if len(parts) != 3 or parts[0] != SKILLS_DIR or parts[2] != SKILL_FILE:
+                continue                             # only skills/<name>/SKILL.md (ignore nested/aux files)
+            name = parts[1]
+            blob = _git(repo.path, "cat-file", "-p", f"{head_ref}:{p.strip()}")
+            if blob.returncode != 0:
+                rejects.append((p.strip(), "cat-file failed")); continue
+            skill, why = skillmatch.lint_skill(name, blob.stdout)
+            if skill is None:
+                rejects.append((p.strip(), why)); continue
+            skill["content_sha"] = hashlib.sha256(blob.stdout.encode()).hexdigest()
+            skill["body_sha"] = hashlib.sha256(skill["body"].encode()).hexdigest()
+            skills.append(skill)
+
+    if rejects and not DRY_RUN:
+        listing = "\n".join(f"- `{p}`: {why}" for p, why in rejects)
+        _alert_jefe(f"review-skill lint rejected {len(rejects)} for {rid}",
+                    f"These SKILL.md files on main did NOT promote (lint is fail-closed):\n\n"
+                    f"{listing}\n\nThey are not indexed. Fix + re-merge to promote.")
+
+    if DRY_RUN:
+        log(f"{rid}: DRY-RUN would index {len(skills)} skill(s), reject {len(rejects)} "
+            f"(skills/ tree {tree_sha[:8] if tree_sha != 'none' else 'none'})"); return
+
+    try:
+        res = await led.index_skills(rid, skills)
+    except Exception as e:                           # a DB CHECK backstop (belt) -> alert, do NOT advance the marker
+        log(f"{rid}: index_skills raised ({e}) — not advancing tree marker")
+        _alert_jefe(f"review-skill index FAILED for {rid}",
+                    f"index_skills raised (a DB CHECK backstop tripped, or the table is absent "
+                    f"pre-migration): {e}\nNo tree marker written; will retry next tick."); return
+    try:
+        _skill_tree_file(rid).write_text(tree_sha + "\n")
+    except OSError:
+        pass
+    log(f"{rid}: indexed skills {res} ({len(rejects)} rejected, "
+        f"tree {tree_sha[:8] if tree_sha != 'none' else 'none'})")
+
+
 async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> None:
     rid, ref = repo.repo_id, repo.watch_ref
     cur = await led.get_cursor(rid, ref)
@@ -353,6 +518,11 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     head = hr.stdout.strip()
     if hr.returncode != 0 or not _SHA_RE.match(head):
         log(f"{rid}: could not resolve a valid HEAD sha — skip"); return
+
+    # +learning rung (Step 5): verify provenance + (re)index skills/ from the just-fetched owned
+    # ref. Runs on EVERY tick regardless of cursor state (protection must be re-checked each poll);
+    # never gates the review path below (its failures are swallowed into a fail-closed block flag).
+    await _index_skills(led, repo)
 
     # decide
     if cur is None:                                      # first sight (B2): seed, do NOT review
@@ -453,6 +623,16 @@ async def tick() -> int:
                     await process_repo(led, repo, budget)
                 except Exception as e:                   # one bad repo never sinks the tick
                     log(f"{repo.repo_id}: tick error {e!r}")
+            # +learning rung (Step 5): prune the skill lifecycle ONCE per tick — inline, no
+            # separate cron (v0.3 #7). Time-based + global, so it's decoupled from any per-repo
+            # change-detect skip. Fail-soft: a missing table (pre-migration) is logged, not fatal.
+            if not DRY_RUN:
+                try:
+                    pruned = await led.prune_skills()
+                    if pruned.get("staled") or pruned.get("archived"):
+                        log(f"skills pruned {pruned}")
+                except Exception as e:
+                    log(f"prune_skills skipped ({e!r})")
         finally:
             await led.close()
         log(f"tick complete — {budget[0]} review(s) dispatched across {len(repos)} repo(s)")
