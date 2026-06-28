@@ -422,6 +422,10 @@ async def test_skills_blocked_when_unprotected(led: PostgresLedger) -> None:
     assert (C.STATE / "skills-blocked-skblock").exists(), "unprotected main -> fail-closed block flag"
     assert (await led.select_skills("skblock", ["src/a.swift"]))["skills"] == [], "nothing indexed when blocked"
     assert _has_skill_alert(C.JEFE_INBOX), "fail-closed block alerts jefe"
+    # debounce: a SECOND consecutive blocked tick must NOT add another alert (no hourly spam)
+    n1 = len(list(C.JEFE_INBOX.glob("*.md")))
+    await C.process_repo(led, repo, [0])
+    assert len(list(C.JEFE_INBOX.glob("*.md"))) == n1, "an already-blocked repo does not re-alert each tick"
 
 
 async def test_skills_protection_downgrade_blocks_next_tick(led: PostgresLedger) -> None:

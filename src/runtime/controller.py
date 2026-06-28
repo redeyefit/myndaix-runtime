@@ -403,11 +403,14 @@ def _block_repo_skills(rid: str, reason: str) -> None:
     log(f"{rid}: SKILLS BLOCKED — {reason}")
     if DRY_RUN:
         log(f"{rid}: DRY-RUN would write block flag + alert"); return
+    already_blocked = _skill_block_flag(rid).exists()    # debounce: alert ONLY on the transition into blocked
     try:
         STATE.mkdir(parents=True, exist_ok=True)
         _skill_block_flag(rid).write_text(reason + "\n")
     except OSError as e:
         log(f"{rid}: could not write skills block flag ({e})")
+    if already_blocked:
+        return                                           # an hourly re-block stays quiet (the flag already disables selection)
     _alert_jefe(f"review-skills BLOCKED for {rid}",
                 f"Skill selection is DISABLED for `{rid}` (fail-closed): {reason}\n\n"
                 f"No skills will be injected for this repo until the WATCHED branch has full "
