@@ -35,8 +35,11 @@ ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
 STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 min. MUST exceed the worst-case
                                                     # review runtime (canary + 3 review calls x REVIEW_CALL_TIMEOUT
-                                                    # 600s = ~1800s) so a slow-but-LIVE run isn't reaped mid-review
-                                                    # (kilabz: 1800 was = the worst case -> live-lock-reap race).
+                                                    # 600s = ~1800s) so a slow-but-LIVE run isn't reaped mid-review.
+# VALIDATE: a non-numeric PLAY_STALE would abort the arithmetic compare under set -u; a too-small
+# value (e.g. -1, 60) would reap LIVE locks mid-review, recreating the race. Require a positive int
+# >= the 1800s review budget, else fall back to the 2700s default (kilabz R5).
+[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge 1800 ] || STALE=2700
 PRUNE_DAYS=14
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
 LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
@@ -249,7 +252,12 @@ if ! mkdir "$lock" 2>/dev/null; then
     contention
   fi
 fi
-printf '%s' "$$" > "$lock/pid" 2>/dev/null || true
+if ! printf '%s' "$$" > "$lock/pid" 2>/dev/null; then
+  # can't mark ownership -> the pid-checked release below would NEVER remove our lock, so it'd
+  # linger to stale-reap (skipping reviews meanwhile). Drop it now + retry next push rather than
+  # hold an unowned lock (kilabz R5). The trap isn't set yet, so this rm is safe.
+  rm -rf "$lock" 2>/dev/null || true; note lockpid "pid-write failed; released lock, retry next push"; exit 0
+fi
 # OWNERSHIP-checked release: only remove the lock if it is STILL ours. If a later worker reaped a
 # (wrongly) stale lock and took it over, our pid no longer matches $lock/pid, so our EXIT trap must
 # NOT delete the successor's lock (kilabz: the old unconditional rm let a reaped worker do exactly that).
