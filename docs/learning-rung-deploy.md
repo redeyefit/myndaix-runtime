@@ -28,6 +28,16 @@ A `MYNDAIX_CONTROLLER_DRY_RUN=1` tick today reports **SKILLS BLOCKED** for every
 - **Keep the existing `test` required status check** (the automerge CI gate) — the protection
   PUT replaces the whole object, so preserve `required_status_checks.contexts = ["test"]`.
 
+**Threat-model note (0 required approvals).** With 0 approvals a holder of a write token (or a
+rogue agent) could open + self-merge a PR with no second human, shifting trust onto the
+`play-review` LLM gate (injection/hallucination-prone) + CI. This is an accepted solo-founder
+trade-off, and the compensating controls are deliberate: (1) for the SKILL corpus specifically,
+provenance is unforgeable regardless of approvals — `skills/` is in automerge's `_DENY_DIRS`, so a
+skill can only reach main via a PR a human chose to merge; (2) the diff-class gate bounds what
+automerge can land to inert docs; (3) `enforce_admins` + no-force-push mean every change is a
+revertible, audited merge commit. If you want a hard second-human gate on code, raise the count to
+1 — but then disable/relax the automerge rung, which relies on 0.
+
 Verify exactly what the controller checks:
 
 ```
