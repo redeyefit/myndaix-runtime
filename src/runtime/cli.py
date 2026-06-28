@@ -27,7 +27,11 @@ DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 async def submit(agent: str, task: str, *, context: Optional[dict] = None,
                  repo_id: Optional[str] = None, base_ref: Optional[str] = None,
-                 timeout_s: float = 180.0) -> int:
+                 timeout_s: float = float(os.environ.get("MXR_TIMEOUT_S", "180"))) -> int:
+    # ^ the SYNC wait for the job to finish. Default 180s for interactive ops; the review path
+    #   (play-review) sets MXR_TIMEOUT_S higher so mxr doesn't abandon a slow review BEFORE the
+    #   agent's own ~300s exec cap — else the verdict only lands in the ledger, not inline. Read
+    #   from env at import (each mxr call is a fresh process), so the caller's env governs.
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
         print(f"unknown agent '{agent}'. roster: {roster}", file=sys.stderr)
@@ -150,6 +154,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         gp.add_argument("job_id", help="the job uuid (from a prior `mxr` submit)")
         gargs = gp.parse_args(raw[1:])
         return asyncio.run(get_job(gargs.job_id))
+
+    # `mxr skillselect <repo_id> <changed-path>...` — the +learning rung READ path (build
+    # plan Step 4). Routed through mxr so it inherits the runtime venv + PYTHONPATH +
+    # MYNDAIX_DSN exactly like every other entry point (bare `python3 -m runtime.skillselect`
+    # would not resolve the package in play-review's hook env, and the package lives here
+    # regardless of which repo is under review). Special-cased ABOVE the flat agent/task
+    # parser, like `get`; skillselect fails OPEN to empty stdout. PLAY_NONCE/PLAY_ID/PLAY_GATE
+    # pass through the inherited env.
+    if raw and raw[0] == "skillselect":
+        from runtime import skillselect
+        return skillselect.main(["skillselect", *raw[1:]])
 
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',

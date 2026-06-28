@@ -31,6 +31,7 @@ Design rules, enforced everywhere below:
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import uuid
@@ -40,7 +41,7 @@ from uuid import UUID
 
 import asyncpg
 
-from runtime import registry
+from runtime import registry, skillmatch
 from runtime.contracts import (
     Authority, ErrorClass, Job, LostLease, Result, TransportEnvelope,
 )
@@ -89,6 +90,9 @@ class PostgresLedger:
     # (soft filter and hard count never trip) for instant rollback WITHOUT a code revert
     # — set $MYNDAIX_MAX_PER_REPO=1000000 in the pool's env and restart. Default 4.
     MAX_PER_REPO = int(os.environ.get("MYNDAIX_MAX_PER_REPO") or 4)
+    # +learning rung: review-skill lifecycle windows (deterministic prune, archive-not-delete).
+    SKILL_STALE_DAYS = 30        # active -> stale after this many days with no skill_use
+    SKILL_ARCHIVE_DAYS = 90      # stale -> archived after this many days (reactivation = human re-arm)
     LEASE_MAX_REPICKS = 16       # bounded re-PICK budget per lease_job call: each over-cap
                                  # repo is excluded from the next PICK, so the eligible set
                                  # strictly shrinks (anti-spin). Exhaustion -> None (re-poll).
@@ -995,3 +999,119 @@ class PostgresLedger:
                     RETURNING repo_id""",
                 repo_id, ref, head, max_attempts)
         return row is not None
+
+    # ---- review skills ("+learning" rung) — DESIGN v0.3 governing sections --------------
+    # Each verb mirrors the CAS/UPSERT discipline above. The pure matching + injection logic
+    # lives in runtime.skillmatch (DB-free, unit-tested). The BODY lives in Postgres (the
+    # indexer reads it from a trusted merged ref); selection NEVER rehashes disk (codex MAJOR).
+    async def index_skills(self, repo_id: str, skills: list[dict]) -> dict:
+        """UPSERT the per-repo skill cache from a trusted merged ref's skills/ contents (the
+        controller parses + lint-validates each SKILL.md from the OWNED ref, never the worktree).
+        One transaction. ON CONFLICT updates only when content_sha drifted (idempotent — a no-op
+        tick changes nothing). A skill no longer present on the ref is ARCHIVED (reversible —
+        archive-not-delete; re-adding via a PR upserts it back to active). The caller
+        pre-validates (slug/desc/body/trigger/injection); the DB CHECKs are the fail-closed
+        backstop (a violation raises -> the indexer alerts, never silently indexes a bad row).
+        `skills` items: {name, description, body, body_sha, content_sha, path_trigger}."""
+        present = [s["name"] for s in skills]
+        up = 0
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                for s in skills:
+                    row = await con.fetchrow(
+                        """INSERT INTO skill
+                               (name, description, body, body_sha, content_sha,
+                                repo_scope, path_trigger, provenance, state)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,'promoted','active')
+                           ON CONFLICT (repo_scope, name) DO UPDATE
+                               SET description = EXCLUDED.description, body = EXCLUDED.body,
+                                   body_sha = EXCLUDED.body_sha, content_sha = EXCLUDED.content_sha,
+                                   path_trigger = EXCLUDED.path_trigger,
+                                   state = 'active'
+                             WHERE skill.content_sha IS DISTINCT FROM EXCLUDED.content_sha
+                           RETURNING name""",
+                        s["name"], s["description"], s["body"], s["body_sha"],
+                        s["content_sha"], repo_id, s["path_trigger"])
+                    if row is not None:
+                        up += 1
+                arch = await con.fetch(
+                    """UPDATE skill SET state = 'archived'
+                        WHERE repo_scope = $1 AND state <> 'archived'
+                          AND name <> ALL($2::text[])
+                        RETURNING name""",
+                    repo_id, present)
+        return {"upserted": up, "archived_removed": len(arch), "total": len(skills)}
+
+    async def select_skills(self, repo_id: str, changed_paths: list[str]) -> dict:
+        """Pick <=2 ACTIVE skills for `repo_id` whose path_trigger matches any changed path
+        (path-SEGMENT match), ordered new-first -> specificity desc -> recency desc. Matching +
+        ordering are pure (runtime.skillmatch). A banned/broad trigger or a body_sha-drift row
+        (tampered/half-written) is DROPPED here (fail-closed out of selection), drift surfaced
+        for a jefe alert. Returns {"skills":[{name,body}], "drift":[name]}."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT name, body, body_sha, path_trigger, last_used_at
+                     FROM skill WHERE repo_scope = $1 AND state = 'active'""",
+                repo_id)
+        cand, drift = [], []
+        for r in rows:
+            trig = r["path_trigger"]
+            if skillmatch.is_banned_trigger(trig):
+                continue  # belt: a banned trigger should never have been indexed
+            if not any(skillmatch.seg_match(trig, p) for p in changed_paths):
+                continue
+            if hashlib.sha256(r["body"].encode()).hexdigest() != r["body_sha"]:
+                drift.append(r["name"])
+                continue
+            cand.append(r)
+        cand.sort(key=lambda r: (
+            r["last_used_at"] is not None,                      # NULL (new) sorts first
+            -skillmatch.specificity(r["path_trigger"]),         # more specific first
+            -(r["last_used_at"].timestamp() if r["last_used_at"] else 0.0),  # more recent first
+        ))
+        return {"skills": [{"name": r["name"], "body": r["body"]} for r in cand[:2]],
+                "drift": drift}
+
+    async def record_skill_use(self, repo_id: str, review_play: str, used: list[dict]) -> None:
+        """Debounced usage accounting: bump last_used_at (at most once/hour per skill, so it
+        stays off the review hot path) + append an audit row per skill. The CALLER (skillselect)
+        swallows any error — a DB hiccup must never block a review (selection fails OPEN).
+        `used` items: {name, body_sha}."""
+        if not used:
+            return
+        names = [u["name"] for u in used]
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    """UPDATE skill SET last_used_at = now()
+                        WHERE repo_scope = $1 AND name = ANY($2::text[])
+                          AND (last_used_at IS NULL OR last_used_at < now() - interval '1 hour')""",
+                    repo_id, names)
+                for u in used:
+                    await con.execute(
+                        """INSERT INTO skill_use (id, review_play, skill_name, body_sha, repo_scope)
+                           VALUES ($1,$2,$3,$4,$5)""",
+                        _new_id(), review_play, u["name"], u["body_sha"], repo_id)
+
+    async def prune_skills(self) -> dict:
+        """Deterministic, NO-LLM lifecycle prune — status-flip only (never deletes a row/file;
+        reversible == fail-closed). active -> stale after SKILL_STALE_DAYS of no use; stale ->
+        archived after SKILL_ARCHIVE_DAYS. NO reactivate-on-reuse (a stale skill is never
+        selected, so reuse can't reach it — reactivation is human re-arm only, v0.3 #5). The
+        `state` guard makes each transition a CAS (resolves a prune-vs-index race). Returns
+        {staled, archived}."""
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                staled = await con.fetch(
+                    """UPDATE skill SET state = 'stale'
+                        WHERE state = 'active'
+                          AND COALESCE(last_used_at, created_at) < now() - $1::interval
+                        RETURNING name""",
+                    _dt.timedelta(days=self.SKILL_STALE_DAYS))
+                archived = await con.fetch(
+                    """UPDATE skill SET state = 'archived'
+                        WHERE state = 'stale'
+                          AND COALESCE(last_used_at, created_at) < now() - $1::interval
+                        RETURNING name""",
+                    _dt.timedelta(days=self.SKILL_ARCHIVE_DAYS))
+        return {"staled": len(staled), "archived": len(archived)}

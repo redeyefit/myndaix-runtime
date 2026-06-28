@@ -30,6 +30,27 @@ C.DSN = DSN
 _TMP = Path(tempfile.mkdtemp(prefix="ctrl-test-"))
 _N = [0]
 
+# +learning indexer isolation: process_repo now calls _index_skills, which shells out to `gh`
+# and (fail-closed) alerts the human inbox. Stub gh + redirect the inbox to _TMP so NO test
+# hits real GitHub or the real ~/.myndaix inbox. Default = fully protected (so existing tests
+# index an empty corpus = a clean no-op); skill tests override C._gh_json per-test.
+_GH_PROT = {"required_pull_request_reviews": {}, "enforce_admins": {"enabled": True},
+            "allow_force_pushes": {"enabled": False}}
+
+
+def _make_gh(protected: bool = True, nwo: str = "o/r"):
+    def _gh(repo, *args, timeout=None):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": nwo}
+        if args and args[0] == "api":                # the branch-protection endpoint
+            return _GH_PROT if protected else None
+        return None
+    return _gh
+
+
+C.JEFE_INBOX = _TMP / "jefe"
+C._gh_json = _make_gh(True)
+
 
 def g(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
@@ -75,6 +96,8 @@ def fresh_seam(name: str) -> Path:
     C.DISPATCH_OVERRIDE = str(base / "dispatched.jsonl")
     C.DRY_RUN = False
     C.MAX_DISPATCH_PER_TICK = 3
+    C._gh_json = _make_gh(True)                          # reset to protected default (skill tests override)
+    C.JEFE_INBOX = _TMP / "jefe"
     return Path(C.DISPATCH_OVERRIDE)
 
 
@@ -346,6 +369,260 @@ async def test_end_to_end_stub_play_review(led: PostgresLedger) -> None:
         assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered", "end-to-end advance failed"
     finally:
         C.TEST_MODE = True
+
+
+# =====================================================================================
+# +learning rung: the controller skill indexer + branch-protection provenance (Step 5/7).
+# gh is stubbed (_make_gh) so the arm is exercised without a real GitHub; the jefe inbox is a
+# temp dir. Skills are read from the trusted fetched owned ref by process_repo's fetch.
+# =====================================================================================
+async def _truncate_skills(led: PostgresLedger) -> None:
+    async with led._pool.acquire() as con:
+        await con.execute("TRUNCATE skill, skill_use")
+
+
+def add_skill(repo: C.Repo, name: str, *, desc: str = "prefer fresh context for the write",
+              trigger: str = "src/*.swift", body: str = "When reviewing this diff, prefer X.",
+              branch: str = "main") -> str:
+    """Commit + push a skills/<name>/SKILL.md to `branch` (simulates a merged skill PR)."""
+    d = repo.path / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {desc}\npath_trigger: {trigger}\n---\n\n{body}\n")
+    g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", f"add skill {name}")
+    g(repo.path, "push", "-q", "origin", branch)
+    return head_of(repo)
+
+
+def _has_skill_alert(inbox: Path) -> bool:
+    return inbox.is_dir() and any("skills-controller" in p.name for p in inbox.glob("*.md"))
+
+
+async def test_skills_indexed_when_protected(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skidx"); repo = make_repo("skidx")
+    C.JEFE_INBOX = _TMP / "jefe-skidx"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "fresh-ctx", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                 # fetch owned ref -> index from it
+    assert not (C.STATE / "skills-blocked-skidx").exists(), "protected main -> no block flag"
+    assert (C.STATE / "skills-tree-skidx").exists(), "successful index writes the tree marker"
+    sel = await led.select_skills("skidx", ["src/ContentView.swift"])
+    assert len(sel["skills"]) == 1 and sel["skills"][0]["name"] == "fresh-ctx", f"indexed+selectable: {sel}"
+    assert not _has_skill_alert(C.JEFE_INBOX), "a clean index does not alert"
+
+
+async def test_skills_blocked_when_unprotected(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skblock"); repo = make_repo("skblock")
+    C.JEFE_INBOX = _TMP / "jefe-skblock"
+    C._gh_json = _make_gh(protected=False)               # main has no/weak protection
+    add_skill(repo, "foo")
+    await C.process_repo(led, repo, [0])
+    assert (C.STATE / "skills-blocked-skblock").exists(), "unprotected main -> fail-closed block flag"
+    assert (await led.select_skills("skblock", ["src/a.swift"]))["skills"] == [], "nothing indexed when blocked"
+    assert _has_skill_alert(C.JEFE_INBOX), "fail-closed block alerts jefe"
+    # debounce: a SECOND consecutive blocked tick must NOT add another alert (no hourly spam)
+    n1 = len(list(C.JEFE_INBOX.glob("*.md")))
+    await C.process_repo(led, repo, [0])
+    assert len(list(C.JEFE_INBOX.glob("*.md"))) == n1, "an already-blocked repo does not re-alert each tick"
+
+
+async def test_skills_protection_downgrade_blocks_next_tick(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skdown"); repo = make_repo("skdown")
+    C.JEFE_INBOX = _TMP / "jefe-skdown"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "bar", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                 # indexed under protection
+    assert (await led.select_skills("skdown", ["src/a.swift"]))["skills"], "indexed while protected"
+    C._gh_json = _make_gh(protected=False)               # protection DROPS after indexing
+    await C.process_repo(led, repo, [0])                 # re-verified every tick -> must block now
+    assert (C.STATE / "skills-blocked-skdown").exists(), "a downgrade blocks the next tick (no grandfathering)"
+
+
+async def test_skills_lint_reject_alerts_not_indexed(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("sklint"); repo = make_repo("sklint")
+    C.JEFE_INBOX = _TMP / "jefe-sklint"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "toobroad", trigger="*")             # banned trigger -> lint fail-closed
+    await C.process_repo(led, repo, [0])
+    assert (await led.select_skills("sklint", ["any.py"]))["skills"] == [], "lint-rejected skill is not indexed"
+    assert _has_skill_alert(C.JEFE_INBOX), "a lint rejection alerts jefe"
+
+
+async def test_skills_taint_blocks_relaunder_after_window(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("sktaint"); repo = make_repo("sktaint")
+    C.JEFE_INBOX = _TMP / "jefe-sktaint"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "ok-skill", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                  # indexed under protection
+    assert (await led.select_skills("sktaint", ["src/a.swift"]))["skills"], "indexed while protected"
+    C._gh_json = _make_gh(protected=False)               # protection DROPS
+    add_skill(repo, "smuggled", trigger="src/*.swift")   # direct-push during the unprotected window
+    await C.process_repo(led, repo, [0])                  # protection down -> blocked, nothing indexed
+    assert (C.STATE / "skills-blocked-sktaint").exists(), "unprotected -> blocked"
+    C._gh_json = _make_gh(protected=True)                # protection RESTORED
+    await C.process_repo(led, repo, [0])                  # tree changed while blocked -> must STAY blocked
+    assert (C.STATE / "skills-blocked-sktaint").exists(), "tainted: stays blocked after a window change (no launder)"
+    assert (C.STATE / "skills-taint-sktaint").exists(), "taint marker written (debounces the alert)"
+    assert _has_skill_alert(C.JEFE_INBOX), "taint alerts jefe for a manual audit"
+    names = [s["name"] for s in (await led.select_skills("sktaint", ["src/a.swift"]))["skills"]]
+    assert "smuggled" not in names, "the window-pushed skill was NOT promoted while tainted"
+
+
+async def test_skills_protection_checks_watched_branch_not_main(led: PostgresLedger) -> None:
+    # pins the watch-ref fix: a repo watching refs/heads/dev must verify DEV's protection (and
+    # index from dev), NOT a hard-coded main. The gh mock here is protected for dev ONLY — the
+    # old hard-coded-main code would query main, get None, and block (this test would fail).
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skwatch"); base = make_repo("skwatch")
+    g(base.path, "checkout", "-q", "-b", "dev")
+    g(base.path, "push", "-q", "-u", "origin", "dev")
+    repo = C.Repo("skwatch", base.path, "refs/heads/dev")   # WATCH dev, not main
+    add_skill(repo, "devskill", trigger="src/*.swift", branch="dev")
+    C.JEFE_INBOX = _TMP / "jefe-skwatch"
+    queried: list = []
+
+    def _gh(repo_path, *args, timeout=None):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args and args[0] == "api":
+            queried.append(args[-1])
+            return _GH_PROT if "/branches/dev/protection" in args[-1] else None  # main -> unprotected
+        return None
+    C._gh_json = _gh
+    await C.process_repo(led, repo, [0])
+    assert any("/branches/dev/protection" in q for q in queried), f"must query the WATCHED branch (dev): {queried}"
+    assert not any("/branches/main/protection" in q for q in queried), "must NOT query a hard-coded main"
+    assert not (C.STATE / "skills-blocked-skwatch").exists(), "dev is protected -> not blocked"
+    assert (await led.select_skills("skwatch", ["src/x.swift"]))["skills"], "indexed from the watched branch"
+
+
+async def test_skills_slashed_watch_ref_is_url_encoded(led: PostgresLedger) -> None:
+    # a slashed branch (release/2026, allowed by _REF_RE) must be URL-encoded in the gh path, or
+    # the raw slash splits .../branches/release/2026/protection into extra segments -> 404 ->
+    # fail-closed indexing. The mock is protected ONLY for the ENCODED path (kilabz+oracle).
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skslash"); base = make_repo("skslash")
+    g(base.path, "checkout", "-q", "-b", "release/2026")
+    g(base.path, "push", "-q", "-u", "origin", "release/2026")
+    repo = C.Repo("skslash", base.path, "refs/heads/release/2026")
+    add_skill(repo, "relskill", trigger="src/*.swift", branch="release/2026")
+    C.JEFE_INBOX = _TMP / "jefe-skslash"
+    queried: list = []
+
+    def _gh(rp, *args, timeout=None):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args and args[0] == "api":
+            queried.append(args[-1])
+            return _GH_PROT if "branches/release%2F2026/protection" in args[-1] else None
+        return None
+    C._gh_json = _gh
+    await C.process_repo(led, repo, [0])
+    assert any("release%2F2026" in q for q in queried), f"slashed branch must be URL-encoded: {queried}"
+    assert not (C.STATE / "skills-blocked-skslash").exists(), "encoded protection lookup succeeds -> not blocked"
+    assert (await led.select_skills("skslash", ["src/x.swift"]))["skills"], "indexed from the slashed watched branch"
+
+
+async def test_skills_delete_while_blocked_is_tainted(led: PostgresLedger) -> None:
+    # deleting skills/ while blocked (tree -> 'none' from a real prior tree) archives all skills;
+    # it must ALSO taint, not auto-clear-and-launder the deletion (kilabz #3).
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skdel"); repo = make_repo("skdel")
+    C.JEFE_INBOX = _TMP / "jefe-skdel"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "doomed", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                 # indexed under protection
+    assert (await led.select_skills("skdel", ["src/a.swift"]))["skills"], "indexed while protected"
+    C._gh_json = _make_gh(protected=False)               # protection DROPS
+    g(repo.path, "rm", "-r", "-q", "skills")             # skills/ DELETED during the window
+    g(repo.path, "commit", "-q", "-m", "rm skills"); g(repo.path, "push", "-q", "origin", "main")
+    await C.process_repo(led, repo, [0])                 # blocked
+    assert (C.STATE / "skills-blocked-skdel").exists(), "unprotected -> blocked"
+    C._gh_json = _make_gh(protected=True)                # protection RESTORED
+    await C.process_repo(led, repo, [0])                 # tree -> 'none' while blocked -> MUST taint
+    assert (C.STATE / "skills-blocked-skdel").exists(), "delete-while-blocked stays blocked (not laundered)"
+    assert (C.STATE / "skills-taint-skdel").exists(), "delete-while-blocked taints"
+    async with led._pool.acquire() as con:
+        st = await con.fetchval("SELECT state FROM skill WHERE repo_scope='skdel' AND name='doomed'")
+    assert st == "active", "the existing skill was not silently archived by a laundered empty index"
+
+
+async def test_skills_transient_block_auto_clears(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skblip"); repo = make_repo("skblip")
+    C.JEFE_INBOX = _TMP / "jefe-skblip"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "stable", trigger="src/*.swift")
+    await C.process_repo(led, repo, [0])                  # indexed
+    C._gh_json = _make_gh(protected=False)               # transient unreadable protection (a gh blip)
+    await C.process_repo(led, repo, [0])                  # blocked, but skills/ UNCHANGED
+    assert (C.STATE / "skills-blocked-skblip").exists(), "blip -> blocked"
+    C._gh_json = _make_gh(protected=True)                # readable again, nothing changed
+    await C.process_repo(led, repo, [0])
+    assert not (C.STATE / "skills-blocked-skblip").exists(), "transient blip + unchanged skills/ auto-clears (no manual audit)"
+
+
+async def test_gh_unavailable_blocks_skills_not_reviews(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    seam = fresh_seam("ghnone"); repo = make_repo("ghnone")
+    C.JEFE_INBOX = _TMP / "jefe-ghnone"
+    C._gh_json = lambda repo, *a, **k: None              # what the real _gh_json returns when gh is missing/hung
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # HEAD moved -> review MUST still dispatch
+    assert len(records(seam)) == 1, "gh unavailable must NOT block the review dispatch (skills fail closed alone)"
+    assert (C.STATE / "skills-blocked-ghnone").exists(), "gh unavailable -> fail-closed block flag for skills only"
+
+
+async def test_indexer_exception_never_sinks_review(led: PostgresLedger) -> None:
+    await _truncate(led); await _truncate_skills(led)
+    seam = fresh_seam("idxboom"); repo = make_repo("idxboom")
+    C.JEFE_INBOX = _TMP / "jefe-idxboom"
+
+    def _boom(repo, *a, **k):
+        raise RuntimeError("indexer blew up")
+    C._gh_json = _boom                                   # any indexer exception, however deep
+    await C.process_repo(led, repo, [0])                 # seed
+    advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # indexer raises -> wrapper swallows -> review dispatches
+    assert len(records(seam)) == 1, "an indexer exception must never sink the review path"
+
+
+async def test_tick_self_migrates_before_indexing(led: PostgresLedger) -> None:
+    # the controller is a SEPARATE launchd job from serve; it must self-migrate so a deploy can't
+    # tick it against a stale skill PK before serve reboots with 0006 (kilabz R3 Medium).
+    await _truncate(led)
+    async with led._pool.acquire() as con:               # stale the skill schema: single-column PK
+        await con.execute("DROP TABLE IF EXISTS skill CASCADE")
+        await con.execute(
+            "CREATE TABLE skill (name text PRIMARY KEY, description text NOT NULL, body text "
+            "NOT NULL, body_sha text NOT NULL, content_sha text NOT NULL, repo_scope text NOT "
+            "NULL, path_trigger text NOT NULL, provenance text NOT NULL DEFAULT 'promoted', "
+            "state text NOT NULL DEFAULT 'active', last_used_at timestamptz, "
+            "created_at timestamptz NOT NULL DEFAULT now())")
+    saved = (C.REPOS_JSON, C.LOCK, C.STATE, C.DRY_RUN, C.JEFE_INBOX, C._gh_json)
+    try:
+        repo = make_repo("ticmig")
+        cfg = _TMP / "repos-ticmig.json"; cfg.write_text(json.dumps({"ticmig": {"path": str(repo.path)}}))
+        C.REPOS_JSON = cfg
+        C.LOCK = _TMP / "controller-ticmig.lock"
+        C.STATE = _TMP / "state-ticmig"; C.STATE.mkdir(parents=True, exist_ok=True)
+        C.JEFE_INBOX = _TMP / "jefe-ticmig"; C._gh_json = _make_gh(True); C.DRY_RUN = False
+        await C.tick()                                   # self-migrate runs before the repo loop
+        async with led._pool.acquire() as con:
+            cols = await con.fetchval(
+                "SELECT array_agg(a.attname ORDER BY array_position(c.conkey, a.attnum)) "
+                "FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid "
+                "JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=ANY(c.conkey) "
+                "WHERE t.relname='skill' AND c.contype='p'")
+        assert cols == ["repo_scope", "name"], f"tick must self-migrate the skill PK: {cols}"
+    finally:
+        C.REPOS_JSON, C.LOCK, C.STATE, C.DRY_RUN, C.JEFE_INBOX, C._gh_json = saved
 
 
 async def main() -> None:
