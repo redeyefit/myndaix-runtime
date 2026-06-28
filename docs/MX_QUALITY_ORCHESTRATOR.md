@@ -365,3 +365,17 @@ Ordered so each step is testable before the next:
 - **[MAJOR, poll-deadline]** the poll deadline started at submit, but the supplier's 600s starts at lease → queue delay could false-time-out a charging render. Fixed: a `QUEUE_GRACE` window while queued, then a full `deadline_s` render window from the first leased/running observation.
 - **[MINOR]** `get_spec("higgsfield")` None-guard; design doc restored into the repo.
 - **Reviewers confirmed clean:** charge-gate-precedes-spend, critic buffer safety + math, `get_status` field reads. Refuted (not folded): "real ledger path untested" (covered by the loop + mock-transport tests), cost-readback (accepted v1 simplification), concurrent-runs (speculative).
+
+**KNOWN RESIDUAL (round-3, accepted for v1 — bounded; flagged for a dedicated follow-up):**
+`_supplier_ledger` cancels a timed-out job (`led.cancel`), but cancelling a non-idempotent paid job
+that is racing a worker lease is a fundamental **TOCTOU on a network call**: a worker can lease + reach
+the paid submit in the window between the DB ownership read and the HTTP POST, so a charge can begin
+just after cancel. `get_attempt_job`'s read could be made a locking ownership gate (lock attempt→job
+FOR UPDATE, canonical order) to NARROW the window, but it cannot fully close it (the submit happens
+after any DB check) — it is the SAME best-effort limitation the codebase already accepts for
+"already-leased may have charged." **Blast radius is bounded:** the `non_idempotent` flag sends a
+charged-after-cancel job to `dead` (NOT requeued), so it is at most ONE extra surfaced charge
+(recover via `mxr get <jid>`), never an unbounded re-charge. **Follow-up (own PR, cap_stress-verified,
+deadlock-ordering-sensitive — do NOT rush into the orchestrator PR):** make `get_attempt_job` a
+locking ownership gate + a `begin_attempt` CAS immediately before `_invoke`, to shrink the window to
+[CAS commit → HTTP submit]. Benefits every paid agent, not just the orchestrator.
