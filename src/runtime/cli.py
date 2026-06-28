@@ -27,7 +27,11 @@ DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 async def submit(agent: str, task: str, *, context: Optional[dict] = None,
                  repo_id: Optional[str] = None, base_ref: Optional[str] = None,
-                 timeout_s: float = 180.0) -> int:
+                 timeout_s: float = float(os.environ.get("MXR_TIMEOUT_S", "180"))) -> int:
+    # ^ the SYNC wait for the job to finish. Default 180s for interactive ops; the review path
+    #   (play-review) sets MXR_TIMEOUT_S higher so mxr doesn't abandon a slow review BEFORE the
+    #   agent's own ~300s exec cap — else the verdict only lands in the ledger, not inline. Read
+    #   from env at import (each mxr call is a fresh process), so the caller's env governs.
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
         print(f"unknown agent '{agent}'. roster: {roster}", file=sys.stderr)
