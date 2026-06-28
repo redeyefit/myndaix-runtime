@@ -99,10 +99,18 @@ V1_ROSTER: list[AgentSpec] = [
     AgentSpec(agent_id="higgsfield", reach=Reach.API, authority=Authority.RESPONDER,
               model="dop-lite", role="image/text->video generation",
               profile=Profile(timeout_s=600, cost_budget=2.0),
+              # non_idempotent: the submit POST CHARGES credits and is NOT deduplicated. A worker
+              # CRASH after the charged submit (no TERMINAL Result returned) would otherwise expire
+              # the lease and let reclaim REQUEUE this RESPONDER -> a second charged submit (double
+              # charge, bounded only by MAX_ATTEMPTS). The flag makes _requeue_safe return False, so
+              # a crashed/expired paid job goes dead+surfaced (recover via `mxr get <jid>`), never
+              # auto-resubmitted (cross-family review CRITICAL — clean TERMINAL returns were already
+              # safe; this closes the worker-CRASH window).
               adapter={"kind": "higgsfield",
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
-                       "application": "/higgsfield-ai/dop/lite"}),
+                       "application": "/higgsfield-ai/dop/lite",
+                       "non_idempotent": True}),
     # Stitcher: long video from a shot-list (generate per shot -> last-frame chain ->
     # ffmpeg concat -> deterministic brand overlay). reach=API + adapter.kind 'stitch'
     # routes to invoke_stitch. authority=WORKSPACE_ACTOR -> NEVER auto-retried (so the
@@ -117,7 +125,8 @@ V1_ROSTER: list[AgentSpec] = [
                        "base": "https://platform.higgsfield.ai",
                        "secret_ref": "HF_KEY",
                        "application": "/higgsfield-ai/dop/lite",
-                       "max_segments": 12}),
+                       "max_segments": 12,
+                       "non_idempotent": True}),   # paid; WORKSPACE_ACTOR already non-requeue (belt)
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}

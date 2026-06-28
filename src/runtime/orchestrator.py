@@ -26,12 +26,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 import uuid
 from typing import Awaitable, Callable, Optional
 
 from runtime import critic
 from runtime.registry import get as get_spec
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_WS = re.compile(r"\s+")
+BRIEF_MAX = 500
+MAX_RETRIES_CAP = 2          # HARD ceiling on bounded charged retries (design §6)
+FRAME_GRAB_TIMEOUT_S = 45.0  # wall clock for the ffmpeg frame grab (anti-hang on a dead URL)
+QUEUE_GRACE_S = 180.0        # how long a stage-3 job may sit QUEUED before the render window starts
+
+
+def _sanitize_brief(brief: str) -> str:
+    """Collapse control chars / newlines and cap length on the free-text brief BEFORE it is
+    interpolated into the labeled-block prompt. A newline would otherwise let the brief forge a
+    new labeled section (e.g. 'STYLE: anime' / 'NEGATIVES: none'), overriding the brand LOCKS
+    (cross-family review). Brand LOCKS/NEGATIVES stay in non-user-controlled lines."""
+    return _WS.sub(" ", _CTRL.sub(" ", brief or "")).strip()[:BRIEF_MAX].strip()
 
 # ---- pinned motion catalog (live /v1/motions UUIDs, verified 2026-06-28) ------------------
 # The API forwards `motion_id` verbatim (runner.py:330) and it must be the UUID, not the name.
@@ -76,7 +92,7 @@ def build_prompt(brief: str, brand: str) -> dict:
     """Expand the brief into the labeled-block prompt. The ONLY free-text slot is Caption (the
     brief); every brand slot is filled VERBATIM from the brand LOCKS. Fail-closed on an unknown
     brand or a missing LOCK slot (design §4)."""
-    brief = (brief or "").strip()
+    brief = _sanitize_brief(brief)
     if not brief:
         raise ValueError("empty brief")
     b = BRAND_DEFAULTS.get(brand)
@@ -171,18 +187,27 @@ class OrchestratorDriver:
                                    context=context, created_by="orchestrator",
                                    repo_id=context.get("repo_id"))
         loop = asyncio.get_event_loop()
-        end = loop.time() + deadline_s
+        # Two windows (cross-family MAJOR): the supplier's render timeout starts when the worker
+        # LEASES the job, not at submit. So allow QUEUE_GRACE while QUEUED, then a FULL deadline_s
+        # render window from the first leased/running observation — queue delay can't false-time-out
+        # a still-charging render. A timeout surfaces the job id (it may have charged); never abandon.
+        queue_cap = loop.time() + QUEUE_GRACE_S
+        render_cap = None
         st = {}
-        while loop.time() < end:
+        while True:
+            now = loop.time()
             st = await led.get_status(jid)
-            if st and st.get("status") in ("done", "failed", "dead"):
+            stt = st.get("status") if st else None
+            if stt in ("done", "failed", "dead"):
                 break
+            if stt in ("leased", "running") and render_cap is None:
+                render_cap = now + deadline_s
+            cap = render_cap if render_cap is not None else queue_cap
+            if now >= cap:
+                where = "rendering" if render_cap is not None else "queued"
+                raise TimeoutError(f"stage-3 job {jid} stuck {where} past its deadline — "
+                                   f"recover via `mxr get {jid}` (it may have charged)")
             await asyncio.sleep(POLL_INTERVAL_S)
-        else:
-            # >=600s deadline reached: the supplier bounds itself at Profile.timeout_s, so this
-            # is rare. Surface the job id (it may still be charging) — never silently abandon.
-            raise TimeoutError(f"stage-3 job {jid} not terminal after {deadline_s:.0f}s — "
-                               f"recover via `mxr get {jid}` (it may have charged)")
         if st.get("status") != "done" or not st.get("artifact_ref"):
             err = next((a.get("text") for a in (st.get("attempts") or [])
                         if a.get("status") == "failed" and a.get("text")), st.get("status"))
@@ -192,16 +217,30 @@ class OrchestratorDriver:
                 "job_id": str(jid)}
 
     async def _grab_frame(self, plate_ref: str, w: int = 64, h: int = 36) -> tuple:
-        """Extract ONE downscaled rgb24 frame from the plate via ffmpeg (handles https URL or
-        local path). Pure-bytes out, for the dependency-free critic."""
-        if not (plate_ref.startswith("https://") or plate_ref.startswith("/")
-                or plate_ref.startswith("file://")):
-            raise ValueError(f"refusing to grab a non-https/non-local plate_ref: {plate_ref!r}")
-        cmd = ["ffmpeg", "-v", "error", "-i", plate_ref, "-frames:v", "1",
-               "-vf", f"scale={w}:{h}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+        """Extract ONE downscaled rgb24 frame from the plate via ffmpeg, for the critic.
+        HTTPS-only + SSRF-guarded (a poisoned artifact_ref must not make ffmpeg fetch a
+        loopback/file target — the runner does NOT scheme-check the result url) + wall-clock
+        bounded (a dead-but-open URL must not hang the driver AFTER a paid render). v1 plates are
+        public Higgsfield/Cloudinary https urls; tests inject their own grabber."""
+        if not plate_ref.startswith("https://"):
+            raise ValueError(f"refusing to grab a non-https plate_ref: {plate_ref!r}")
+        from runtime.runner import _reject_unsafe_url
+        reason = await _reject_unsafe_url(plate_ref)
+        if reason:
+            raise ValueError(f"plate_ref rejected (SSRF): {reason}")
+        cmd = ["ffmpeg", "-v", "error", "-rw_timeout", "20000000", "-i", plate_ref,
+               "-frames:v", "1", "-vf", f"scale={w}:{h}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate()
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=FRAME_GRAB_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise RuntimeError(f"ffmpeg frame-grab timed out after {FRAME_GRAB_TIMEOUT_S:.0f}s")
         if proc.returncode != 0 or len(out) < w * h * 3:
             raise RuntimeError(f"ffmpeg frame-grab failed ({proc.returncode}): {err.decode()[:200]}")
         return out[:w * h * 3], w, h
@@ -216,6 +255,7 @@ class OrchestratorDriver:
         supplier = supplier or self._supplier_ledger
         frame_grabber = frame_grabber or self._grab_frame
         hexes = BRAND_DEFAULTS.get(brand, {}).get("hexes", [])
+        max_retries = max(0, min(MAX_RETRIES_CAP, int(max_retries)))   # HARD cap on charged retries
 
         # stage 1 + 2 (free, in-process)
         shot = build_prompt(brief, brand)
@@ -223,25 +263,41 @@ class OrchestratorDriver:
         cost_est = estimate_cost(routed)
 
         # ===== HUMAN COST GATE (before ANY spend) =====
+        # disclose the WORST-CASE spend: the loop may run 1 + max_retries charged attempts, so the
+        # gate must approve the max, not a single attempt (cross-family CRITICAL).
+        max_attempts = max_retries + 1
         plan = {"brief": brief, "brand": brand, "shot_id": shot_id, "image_url": image_url,
                 "motion": routed["motion_name"], "motion_id": routed["motion_id"],
-                "motion_strength": routed["motion_strength"], "estimated_cost": cost_est}
+                "motion_strength": routed["motion_strength"], "estimated_cost": cost_est,
+                "max_attempts": max_attempts,
+                "max_estimated_cost": round(cost_est * max_attempts, 4)}
         if not approve(plan):
             return {"status": "aborted", "reason": "cost gate not approved", "plan": plan}
 
         # ===== stage 3 (supplier, spends) + stage 4 (critic), bounded one-variable retry =====
-        deadline = max(600.0, float(getattr(get_spec("higgsfield").profile, "timeout_s", 600)))
+        spec = get_spec("higgsfield")
+        prof_to = getattr(getattr(spec, "profile", None), "timeout_s", 600) if spec else 600
+        deadline = max(600.0, float(prof_to or 600))
         ms = routed["motion_strength"]
         attempts = []
         result = None
-        for attempt in range(max_retries + 1):
+        for attempt in range(max_attempts):
             ctx = {"image_url": image_url, "prompt": routed["prompt"],
                    "motion_id": routed["motion_id"], "motion_strength": ms,
                    "cost_est": cost_est, "repo_id": repo_id}
             if end_image_url:
                 ctx["end_image_url"] = end_image_url
-            sup = await supplier(ctx, deadline)
-            rgb, w, h = await frame_grabber(sup["artifact_ref"])
+            try:
+                sup = await supplier(ctx, deadline)
+                rgb, w, h = await frame_grabber(sup["artifact_ref"])
+            except Exception as e:                       # noqa: BLE001
+                # a supplier/frame-grab failure is NOT a critic FAIL: do NOT re-run stage 3 (a
+                # re-submit of a non-idempotent paid supplier could double-charge). Record + surface
+                # to a human with the context — never crash the driver (cross-family + workflow MAJOR).
+                attempts.append({"motion_strength": ms, "cost": 0.0, "critic": "error",
+                                 "reasons": [f"{type(e).__name__}: {e}"]})
+                return {"status": "needs_human", "reason": f"stage-3/critic error: {e}",
+                        "attempts": attempts, "plan": plan}
             verdict = critic.critic_generic(rgb, w, h, hexes=hexes)
             attempts.append({"motion_strength": ms, "cost": sup.get("cost", 0.0),
                              "critic": verdict["status"], "reasons": verdict["reasons"]})
