@@ -154,6 +154,8 @@ def test_parse_rule_tags():
     ok("toctou-race" not in tags, "an inline mid-sentence mention is NOT a signal (own-line only)")
     ok("not-a-real-tag" not in tags, "off-list tag dropped (S3)")
     ok(C.parse_rule_tags("") == set(), "empty text -> no tags")
+    # round-3 cross-family fix: LLMs frequently emit Windows CRLF; a dangling \r must NOT drop the signal
+    ok("fail-open" in C.parse_rule_tags("rule:fail-open\r\nnext line"), "CRLF line endings tolerated (\\r absorbed)")
 
 
 def test_agreed_tags_is_cross_family_intersection():

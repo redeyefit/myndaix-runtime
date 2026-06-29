@@ -43,6 +43,13 @@ STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 
 PRUNE_DAYS=14
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
 LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
+CAPTURE_TIMEOUT="${PLAY_CAPTURE_TIMEOUT:-20}"         # observe-only capture is FAIL-OPEN: bound every capture call so a hung
+                                                      # mxr/python/DB connect can NEVER block the review or wedge the held lock
+# bounded, fail-open wrapper for the observe-only capture calls. perl's alarm+exec REPLACES perl with
+# the child, so SIGALRM kills the child after N s — one process, no lingering. If perl is unavailable,
+# skip capture entirely (return non-zero) rather than risk an UNBOUNDED call that could wedge the lock.
+have_perl() { command -v perl >/dev/null 2>&1; }
+cap_run()   { perl -e 'alarm shift; exec @ARGV or exit 127' "$CAPTURE_TIMEOUT" "$@"; }
 ZERO=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
@@ -328,8 +335,8 @@ if ! gate; then
   # finding-class with a `rule:<tag>` line from the fixed taxonomy (python is the single source of
   # truth for the list, so the prompt can't drift from the allowlist). A tag both families emit
   # advances recurrence; everything is fail-open so a missing list just means no tags.
-  if [[ -f "$ORCH/CAPTURE_ENABLED" ]]; then
-    cap_tags="$(mxr capture-record --list-tags 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/ *$//' || true)"
+  if [[ -f "$ORCH/CAPTURE_ENABLED" ]] && have_perl; then
+    cap_tags="$(cap_run mxr capture-record --list-tags 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/ *$//' || true)"
     [[ -n "$cap_tags" ]] && cap_intro=" Separately, IF (and only if) a finding is a RECURRING CLASS of issue rather than a one-off, add a line of EXACTLY the form rule:<tag> on its own line, choosing <tag> ONLY from this fixed set: ${cap_tags}. Omit the line entirely if no listed tag fits or the issue is a one-off — never invent a tag."
   fi
 fi
@@ -399,9 +406,11 @@ $review
   # delay the verdict (cross-family MAJOR). Records the rule:<tag> signals BOTH families agreed on;
   # the python no-ops unless $ORCH/CAPTURE_ENABLED, fails closed on any skills/** path + mixed diff,
   # and NEVER opens a PR (no proposer yet). Skip the auto-proposal branches. Best-effort + fail-open.
-  if [[ -f "$ORCH/CAPTURE_ENABLED" && "$ref" != *skill/auto/* ]]; then
+  if [[ -f "$ORCH/CAPTURE_ENABLED" && "$ref" != *skill/auto/* ]] && have_perl; then
     cap_author="$(git -C "$repo" log -1 --format='%ae' "$tip" 2>/dev/null || echo unknown)"
-    mxr capture-record "$repo_id" "$tip" "$play" "$cap_author" \
-      --kilabz "$review" --oracle "$oracle_review" -- ${changed[@]+"${changed[@]}"} >/dev/null 2>&1 || true
+    # flags FIRST, then `--`, then ALL positionals — so a positional that begins with `-`
+    # (repo_id/sha/author) can't be mis-parsed as an option and crash the record (silent drop).
+    cap_run mxr capture-record --kilabz "$review" --oracle "$oracle_review" -- \
+      "$repo_id" "$tip" "$play" "$cap_author" ${changed[@]+"${changed[@]}"} >/dev/null 2>&1 || true
   fi
 fi

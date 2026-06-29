@@ -1266,6 +1266,7 @@ class PostgresLedger:
                     WHERE state = 'proposed'
                       AND proposed_at IS NOT NULL
                       AND proposed_at < now() - make_interval(days => $1)
+                    ORDER BY fingerprint
                     FOR UPDATE
                )
                UPDATE capture_candidate c

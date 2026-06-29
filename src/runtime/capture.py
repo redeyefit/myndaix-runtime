@@ -229,7 +229,7 @@ def draft_hash(rendered: str) -> str:
 
 
 # ---- instrumentation: parse reviewer-emitted `rule:<tag>` lines + cross-family agreement --------
-_RULE_LINE = re.compile(r"(?mi)^[ \t]*rule:[ \t]*([a-z0-9][a-z0-9-]{1,60})[ \t]*$")
+_RULE_LINE = re.compile(r"(?mi)^[ \t]*rule:[ \t]*([a-z0-9][a-z0-9-]{1,60})[ \t\r]*$")
 
 
 def parse_rule_tags(text: str) -> set[str]:
