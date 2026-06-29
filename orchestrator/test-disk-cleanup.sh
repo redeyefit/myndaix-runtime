@@ -49,5 +49,27 @@ mkdir -p "$SBOX/notcache"; echo k > "$SBOX/notcache/f"
 DRY=0 purge_cache "$SBOX/notcache" "NOTCACHE" >/dev/null 2>&1
 ok "$([ -f "$SBOX/notcache/f" ] && echo 1)" "purge_cache REFUSES a dir outside ~/Library/Caches"
 
+# --- codex CRITICAL: a SYMLINKED allowlisted dir must be refused (else the glob/find enumerates its
+#     real target and remove_hard rm -rf's it). Both reap_aged + purge_cache must spare the target. ---
+mkdir -p "$SBOX/precious2"; echo keep > "$SBOX/precious2/data.txt"
+SYM="$HOME/Library/Caches/mxq-symlink-selftest"
+ln -s "$SBOX/precious2" "$SYM"
+DRY=0 purge_cache "$SYM" "SYMLINK-CACHE" >/dev/null 2>&1
+ok "$([ -f "$SBOX/precious2/data.txt" ] && echo 1)" "purge_cache REFUSES a symlinked cache dir (target survived)"
+DRY=0 reap_aged "$SYM" 0 "SYMLINK-REAP" >/dev/null 2>&1
+ok "$([ -f "$SBOX/precious2/data.txt" ] && echo 1)" "reap_aged REFUSES a symlinked dir (target survived)"
+rm -f "$SYM"
+
+# --- a symlinked CHILD inside an allowlisted dir is left untouched (its target survives) ---
+mkdir -p "$SBOX/childtarget"; echo k > "$SBOX/childtarget/f"
+ln -s "$SBOX/childtarget" "$LIVE/symchild"
+touch -h -t 202601010000 "$LIVE/symchild" 2>/dev/null
+DRY=0 reap_aged "$LIVE" 1 "CHILDSYM" >/dev/null 2>&1
+ok "$([ -f "$SBOX/childtarget/f" ] && echo 1)" "reap_aged skips a symlinked child (its target survived)"
+
+# --- codex HIGH: refuse to run with a bad HOME (empty/"/") so the allowlist can't become /Library ---
+HOME=/ bash "$DIR/disk-cleanup.sh" >/dev/null 2>&1; ok "$([ $? -ne 0 ] && echo 1)" "refuses to run with HOME=/ (no /Library deletion)"
+env -u HOME bash "$DIR/disk-cleanup.sh" >/dev/null 2>&1; ok "$([ $? -ne 0 ] && echo 1)" "refuses to run with HOME unset"
+
 chmod -R u+rwX "$LIVE" 2>/dev/null; rm -rf "$LIVE" 2>/dev/null   # clean the self-test dir
 echo "ALL PASS ($PASS checks)"; [ "$FAIL" = 0 ] || { echo "FAILED ($FAIL)"; exit 1; }
