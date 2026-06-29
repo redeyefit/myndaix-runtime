@@ -322,6 +322,47 @@ def test_frame_grab_failure_preserves_paid_artifact():
     ok(len(calls) == 1, "no re-submit after a paid render")
 
 
+def test_persona_run_happy():
+    calls = []
+
+    async def pj(plate_ref):
+        return {"status": "pass", "metric": {"similarity": 0.85}, "reasons": [], "retry_hint": None}
+    m = asyncio.run(O.OrchestratorDriver().run(
+        "the founder", image_url="https://res.cloudinary.com/x/seed.png", approve=lambda p: True,
+        render_type="persona", supplier=_supplier(calls), persona_judge=pj))
+    ok(m["status"] == "ok", f"persona run completes (got {m.get('status')})")
+    ok(m["render_type"] == "persona", "manifest render_type=persona")
+    ok(m["critic"]["metric"].get("similarity") == 0.85, "persona Soul-ID verdict flows into the manifest")
+    ok(len(calls) == 1, "supplier called once")
+
+
+def test_persona_run_retry_then_needs_human():
+    calls = []
+
+    async def pj(plate_ref):
+        return {"status": "fail", "metric": {"similarity": 0.2}, "reasons": ["identity mismatch"],
+                "retry_hint": {"motion_strength_delta": -0.1}}
+    m = asyncio.run(O.OrchestratorDriver().run(
+        "the founder", image_url="https://res.cloudinary.com/x/seed.png", approve=lambda p: True,
+        render_type="persona", supplier=_supplier(calls), persona_judge=pj,
+        motion_strength=0.5, max_retries=2))
+    ok(m["status"] == "needs_human", "persona identity FAIL -> needs_human after retries")
+    ok(len(calls) == 3, "1 + 2 retries (bounded)")
+    strengths = [c["motion_strength"] for c in calls]
+    ok(strengths[0] > strengths[-1], f"motion_strength lowered on persona fail (warp mitigation): {strengths}")
+
+
+def test_persona_ref_unavailable_is_pre_spend():
+    # an unresolvable persona reference must fail BEFORE the supplier is called (no spend)
+    calls = []
+    m = asyncio.run(O.OrchestratorDriver().run(
+        "the founder", image_url="https://res.cloudinary.com/x/seed.png", approve=lambda p: True,
+        render_type="persona", ref_image="/nonexistent-ref.png", supplier=_supplier(calls)))
+    ok(m["status"] == "needs_human" and "persona reference" in m["reason"],
+       "unresolvable persona ref -> needs_human")
+    ok(len(calls) == 0, "no spend when the persona reference can't be resolved (pre-gate)")
+
+
 def test_requeue_safe_paid_agent_never_requeues():
     from runtime.ledger.postgres_store import PostgresLedger as L
     ok(L._requeue_safe("higgsfield") is False, "paid higgsfield never auto-requeues (no double-charge)")
