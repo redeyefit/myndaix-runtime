@@ -61,8 +61,24 @@ def test_cli_no_worktree_runs_in_fresh_scratch_cwd():
     assert r.status is ResultStatus.OK, r.text
     ran_in = os.path.realpath(r.text.strip())
     assert ran_in != serve_cwd                                # NOT the inherited repo cwd
+    # not even UNDER serve_cwd — guards the TMPDIR-under-repo case where git parent-discovery
+    # from the scratch dir could still reach the base tree (kilabz: defense-in-depth).
+    assert os.path.commonpath([ran_in, serve_cwd]) != serve_cwd
     assert os.path.basename(ran_in).startswith("mdx-cli-cwd.")
     assert not os.path.exists(ran_in)                         # scratch cwd cleaned up in finally
+
+
+def test_cli_empty_worktree_path_still_gets_scratch_cwd():
+    # an empty-string worktree_path must NOT slip through to cwd=None (which re-inherits the
+    # serve cwd and defeats the fix) — the `or None` guard turns it into a fresh scratch cwd.
+    serve_cwd = os.path.realpath(os.getcwd())
+    job = _job()
+    job.worktree_path = ""
+    r = asyncio.run(runner.invoke_cli(_spec(["/bin/pwd"], "stdin"), job))
+    assert r.status is ResultStatus.OK, r.text
+    ran_in = os.path.realpath(r.text.strip())
+    assert ran_in != serve_cwd
+    assert os.path.basename(ran_in).startswith("mdx-cli-cwd.")
 
 
 def test_cli_with_worktree_runs_there_and_is_preserved():

@@ -150,11 +150,19 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     # "phantom" (a false PLAY_PASS in the automerge gate). The diff is fully inlined in the prompt,
     # so an empty scratch cwd is both sufficient and correct: it removes the misleading tree without
     # checking out untrusted head code. WORKSPACE_ACTOR fix jobs keep their isolated worktree.
-    cwd = job.worktree_path
-    scratch_cwd = tempfile.mkdtemp(prefix="mdx-cli-cwd.") if cwd is None else None
+    # `or None` (not `is None`) so an empty-string worktree_path can't slip through to cwd=None,
+    # which would re-inherit the serve cwd and defeat the fix. The scratch cwd lives under the
+    # system temp root (TMPDIR=/var/folders/... under launchd — never the repo; a test asserts it is
+    # not under cwd via commonpath), so git parent-discovery from it finds no tree.
+    cwd = job.worktree_path or None
+    scratch_cwd = None
     started = time.monotonic()
     try:
         try:
+            # allocate the scratch cwd INSIDE the try so an mkdtemp OSError (e.g. ENOSPC) becomes a
+            # clean TERMINAL Result instead of a bubbled crash, and the finally still frees scratch.
+            if cwd is None:
+                scratch_cwd = tempfile.mkdtemp(prefix="mdx-cli-cwd.")
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
