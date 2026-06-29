@@ -81,6 +81,10 @@ BRAND_DEFAULTS = {
 # standing NEGATIVE block — the supplier renders motion+background ONLY; WE render brand text.
 STANDING_NEGATIVES = ["no on-screen text", "no watermark", "no logo", "no warped faces",
                       "no extra fingers", "no text artifacts", "no people"]
+# persona/Soul-ID mode: the seed IS a person we WANT to keep — so DROP "no people" and emphasize
+# identity stability instead (animating a face's #1 failure is warping/drift, caught by the Soul-ID gate).
+PERSONA_NEGATIVES = ["no warped faces", "no morphing", "no identity change", "no distorted features",
+                     "no extra fingers", "no extra limbs", "no on-screen text", "no watermark", "no logo"]
 
 # rough display-only cost estimate (credits) — UNVERIFIED; measure live before any cost LOGIC.
 COST_EST = {"hero": 40, "filler": 6}
@@ -129,23 +133,31 @@ def load_brand(slug: str, brands_dir: Optional[str] = None) -> dict:
 
 
 # ============================ stage 1: prompt-director (in-process) =========================
-def build_prompt(brief: str, brand: str, *, brands_dir: Optional[str] = None) -> dict:
+def build_prompt(brief: str, brand: str, *, brands_dir: Optional[str] = None,
+                 render_type: str = "generic") -> dict:
     """Expand the brief into the labeled-block prompt. The ONLY free-text slot is Caption (the
     brief); every brand slot is filled VERBATIM from the resolved brand LOCKS (file or fallback).
-    Fail-closed on an unknown brand or a missing LOCK slot (design §4)."""
+    render_type 'persona' swaps the NEGATIVES + COMPOSITION for animating a SUBJECT (keep identity,
+    not 'no people'). Fail-closed on an unknown brand or a missing LOCK slot (design §4)."""
     brief = _sanitize_brief(brief)
     if not brief:
         raise ValueError("empty brief")
+    if render_type not in ("generic", "persona"):
+        raise ValueError(f"bad render_type {render_type!r}")
     b = load_brand(brand, brands_dir)
     missing = [k for k in _BRAND_REQUIRED if not b.get(k)]
     if missing:
         raise ValueError(f"brand {brand!r} missing LOCK slots {missing} — fail-closed")
-    negatives = STANDING_NEGATIVES + list(b["banned_tropes"])
+    persona = render_type == "persona"
+    negatives = (PERSONA_NEGATIVES if persona else STANDING_NEGATIVES) + list(b["banned_tropes"])
+    composition = ("subtle, natural camera + subject motion; keep the subject's identity, face, and "
+                   "proportions STABLE and unchanged" if persona
+                   else "cinematic hero composition, rule-of-thirds, deliberate negative space")
     hexes = list(b["hexes"])
     prompt = "\n".join([
         f"Caption: {brief}",
         f"STYLE: {b['style']}",
-        "COMPOSITION: cinematic hero composition, rule-of-thirds, deliberate negative space",
+        f"COMPOSITION: {composition}",
         f"SCENE: {brief}",
         f"CINEMATOGRAPHY_AND_LIGHTING: {b['lighting']}",
         f"CAMERA_AND_LENS: {b['camera_lens']}",
@@ -158,6 +170,7 @@ def build_prompt(brief: str, brand: str, *, brands_dir: Optional[str] = None) ->
         "caption": brief,
         "locks": {"hexes": hexes, "style": b["style"], "camera_lens": b["camera_lens"]},
         "negatives": negatives,
+        "render_type": render_type,
         "total_shots": 1,
     }
 
@@ -298,22 +311,98 @@ class OrchestratorDriver:
             raise RuntimeError(f"ffmpeg frame-grab failed ({proc.returncode}): {err.decode()[:200]}")
         return out[:w * h * 3], w, h
 
+    # ---- persona / Soul-ID gate (stage 4 for render_type="persona") ----
+    async def _grab_frame_png(self, plate_ref: str, out_path: str, w: int = 512) -> None:
+        """Extract one mid-clip frame of the plate to a PNG FILE for embed_face (bigger than the
+        critic's 64x36 so the face is embeddable). Same https-only + SSRF + timeout guards."""
+        if not plate_ref.startswith("https://"):
+            raise ValueError(f"refusing to grab a non-https plate_ref: {plate_ref!r}")
+        from runtime.runner import _reject_unsafe_url
+        reason = await _reject_unsafe_url(plate_ref)
+        if reason:
+            raise ValueError(f"plate_ref rejected (SSRF): {reason}")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-protocol_whitelist", "https,tls,tcp,crypto",
+               "-rw_timeout", "20000000", "-ss", "2", "-i", plate_ref, "-frames:v", "1",
+               "-vf", f"scale={w}:-1", out_path]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=FRAME_GRAB_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise RuntimeError(f"ffmpeg persona frame-grab timed out after {FRAME_GRAB_TIMEOUT_S:.0f}s")
+        if proc.returncode != 0 or not Path(out_path).is_file():
+            raise RuntimeError(f"ffmpeg persona frame-grab failed ({proc.returncode}): {err.decode()[:200]}")
+
+    async def _embed_ref(self, ref_image: Optional[str], image_url: str) -> list:
+        """Reference identity embedding (runs ONCE, pre-loop): from a local ref_image if given, else
+        download the public https seed (SSRF-guarded) and embed it. Raises if no face / no InsightFace."""
+        if ref_image:
+            emb, _ = critic.embed_face(ref_image)
+            if emb is None:
+                raise RuntimeError(f"no face found in ref image {ref_image!r}")
+            return emb
+        if not image_url.startswith("https://"):
+            raise ValueError("persona ref: image_url must be https (or pass ref_image)")
+        from runtime.runner import _reject_unsafe_url
+        reason = await _reject_unsafe_url(image_url)
+        if reason:
+            raise ValueError(f"persona ref image_url rejected (SSRF): {reason}")
+        import tempfile
+
+        import httpx
+        tmp = tempfile.mktemp(suffix=".png")
+        r = httpx.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"persona ref download {r.status_code}")
+        Path(tmp).write_bytes(r.content)
+        emb, _ = critic.embed_face(tmp)
+        if emb is None:
+            raise RuntimeError("no face found in the seed image (persona ref)")
+        return emb
+
+    async def _judge_persona(self, plate_ref: str, ref_emb: list) -> dict:
+        """Stage-4 Soul-ID gate: extract a plate frame, embed the largest face, gate identity vs the
+        reference. A FAIL carries a one-variable retry hint (LOWER motion_strength reduces warping)."""
+        import tempfile
+        png = tempfile.mktemp(suffix=".png")
+        await self._grab_frame_png(plate_ref, png)
+        frame_emb, face_frac = critic.embed_face(png)
+        v = critic.critic_persona(frame_emb, ref_emb, face_frac)
+        v["retry_hint"] = {"motion_strength_delta": -0.1} if v["status"] == "fail" else None
+        return v
+
     async def run(self, brief: str, *, brand: str = "myndaix", image_url: str,
                   approve: ApproveFn, shot_id: str = "shot-01", role: str = "hero",
+                  render_type: str = "generic", ref_image: Optional[str] = None,
                   motion: Optional[str] = None, motion_strength: Optional[float] = None,
                   end_image_url: Optional[str] = None, repo_id: Optional[str] = None,
                   max_retries: int = 2, brands_dir: Optional[str] = None,
                   supplier: Optional[SupplierFn] = None,
-                  frame_grabber: Optional[FrameGrabber] = None) -> dict:
+                  frame_grabber: Optional[FrameGrabber] = None, persona_judge=None) -> dict:
         supplier = supplier or self._supplier_ledger
         frame_grabber = frame_grabber or self._grab_frame
         max_retries = max(0, min(MAX_RETRIES_CAP, int(max_retries)))   # HARD cap on charged retries
 
         # stage 1 + 2 (free, in-process)
-        shot = build_prompt(brief, brand, brands_dir=brands_dir)
+        shot = build_prompt(brief, brand, brands_dir=brands_dir, render_type=render_type)
         hexes = shot["locks"]["hexes"]               # resolved brand hexes (brand file or fallback)
         routed = route(shot, role=role, motion=motion, motion_strength=motion_strength)
         cost_est = estimate_cost(routed)
+
+        # persona Soul-ID gate needs a reference embedding — resolve it BEFORE the cost gate so a
+        # missing InsightFace / faceless reference fails for FREE (pre-spend), never after a charge.
+        ref_emb = None
+        if render_type == "persona" and persona_judge is None:
+            try:
+                ref_emb = await self._embed_ref(ref_image, image_url)
+            except Exception as e:                       # noqa: BLE001
+                return {"status": "needs_human", "reason": f"persona reference unavailable: {e}",
+                        "plan": {"brief": brief, "brand": brand, "render_type": render_type}}
 
         # ===== HUMAN COST GATE (before ANY spend) =====
         # disclose the WORST-CASE spend: the loop may run 1 + max_retries charged attempts, so the
@@ -353,16 +442,20 @@ class OrchestratorDriver:
                 return {"status": "needs_human", "reason": f"stage-3 supplier error: {e}",
                         "attempts": attempts, "plan": plan}
             try:
-                rgb, w, h = await frame_grabber(sup["artifact_ref"])
+                if render_type == "persona":
+                    verdict = (await persona_judge(sup["artifact_ref"]) if persona_judge
+                               else await self._judge_persona(sup["artifact_ref"], ref_emb))
+                else:
+                    rgb, w, h = await frame_grabber(sup["artifact_ref"])
+                    verdict = critic.critic_generic(rgb, w, h, hexes=hexes)
             except Exception as e:                       # noqa: BLE001 — paid plate, QC step failed
                 attempts.append({"motion_strength": ms, "cost": sup.get("cost") or cost_est,
                                  "artifact_ref": sup.get("artifact_ref"), "job_id": sup.get("job_id"),
-                                 "critic": "error", "reasons": [f"frame-grab: {type(e).__name__}: {e}"]})
+                                 "critic": "error", "reasons": [f"stage-4 QC: {type(e).__name__}: {e}"]})
                 return {"status": "needs_human", "plate_url": sup.get("artifact_ref"),
                         "cost": round(sup.get("cost") or cost_est, 4),
-                        "reason": f"stage-4 frame-grab failed (the plate WAS rendered + charged): {e}",
+                        "reason": f"stage-4 QC failed (the plate WAS rendered + charged): {e}",
                         "attempts": attempts, "plan": plan}
-            verdict = critic.critic_generic(rgb, w, h, hexes=hexes)
             attempts.append({"motion_strength": ms, "cost": sup.get("cost", 0.0),
                              "critic": verdict["status"], "reasons": verdict["reasons"]})
             if verdict["status"] != "fail":
@@ -381,7 +474,7 @@ class OrchestratorDriver:
             "plate_url": sup["artifact_ref"],
             "shot_id": shot_id,
             "duration": NOMINAL_DURATION_S,
-            "render_type": "generic",
+            "render_type": render_type,
             "applied_locks": {"hexes": hexes, "camera_preset": routed["motion_name"],
                               "motion_id": routed["motion_id"],
                               "motion_strength": ms, "brand": brand},
@@ -425,7 +518,8 @@ async def _amain(args) -> int:
             args.brief, brand=args.brand, image_url=args.image_url, approve=approve,
             shot_id=args.shot_id, role=args.role, motion=args.motion,
             motion_strength=args.motion_strength, end_image_url=args.end_image_url,
-            repo_id=args.repo, brands_dir=args.brands_dir)
+            repo_id=args.repo, brands_dir=args.brands_dir,
+            render_type=args.render_type, ref_image=args.ref_image)
     finally:
         await drv.close()
     print(json.dumps(manifest, indent=2))
@@ -441,6 +535,11 @@ def main(argv: Optional[list] = None) -> int:
                    help="public seed still URL (rendered+uploaded by mx-engine; image->video)")
     p.add_argument("--shot-id", dest="shot_id", default="shot-01")
     p.add_argument("--role", default="hero", choices=["hero", "filler"])
+    p.add_argument("--render-type", dest="render_type", default="generic",
+                   choices=["generic", "persona"],
+                   help="persona = animate a SUBJECT; stage-4 runs the Soul-ID face gate vs --ref-image/seed")
+    p.add_argument("--ref-image", dest="ref_image", default=None,
+                   help="persona: local reference still for the identity gate (else the seed image_url)")
     p.add_argument("--motion", default=None, help=f"motion name (default by role); one of {sorted(MOTION_CATALOG)}")
     p.add_argument("--motion-strength", dest="motion_strength", type=float, default=None)
     p.add_argument("--end-image-url", dest="end_image_url", default=None)
