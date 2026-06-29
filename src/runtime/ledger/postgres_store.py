@@ -41,7 +41,7 @@ from uuid import UUID
 
 import asyncpg
 
-from runtime import registry, skillmatch
+from runtime import capture, registry, skillmatch
 from runtime.contracts import (
     Authority, ErrorClass, Job, LostLease, Result, TransportEnvelope,
 )
@@ -1136,3 +1136,164 @@ class PostgresLedger:
                         RETURNING name""",
                     _dt.timedelta(days=self.SKILL_ARCHIVE_DAYS))
         return {"staled": len(staled), "archived": len(archived)}
+
+    # ---- auto-capture ("the proposer") — v0.4 multi-signal recurrence + S6 state machine ----
+    # NO LLM decides recurrence: an occurrence is recorded only for an ALLOWLISTED tag that BOTH
+    # families flagged (caller enforces cross_family), and a class becomes `ready` only on the pure
+    # multi-signal gate (capture.recurrence_ready). The separate proposer (S7) drives ready ->
+    # proposing -> proposed; the human merge drives proposed -> promoted|declined.
+    async def record_capture(self, repo_id: str, rule_tag: str, path_glob: str | None,
+                             commit_sha: str, event_id: str, author: str, cross_family: bool, *,
+                             min_recur: int, min_events: int, min_authors: int,
+                             repropose_mult: int) -> dict | None:
+        """Record ONE cross-family-agreed sighting of `rule_tag` on `repo_id` (deduped per
+        (class, commit)), recompute the distinct-signal counts, and RETURN the candidate dict iff
+        this call JUST transitioned the class to 'ready' (else None). Fail-closed: a missing/off-
+        list tag, a non-cross-family signal, or a signal from skills/** records NOTHING. A 'declined'
+        class re-fires only past the (higher) repropose floor; a class already ready/proposing/
+        proposed/promoted/stale/error is counted (occurrence inserted) but never re-readied here."""
+        if not cross_family or not capture.is_allowed_tag(rule_tag) or capture.slug(rule_tag) is None:
+            return None
+        if path_glob and path_glob.startswith("skills/"):       # never capture from the corpus itself
+            return None
+        fp = capture.fingerprint(repo_id, rule_tag)
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    """INSERT INTO capture_candidate (fingerprint, repo_scope, rule_tag, path_glob)
+                           VALUES ($1,$2,$3,$4)
+                       ON CONFLICT (fingerprint) DO UPDATE
+                           SET last_seen = now(),
+                               path_glob = COALESCE(EXCLUDED.path_glob, capture_candidate.path_glob)""",
+                    fp, repo_id, rule_tag, path_glob)
+                await con.execute(
+                    """INSERT INTO capture_occurrence
+                           (fingerprint, commit_sha, event_id, author, path_glob)
+                           VALUES ($1,$2,$3,$4,$5)
+                       ON CONFLICT (fingerprint, commit_sha) DO NOTHING""",
+                    fp, commit_sha, event_id, author, path_glob)
+                counts = await con.fetchrow(
+                    """SELECT count(*)                  AS commits,
+                              count(DISTINCT event_id)  AS events,
+                              count(DISTINCT author)    AS authors
+                         FROM capture_occurrence WHERE fingerprint = $1""", fp)
+                cand = await con.fetchrow(
+                    "SELECT state, decline_count, path_glob FROM capture_candidate WHERE fingerprint = $1",
+                    fp)
+                state, decline = cand["state"], cand["decline_count"]
+                # a declined OR TTL-staled class re-fires only past the (higher) repropose floor;
+                # 'stale' MUST be re-readyable or a TTL-expired class wedges forever (cross-family).
+                eff_recur = (capture.reready_threshold(decline, min_recur=min_recur, mult=repropose_mult)
+                             if state in ("declined", "stale") else min_recur)
+                ready = capture.recurrence_ready(
+                    counts["commits"], counts["events"], counts["authors"],
+                    min_recur=eff_recur, min_events=min_events, min_authors=min_authors)
+                if state in ("new", "accumulating", "declined", "stale") and ready:
+                    await con.execute(
+                        "UPDATE capture_candidate SET state = 'ready' WHERE fingerprint = $1", fp)
+                    return {"fingerprint": fp, "repo_scope": repo_id, "rule_tag": rule_tag,
+                            "path_glob": cand["path_glob"], "decline_count": decline,
+                            "commits": counts["commits"], "events": counts["events"],
+                            "authors": counts["authors"]}
+                if state == "new":
+                    await con.execute(
+                        "UPDATE capture_candidate SET state = 'accumulating' WHERE fingerprint = $1", fp)
+        return None
+
+    async def claim_for_proposing(self, fingerprint: str, branch: str, draft_sha: str) -> bool:
+        """CAS 'ready' -> 'proposing', pinning the deterministic branch + draft_sha BEFORE any
+        git/gh side effect (S6). Stamps proposed_at as the 'in-flight since' time so a crash mid-
+        proposing can be reaped (reap_stuck_proposing). Returns True iff this call won the claim — a
+        concurrent proposer tick gets False and must not also open a PR."""
+        row = await self._pool.fetchrow(
+            """UPDATE capture_candidate
+                   SET branch = $2, draft_sha = $3, state = 'proposing', proposed_at = now()
+                WHERE fingerprint = $1 AND state = 'ready'
+                RETURNING fingerprint""", fingerprint, branch, draft_sha)
+        return row is not None
+
+    async def reap_stuck_proposing(self, timeout_minutes: int) -> int:
+        """S6 anti-wedge: a proposer that crashed AFTER claiming 'proposing' but BEFORE opening the
+        PR would occupy a MAX_OPEN slot forever (expire_stale_captures only touches 'proposed').
+        Release any 'proposing' row older than the timeout back to 'ready' (clearing the pinned
+        branch/draft_sha) so the next tick retries. Returns the count reaped."""
+        rows = await self._pool.fetch(
+            """UPDATE capture_candidate SET state = 'ready', branch = NULL, draft_sha = NULL
+                WHERE state = 'proposing'
+                  AND proposed_at IS NOT NULL
+                  AND proposed_at < now() - make_interval(mins => $1)
+                RETURNING fingerprint""", timeout_minutes)
+        return len(rows)
+
+    async def mark_capture_proposed(self, fingerprint: str, branch: str, draft_sha: str,
+                                    pr_number: int) -> bool:
+        """CAS 'proposing' -> 'proposed' once the PR is open (S6). FENCED on the claim identity
+        (branch + draft_sha): after reap_stuck_proposing releases A's claim and B re-claims, A's
+        late mark won't match B's row, so A can't clobber B's live claim / double-open a PR
+        (cross-family race). Returns True iff THIS claim transitioned."""
+        row = await self._pool.fetchrow(
+            """UPDATE capture_candidate SET state = 'proposed', pr_number = $4, proposed_at = now()
+                WHERE fingerprint = $1 AND state = 'proposing' AND branch = $2 AND draft_sha = $3
+                RETURNING fingerprint""", fingerprint, branch, draft_sha, pr_number)
+        return row is not None
+
+    async def release_proposing(self, fingerprint: str, branch: str, draft_sha: str) -> bool:
+        """Recovery: a proposer claimed 'proposing' but failed BEFORE opening the PR. CAS back to
+        'ready' (clearing the pinned branch/draft_sha). FENCED on the claim identity so a resumed A
+        can't release B's later claim (cross-family race). Returns True iff THIS claim released."""
+        row = await self._pool.fetchrow(
+            """UPDATE capture_candidate SET state = 'ready', branch = NULL, draft_sha = NULL
+                WHERE fingerprint = $1 AND state = 'proposing' AND branch = $2 AND draft_sha = $3
+                RETURNING fingerprint""", fingerprint, branch, draft_sha)
+        return row is not None
+
+    async def resolve_capture(self, fingerprint: str, outcome: str) -> bool:
+        """The human's decision on a proposed candidate: 'promoted' (PR merged) or 'declined' (PR
+        closed). CAS from 'proposed' only. A declined class increments decline_count and clears its
+        proposal state so it can RE-accumulate toward the (higher) repropose floor; a promoted one
+        is terminal. A class already resolved returns False (idempotent)."""
+        if outcome == "promoted":
+            row = await self._pool.fetchrow(
+                """UPDATE capture_candidate SET state = 'promoted'
+                    WHERE fingerprint = $1 AND state = 'proposed' RETURNING fingerprint""", fingerprint)
+        elif outcome == "declined":
+            row = await self._pool.fetchrow(
+                """UPDATE capture_candidate
+                       SET state = 'declined', decline_count = decline_count + 1,
+                           branch = NULL, draft_sha = NULL, pr_number = NULL, proposed_at = NULL
+                    WHERE fingerprint = $1 AND state = 'proposed' RETURNING fingerprint""", fingerprint)
+        else:
+            raise ValueError(f"resolve_capture: bad outcome {outcome!r}")
+        return row is not None
+
+    async def count_open_proposals(self) -> int:
+        """Open auto-PRs in flight (proposing or proposed) — the proposer gates on this vs
+        CAPTURE_MAX_OPEN (S8 anti-fatigue) before claiming the next 'ready' class."""
+        return await self._pool.fetchval(
+            "SELECT count(*) FROM capture_candidate WHERE state IN ('proposing','proposed')")
+
+    async def expire_stale_captures(self, ttl_days: int) -> list[dict]:
+        """S8 anti-wedge: mark any 'proposed' class whose PR has sat past the TTL as 'stale' and
+        RETURN {fingerprint, pr_number} so the proposer can close the abandoned PR — a garbage flood
+        can't permanently occupy the MAX_OPEN slots. INCREMENTS decline_count (so a re-accumulating
+        stale class re-fires only past the exponential repropose floor — without this it would
+        immediately re-ready on the next sighting, spam-proposing; cross-family CRITICAL) and clears
+        the proposal fields like a decline."""
+        # CTE captures the OLD pr_number (RETURNING would otherwise yield the cleared NULL) so the
+        # proposer can still close the abandoned PR, while we clear the proposal fields like a decline.
+        rows = await self._pool.fetch(
+            """WITH due AS (
+                   SELECT fingerprint, pr_number FROM capture_candidate
+                    WHERE state = 'proposed'
+                      AND proposed_at IS NOT NULL
+                      AND proposed_at < now() - make_interval(days => $1)
+                    ORDER BY fingerprint
+                    FOR UPDATE
+               )
+               UPDATE capture_candidate c
+                   SET state = 'stale', decline_count = c.decline_count + 1,
+                       branch = NULL, draft_sha = NULL, pr_number = NULL, proposed_at = NULL
+                FROM due
+                WHERE c.fingerprint = due.fingerprint
+                RETURNING c.fingerprint, due.pr_number""", ttl_days)
+        return [{"fingerprint": r["fingerprint"], "pr_number": r["pr_number"]} for r in rows]

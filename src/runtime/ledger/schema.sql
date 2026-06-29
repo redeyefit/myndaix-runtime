@@ -156,3 +156,36 @@ CREATE TABLE skill_use (
     repo_scope  text NOT NULL,
     used_at     timestamptz NOT NULL DEFAULT now()
 );
+
+-- auto-capture rung (the proposer): v0.4 multi-signal recurrence + S6 state machine. Mirrors
+-- migrations/0007_capture_candidate.sql (keep the two in lockstep). A (repo, allowlisted rule_tag)
+-- class that recurs with enough INDEPENDENT signal gets ONE proposed skill PR; the proposer never
+-- promotes. NO LLM in the trigger; the glob is SECONDARY locality (-> the proposed path_trigger).
+CREATE TABLE capture_candidate (
+    fingerprint   text PRIMARY KEY,                 -- sha256(repo_scope \0 rule_tag): the class key
+    repo_scope    text NOT NULL,
+    rule_tag      text NOT NULL,                     -- allowlisted taxonomy tag (recurrence class)
+    path_glob     text,                              -- SECONDARY locality -> proposed path_trigger
+    state         text NOT NULL DEFAULT 'new'        -- S6 two-phase idempotent state machine
+                  CHECK (state IN ('new','accumulating','ready','proposing',
+                                   'proposed','promoted','declined','stale','error')),
+    branch        text,                              -- skill/auto/<slug> (pinned at ready->proposing)
+    draft_sha     text,                              -- sha256(rendered SKILL.md) (S6 idempotency)
+    pr_number     int,
+    decline_count int NOT NULL DEFAULT 0 CHECK (decline_count >= 0),  -- repropose floor (S8)
+    first_seen    timestamptz NOT NULL DEFAULT now(),
+    last_seen     timestamptz NOT NULL DEFAULT now(),
+    proposed_at   timestamptz                        -- when the PR opened (TTL anti-wedge, S8)
+);
+
+CREATE TABLE capture_occurrence (
+    fingerprint  text NOT NULL REFERENCES capture_candidate(fingerprint) ON DELETE CASCADE,
+    commit_sha   text NOT NULL,
+    event_id     text NOT NULL,                      -- the review/push event (run id): temporal indep.
+    author       text NOT NULL,
+    path_glob    text,
+    seen_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (fingerprint, commit_sha)            -- one occurrence per (class, commit)
+);
+
+CREATE INDEX idx_capture_candidate_state ON capture_candidate (state);
