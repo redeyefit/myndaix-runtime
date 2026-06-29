@@ -3,6 +3,9 @@ agents needed. Proves: arg channel, stdin channel, nonzero->terminal, timeout->k
 Runnable with pytest OR standalone: `PYTHONPATH=src python3 tests/test_runner.py`.
 """
 import asyncio
+import os
+import shutil
+import tempfile
 import uuid
 
 from runtime import runner
@@ -46,6 +49,49 @@ def test_cli_timeout_is_killed():
     # sleep ignores stdin; 1s timeout fires well before the 30s sleep finishes.
     r = asyncio.run(runner.invoke_cli(_spec(["sleep", "30"], "stdin"), _job(prompt="x", timeout=1)))
     assert r.status is ResultStatus.TIMEOUT
+
+
+# -- gate fix: a job WITHOUT a worktree must run in a fresh empty scratch cwd, NOT the serve
+#    process's inherited cwd (the repo at base) — else a reviewer reads the wrong tree and calls
+#    real diff-findings "phantom". The scratch cwd is removed after the run.
+
+def test_cli_no_worktree_runs_in_fresh_scratch_cwd():
+    serve_cwd = os.path.realpath(os.getcwd())
+    r = asyncio.run(runner.invoke_cli(_spec(["/bin/pwd"], "stdin"), _job()))
+    assert r.status is ResultStatus.OK, r.text
+    ran_in = os.path.realpath(r.text.strip())
+    assert ran_in != serve_cwd                                # NOT the inherited repo cwd
+    # not even UNDER serve_cwd — guards the TMPDIR-under-repo case where git parent-discovery
+    # from the scratch dir could still reach the base tree (kilabz: defense-in-depth).
+    assert os.path.commonpath([ran_in, serve_cwd]) != serve_cwd
+    assert os.path.basename(ran_in).startswith("mdx-cli-cwd.")
+    assert not os.path.exists(ran_in)                         # scratch cwd cleaned up in finally
+
+
+def test_cli_empty_worktree_path_still_gets_scratch_cwd():
+    # an empty-string worktree_path must NOT slip through to cwd=None (which re-inherits the
+    # serve cwd and defeats the fix) — the `or None` guard turns it into a fresh scratch cwd.
+    serve_cwd = os.path.realpath(os.getcwd())
+    job = _job()
+    job.worktree_path = ""
+    r = asyncio.run(runner.invoke_cli(_spec(["/bin/pwd"], "stdin"), job))
+    assert r.status is ResultStatus.OK, r.text
+    ran_in = os.path.realpath(r.text.strip())
+    assert ran_in != serve_cwd
+    assert os.path.basename(ran_in).startswith("mdx-cli-cwd.")
+
+
+def test_cli_with_worktree_runs_there_and_is_preserved():
+    wt = tempfile.mkdtemp(prefix="mdx-test-wt.")
+    try:
+        job = _job()
+        job.worktree_path = wt
+        r = asyncio.run(runner.invoke_cli(_spec(["/bin/pwd"], "stdin"), job))
+        assert r.status is ResultStatus.OK, r.text
+        assert os.path.realpath(r.text.strip()) == os.path.realpath(wt)
+        assert os.path.isdir(wt)                              # invoke_cli must NOT remove a caller-owned worktree
+    finally:
+        shutil.rmtree(wt, ignore_errors=True)
 
 
 # -- P2 env scrub: a CLI subprocess must NOT inherit sibling agents' secrets ----

@@ -144,15 +144,31 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     # throwaway HOME seeded with only its auth, so an injected fix-list can't make it read the
     # operator's ~/.ssh/~/.aws/~/.myndaix. No-op (scratch=None) for agents without the flag.
     env, scratch = _make_scratch_home(spec, _cli_env(spec))
+    # A job without an explicit worktree must NOT inherit the serve process's cwd (the runtime
+    # repo working tree, pinned at the default branch). A reviewer/triage agent that reads that
+    # tree to "verify" a finding sees the BASE, not the reviewed head, and calls real diff-findings
+    # "phantom" (a false PLAY_PASS in the automerge gate). The diff is fully inlined in the prompt,
+    # so an empty scratch cwd is both sufficient and correct: it removes the misleading tree without
+    # checking out untrusted head code. WORKSPACE_ACTOR fix jobs keep their isolated worktree.
+    # `or None` (not `is None`) so an empty-string worktree_path can't slip through to cwd=None,
+    # which would re-inherit the serve cwd and defeat the fix. The scratch cwd lives under the
+    # system temp root (TMPDIR=/var/folders/... under launchd — never the repo; a test asserts it is
+    # not under cwd via commonpath), so git parent-discovery from it finds no tree.
+    cwd = job.worktree_path or None
+    scratch_cwd = None
     started = time.monotonic()
     try:
         try:
+            # allocate the scratch cwd INSIDE the try so an mkdtemp OSError (e.g. ENOSPC) becomes a
+            # clean TERMINAL Result instead of a bubbled crash, and the finally still frees scratch.
+            if cwd is None:
+                scratch_cwd = tempfile.mkdtemp(prefix="mdx-cli-cwd.")
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=job.worktree_path or None,
+                cwd=cwd or scratch_cwd,
                 env=env,                 # scrubbed allowlist (+ scratch HOME): no inherited secrets (P2)
                 start_new_session=True,  # own process group -> killpg reaches every child
             )
@@ -182,6 +198,8 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     finally:
         if scratch:                      # the seeded auth copy is transient — always remove it
             shutil.rmtree(scratch, ignore_errors=True)
+        if scratch_cwd:                  # the empty scratch cwd is per-invocation — always remove it
+            shutil.rmtree(scratch_cwd, ignore_errors=True)
 
     code = proc.returncode
     if code == 0:
