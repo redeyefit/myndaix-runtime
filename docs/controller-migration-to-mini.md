@@ -1,8 +1,10 @@
 # Runbook — Migrate review autonomy (controller + automerge + fix-sweep) to the always-on Mini
 
-**Status:** PLAN — NOT executed. Run it as an **attended** session (it's a live autonomy cutover with a
-deliberate seconds-long gap). Designed + adversarially hardened by a multi-lens workflow (3 design lenses →
-synthesis → 3 adversarial passes); the valid findings are folded below.
+**Status:** EXECUTED 2026-06-28 (attended). The Mini is now the autonomous brain — controller (hourly),
+automerge (:30), fix-sweep (hourly) live on the always-on host; MacBook autonomy loops booted out + disabled
+(pool kept for interactive `mxr`); cursor seeded at HEAD; CAPTURE_ENABLED + SKILLS_ENABLED armed on the Mini.
+Designed + adversarially hardened by a multi-lens workflow (3 design lenses → synthesis → 3 adversarial
+passes); the valid findings were folded below. Kept as the rollback + re-run reference.
 
 **Goal:** make the *thin* autonomous brain run 24/7 on the Mini instead of sleeping with the MacBook. Move
 ONLY the review/merge loops; the MacBook keeps its `ai.myndaix.runtime` pool for interactive `mxr`. Lean
