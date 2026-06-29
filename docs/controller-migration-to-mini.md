@@ -11,7 +11,11 @@ ONLY the review/merge loops; the MacBook keeps its `ai.myndaix.runtime` pool for
 controller, not a fat orchestrator (see the orchestration-layers decision: interactive=Mack, autonomous=thin
 controller, Lobster=callable specialist). Everything reversible.
 
-## Ground truth (verified 2026-06-28)
+## Pre-cutover snapshot (verified 2026-06-28, FROZEN — the state BEFORE execution)
+> This section is the *pre-cutover* world, deliberately frozen as the rollback / re-run reference. The
+> **post-cutover** reality is in the **Status** header above (Mini = the live brain; MacBook loops disabled;
+> 0007 applied; PAT installed on Mini + parked on MacBook; cursor seeded; CAPTURE+SKILLS armed). Do NOT read
+> the facts below as current — they describe what was true immediately before the firebreak.
 - **MacBook** (sole live brain now): `ai.myndaix.{controller(hourly),automerge(:30,ARMED),fix-sweep(hourly),runtime}` + `com.myndaix.mxq-draft` (OUT OF SCOPE). `$ORCH=~/.myndaix/orchestrator`: SKILLS+AUTOMERGE armed, CAPTURE/AUTOFIX off; `repos.json`→[fieldvision, myndaix-runtime]. PAT `~/.myndaix/.automerge-token` (r2, 93B, Contents+PRs RW + Metadata R on redeyefit/myndaix-runtime). DB `runtime`: review_cursor — myndaix-runtime reviewed=39287f4 **state=blocked attempts=3 pending=85618e0**, fieldvision baseline. serve serves the working tree (currently `chore/disk-cleanup-job`).
 - **Mini** (target, M4/24GB, 24/7): only `ai.myndaix.runtime` (pool live). NO `$ORCH`. Clone STALE at 85618e0 (PR#32) — needs pull. DB `runtime`: migrations 0001-0006, review_cursor 0 rows, **0007 NOT applied**. PAT ABSENT. agy authed (works via pool), gh=redeyefit, secrets dir present (load.sh + env/).
 - **Shared/critical:** separate Postgres DBs per host (no shared lock; cursor + `automerge_seen` are per-DB). branch protection on main = server-side (requires `test`, no required reviews). Two brains on the same GitHub repos = double reviews + automerge merge-RACE → **exactly one host may run these loops.**
