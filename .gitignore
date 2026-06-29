@@ -12,3 +12,4 @@ build/
 .ruff_cache/
 .DS_Store
 .runtime.log
+.playwright-mcp/
