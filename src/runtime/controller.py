@@ -65,7 +65,12 @@ DEFAULT_WATCH_REF = "refs/heads/main"
 MAX_DISPATCH_PER_TICK = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DISPATCH", "3"))
 MAX_DISPATCH_PER_DAY = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DAY", "20"))
 MAX_ATTEMPTS = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", "3"))
-PENDING_STALE = int(os.environ.get("MYNDAIX_CONTROLLER_PENDING_STALE", "3600"))  # 1 h
+PENDING_STALE = int(os.environ.get("MYNDAIX_CONTROLLER_PENDING_STALE", "7200"))  # 2 h
+# Must exceed BOTH the play-review worst-case worker runtime (STALE lock budget 2700s) AND the
+# tick interval (3600s): the worker now OUTLIVES the dispatching tick (it is nohup-detached and
+# the plist sets AbandonProcessGroup, so launchd no longer reaps it on tick exit). A PENDING_STALE
+# equal to the interval left zero margin — a worker still running at the next tick could be
+# re-claimed into a second concurrent same-head dispatch. 7200 gives ~2 ticks of headroom.
 FETCH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_FETCH_TIMEOUT", "60"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
 
