@@ -237,6 +237,11 @@ autofix_fire(){
   # MYNDAIX_FIX_* test seam inherited via nohup. Pass a FIXED trusted PATH literal (NOT the inherited
   # $PATH, Oracle MINOR) so a poisoned PATH can't redirect the fixer's `#!/usr/bin/env bash` shebang;
   # play-fix self-establishes its full PATH + pool auth at :20.
+  # REAP LANDMINE: this nohup-detached child stays in the dispatcher's process group (no setsid on
+  # macOS). It is only safe under a launchd dispatcher because BOTH launchd callers hard-disable
+  # autofix (controller.py + automerge.py set PLAY_DISABLE_AUTOFIX=1), so autofix_fire never runs
+  # there. A future launchd dispatcher that ARMS autofix MUST set AbandonProcessGroup=true on its
+  # plist, or launchd will reap this fixer when the short-lived job exits (same bug the controller hit).
   nohup env -i PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" HOME="$HOME" "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
   return 0
 }
