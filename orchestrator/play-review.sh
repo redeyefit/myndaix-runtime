@@ -89,6 +89,11 @@ fi
 # ===========================================================================
 repo="$2"; base="$3"; tip="$4"; ref="$5"; remote_url="${6:-}"
 repo_id="$(basename "$repo")"                        # repo bucket for per-repo concurrency (PR-2); review jobs carry it, canary stays cap-exempt
+# transient-marker scope — must derive IDENTICALLY to controller._transient_marker: repo basename
+# + ref, slugged like python _slug (every char outside [A-Za-z0-9._-] -> '-', so refs/heads/main
+# -> refs-heads-main). A bare transient-<tip> was GLOBAL: two watched repos sharing a commit sha
+# (forks) could steal each other's refunds. Contract-tested in tests/test_controller.py.
+marker_slug="${repo_id//[^A-Za-z0-9._-]/-}-${ref//[^A-Za-z0-9._-]/-}"
 scope=(--repo "$repo_id" --base-ref "$tip")          # stamp the reviewed repo + exact reviewed SHA on the real review jobs
 play="$(date +%Y%m%d%H%M%S)-$$"
 run="$RUNS/$play"
@@ -148,7 +153,7 @@ abort(){ note "$1" "ABORT: $2"
   # controller refunds the attempt (transient can't climb the blocked ceiling) and releases the
   # slot for prompt re-dispatch. Push-mode only (gate exited above). Other stages (diff/review/
   # triage) still count toward the ceiling — a poison diff is what CAUSES those failures.
-  [[ "$1" == canary ]] && { : > "$STATE/transient-$tip" 2>/dev/null || true; }
+  [[ "$1" == canary ]] && { : > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true; }
   deliver "review ABORTED — $1" "$2" || true; exit 0; }
 
 fence(){ # fence <label> <text> — nonce-gated on BOTH boundaries
@@ -255,6 +260,11 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   : > "$STATE/SKIPPED-$tip" 2>/dev/null || true
   note contention "lock held; skipped $tip"
   gate && { write_verdict "ABORTED"; exit 2; }               # gate: contention = TRANSIENT (exit 2 -> retry next tick)
+  # lock contention is TRANSIENT by definition (the lock stale-reaps at 45 min; the streak alert
+  # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
+  # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
+  # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
+  : > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true
   deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. Re-push to retry (e.g. git commit --allow-empty -m retrigger && git push)." || true
   exit 0
 }

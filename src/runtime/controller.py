@@ -355,8 +355,14 @@ def _done(sha: str) -> bool:
     return (STATE / f"done-{sha}").exists()
 
 
-def _transient_marker(sha: str) -> Path:
-    return STATE / f"transient-{sha}"
+def _transient_marker(repo: Repo, ref: str, sha: str) -> Path:
+    # Scoped transient-<repo>-<ref>-<sha>: a bare transient-<sha> was GLOBAL, so two watched
+    # repos sharing a commit sha (e.g. forks) could steal each other's refunds. Keyed on the
+    # BASENAME of the repo path — NOT rid — because the worker derives its repo_id as
+    # `basename "$repo"` (play-review.sh) and the two sides must match even if a repos.json
+    # key ever diverges from the dir name. _slug MUST stay identical to the worker's bash
+    # substitution ${var//[^A-Za-z0-9._-]/-} (contract-tested in test_controller).
+    return STATE / f"transient-{_slug(Path(repo.path).name)}-{_slug(ref)}-{sha}"
 
 
 def _transient_streak_file(rid: str) -> Path:
@@ -383,6 +389,32 @@ def _reset_transient_streak(rid: str) -> None:
         _transient_streak_file(rid).unlink()
     except OSError:
         pass
+
+
+async def _try_forgive_transient(led: PostgresLedger, repo: Repo, rid: str, ref: str,
+                                 sha: str) -> bool:
+    """Consume this head's transient marker (unlink-FIRST, so a crash between the steps loses
+    one refund rather than double-forgiving a FUTURE dispatch of the same sha) and refund the
+    attempt in the ledger. Shared by process_repo's transient pass AND its blocked-ceiling
+    re-check so the consume/forgive/streak logic cannot drift between the two sites. Returns
+    True iff an attempt was forgiven (callers log their own site-specific line)."""
+    tm = _transient_marker(repo, ref, sha)
+    if not tm.exists():
+        return False
+    try:
+        tm.unlink()                                      # consume: a stale marker must not
+    except OSError:                                      # forgive a FUTURE dispatch of this sha
+        log(f"{rid}: could not consume transient marker for {sha[:8]} — skipping forgive")
+        return False
+    if not await led.forgive_transient(rid, ref, sha):
+        return False
+    if _bump_transient_streak(rid) == TRANSIENT_ALERT_STREAK:
+        _alert_jefe(f"review backstop: transient canary failures on {rid}",
+                    f"{TRANSIENT_ALERT_STREAK} consecutive review dispatches for {rid} "
+                    f"aborted at the canary stage (agent/pool unreachable). The controller "
+                    f"is refunding attempts and retrying each tick — nothing is blocked — "
+                    f"but the pool or an agent (kilabz/oracle auth, serve) likely needs a look.")
+    return True
 
 
 def _pin(repo: Repo, refname: str, sha: str) -> bool:
@@ -645,31 +677,19 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
                 _reset_transient_streak(rid)
             cur = await led.get_cursor(rid, ref)
 
-    # transient-abort pass: a canary-stage abort is pool/agent flakiness, never a poison head
-    # (2026-06-30: three such aborts hard-blocked the backstop until a new head landed). The
-    # worker writes transient-<tip>; consume it exactly once -> refund the attempt + force the
-    # pending row stale so the decide pass below re-dispatches THIS tick instead of waiting out
-    # PENDING_STALE. The blocked ceiling then counts only non-transient failures. A streak of
-    # forgives without a delivery surfaces the outage to Jefe ONCE (== so re-alerts need a new
-    # streak), but NEVER blocks — retrying a canary is cheap and self-heals when the pool does.
+    # transient-abort pass: a canary-stage abort (or lock contention) is pool/agent flakiness,
+    # never a poison head (2026-06-30: three such aborts hard-blocked the backstop until a new
+    # head landed). The worker writes transient-<repo>-<ref>-<tip>; consume it exactly once ->
+    # refund the attempt + force the pending row stale so the decide pass below re-dispatches
+    # THIS tick instead of waiting out PENDING_STALE. The blocked ceiling then counts only
+    # non-transient failures. A streak of forgives without a delivery surfaces the outage to
+    # Jefe ONCE (== so re-alerts need a new streak), but NEVER blocks — retrying a canary is
+    # cheap and self-heals when the pool does.
     if cur and cur["pending_sha"] and not _done(cur["pending_sha"]):
         ps = cur["pending_sha"]
-        tm = _transient_marker(ps)
-        if tm.exists():
-            try:
-                tm.unlink()                              # consume: a stale marker must not
-            except OSError:                              # forgive a FUTURE dispatch of this sha
-                log(f"{rid}: could not consume transient marker for {ps[:8]} — skipping forgive")
-            else:
-                if await led.forgive_transient(rid, ref, ps):
-                    log(f"{rid}: transient abort on {ps[:8]} — attempt refunded, slot released")
-                    if _bump_transient_streak(rid) == TRANSIENT_ALERT_STREAK:
-                        _alert_jefe(f"review backstop: transient canary failures on {rid}",
-                                    f"{TRANSIENT_ALERT_STREAK} consecutive review dispatches for {rid} "
-                                    f"aborted at the canary stage (agent/pool unreachable). The controller "
-                                    f"is refunding attempts and retrying each tick — nothing is blocked — "
-                                    f"but the pool or an agent (kilabz/oracle auth, serve) likely needs a look.")
-                cur = await led.get_cursor(rid, ref)
+        if await _try_forgive_transient(led, repo, rid, ref, ps):
+            log(f"{rid}: transient abort on {ps[:8]} — attempt refunded, slot released")
+            cur = await led.get_cursor(rid, ref)
 
     url = remote_url(repo)                                # validate transport BEFORE fetch (M1)
     if url is None:
@@ -725,9 +745,18 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
 
     # ceiling: stop chasing a head that has failed MAX_ATTEMPTS dispatches
     if cur["pending_sha"] == head and cur["attempts"] >= MAX_ATTEMPTS and cur["state"] != "blocked":
-        if await led.mark_blocked(rid, ref, head, MAX_ATTEMPTS):
-            log(f"{rid}: BLOCKED {head[:8]} after {cur['attempts']} attempts — surfaced, backing off")
-        return
+        # marker-after-pass race: the worker's abort can land the marker AFTER this tick's
+        # transient pass but before this check. Blocking then would re-wedge like the original
+        # bug — the NEXT tick's pass consumes the marker, but a plain forgive couldn't repair a
+        # 'blocked' row and the marker is gone. Re-check + forgive HERE instead of blocking,
+        # then fall through so the decide pass below re-claims THIS tick.
+        if await _try_forgive_transient(led, repo, rid, ref, head):
+            log(f"{rid}: transient abort on {head[:8]} at the ceiling — attempt refunded "
+                f"instead of blocking")
+        else:
+            if await led.mark_blocked(rid, ref, head, MAX_ATTEMPTS):
+                log(f"{rid}: BLOCKED {head[:8]} after {cur['attempts']} attempts — surfaced, backing off")
+            return
 
     if budget[0] >= MAX_DISPATCH_PER_TICK:
         log(f"{rid}: per-tick dispatch budget reached — deferring {head[:8]} to next tick"); return

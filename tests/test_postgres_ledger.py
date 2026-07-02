@@ -630,6 +630,26 @@ async def test_forgive_transient_net_flat_cycle(led: PostgresLedger) -> None:
         "attempts never reaches 2 across transient cycles (can't climb to the ceiling)"
 
 
+# -- controller-loop cursor: forgive_transient repairs a raced BLOCKED row ------
+async def test_forgive_transient_repairs_blocked_row(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoTB", "refs/heads/main", "1" * 40, "2" * 40
+    hour = _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # attempt 1
+    assert await led.mark_blocked(R, REF, B, 1) is True                    # the race: block won
+    assert (await led.get_cursor(R, REF))["state"] == "blocked"
+    # the marker is written only by the LOCAL worker (a poison head never writes one), so a
+    # blocked row WITH a marker is a mis-classified transient -> forgive repairs the block
+    assert await led.forgive_transient(R, REF, B) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["state"] == "dispatching", "forgive must repair the blocked row"
+    assert cur["attempts"] == 0, "and still refund the attempt"
+    # epoch'd updated_at + repaired state -> a NOW stale cutoff re-claims immediately
+    assert await led.claim_dispatch(R, REF, B, _utcnow()) is True
+    assert (await led.get_cursor(R, REF))["attempts"] == 1
+
+
 # -- controller-loop cursor: skip_to advances past an empty-diff head ----------
 async def test_skip_to(led: PostgresLedger) -> None:
     await _truncate(led)

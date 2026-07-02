@@ -277,7 +277,7 @@ async def test_transient_marker_forgives_and_redispatches(led: PostgresLedger) -
     head2 = advance(repo, "c1")
     await C.process_repo(led, repo, [0])                 # dispatch #1 (pending=head2, attempts=1)
     assert len(records(seam)) == 1
-    marker = C._transient_marker(head2)
+    marker = C._transient_marker(repo, repo.watch_ref, head2)
     marker.write_text("")                                # the worker's canary-abort marker
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -302,7 +302,7 @@ async def test_transient_streak_alerts_once_and_delivery_resets(led: PostgresLed
         head2 = advance(repo, "c1")
         await C.process_repo(led, repo, [0])             # dispatch #1
         for _ in range(4):                               # 4 transient cycles: streak 1..4
-            C._transient_marker(head2).write_text("")
+            C._transient_marker(repo, repo.watch_ref, head2).write_text("")
             await C.process_repo(led, repo, [0])         # forgive + re-dispatch each tick
         assert len(alerts) == 1, f"alert fires ONLY at streak=={C.TRANSIENT_ALERT_STREAK}, got {len(alerts)}"
         assert C._transient_streak_file(repo.repo_id).exists(), "streak persists while the outage lasts"
@@ -322,13 +322,83 @@ async def test_stale_transient_marker_ignored(led: PostgresLedger) -> None:
     await C.process_repo(led, repo, [0])                 # baseline
     advance(repo, "c1")
     await C.process_repo(led, repo, [0])                 # dispatch (pending=head2, attempts=1)
-    foreign = C._transient_marker("f" * 40)              # NOT the pending head
+    foreign = C._transient_marker(repo, repo.watch_ref, "f" * 40)   # NOT the pending head
     foreign.write_text("")
     await C.process_repo(led, repo, [0])
     assert foreign.exists(), "a non-pending sha's marker must be left untouched"
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["attempts"] == 1, "no forgive happened (attempts unchanged)"
     assert len(records(seam)) == 1, "no re-dispatch (the in-flight head stays deduped)"
+
+
+# -- marker lands AFTER the transient pass, AT the ceiling -> forgive, never block --
+async def test_ceiling_with_marker_forgives_and_redispatches(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("ceilmark"); repo = make_repo("ceilmark")
+    await C.process_repo(led, repo, [0])                 # baseline
+    head2 = advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch #1 (pending=head2)
+    async with led._pool.acquire() as con:               # simulate the ceiling reached
+        await con.execute(
+            "UPDATE review_cursor SET attempts=$1 WHERE repo_id=$2",
+            C.MAX_ATTEMPTS, repo.repo_id)
+    # plant the marker BETWEEN the transient pass and the ceiling check — the real race window
+    # (_index_skills runs after fetch, before decide — exactly the gap the worker's abort races)
+    saved = C._index_skills
+
+    async def _plant(_led, _repo):
+        C._transient_marker(repo, repo.watch_ref, head2).write_text("")
+
+    C._index_skills = _plant
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            await C.process_repo(led, repo, [0])
+    finally:
+        C._index_skills = saved
+    assert "at the ceiling" in buf.getvalue(), "the ceiling forgive must be logged"
+    assert not C._transient_marker(repo, repo.watch_ref, head2).exists(), "marker consumed"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["state"] == "dispatching", "a marker at the ceiling forgives — never blocks"
+    assert len(records(seam)) == 2, "the same tick must re-dispatch after a ceiling forgive"
+
+
+# -- a marker for the SAME sha under a different repo or ref is NOT consumed (scoping) --
+async def test_transient_marker_scoped_by_repo_and_ref(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("scopemark"); repo = make_repo("scopemark")
+    await C.process_repo(led, repo, [0])                 # baseline
+    head2 = advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch (pending=head2, attempts=1)
+    fork = C.Repo("scopefork", _TMP / "scopefork", repo.watch_ref)   # same sha, DIFFERENT repo
+    m_repo = C._transient_marker(fork, repo.watch_ref, head2)
+    m_ref = C._transient_marker(repo, "refs/heads/dev", head2)       # same repo, DIFFERENT ref
+    m_repo.write_text(""); m_ref.write_text("")
+    await C.process_repo(led, repo, [0])
+    assert m_repo.exists() and m_ref.exists(), "foreign-scope markers must be left untouched"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["attempts"] == 1, "no forgive happened (attempts unchanged)"
+    assert len(records(seam)) == 1, "no re-dispatch (the in-flight head stays deduped)"
+
+
+# -- the bash (play-review.sh) and python marker derivations MUST agree ----------
+async def test_transient_marker_bash_python_contract(led: PostgresLedger) -> None:
+    fresh_seam("contract")
+    tip = "a" * 40
+    # a ref with slashes + a repo dir name with a dot — the CONTRACT is the file-name string
+    repo = C.Repo("my.repo", _TMP / "somewhere" / "my.repo", "refs/heads/feat/x")
+    expected = f"transient-my.repo-refs-heads-feat-x-{tip}"
+    assert C._transient_marker(repo, repo.watch_ref, tip).name == expected
+    # the worker's derivation, verbatim from play-review.sh (bash 3.2 pattern substitution)
+    r = subprocess.run(
+        ["bash", "-c",
+         'repo_id="$(basename "$1")"; ref="$2"; tip="$3"; '
+         'marker_slug="${repo_id//[^A-Za-z0-9._-]/-}-${ref//[^A-Za-z0-9._-]/-}"; '
+         'printf "transient-%s-%s" "$marker_slug" "$tip"',
+         "bash", str(repo.path), repo.watch_ref, tip],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == expected, f"bash and python marker names must agree: {r.stdout!r}"
 
 
 # -- config: duplicate basenames rejected; junk entries skipped ----------------
