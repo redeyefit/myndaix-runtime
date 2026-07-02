@@ -11,8 +11,10 @@ Run:
         PYTHONPATH=src python3 tests/test_controller.py
 """
 import asyncio
+import contextlib
 import datetime as _dt
 import inspect
+import io
 import json
 import os
 import subprocess
@@ -265,6 +267,68 @@ async def test_blocked_after_max_attempts(led: PostgresLedger) -> None:
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["state"] == "blocked"
     assert len(records(seam)) == before, "a blocked head must not re-dispatch"
+
+
+# -- a transient (canary-abort) marker refunds the attempt + re-dispatches THIS tick --
+async def test_transient_marker_forgives_and_redispatches(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("transient"); repo = make_repo("transient")
+    await C.process_repo(led, repo, [0])                 # baseline
+    head2 = advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch #1 (pending=head2, attempts=1)
+    assert len(records(seam)) == 1
+    marker = C._transient_marker(head2)
+    marker.write_text("")                                # the worker's canary-abort marker
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await C.process_repo(led, repo, [0])             # forgive + SAME-tick re-dispatch
+    assert not marker.exists(), "the marker must be consumed exactly once"
+    assert "transient abort" in buf.getvalue(), "the forgive must be logged"
+    assert len(records(seam)) == 2, "the same tick must re-dispatch after a forgive"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["pending_sha"] == head2 and cur["state"] == "dispatching"
+    assert cur["attempts"] == 1, "refund + re-claim nets attempts flat (can't climb the ceiling)"
+
+
+# -- a streak of transient forgives alerts jefe EXACTLY once; delivery resets it --
+async def test_transient_streak_alerts_once_and_delivery_resets(led: PostgresLedger) -> None:
+    await _truncate(led)
+    fresh_seam("streak"); repo = make_repo("streak")
+    alerts: list = []
+    saved = C._alert_jefe
+    C._alert_jefe = lambda subject, body: alerts.append(subject)
+    try:
+        await C.process_repo(led, repo, [0])             # baseline
+        head2 = advance(repo, "c1")
+        await C.process_repo(led, repo, [0])             # dispatch #1
+        for _ in range(4):                               # 4 transient cycles: streak 1..4
+            C._transient_marker(head2).write_text("")
+            await C.process_repo(led, repo, [0])         # forgive + re-dispatch each tick
+        assert len(alerts) == 1, f"alert fires ONLY at streak=={C.TRANSIENT_ALERT_STREAK}, got {len(alerts)}"
+        assert C._transient_streak_file(repo.repo_id).exists(), "streak persists while the outage lasts"
+        (C.STATE / f"done-{head2}").write_text("")       # the review finally delivers
+        await C.process_repo(led, repo, [0])             # advance pass consumes the marker
+        cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+        assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered"
+        assert not C._transient_streak_file(repo.repo_id).exists(), "a delivery resets the streak file"
+    finally:
+        C._alert_jefe = saved
+
+
+# -- a marker for a sha that is NOT the pending head is left untouched ----------
+async def test_stale_transient_marker_ignored(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("stalemark"); repo = make_repo("stalemark")
+    await C.process_repo(led, repo, [0])                 # baseline
+    advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch (pending=head2, attempts=1)
+    foreign = C._transient_marker("f" * 40)              # NOT the pending head
+    foreign.write_text("")
+    await C.process_repo(led, repo, [0])
+    assert foreign.exists(), "a non-pending sha's marker must be left untouched"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["attempts"] == 1, "no forgive happened (attempts unchanged)"
+    assert len(records(seam)) == 1, "no re-dispatch (the in-flight head stays deduped)"
 
 
 # -- config: duplicate basenames rejected; junk entries skipped ----------------

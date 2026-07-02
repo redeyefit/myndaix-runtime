@@ -77,6 +77,10 @@ gate_run(){ env HOME="$FAKE" PLAY_GATE=1 PLAY_GATE_VERDICT="$ROOT/verdict.json" 
 echo "1. NEEDS-FIX path";    reset; STUB_TRIAGE="1. fix it" run; ck "delivers NEEDS-FIX" "review NEEDS-FIX"
 echo "2. clean PASS gate";   reset; STUB_TRIAGE="PLAY_PASS" run; ck "delivers PASS" "review PASS"
 echo "3. canary failure";    reset; STUB_CANARY_FAIL=kilabz run; ck "aborts on canary" "ABORTED — canary"
+echo "3b. canary abort marks transient (push mode); gate mode does NOT"; reset; STUB_CANARY_FAIL=kilabz run
+  ckfile "$STATE/transient-$TIP" "push-mode canary abort writes transient-<tip>"
+  reset; STUB_CANARY_FAIL=kilabz gate_run >/dev/null 2>&1 || true
+  cknofile "$STATE/transient-$TIP" "gate-mode canary abort writes NO transient marker"
 echo "4. dedupe (2nd no-op)"; reset; STUB_TRIAGE="PLAY_PASS" run; before="$(ls "$INBOX" | wc -l)"; STUB_TRIAGE="PLAY_PASS" run; after="$(ls "$INBOX" | wc -l)"
   if [[ "$before" == "$after" ]]; then echo "  ok: 2nd run produced no new delivery"; PASS=$((PASS+1)); else echo "  FAIL: dedupe ($before -> $after)"; FAIL=$((FAIL+1)); fi
 echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"

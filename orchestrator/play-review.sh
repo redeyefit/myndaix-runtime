@@ -144,6 +144,11 @@ deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits
 
 abort(){ note "$1" "ABORT: $2"
   gate && { write_verdict "ABORTED"; exit 2; }               # gate: abort = TRANSIENT (exit 2 -> retry), distinct from a real NEEDS-FIX (exit 1)
+  # canary abort = agent/pool unreachable = INFRA-transient, never a poison head: mark it so the
+  # controller refunds the attempt (transient can't climb the blocked ceiling) and releases the
+  # slot for prompt re-dispatch. Push-mode only (gate exited above). Other stages (diff/review/
+  # triage) still count toward the ceiling — a poison diff is what CAUSES those failures.
+  [[ "$1" == canary ]] && { : > "$STATE/transient-$tip" 2>/dev/null || true; }
   deliver "review ABORTED — $1" "$2" || true; exit 0; }
 
 fence(){ # fence <label> <text> — nonce-gated on BOTH boundaries

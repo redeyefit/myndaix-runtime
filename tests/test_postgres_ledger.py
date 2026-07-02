@@ -574,6 +574,62 @@ async def test_release_dispatch(led: PostgresLedger) -> None:
     assert await led.release_dispatch(R, REF, "9" * 40) is False
 
 
+# -- controller-loop cursor: forgive_transient refunds the attempt + releases ---
+async def test_forgive_transient_refunds_and_releases(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoT", "refs/heads/main", "1" * 40, "2" * 40
+    hour = _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # attempt 1
+    assert (await led.get_cursor(R, REF))["attempts"] == 1
+    # a canary (transient) abort forgives: attempt refunded, slot released, still dispatching
+    assert await led.forgive_transient(R, REF, B) is True
+    cur = await led.get_cursor(R, REF)
+    assert cur["attempts"] == 0, "forgive must refund the attempt"
+    assert cur["state"] == "dispatching" and cur["pending_sha"] == B
+    # updated_at was epoch'd -> a NOW stale cutoff re-claims immediately (no PENDING_STALE wait)
+    assert await led.claim_dispatch(R, REF, B, _utcnow()) is True
+    assert (await led.get_cursor(R, REF))["attempts"] == 1, "re-claim increments back to 1 (net flat)"
+
+
+# -- controller-loop cursor: forgive_transient guards ----------------------------
+async def test_forgive_transient_guards(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoTG", "refs/heads/main", "1" * 40, "2" * 40
+    hour = _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True
+    # wrong head -> no forgive
+    assert await led.forgive_transient(R, REF, "9" * 40) is False
+    # attempts floor at 0: first forgive refunds 1 -> 0; a second STILL matches the row
+    # (state stays dispatching, pending same) so it returns True but attempts stays 0
+    assert await led.forgive_transient(R, REF, B) is True
+    assert (await led.get_cursor(R, REF))["attempts"] == 0
+    assert await led.forgive_transient(R, REF, B) is True, "row still matches (dispatching + pending)"
+    assert (await led.get_cursor(R, REF))["attempts"] == 0, "attempts floors at 0, never negative"
+    # state not 'dispatching' (after advance) -> no forgive
+    assert await led.advance_cursor(R, REF, B) is True
+    assert await led.forgive_transient(R, REF, B) is False, "delivered row must not forgive"
+
+
+# -- controller-loop cursor: transient cycles keep attempts net-flat ------------
+async def test_forgive_transient_net_flat_cycle(led: PostgresLedger) -> None:
+    await _truncate(led)
+    R, REF, A, B = "repoTF", "refs/heads/main", "1" * 40, "2" * 40
+    hour = _dt.timedelta(hours=1)
+    await led.upsert_baseline(R, REF, A)
+    assert await led.claim_dispatch(R, REF, B, _utcnow() - hour) is True   # claim -> 1
+    assert (await led.get_cursor(R, REF))["attempts"] == 1
+    assert await led.forgive_transient(R, REF, B) is True                  # forgive -> 0
+    assert (await led.get_cursor(R, REF))["attempts"] == 0
+    assert await led.claim_dispatch(R, REF, B, _utcnow()) is True          # re-claim -> 1
+    assert (await led.get_cursor(R, REF))["attempts"] == 1
+    assert await led.forgive_transient(R, REF, B) is True                  # forgive -> 0
+    assert (await led.get_cursor(R, REF))["attempts"] == 0
+    assert (await led.get_cursor(R, REF))["attempts"] < 2, \
+        "attempts never reaches 2 across transient cycles (can't climb to the ceiling)"
+
+
 # -- controller-loop cursor: skip_to advances past an empty-diff head ----------
 async def test_skip_to(led: PostgresLedger) -> None:
     await _truncate(led)

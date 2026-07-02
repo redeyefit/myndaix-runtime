@@ -65,6 +65,7 @@ DEFAULT_WATCH_REF = "refs/heads/main"
 MAX_DISPATCH_PER_TICK = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DISPATCH", "3"))
 MAX_DISPATCH_PER_DAY = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DAY", "20"))
 MAX_ATTEMPTS = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", "3"))
+TRANSIENT_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_TRANSIENT_STREAK", "3"))
 PENDING_STALE = int(os.environ.get("MYNDAIX_CONTROLLER_PENDING_STALE", "7200"))  # 2 h
 # Must exceed BOTH the play-review worst-case worker runtime (STALE lock budget 2700s) AND the
 # tick interval (3600s): the worker now OUTLIVES the dispatching tick (it is nohup-detached and
@@ -354,6 +355,36 @@ def _done(sha: str) -> bool:
     return (STATE / f"done-{sha}").exists()
 
 
+def _transient_marker(sha: str) -> Path:
+    return STATE / f"transient-{sha}"
+
+
+def _transient_streak_file(rid: str) -> Path:
+    return STATE / f"transient-streak-{_slug(rid)}"
+
+
+def _bump_transient_streak(rid: str) -> int:
+    f = _transient_streak_file(rid)
+    try:
+        n = int(f.read_text().strip() or "0")
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(n))
+    except OSError:
+        pass
+    return n
+
+
+def _reset_transient_streak(rid: str) -> None:
+    try:
+        _transient_streak_file(rid).unlink()
+    except OSError:
+        pass
+
+
 def _pin(repo: Repo, refname: str, sha: str) -> bool:
     """Anchor a sha behind a controller-owned ref so git gc can't prune it (codex M4 /
     Oracle MAJOR: a force-pushed-away sha would else fail cat-file forever). Returns the
@@ -611,7 +642,34 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
                 log(f"{rid}: cannot pin reviewed {ps[:8]} — not advancing")
             elif await led.advance_cursor(rid, ref, ps):
                 log(f"{rid}: cursor advanced to {ps[:8]} (review delivered)")
+                _reset_transient_streak(rid)
             cur = await led.get_cursor(rid, ref)
+
+    # transient-abort pass: a canary-stage abort is pool/agent flakiness, never a poison head
+    # (2026-06-30: three such aborts hard-blocked the backstop until a new head landed). The
+    # worker writes transient-<tip>; consume it exactly once -> refund the attempt + force the
+    # pending row stale so the decide pass below re-dispatches THIS tick instead of waiting out
+    # PENDING_STALE. The blocked ceiling then counts only non-transient failures. A streak of
+    # forgives without a delivery surfaces the outage to Jefe ONCE (== so re-alerts need a new
+    # streak), but NEVER blocks — retrying a canary is cheap and self-heals when the pool does.
+    if cur and cur["pending_sha"] and not _done(cur["pending_sha"]):
+        ps = cur["pending_sha"]
+        tm = _transient_marker(ps)
+        if tm.exists():
+            try:
+                tm.unlink()                              # consume: a stale marker must not
+            except OSError:                              # forgive a FUTURE dispatch of this sha
+                log(f"{rid}: could not consume transient marker for {ps[:8]} — skipping forgive")
+            else:
+                if await led.forgive_transient(rid, ref, ps):
+                    log(f"{rid}: transient abort on {ps[:8]} — attempt refunded, slot released")
+                    if _bump_transient_streak(rid) == TRANSIENT_ALERT_STREAK:
+                        _alert_jefe(f"review backstop: transient canary failures on {rid}",
+                                    f"{TRANSIENT_ALERT_STREAK} consecutive review dispatches for {rid} "
+                                    f"aborted at the canary stage (agent/pool unreachable). The controller "
+                                    f"is refunding attempts and retrying each tick — nothing is blocked — "
+                                    f"but the pool or an agent (kilabz/oracle auth, serve) likely needs a look.")
+                cur = await led.get_cursor(rid, ref)
 
     url = remote_url(repo)                                # validate transport BEFORE fetch (M1)
     if url is None:
