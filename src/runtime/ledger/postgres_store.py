@@ -977,6 +977,32 @@ class PostgresLedger:
                 repo_id, ref, head)
         return row is not None
 
+    async def forgive_transient(self, repo_id: str, ref: str, head: str) -> bool:
+        """A dispatch aborted for a TRANSIENT infra reason (play-review's canary-stage abort
+        marker): release the pending slot for prompt re-dispatch AND refund the attempt, so
+        pool/agent flakiness can never climb to the blocked ceiling — only non-transient
+        failures count toward poison (the 2026-06-30 wedge: hours of canary flakiness
+        hard-blocked the backstop until a new head landed). The refund nets against the
+        re-claim's increment, so attempts stay flat across transient cycles. ALSO repairs a
+        'blocked' row back to 'dispatching' — the marker-lands-after-the-transient-pass race,
+        where mark_blocked won the tick. Unblocking here is SAFE because the marker is written
+        only by the LOCAL worker's canary/contention abort — a poison head never writes one —
+        so a blocked row WITH a marker is a mis-classified transient, and claim_dispatch's
+        `NOT (state='blocked' AND pending_sha=head)` guard would otherwise pin it forever.
+        Same CAS shape as release_dispatch (pending head + a known state). Returns True iff
+        forgiven."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """UPDATE review_cursor
+                      SET updated_at = to_timestamp(0),
+                          attempts = GREATEST(attempts - 1, 0),
+                          state = 'dispatching'
+                    WHERE repo_id = $1 AND ref = $2 AND pending_sha = $3
+                      AND state IN ('dispatching', 'blocked')
+                    RETURNING repo_id""",
+                repo_id, ref, head)
+        return row is not None
+
     async def advance_cursor(self, repo_id: str, ref: str, head: str) -> bool:
         """Advance the cursor once a review of `head` DELIVERED (play-review's post-delivery
         done-<sha> marker). Guarded on pending_sha = head so it only ever advances the head

@@ -43,6 +43,9 @@ INBOX="$FAKE/.myndaix/bridge/inbox/jefe"
 STATE="$FAKE/.myndaix/orchestrator/state"
 REPOS_JSON="$FAKE/.myndaix/orchestrator/repos.json"   # PLAY_AUTOFIX gate reads this
 RUNS="$FAKE/.myndaix/orchestrator/runs"
+# scoped transient marker: transient-<repo>-<ref>-<sha> (repo basename 'repo', refs/heads/main
+# slugged). HARDCODED on purpose — this string is the bash<->python contract, don't derive it.
+TMARKER="$STATE/transient-repo-refs-heads-main-$TIP"
 
 # --- recording stub fixer, OUTSIDE the repo (the auto path rejects in-repo fixers). Records its
 #     argv (overwrite) AND appends a per-call marker so we can assert fire-count. ---
@@ -77,6 +80,10 @@ gate_run(){ env HOME="$FAKE" PLAY_GATE=1 PLAY_GATE_VERDICT="$ROOT/verdict.json" 
 echo "1. NEEDS-FIX path";    reset; STUB_TRIAGE="1. fix it" run; ck "delivers NEEDS-FIX" "review NEEDS-FIX"
 echo "2. clean PASS gate";   reset; STUB_TRIAGE="PLAY_PASS" run; ck "delivers PASS" "review PASS"
 echo "3. canary failure";    reset; STUB_CANARY_FAIL=kilabz run; ck "aborts on canary" "ABORTED — canary"
+echo "3b. canary abort marks transient (push mode); gate mode does NOT"; reset; STUB_CANARY_FAIL=kilabz run
+  ckfile "$TMARKER" "push-mode canary abort writes the scoped transient marker"
+  reset; STUB_CANARY_FAIL=kilabz gate_run >/dev/null 2>&1 || true
+  cknofile "$TMARKER" "gate-mode canary abort writes NO transient marker"
 echo "4. dedupe (2nd no-op)"; reset; STUB_TRIAGE="PLAY_PASS" run; before="$(ls "$INBOX" | wc -l)"; STUB_TRIAGE="PLAY_PASS" run; after="$(ls "$INBOX" | wc -l)"
   if [[ "$before" == "$after" ]]; then echo "  ok: 2nd run produced no new delivery"; PASS=$((PASS+1)); else echo "  FAIL: dedupe ($before -> $after)"; FAIL=$((FAIL+1)); fi
 echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"
@@ -91,6 +98,10 @@ echo "7c. PLAY_MAX_DIFF knob still caps (env override)"; reset; head -c 5000 /de
   env HOME="$FAKE" PLAY_MAX_DIFF=1000 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$SMTIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF=1000 caps a 5KB diff" "ABORTED — diff"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 echo "8. contention records a visible skip"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"; ckfile "$STATE/SKIPPED-$TIP" "SKIPPED sentinel written"
+echo "8b. contention marks transient (push mode); gate contention does NOT"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run
+  ckfile "$TMARKER" "push-mode contention writes the scoped transient marker"
+  reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
+  cknofile "$TMARKER" "gate-mode contention writes NO transient marker"
 echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock"; touch -t 202001010000 "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "reaps stale lock + reviews" "review PASS"
 echo "10. embedded-whitespace token is NOT a pass"; reset; STUB_TRIAGE="P L A Y _ P A S S" run; ck "spaced token -> NEEDS-FIX" "review NEEDS-FIX"
 echo "11. unconfirmed push is NOT deduped"; reset; STUB_TRIAGE="PLAY_PASS" run "/tmp/no-such-remote-$$"; ck "still delivers PASS" "review PASS"; cknofile "$STATE/done-$TIP" "unconfirmed push not marked done"
