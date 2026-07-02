@@ -181,6 +181,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         from runtime import capturerecord
         return capturerecord.main(["capture-record", *raw[1:]])
 
+    # `mxr outcome-record ...` — outcomes-ledger INSTRUMENTATION (the per-finding OUTCOME LABEL
+    # recorder). Same routing rationale as capture-record (inherits venv/PYTHONPATH/DSN via mxr);
+    # fails OPEN, HARD no-op in gate mode, never opens a PR. Records finding:<tag> lines from BOTH
+    # families into finding_outcome (CLOSE + OPEN) and prints the recorded keys for play-review.
+    # `mxr outcome-stats` is checked BEFORE `outcome` because the flat parser would read "-stats" as
+    # a prefix; both are special-cased above the flat agent/task parser like get/skillselect.
+    if raw and raw[0] == "outcome-record":
+        from runtime import outcomerecord
+        return outcomerecord.main(["outcome-record", *raw[1:]])
+    if raw and raw[0] == "outcome-stats":
+        from runtime import outcomerecord
+        return outcomerecord.stats_main(["outcome-stats", *raw[1:]])
+    # `mxr outcome <finding_key_prefix> fp|wontfix` — the human's per-finding dismissal label.
+    if raw and raw[0] == "outcome":
+        from runtime import outcomerecord
+        return outcomerecord.dismiss_main(["outcome", *raw[1:]])
+
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')
