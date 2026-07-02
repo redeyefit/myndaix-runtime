@@ -129,9 +129,11 @@ class _R:
         self.stdout = out
 
 
-def _patch_gate(monkey, review_ret="needs_fix", count_val=0):
-    """Stub every helper evaluate_pr calls up to the cap/review boundary. Returns a list
-    that records each _review_pass call so a test can assert it did/didn't run."""
+def _run_eval(budget_val=0, day_count=0, author_count=0, review_ret="needs_fix"):
+    """Stub every helper evaluate_pr calls up to the cap/review boundary and run it. `_count`
+    is PATH-AWARE so each of the three caps (per-tick via budget, per-day, per-author) can be
+    tripped in ISOLATION — the day and author counters live at distinct _day() paths. Returns
+    (result, calls) where calls records each _review_pass invocation."""
     H, M, B = "a" * 40, "b" * 40, "c" * 40
     calls = []
 
@@ -143,51 +145,47 @@ def _patch_gate(monkey, review_ret="needs_fix", count_val=0):
             return _R(0, B.encode())
         return _R(0, b"stub")                      # fetch, diff --raw, diff content
 
-    monkey["_git"] = fake_git
-    monkey["_merge_queue"] = lambda repo: False
-    monkey["parse_raw_z"] = lambda out: []
-    monkey["classify_diff"] = lambda entries: (True, "")
-    monkey["_ci_green"] = lambda repo, head: True
-    monkey["_count"] = lambda p: count_val
+    def fake_count(p):
+        return author_count if "author" in str(p) else day_count
 
     def fake_review(repo, b, h):
         calls.append((b, h))
         return review_ret
 
-    monkey["_review_pass"] = fake_review
-    return H, M, calls
-
-
-def _run_eval(count_val, review_ret="needs_fix"):
-    saved = {k: getattr(A, k) for k in
-             ("_git", "_merge_queue", "parse_raw_z", "classify_diff",
-              "_ci_green", "_count", "_review_pass")}
-    monkey = {}
-    H, M, calls = _patch_gate(monkey, review_ret=review_ret, count_val=count_val)
+    monkey = {"_git": fake_git, "_merge_queue": lambda repo: False,
+              "parse_raw_z": lambda out: [], "classify_diff": lambda entries: (True, ""),
+              "_ci_green": lambda repo, head: True, "_count": fake_count,
+              "_review_pass": fake_review}
+    saved = {k: getattr(A, k) for k in monkey}
     for k, v in monkey.items():
         setattr(A, k, v)
     try:
         pr = {"number": 45, "headRefOid": H, "baseRefOid": M,
               "author": {"login": "redeyefit"}, "isDraft": False,
               "isCrossRepository": False, "mergeStateStatus": "CLEAN"}
-        res = A.evaluate_pr({"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}, pr, [0])
+        res = A.evaluate_pr({"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}, pr, [budget_val])
         return res, calls
     finally:
         for k, v in saved.items():
             setattr(A, k, v)
 
 
-def test_cap_blocked_pr_never_reaches_the_paid_review():
-    # author/day caps already spent → must DEFER (None) WITHOUT running the paid review
-    res, calls = _run_eval(count_val=99)
-    ok(res is None, "cap-blocked PR defers (None), not recorded terminal")
-    ok(calls == [], "the paid review is NOT called when a cap is already spent (no spend leak)")
+def test_each_cap_blocks_before_the_paid_review():
+    # EACH of the three caps, tripped in ISOLATION (the others clear), must DEFER (None)
+    # WITHOUT running the paid review — the whole point of the reorder (kilabz LOW: prove all
+    # three, not just the daily cap that would trip first under a blanket count).
+    for label, kw in (("per-tick budget", dict(budget_val=A.MAX_PER_TICK)),
+                      ("per-day cap",     dict(day_count=A.MAX_PER_DAY)),
+                      ("per-author cap",  dict(author_count=A.MAX_PER_AUTHOR_DAY))):
+        res, calls = _run_eval(**kw)
+        ok(res is None, f"{label}: defers (None), not recorded terminal")
+        ok(calls == [], f"{label}: paid review NOT called (no spend leak)")
 
 
 def test_uncapped_pr_reaches_the_review():
-    # caps clear → the review DOES run (proves the reorder didn't skip the gate entirely)
-    res, calls = _run_eval(count_val=0, review_ret="needs_fix")
-    ok(len(calls) == 1, "the review runs when caps pass")
+    # all caps clear → the review DOES run (proves the reorder didn't skip the gate entirely)
+    res, calls = _run_eval(review_ret="needs_fix")
+    ok(len(calls) == 1, "the review runs when every cap passes")
     ok(res == ("needs_fix", "review did not PASS — human"), "review verdict flows through")
 
 
