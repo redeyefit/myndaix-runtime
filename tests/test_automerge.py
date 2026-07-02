@@ -117,6 +117,80 @@ def test_parse_raw_z_is_strict():
     raises(b":100644 100644 a b M\x00ok.md\x00:100644 100644 c M\x00x.md\x00", "second info has 4 fields")
 
 
+# -- gate ORDERING: caps run BEFORE the paid review (spend-leak regression) ----
+# The audit's #1 finding: gate-review-before-caps re-ran the full 3-agent review every
+# hourly tick for any PR blocked only by a cap (a None decision records nothing → never
+# deduped) — a paid-agent spend leak, and why a 2nd same-author docs PR looked "stuck".
+# These stub the module I/O to drive evaluate_pr to the cap boundary and prove the review
+# is only reached when the caps pass.
+class _R:
+    def __init__(self, rc=0, out=b""):
+        self.returncode = rc
+        self.stdout = out
+
+
+def _patch_gate(monkey, review_ret="needs_fix", count_val=0):
+    """Stub every helper evaluate_pr calls up to the cap/review boundary. Returns a list
+    that records each _review_pass call so a test can assert it did/didn't run."""
+    H, M, B = "a" * 40, "b" * 40, "c" * 40
+    calls = []
+
+    def fake_git(path, *args, **kw):
+        a = args[0] if args else ""
+        if a == "rev-parse":
+            return _R(0, (H if "pr/" in args[1] else M).encode())
+        if a == "merge-base":
+            return _R(0, B.encode())
+        return _R(0, b"stub")                      # fetch, diff --raw, diff content
+
+    monkey["_git"] = fake_git
+    monkey["_merge_queue"] = lambda repo: False
+    monkey["parse_raw_z"] = lambda out: []
+    monkey["classify_diff"] = lambda entries: (True, "")
+    monkey["_ci_green"] = lambda repo, head: True
+    monkey["_count"] = lambda p: count_val
+
+    def fake_review(repo, b, h):
+        calls.append((b, h))
+        return review_ret
+
+    monkey["_review_pass"] = fake_review
+    return H, M, calls
+
+
+def _run_eval(count_val, review_ret="needs_fix"):
+    saved = {k: getattr(A, k) for k in
+             ("_git", "_merge_queue", "parse_raw_z", "classify_diff",
+              "_ci_green", "_count", "_review_pass")}
+    monkey = {}
+    H, M, calls = _patch_gate(monkey, review_ret=review_ret, count_val=count_val)
+    for k, v in monkey.items():
+        setattr(A, k, v)
+    try:
+        pr = {"number": 45, "headRefOid": H, "baseRefOid": M,
+              "author": {"login": "redeyefit"}, "isDraft": False,
+              "isCrossRepository": False, "mergeStateStatus": "CLEAN"}
+        res = A.evaluate_pr({"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}, pr, [0])
+        return res, calls
+    finally:
+        for k, v in saved.items():
+            setattr(A, k, v)
+
+
+def test_cap_blocked_pr_never_reaches_the_paid_review():
+    # author/day caps already spent → must DEFER (None) WITHOUT running the paid review
+    res, calls = _run_eval(count_val=99)
+    ok(res is None, "cap-blocked PR defers (None), not recorded terminal")
+    ok(calls == [], "the paid review is NOT called when a cap is already spent (no spend leak)")
+
+
+def test_uncapped_pr_reaches_the_review():
+    # caps clear → the review DOES run (proves the reorder didn't skip the gate entirely)
+    res, calls = _run_eval(count_val=0, review_ret="needs_fix")
+    ok(len(calls) == 1, "the review runs when caps pass")
+    ok(res == ("needs_fix", "review did not PASS — human"), "review verdict flows through")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

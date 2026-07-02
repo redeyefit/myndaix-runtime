@@ -450,20 +450,28 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
     if ci is False:
         return ("skipped", "CI failed for this head — human")
 
-    # gate 4: synchronous review — pass / needs_fix(terminal) / transient(defer)
-    rev = _review_pass(repo, B, H)
-    if rev == "transient":
-        return None
-    if rev == "needs_fix":
-        return ("needs_fix", "review did not PASS — human")
-
-    # gate 5: bounds — all DEFER (None), never recorded as terminal
+    # gate 4: bounds — all DEFER (None), never recorded as terminal. RUN THESE BEFORE the paid
+    # review (gate 5): the caps are cheap and head+day-determined, so a PR that is only cap-blocked
+    # cannot merge this tick no matter what the review says. Reviewing first meant every eligible
+    # docs PR beyond the day's caps re-ran the full 3-agent review EVERY hourly tick, indefinitely
+    # (a None decision records nothing → never deduped) — a real paid-agent spend leak, and the
+    # cause of a 2nd same-author docs PR appearing "stuck / never merges" all UTC-day (author cap
+    # =1, can't clear without a new push, which would be a new head anyway). The terminal
+    # classification gates (docs-class, CI) stay ABOVE this so a non-docs / CI-failed PR is still
+    # recorded even when capped; only the expensive review moves below the caps.
     if budget[0] >= MAX_PER_TICK:
         return None
     if not DRY_RUN and _count(_day()) >= MAX_PER_DAY:
         log(f"PR#{n}: daily merge cap — defer"); return None
     if not DRY_RUN and _count(_day(f"-author-{author}")) >= MAX_PER_AUTHOR_DAY:
         log(f"PR#{n}: author {author} daily cap — defer"); return None
+
+    # gate 5: synchronous review — pass / needs_fix(terminal) / transient(defer)
+    rev = _review_pass(repo, B, H)
+    if rev == "transient":
+        return None
+    if rev == "needs_fix":
+        return ("needs_fix", "review did not PASS — human")
 
     if DRY_RUN:
         log(f"PR#{n} @ {H[:8]}: DRY-RUN would MERGE (docs-only + CI green + review PASS)")
