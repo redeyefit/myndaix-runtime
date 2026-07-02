@@ -44,8 +44,16 @@ V1_ROSTER: list[AgentSpec] = [
     # env — incl. sibling agents' secrets — is scrubbed by runner._cli_env). claude/codex/agy
     # also accept $HOME login; declaring the key keeps env-auth deploys working too.
     AgentSpec(agent_id="lobster", reach=Reach.CLI, authority=Authority.CONTROLLER,
-              model="opus", role="orchestration/judgment",
-              adapter={"kind": "cli", "argv": ["claude", "-p", "--output-format", "text"],
+              model="sonnet", role="orchestration/judgment",
+              # PIN --model (the oracle lesson, agy below): a bare `claude -p` runs the HOST's
+              # default model — which drifts (it tracks whatever the operator last picked
+              # interactively, e.g. a limited-window preview model) and differs per machine.
+              # Triage is structured extraction on the automerge-gate path: it needs the SAME
+              # model on both hosts, and sonnet-tier is sufficient for it (optimal-team brief);
+              # auth is flat-rate (Max plan), so this is about determinism + preserving premium
+              # model quota for hard work, not dollars.
+              adapter={"kind": "cli", "argv": ["claude", "-p", "--model", "sonnet",
+                       "--output-format", "text"],
                        "prompt_channel": "stdin", "env_passthrough": ["ANTHROPIC_API_KEY"]}),
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
@@ -57,7 +65,14 @@ V1_ROSTER: list[AgentSpec] = [
                        "env_passthrough": ["ANTHROPIC_API_KEY"]}),
     AgentSpec(agent_id="kilabz", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gpt-5.5", role="code reviewer (read-only)",
+              # PIN model + reasoning effort: without `-c model=...` codex runs the HOST's
+              # ~/.codex/config.toml model — true-by-luck on one machine, unverified on the
+              # other. The reviewer family must be deterministic from the REPO on every host.
+              # gpt-5.5 stays (NOT the brief's 5.3-codex cost swap: codex auth here is
+              # flat-rate ChatGPT plan — `codex login status` — so the API-price argument is
+              # moot and a downgrade would be a pure review-quality loss).
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
+                       "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
