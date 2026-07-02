@@ -1,10 +1,18 @@
-# Outcomes Ledger — DESIGN (v0.1 draft)
+# Outcomes Ledger — DESIGN (v0.2)
 
 _The self-learning rung's missing primitive: the per-finding OUTCOME LABEL. One append-only
 Postgres table + computed SQL views on the existing spine. **v1 COLLECTS ONLY — no dial acts on
 the data** (suppression/promotion is a LATER rung, gated on accrued signal + human approval).
 Inputs: `docs/research/outcomes-ledger-prior-art.md` (17 confirmed claims, 19 sources) + the
-optimal-team brief §3. Status: draft, pre cross-family review._
+optimal-team brief §3._
+
+_v0.2 folds a 29-agent adversarial in-session review (4 lenses, every non-minor finding
+independently re-verified against the code): 23 confirmed findings + 13 minors folded, 2 claims
+refuted. Headline fixes: path joined into `finding_key`; recording moved to EVERY delivered
+review (the v0.1 seam only fired on NEEDS-FIX, so clean-PASS fixes could never close); sticky
+dismissals; human labels outrank auto closes; finding keys surfaced in the delivered verdict
+(else the dismissal verb is dead-on-arrival and precision is identically 1.0); revert detection
+CUT from v1 as a theory-build. Status: awaiting cross-family review._
 
 ## 1. What & why
 
@@ -18,35 +26,43 @@ across reviews** and a **constrained dismissal enum**.
 
 Non-goals (v1, explicit): no auto-suppression or promotion dials acting on the data; no LLM
 anywhere in the pipeline; no dashboard/UI; no per-finding thumbs-up/down labeling flow; no
-embeddings/vector store; no automerge-gate coupling of any kind.
+embeddings/vector store; no automerge-gate coupling of any kind; **no revert detection** (the
+`reverted` enum value is reserved; the detector is a shared primitive that rides the
+autonomy-ladder rung, where demotion needs it anyway — building it twice or early is waste).
 
 ## 2. Data flow
 
 ```
-push review (play-review.sh, NOT gate mode)
-  └─ post-delivery, bounded + fail-open (same seam as capture-record):
-     mxr outcome-record --kilabz "$review" --oracle "$oracle_review" -- <repo> <tip> <play> [changed...]
-       parse per-family structured finding lines → validate → line-hash at <tip> → INSERT 'open' rows
+EVERY delivered push review (play-review.sh, NOT gate mode) — PASS and NEEDS-FIX alike:
+  └─ post-delivery, bounded + fail-open:
+     mxr outcome-record [--kilabz "$review" --oracle "$oracle_review"] -- <repo_path> <tip> <ref> <play> [changed...]
+       PHASE 1 — CLOSE (runs on every review, incl. PLAY_PASS):
+         for each 'open' finding of THIS repo whose path ∈ this diff's changed set,
+         where this review's ref matches the finding's ref OR is the default branch:
+           flagged line-hash no longer present in that file at <tip>
+             → INSERT 'applied_fixed' (outcome_source=auto_fix_landed)   [SonarQube auto-Fixed]
+           (never scoped cross-branch: an unrelated branch's tip can't mint a close)
+       PHASE 2 — OPEN (NEEDS-FIX reviews only; reviews that PASS raised nothing actionable):
+         parse per-family `finding:` lines → validate → line-hash at <tip> → INSERT 'open' rows
+         SKIP any key whose latest state for that family is dismissed_* (sticky dismissals —
+         GitHub/SonarQube both make dismissal suppress re-detection; that's what the stable
+         key exists FOR). Re-raise after 'expired' or 'applied_fixed' is allowed (regression).
 
-next push review of the same repo
-  └─ outcome-record FIRST closes what it can: for each 'open' finding whose path is in THIS
-     diff's changed set, if the flagged line-hash no longer exists in that file at the new tip
-     → INSERT 'applied_fixed' (outcome_source=auto_fix_landed)   [SonarQube auto-Fixed]
+human (Jefe, or Mack relaying the inbox — ONE command per finding)
+  └─ the DELIVERED VERDICT lists each finding's short key + a paste-ready command:
+         mxr outcome <finding_key12> fp        # reviewer was WRONG → down-weights the class
+         mxr outcome <finding_key12> wontfix   # reviewer was RIGHT, human declines → neutral
+     Without this surfacing, dismissal never happens solo and the fp side of precision stays
+     empty forever — the dataset would be worthless. The verb FAILS CLOSED on a non-unique or
+     <12-hex-char prefix (prints colliding full keys; grinding a 48-bit prefix collision into a
+     crafted diff line is no longer a mislabel, just an error message).
 
-controller tick (existing hourly loop)
-  └─ revert detection: a new commit on main that reverts a commit which closed a finding
-     (git log --grep='This reverts commit' + parent match) → INSERT 'reverted'
-     (outcome_source=auto_git_revert). Shared primitive with the autonomy-ladder addendum.
-
-human (Jefe/Mack, one command)
-  └─ mxr outcome <finding_key_prefix> fp|wontfix
-     → INSERT 'dismissed_false_positive' | 'dismissed_wontfix' (outcome_source=human_dismiss)
-     THE load-bearing split: fp = the reviewer was WRONG (down-weights the class);
-     wontfix = the reviewer was RIGHT, human declines (does NOT down-weight).
-
-expiry sweep (same tick)
+expiry sweep (piggybacks the same outcome-record invocation, cheap SQL)
   └─ 'open' > OUTCOME_TTL_DAYS (default 30, flagged) → INSERT 'expired'
-     (keeps precision denominators honest; expired rows count toward neither side)
+     (keeps denominators honest; expired counts toward neither precision side)
+
+PRECEDENCE (enforced in the verbs, not just convention): a HUMAN row (dismissed_*) is terminal —
+auto closes and re-opens never override it; latest-row-wins applies only among machine rows.
 ```
 
 ## 3. Schema (migration `0008_finding_outcome.sql` + `schema.sql` mirror, lockstep)
@@ -54,107 +70,145 @@ expiry sweep (same tick)
 ```sql
 CREATE TABLE finding_outcome (
     id              uuid PRIMARY KEY,
-    finding_key     text NOT NULL,   -- sha256(repo_id \0 rule_tag \0 line_hash) — stable identity
+    finding_key     text NOT NULL,   -- sha256(repo_id \0 rule_tag \0 path \0 line_hash)
+                                     -- path IS in the key: SonarQube issue identity is per-file
+                                     -- (component+rule+hash); a path-free key lets identical
+                                     -- normalized lines in different files collide, and lets a
+                                     -- crafted diff line mint a legit finding's key (v0.1 CRIT)
     repo_id         text NOT NULL,
+    ref             text NOT NULL,   -- the reviewed ref the finding was raised on (close scoping)
     rule_tag        text NOT NULL,   -- allowlisted capture taxonomy (same list, single source of truth)
     reviewer_family text NOT NULL CHECK (reviewer_family IN ('kilabz','oracle')),
     path            text NOT NULL,   -- validated ∈ the reviewed diff's changed-file set
-    review_run_id   text NOT NULL,   -- the play id that raised/closed it
-    base_sha        text NOT NULL,   -- the reviewed tip the line-hash was computed at
+    source_event    text NOT NULL,   -- 'review:<play>' | 'human:<uuid>' | 'sweep:<utcday>'
+                                     -- (v0.1 had review_run_id NOT NULL — dismiss/sweep rows
+                                     -- have no review run; idempotency was undefined for them)
+    tip_sha         text NOT NULL,   -- the sha the line-hash was computed/checked at
+                                     -- (named tip_sha, NOT base_sha — this repo has already
+                                     -- been bitten once by a base/tip mis-wire)
     outcome         text NOT NULL CHECK (outcome IN
                      ('open','applied_fixed','dismissed_false_positive',
-                      'dismissed_wontfix','reverted','expired')),
+                      'dismissed_wontfix','reverted','expired')),   -- 'reverted' reserved, no writer in v1
     outcome_source  text NOT NULL CHECK (outcome_source IN
                      ('review_raised','auto_fix_landed','auto_git_revert','human_dismiss','ttl_sweep')),
     created_at      timestamptz NOT NULL DEFAULT now()
 );
--- append-only: NEVER UPDATE/DELETE; current state = latest row per (finding_key, reviewer_family).
--- idempotency / spam bounds:
-CREATE UNIQUE INDEX finding_outcome_one_open
-    ON finding_outcome (finding_key, reviewer_family, review_run_id) WHERE outcome = 'open';
-CREATE UNIQUE INDEX finding_outcome_one_close
-    ON finding_outcome (finding_key, reviewer_family, outcome, review_run_id);
+-- append-only: NEVER UPDATE/DELETE. Current state = per (finding_key, reviewer_family):
+--   the latest human row if one exists (human-terminal precedence), else the latest row.
+-- idempotency: one row per (finding_key, reviewer_family, outcome, source_event) — a re-run of
+-- the same review/sweep/dismissal is a no-op conflict, not a duplicate event.
+CREATE UNIQUE INDEX finding_outcome_event_once
+    ON finding_outcome (finding_key, reviewer_family, outcome, source_event);
 CREATE INDEX finding_outcome_key_idx  ON finding_outcome (finding_key, created_at DESC);
 CREATE INDEX finding_outcome_open_idx ON finding_outcome (repo_id, path) WHERE outcome = 'open';
 ```
 
-`line_hash` (SonarQube borrow, ~20 pure lines in a new `runtime/outcomes.py`, DB-free like
-`capture.py`): sha256 of the whitespace-normalized CONTENT of the flagged line as it exists at
-the reviewed tip (`git show <tip>:<path>`, line N) — never the line number, so the identity
-survives diff shifts. If the reviewer's `path:line` doesn't resolve at the tip (bad line, file
-absent, path not in the changed set), the finding row is DROPPED (fail-closed for data quality)
-and a note logged. Known aliasing: two identical lines in one file share a hash — accepted,
-documented (SonarQube accepts the same).
+`line_hash` (SonarQube borrow, pure fns in a new `runtime/outcomes.py`, DB-free like
+`capture.py`): sha256 of the whitespace-normalized CONTENT of the flagged line as read from git
+objects at the reviewed tip (`git show <tip>:<path>`, line N) — never the line number, so the
+identity survives diff shifts. Validation is layered and fail-closed for data quality: the
+reviewer's `<path>:<line>` must (a) name a path in the changed-file set, (b) fall INSIDE one of
+this diff's changed hunks for that path (a wrong-but-resolvable line number can't silently key a
+finding to unrelated code), (c) resolve to a non-empty line. Any miss → the finding row is
+dropped + noted. Known, accepted aliasing: two identical lines in the SAME file share a hash
+(SonarQube accepts the same); cross-FILE aliasing is gone because path is in the key.
 
-## 4. Finding extraction — one structured line, shared with capture
+## 4. Finding extraction — a NEW line, capture's line untouched
 
-Reviewers already emit `rule:<tag>` lines for the capture rung. Extend that SAME convention (one
-prompt change, versioned, serving capture + outcomes + the strength-prompts upgrade):
+v0.1 extended capture's `rule:<tag>` line in place. That was wrong twice over: the two rungs
+have CONFLICTING emission semantics (capture asks for tags on RECURRING classes only; outcomes
+needs EVERY finding keyed — one line biases one rung or dilutes the other), and capture is LIVE
+and armed (changing its parser input distribution ships a silent behavior change to a running
+rung). So:
 
 ```
-rule:<tag> @ <path>:<line>
+rule:<tag>                       ← capture's line, UNCHANGED (recurring classes only)
+finding:<tag> @ <path>:<line>    ← outcomes' line, one per finding, both reviewers
 ```
 
-- Parser tolerates the bare legacy form `rule:<tag>` (capture keeps working; outcomes just can't
-  key it → no row). **Build gate: capture-record's existing parser must accept the extended form
-  before the prompt changes** (its regex is the compatibility contract; regression-tested).
+- Same allowlisted taxonomy for `<tag>` (one source of truth, `--list-tags`).
+- The `finding:` prompt sentence is emitted when `$ORCH/OUTCOMES_ENABLED` — its OWN flag, no
+  CAPTURE_ENABLED coupling in either direction (v0.1 claimed independence but rode capture's
+  prompt; false claim, now true by construction).
+- Tokenization is anchored: the LAST ` @ ` on the line splits fields; `<path>` may contain
+  spaces/`:`/`@`; `<line>` is the digits after the final `:`. Ctrl chars rejected on the RAW
+  line before any strip (capture round-2 lesson). Paths under `skills/` and refs matching
+  `skill/auto/*` are excluded (the sibling rung's self-exclusion rules apply here too).
 - Per-family attribution: outcome-record parses `$review` and `$oracle_review` SEPARATELY —
-  unlike capture (which records only the cross-family intersection), outcomes needs per-family
-  rows because per-family precision is the whole measurement.
-- lobster is triage, not a finder — no lobster rows (brief's schema pruned accordingly).
+  per-family precision is the whole measurement.
+- Per-run bound: at most OUTCOME_MAX_ROWS (default 50, flagged) finding rows per review; the
+  honest spam bound is tags × LINES in the diff (not × files), so an explicit cap replaces the
+  v0.1 hand-wave. Overflow → recorded count noted, remainder dropped.
 
 ## 5. SQL views (COMPUTE only in v1 — nothing acts)
 
+Views read CURRENT STATE (latest row per key×family, human-terminal precedence), never raw event
+counts — event-counting double-counts re-raises and lets churn distort the ratios (v0.1 elided
+this and either reading broke a metric):
+
 ```sql
--- current state per finding = latest row per (finding_key, reviewer_family)
-CREATE VIEW finding_current AS ...;
--- per (rule_tag × reviewer_family), over a 90-day window:
---   precision   = applied_fixed / NULLIF(applied_fixed + dismissed_false_positive, 0)
---   revert_rate = reverted / NULLIF(applied_fixed, 0)
---   volume      = count(*) raised
-CREATE VIEW finding_precision AS ...;
+CREATE VIEW finding_current AS ...;   -- one row per (finding_key, reviewer_family): resolved state
+CREATE VIEW finding_precision AS      -- per (rule_tag × reviewer_family), over ALL history:
+  -- precision = applied_fixed / NULLIF(applied_fixed + dismissed_false_positive, 0)
+  -- volume    = count(*) of current findings
+  ...;
 ```
 
+No time window in v1: at solo review volume a 90-day window can silently discard most of the
+scarce history (a class may see a handful of labels per quarter). Windowing is a LATER-rung
+tuning decision made with real volume in hand — a one-line view change on an append-only table
+that loses nothing meanwhile. Ad-hoc visibility: `mxr outcome-stats` prints the views (no
+dashboard; this also serves the morning brain-check).
+
 Deferred to the LATER rung (do NOT build now): the suppress/promote dial, the weekly SQL report,
-any threshold acting on these views. They arrive only after real volume accrues, human-gated.
+revert detection, any threshold acting on these views.
 
 ## 6. Security surface & failure modes
 
-- **Untrusted input:** finding lines are LLM output over an untrusted diff. Defenses (all reuse
-  the capture rung's proven pieces): rule_tag must ∈ the allowlisted taxonomy; path must ∈ the
-  changed-file set of THIS reviewed range (no traversal, ctrl-chars rejected on the RAW value
-  before strip — capture round-2 lesson); everything passed via `sys.argv`, never interpolated;
-  line resolution reads git objects (`git show tip:path`), never the working tree.
-- **Availability:** recording is post-delivery, bounded by `cap_run` (perl alarm), fail-open —
-  a hung DB/mxr can never delay a verdict or wedge the review lock. Default OFF
-  (`$ORCH/OUTCOMES_ENABLED`), HARD no-op in gate mode (`PLAY_GATE=1`), independent of
-  CAPTURE_ENABLED.
-- **Spam/growth:** unique partial indexes bound rows per (finding, run); a hostile review can
-  inject at most (allowlisted tags × changed files) rows per run — all inert data, nothing reads
-  it for decisions in v1. TTL sweep keeps 'open' bounded.
-- **Parser drift → zero rows:** fail-open means silence, not breakage; the build adds a
-  row-count line to the existing brain health check so starvation is VISIBLE, not silent.
-- **Revert false-positives:** revert detection scoped to commits that CLOSED a finding
-  (auto_fix_landed rows), not arbitrary reverts.
+- **Untrusted input:** finding lines are LLM output over an untrusted diff. Defenses (reusing
+  the capture rung's proven pieces): rule_tag ∈ allowlisted taxonomy; path ∈ changed-file set;
+  line ∈ a changed hunk of that path; ctrl-chars rejected raw; `sys.argv` only, no
+  interpolation; git-object reads (`git show tip:path`), never the working tree; per-run row cap.
+- **Key forgery:** finding_key covers (repo, tag, path, line-content) — to collide with a legit
+  finding an attacker must plant the SAME normalized line in the SAME file the legit finding is
+  in, i.e. touch the code the finding is about, which a human reviews on merge. Cross-file
+  minting (the v0.1 hole) is closed by path-in-key; prefix-grinding is closed by the fail-closed
+  ≥12-hex dismissal verb.
+- **Availability:** recording is post-delivery, bounded (cap_run alarm — build must verify ONE
+  bounded invocation covers the git-show batch; batch the reads, don't N× the alarm), fail-open.
+  Default OFF (`$ORCH/OUTCOMES_ENABLED`), HARD no-op in gate mode (`PLAY_GATE=1`).
+- **Human-vs-auto race:** precedence rule in §2 — verbs never write an auto row over a human
+  terminal state, so the winner is policy, not wall-clock.
+- **Parser drift → zero rows:** fail-open means silence, not breakage; `mxr outcome-stats` in
+  the morning brain-check makes starvation VISIBLE (v0.1 pointed at a health check that doesn't
+  exist; the stats verb is the concrete surface).
+- **Known-accepted false labels (documented, tolerated in v1):** file rename or whole-file
+  delete reads as applied_fixed (line gone); a fix that lands on a branch never reviewed again
+  expires instead of closing. Both are noise the volume floor at the LATER rung must absorb;
+  neither is attacker-steerable beyond what merging arbitrary code already implies.
 
 ## 7. Borrowed / built / rejected (from the brief §F–G)
 
 | Piece | Verdict |
 |---|---|
 | append-only `finding_outcome` + views | BUILD (one table on the spine) |
-| line-hash stable identity | BORROW pattern (SonarQube) |
-| dismissal enum fp vs wontfix | BORROW pattern (GitHub/SonarQube) — the load-bearing split |
+| line-hash stable identity, path-scoped | BORROW pattern (SonarQube — identity is per-file) |
+| dismissal enum fp vs wontfix, STICKY on re-detection | BORROW pattern (GitHub/SonarQube) |
 | auto fix-landed on next scan | BORROW pattern (SonarQube auto-Fixed) |
 | reviewer-as-classifier per-family precision | BORROW pattern (LLM-judge lit) |
+| revert detection | DEFER to the autonomy-ladder rung (shared primitive there) |
 | fine-tuning / embeddings / vector store / dashboard / kappa stats / per-finding voting UI | REJECT |
 
 ## 8. Build plan (feature-flagged, each PR suite-green)
 
-- **PR-A** `outcomes.py` pure (line-hash, parser, validation) + migration 0008 + schema.sql
-  mirror + ledger verbs (`record_findings`, `close_fixed`, `record_revert`, `human_dismiss`,
-  `expire_open`) + tests (incl. adversarial: tag/path injection, traversal, ctrl chars, dup spam).
-- **PR-B** `mxr outcome-record` + `mxr outcome` verbs + play-review post-delivery wiring +
-  prompt extension (after the capture-parser compatibility gate) + fixture tests.
-- **PR-C** controller-tick revert detection + TTL sweep + health-check row counts.
+- **PR-A** `outcomes.py` pure (line-hash, `finding:` parser, hunk validation) + migration 0008 +
+  schema.sql mirror + ledger verbs (`record_findings` incl. sticky-dismiss + close-phase,
+  `human_dismiss` fail-closed prefix, `expire_open`, `outcome_stats`) + tests (adversarial:
+  tag/path/line injection, hunk-outside line, cross-file collision attempt, dup spam, human-
+  precedence race, PASS-review close).
+- **PR-B** `mxr outcome-record` / `mxr outcome` / `mxr outcome-stats` + play-review wiring on
+  BOTH verdict branches (close-phase on PASS too) + the `finding:` prompt sentence behind
+  OUTCOMES_ENABLED + per-finding keys & paste-ready dismiss commands in the delivered verdict +
+  fixture tests. Capture's parser and prompt line are untouched by construction.
 
 Deploy = normal serve-restart auto-migrate; arm = `touch $ORCH/OUTCOMES_ENABLED`; disarm = rm.
