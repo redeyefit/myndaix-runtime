@@ -189,3 +189,61 @@ CREATE TABLE capture_occurrence (
 );
 
 CREATE INDEX idx_capture_candidate_state ON capture_candidate (state);
+
+-- outcomes-ledger rung (the per-finding OUTCOME LABEL): append-only event log + computed views on
+-- the existing spine (v0.3, cross-family reviewed). Mirrors migrations/0008_finding_outcome.sql
+-- (keep the two in lockstep). Every delivered push review records what HAPPENED to each finding —
+-- applied_fixed (the hashed line is gone at the next review), dismissed_* (a human label), expired
+-- (TTL sweep) — so per-class precision becomes measurable. Identity is a PATH-SCOPED line-hash
+-- (finding_key = sha256(repo_id \0 rule_tag \0 path \0 line_hash)) so cross-file identical lines
+-- never collide. NO LLM anywhere; v1 COLLECTS ONLY (no dial acts on the data). NEVER UPDATE/DELETE —
+-- current state is the finding_current view (human-terminal precedence, else latest-by-seq).
+CREATE TABLE finding_outcome (
+    seq             bigserial,       -- monotonic EVENT ORDER: 'latest row' is by seq, not created_at
+    id              uuid PRIMARY KEY,
+    finding_key     text NOT NULL,   -- sha256(repo_id \0 rule_tag \0 path \0 line_hash): PATH in key
+    repo_id         text NOT NULL,
+    ref             text NOT NULL,   -- the reviewed ref the finding was raised on (EXACT close scope)
+    rule_tag        text NOT NULL,   -- allowlisted capture taxonomy (shared, single source of truth)
+    reviewer_family text NOT NULL CHECK (reviewer_family IN ('kilabz','oracle')),
+    path            text NOT NULL,   -- validated ∈ the reviewed diff's changed-file set
+    line_hash       text NOT NULL,   -- sha256 of the normalized flagged-line CONTENT at tip_sha
+    source_event    text NOT NULL,   -- 'review:<play>' | 'human:<finding_key12>' | 'sweep:<utcday>'
+    tip_sha         text NOT NULL,   -- the sha the line-hash was computed/checked at (NOT base_sha)
+    outcome         text NOT NULL CHECK (outcome IN
+                     ('open','applied_fixed','dismissed_false_positive',
+                      'dismissed_wontfix','reverted','expired')),  -- 'reverted' reserved, no v1 writer
+    outcome_source  text NOT NULL CHECK (outcome_source IN
+                     ('review_raised','auto_fix_landed','auto_git_revert','human_dismiss','ttl_sweep')),
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+-- idempotency: one row per (finding_key, reviewer_family, outcome, source_event) — a re-run is a no-op.
+CREATE UNIQUE INDEX finding_outcome_event_once
+    ON finding_outcome (finding_key, reviewer_family, outcome, source_event);
+CREATE INDEX finding_outcome_key_idx  ON finding_outcome (finding_key, created_at DESC);
+CREATE INDEX finding_outcome_open_idx ON finding_outcome (repo_id, path) WHERE outcome = 'open';
+
+-- current state per (finding_key, reviewer_family): a human dismissed_* row is TERMINAL (outranks any
+-- later machine row), else latest-by-seq.
+CREATE OR REPLACE VIEW finding_current AS
+SELECT DISTINCT ON (finding_key, reviewer_family)
+       finding_key, reviewer_family, repo_id, ref, rule_tag, path, line_hash,
+       outcome, outcome_source, tip_sha, source_event, created_at, seq
+  FROM finding_outcome
+ ORDER BY finding_key, reviewer_family,
+          (outcome_source = 'human_dismiss') DESC,   -- human-terminal precedence FIRST
+          seq DESC;
+
+-- precision per (rule_tag × reviewer_family), over ALL history (no time window in v1). Reads current
+-- state, never raw event counts. precision = applied_fixed / (applied_fixed + dismissed_false_positive).
+CREATE OR REPLACE VIEW finding_precision AS
+SELECT rule_tag,
+       reviewer_family,
+       count(*) FILTER (WHERE outcome = 'applied_fixed')              AS applied_fixed,
+       count(*) FILTER (WHERE outcome = 'dismissed_false_positive')   AS dismissed_false_positive,
+       count(*)                                                       AS volume,
+       count(*) FILTER (WHERE outcome = 'applied_fixed')::numeric
+         / NULLIF(count(*) FILTER (WHERE outcome IN
+             ('applied_fixed','dismissed_false_positive')), 0)        AS precision
+  FROM finding_current
+ GROUP BY rule_tag, reviewer_family;

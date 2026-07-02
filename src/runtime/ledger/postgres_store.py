@@ -41,7 +41,7 @@ from uuid import UUID
 
 import asyncpg
 
-from runtime import capture, registry, skillmatch
+from runtime import capture, outcomes, registry, skillmatch
 from runtime.contracts import (
     Authority, ErrorClass, Job, LostLease, Result, TransportEnvelope,
 )
@@ -1297,3 +1297,198 @@ class PostgresLedger:
                 WHERE c.fingerprint = due.fingerprint
                 RETURNING c.fingerprint, due.pr_number""", ttl_days)
         return [{"fingerprint": r["fingerprint"], "pr_number": r["pr_number"]} for r in rows]
+
+    # ---- outcomes ledger (the per-finding OUTCOME LABEL) — v0.3 append-only state machine --------
+    # Append-only: NEVER UPDATE/DELETE a finding_outcome row. Current state is the finding_current
+    # view (human-terminal precedence, else latest-by-seq). Idempotency is the unique index
+    # (finding_key, reviewer_family, outcome, source_event) + ON CONFLICT DO NOTHING, so re-running a
+    # review / sweep / dismissal is a no-op, not a duplicate event. NO LLM decides identity or outcome:
+    # the finding_key is a path-scoped line-hash (runtime.outcomes), the CLOSE phase compares STORED
+    # hashes to what git shows at tip, and human labels are terminal (design §2 precedence).
+    async def record_findings(self, repo_id: str, ref: str, tip_sha: str, play: str,
+                              changed_paths: list[str],
+                              open_findings: list[dict]) -> dict:
+        """The per-review recorder: CLOSE phase (runs on EVERY delivered review, incl. PLAY_PASS) +
+        OPEN phase (NEEDS-FIX reviews that raised findings). One transaction; idempotent.
+
+        CLOSE — for each currently-'open' finding of THIS repo whose `path` ∈ `changed_paths` AND
+        whose `ref` EXACTLY matches this review's ref, if the finding's stored `line_hash` is NO
+        LONGER present among the hashes this review resolved for that path at `tip_sha`, INSERT an
+        'applied_fixed' row (source_event 'review:<play>', outcome_source auto_fix_landed). EXACT ref
+        match (not default-branch closure) — a main review must not close a finding raised on an
+        unrelated feature branch whose fix never merged (design §2, v1 scope). The present-hash set is
+        derived from `open_findings` (the findings THIS review re-resolved), so a line still flagged
+        this review is NOT closed.
+
+        OPEN — for each finding in `open_findings` INSERT an 'open' row, SKIPPING any (finding_key,
+        family) whose LATEST state is dismissed_* (sticky dismissals — a human 'this reviewer was
+        wrong' suppresses re-detection, which is what the stable key exists FOR). Re-raise after
+        'expired' or 'applied_fixed' is allowed (a regression).
+
+        `open_findings` is a list of resolved dicts from runtime.outcomes (the wiring layer already ran
+        parse_finding_lines + resolve_and_hash, per family), each:
+            {"tag", "path", "line_hash", "reviewer_family"}   (reviewer_family ∈ kilabz|oracle)
+        Returns {"closed": n, "opened": n, "skipped_dismissed": n} for the caller to log. Fail-closed
+        on a bad family via the DB CHECK; the caller has already validated tags/paths."""
+        # present hashes per (family, path) = the lines STILL flagged this review -> not closed.
+        present: dict[tuple[str, str], set[str]] = {}
+        by_key: dict[str, dict] = {}
+        for f in open_findings:
+            fam, path, lh = f["reviewer_family"], f["path"], f["line_hash"]
+            present.setdefault((fam, path), set()).add(lh)
+            fk = outcomes.finding_key(repo_id, f["tag"], path, lh)
+            by_key[fk] = {"tag": f["tag"], "path": path, "line_hash": lh, "reviewer_family": fam}
+        changed = set(changed_paths)
+        closed = opened = skipped = 0
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                # CLOSE: the current-state rows that are 'open' for this repo+ref on a changed path,
+                # whose stored line_hash is no longer in the present set for that (family, path).
+                open_rows = await con.fetch(
+                    """SELECT fc.finding_key, fc.reviewer_family, fc.rule_tag, fc.path, fc.line_hash
+                         FROM finding_current fc
+                        WHERE fc.repo_id = $1 AND fc.ref = $2 AND fc.outcome = 'open'
+                          AND fc.path = ANY($3::text[])""",
+                    repo_id, ref, list(changed))
+                for r in open_rows:
+                    still = present.get((r["reviewer_family"], r["path"]), set())
+                    if r["line_hash"] in still:
+                        continue                                # line still flagged -> not fixed
+                    ins = await con.fetchval(
+                        """INSERT INTO finding_outcome
+                               (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                                line_hash, source_event, tip_sha, outcome, outcome_source)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'applied_fixed','auto_fix_landed')
+                           ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
+                               DO NOTHING
+                           RETURNING id""",
+                        _new_id(), r["finding_key"], repo_id, ref, r["rule_tag"],
+                        r["reviewer_family"], r["path"], r["line_hash"], f"review:{play}", tip_sha)
+                    if ins is not None:
+                        closed += 1
+                # OPEN: insert 'open' rows, skipping any key whose latest state for that family is
+                # dismissed_* (sticky). One state read per key via finding_current.
+                for fk, f in by_key.items():
+                    cur = await con.fetchrow(
+                        """SELECT outcome FROM finding_current
+                            WHERE finding_key = $1 AND reviewer_family = $2""",
+                        fk, f["reviewer_family"])
+                    if cur is not None and cur["outcome"] in (
+                            "dismissed_false_positive", "dismissed_wontfix"):
+                        skipped += 1
+                        continue
+                    ins = await con.fetchval(
+                        """INSERT INTO finding_outcome
+                               (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                                line_hash, source_event, tip_sha, outcome, outcome_source)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open','review_raised')
+                           ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
+                               DO NOTHING
+                           RETURNING id""",
+                        _new_id(), fk, repo_id, ref, f["tag"], f["reviewer_family"],
+                        f["path"], f["line_hash"], f"review:{play}", tip_sha)
+                    if ins is not None:
+                        opened += 1
+        return {"closed": closed, "opened": opened, "skipped_dismissed": skipped}
+
+    async def human_dismiss(self, finding_key_prefix: str, family_or_all: str, kind: str) -> dict:
+        """The human's per-finding dismissal (the fp-vs-wontfix label). FAIL-CLOSED on an ambiguous or
+        too-short prefix: a <12-hex or non-unique prefix dismisses NOTHING and returns the colliding
+        full keys, so grinding a short-prefix collision is an error message, not a mislabel (design §2).
+
+        `kind` ∈ fp|wontfix maps to dismissed_false_positive|dismissed_wontfix. `family_or_all` is
+        'kilabz'|'oracle'|'all' — a dismissal writes ONE row per reviewer_family currently 'open' on
+        that key (a human overrules whichever family raised it). DETERMINISTIC source_event
+        'human:<finding_key12>' — re-running the exact command is an index-conflict no-op, not a
+        duplicate event (a 'human:<uuid>' would break idempotency). Returns
+        {"dismissed": n, "finding_key": <full>} on success, or {"error": ..., "candidates": [...]}."""
+        prefix = (finding_key_prefix or "").strip().lower()
+        if len(prefix) < 12 or any(c not in "0123456789abcdef" for c in prefix):
+            return {"error": "prefix must be >= 12 hex chars", "candidates": []}
+        if kind == "fp":
+            outcome = "dismissed_false_positive"
+        elif kind == "wontfix":
+            outcome = "dismissed_wontfix"
+        else:
+            raise ValueError(f"human_dismiss: bad kind {kind!r} (expected fp|wontfix)")
+        families = (["kilabz", "oracle"] if family_or_all == "all"
+                    else [family_or_all])
+        if any(fam not in ("kilabz", "oracle") for fam in families):
+            raise ValueError(f"human_dismiss: bad family {family_or_all!r}")
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                # resolve the prefix to EXACTLY ONE full finding_key (fail-closed on 0 or >1). Distinct
+                # keys sharing this prefix -> ambiguous -> refuse + surface the colliding keys.
+                keys = await con.fetch(
+                    """SELECT DISTINCT finding_key FROM finding_outcome
+                        WHERE finding_key LIKE $1 || '%'""", prefix)
+                if len(keys) == 0:
+                    return {"error": "no finding matches that prefix", "candidates": []}
+                if len(keys) > 1:
+                    return {"error": "ambiguous prefix — refine it",
+                            "candidates": [k["finding_key"] for k in keys]}
+                fk = keys[0]["finding_key"]
+                source_event = f"human:{fk[:12]}"
+                # write one dismissal per family CURRENTLY 'open' on this key (idempotent per family).
+                dismissed = 0
+                for fam in families:
+                    cur = await con.fetchrow(
+                        """SELECT repo_id, ref, rule_tag, path, line_hash, tip_sha
+                             FROM finding_current
+                            WHERE finding_key = $1 AND reviewer_family = $2 AND outcome = 'open'""",
+                        fk, fam)
+                    if cur is None:
+                        continue                        # not currently open for this family -> skip
+                    ins = await con.fetchval(
+                        """INSERT INTO finding_outcome
+                               (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                                line_hash, source_event, tip_sha, outcome, outcome_source)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'human_dismiss')
+                           ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
+                               DO NOTHING
+                           RETURNING id""",
+                        _new_id(), fk, cur["repo_id"], cur["ref"], cur["rule_tag"], fam,
+                        cur["path"], cur["line_hash"], source_event, cur["tip_sha"], outcome)
+                    if ins is not None:
+                        dismissed += 1
+        return {"dismissed": dismissed, "finding_key": fk}
+
+    async def expire_open(self, ttl_days: int) -> int:
+        """The TTL sweep (piggybacks the same outcome-record invocation, cheap SQL): INSERT an
+        'expired' row for every finding whose CURRENT state is 'open' and whose latest open event is
+        older than `ttl_days` (design §2 — keeps denominators honest; expired counts toward neither
+        precision side). DETERMINISTIC source_event 'sweep:<utcday>' so re-running the sweep on the
+        same UTC day is an index-conflict no-op. Returns the count expired."""
+        utcday = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+        source_event = f"sweep:{utcday}"
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """INSERT INTO finding_outcome
+                       (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                        line_hash, source_event, tip_sha, outcome, outcome_source)
+                   SELECT gen_random_uuid(), fc.finding_key, fc.repo_id, fc.ref, fc.rule_tag,
+                          fc.reviewer_family, fc.path, fc.line_hash, $1, fc.tip_sha,
+                          'expired', 'ttl_sweep'
+                     FROM finding_current fc
+                    WHERE fc.outcome = 'open'
+                      AND fc.created_at < now() - make_interval(days => $2)
+                   ON CONFLICT (finding_key, reviewer_family, outcome, source_event) DO NOTHING
+                   RETURNING id""",
+                source_event, ttl_days)
+        return len(rows)
+
+    async def outcome_stats(self) -> dict:
+        """The read surface for `mxr outcome-stats` (PR-B) + the morning brain-check: the
+        finding_precision view rows (per rule_tag × reviewer_family) + the current open-finding count
+        (parser-drift starvation is VISIBLE when this stays 0). Reads the computed views only."""
+        async with self._pool.acquire() as con:
+            prec = await con.fetch(
+                """SELECT rule_tag, reviewer_family, applied_fixed, dismissed_false_positive,
+                          volume, precision
+                     FROM finding_precision ORDER BY rule_tag, reviewer_family""")
+            open_n = await con.fetchval(
+                "SELECT count(*) FROM finding_current WHERE outcome = 'open'")
+        return {
+            "precision": [dict(r) for r in prec],
+            "open_count": open_n,
+        }
