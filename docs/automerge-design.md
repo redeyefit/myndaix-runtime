@@ -32,8 +32,8 @@ Bounded, non-Claude (launchd, hourly) sibling of the controller. Each tick: list
 1. **State:** `mergeStateStatus ∈ {CLEAN, BEHIND}`; base branch has **no merge queue** (rules API).
 2. **Docs-only diff-class** (§3) over `B..H`.
 3. **CI green for `H`:** `gh api --paginate` check-runs + statuses for commit `H`; the exact `test` check COMPLETED+SUCCESS; reject zero/running/failing/ambiguous.
-4. **Review PASS:** `play-review --gate` (§4) → validated structured verdict `{run_id,B,H,PASS}` produced by THIS tick. Anything else → no merge + record in `automerge_seen`.
-5. **Bounds:** `AUTOMERGE_ENABLED` flag · per-tick + per-day + per-author caps · not DRY-RUN.
+4. **Bounds:** `AUTOMERGE_ENABLED` flag · per-tick + per-day + per-author caps · not DRY-RUN. **Runs BEFORE the review** (PR #51): the caps are cheap and head+day-determined, so a cap-blocked PR cannot merge this tick regardless of the review — running the paid review first re-ran the full 3-agent review every hourly tick for any over-cap PR (a `None` defer records nothing → never deduped), a spend leak that also made a 2nd same-author docs PR look "stuck" until the UTC day rolled. The terminal-classification gates (docs-class, CI) stay ABOVE the caps so a non-docs / CI-failed PR is still recorded when capped.
+5. **Review PASS:** `play-review --gate` (§4) → validated structured verdict `{run_id,B,H,PASS}` produced by THIS tick. Anything else → no merge + record in `automerge_seen`.
 6. **Atomic merge:** REST `PUT pulls/{n}/merge {sha:H, merge_method:merge}` (409 if head moved) [or `gh pr merge --match-head-commit H`]; assert `{merged:true}`; on queue/auto-enabled/OPEN → disable-auto, log, human.
 
 ## 3. Docs-only diff-class gate (the security boundary; un-gameable)

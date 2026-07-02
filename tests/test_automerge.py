@@ -117,6 +117,78 @@ def test_parse_raw_z_is_strict():
     raises(b":100644 100644 a b M\x00ok.md\x00:100644 100644 c M\x00x.md\x00", "second info has 4 fields")
 
 
+# -- gate ORDERING: caps run BEFORE the paid review (spend-leak regression) ----
+# The audit's #1 finding: gate-review-before-caps re-ran the full 3-agent review every
+# hourly tick for any PR blocked only by a cap (a None decision records nothing → never
+# deduped) — a paid-agent spend leak, and why a 2nd same-author docs PR looked "stuck".
+# These stub the module I/O to drive evaluate_pr to the cap boundary and prove the review
+# is only reached when the caps pass.
+class _R:
+    def __init__(self, rc=0, out=b""):
+        self.returncode = rc
+        self.stdout = out
+
+
+def _run_eval(budget_val=0, day_count=0, author_count=0, review_ret="needs_fix"):
+    """Stub every helper evaluate_pr calls up to the cap/review boundary and run it. `_count`
+    is PATH-AWARE so each of the three caps (per-tick via budget, per-day, per-author) can be
+    tripped in ISOLATION — the day and author counters live at distinct _day() paths. Returns
+    (result, calls) where calls records each _review_pass invocation."""
+    H, M, B = "a" * 40, "b" * 40, "c" * 40
+    calls = []
+
+    def fake_git(path, *args, **kw):
+        a = args[0] if args else ""
+        if a == "rev-parse":
+            return _R(0, (H if "pr/" in args[1] else M).encode())
+        if a == "merge-base":
+            return _R(0, B.encode())
+        return _R(0, b"stub")                      # fetch, diff --raw, diff content
+
+    def fake_count(p):
+        return author_count if "author" in str(p) else day_count
+
+    def fake_review(repo, b, h):
+        calls.append((b, h))
+        return review_ret
+
+    monkey = {"_git": fake_git, "_merge_queue": lambda repo: False,
+              "parse_raw_z": lambda out: [], "classify_diff": lambda entries: (True, ""),
+              "_ci_green": lambda repo, head: True, "_count": fake_count,
+              "_review_pass": fake_review}
+    saved = {k: getattr(A, k) for k in monkey}
+    for k, v in monkey.items():
+        setattr(A, k, v)
+    try:
+        pr = {"number": 45, "headRefOid": H, "baseRefOid": M,
+              "author": {"login": "redeyefit"}, "isDraft": False,
+              "isCrossRepository": False, "mergeStateStatus": "CLEAN"}
+        res = A.evaluate_pr({"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}, pr, [budget_val])
+        return res, calls
+    finally:
+        for k, v in saved.items():
+            setattr(A, k, v)
+
+
+def test_each_cap_blocks_before_the_paid_review():
+    # EACH of the three caps, tripped in ISOLATION (the others clear), must DEFER (None)
+    # WITHOUT running the paid review — the whole point of the reorder (kilabz LOW: prove all
+    # three, not just the daily cap that would trip first under a blanket count).
+    for label, kw in (("per-tick budget", dict(budget_val=A.MAX_PER_TICK)),
+                      ("per-day cap",     dict(day_count=A.MAX_PER_DAY)),
+                      ("per-author cap",  dict(author_count=A.MAX_PER_AUTHOR_DAY))):
+        res, calls = _run_eval(**kw)
+        ok(res is None, f"{label}: defers (None), not recorded terminal")
+        ok(calls == [], f"{label}: paid review NOT called (no spend leak)")
+
+
+def test_uncapped_pr_reaches_the_review():
+    # all caps clear → the review DOES run (proves the reorder didn't skip the gate entirely)
+    res, calls = _run_eval(review_ret="needs_fix")
+    ok(len(calls) == 1, "the review runs when every cap passes")
+    ok(res == ("needs_fix", "review did not PASS — human"), "review verdict flows through")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
