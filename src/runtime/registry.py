@@ -111,6 +111,26 @@ V1_ROSTER: list[AgentSpec] = [
                        "secret_ref": "HF_KEY",
                        "application": "/higgsfield-ai/dop/lite",
                        "non_idempotent": True}),
+    # Speak: talking-head video (one portrait + a public WAV url -> lip-synced clip).
+    # Same invoke_higgsfield spine as DoP; adapter.payload='speak' switches the request
+    # body to the nested /v1/speak shape (built in runner._hf_speak_body). The API takes
+    # AUDIO, not text+voice — TTS the script upstream and host the WAV. Endpoint +
+    # payload contract are from the official higgsfield-js SDK (docs don't list Speak);
+    # unverified against the live API — a wrong shape fails closed as a 422 TERMINAL at
+    # submit, PRE-charge, so the first live call is the cheap validation. timeout_s=900
+    # is unanchored (no render-time data for a 15s/high job; DoP=600) — tune after the
+    # first real render. Speak clips must NOT be stitched (ffmpeg concat is -an, audio
+    # would be stripped) — structurally protected: the stitcher builds flat DoP bodies,
+    # which this endpoint 422-rejects pre-charge.
+    AgentSpec(agent_id="speak", reach=Reach.API, authority=Authority.RESPONDER,
+              model="speak-v2", role="talking-head video (portrait + audio lip-sync)",
+              profile=Profile(timeout_s=900, cost_budget=5.0),
+              adapter={"kind": "higgsfield",
+                       "base": "https://platform.higgsfield.ai",
+                       "secret_ref": "HF_KEY",
+                       "application": "/v1/speak/higgsfield",
+                       "payload": "speak",
+                       "non_idempotent": True}),   # paid submit, same crash-window rule as higgsfield
     # Stitcher: long video from a shot-list (generate per shot -> last-frame chain ->
     # ffmpeg concat -> deterministic brand overlay). reach=API + adapter.kind 'stitch'
     # routes to invoke_stitch. authority=WORKSPACE_ACTOR -> NEVER auto-retried (so the

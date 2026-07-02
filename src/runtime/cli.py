@@ -103,6 +103,12 @@ def _build_context(args: argparse.Namespace) -> dict:
         ctx["motion_id"] = args.motion_id
     if getattr(args, "motion_strength", None) is not None:
         ctx["motion_strength"] = args.motion_strength
+    if getattr(args, "audio_url", None) is not None:
+        ctx["audio_url"] = args.audio_url
+    if getattr(args, "quality", None) is not None:
+        ctx["quality"] = args.quality
+    if getattr(args, "duration", None) is not None:
+        ctx["duration"] = args.duration
     if getattr(args, "shotlist", None):
         try:
             with open(args.shotlist) as f:
@@ -194,6 +200,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="DoP camera-preset uuid (higgsfield/stitcher); see GET /v1/motions")
     p.add_argument("--motion-strength", metavar="N", dest="motion_strength", type=float,
                    help="DoP motion strength, 0.3 (subtle) to 1.0 (dramatic)")
+    p.add_argument("--audio-url", metavar="URL", dest="audio_url",
+                   help="speech audio url (speak agent; public WAV — TTS the script first)")
+    p.add_argument("--quality", choices=("mid", "high"),
+                   help="speak render quality (omit for the API default)")
+    p.add_argument("--duration", type=int, choices=(5, 10, 15),
+                   help="speak clip length in seconds (omit for the API default)")
     p.add_argument("--shotlist", metavar="PATH",
                    help="path to a JSON shot-list (stitcher): ordered list of shot objects")
     p.add_argument("--end-card", metavar="URL", dest="end_card",

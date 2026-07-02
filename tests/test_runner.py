@@ -740,6 +740,175 @@ def test_higgsfield_missing_secret_ref_fails_closed():
     assert "missing API key" in r.text
 
 
+# -- Speak (talking-head) payload family: adapter.payload='speak' switches the request
+# body to the nested /v1/speak shape; the submit/poll/charge contract is unchanged. --
+
+def _speak_spec(**adapter_over):
+    adapter = {"kind": "higgsfield", "base": "https://platform.higgsfield.ai",
+               "secret_ref": "HF_KEY", "application": "/v1/speak/higgsfield",
+               "payload": "speak",
+               "poll_interval_s": 0, "poll_retry_backoff_s": 0}
+    adapter.update(adapter_over)
+    return AgentSpec(agent_id="speak", reach=Reach.API,
+                     authority=Authority.RESPONDER, model="speak-v2", role="talking-head",
+                     profile=Profile(timeout_s=5), adapter=adapter)
+
+
+def _speak_job(prompt="warm, direct to camera", **ctx_over):
+    ctx = {"image_url": "http://1.1.1.1/face.png",
+           "audio_url": "http://1.1.1.1/speech.wav"}
+    ctx.update(ctx_over)
+    # None means "omit this key" so tests can drop required fields
+    ctx = {k: v for k, v in ctx.items() if v is not None}
+    return Job(id=uuid.uuid4(), to_agent="speak", prompt=prompt, timeout_s=5, context=ctx)
+
+
+def test_speak_submit_poll_completed_nested_body():
+    """The speak path must send the NESTED SDK body (input_image/input_audio/prompt +
+    optional quality/duration) — not the flat DoP shape — and complete like any hf job."""
+    import json as _json
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        seen = {}
+
+        def handler(req):
+            if req.method == "POST":
+                assert req.url.path == "/v1/speak/higgsfield"
+                assert req.headers["Authorization"] == "Key id:secret"
+                seen["body"] = _json.loads(req.content)
+                return httpx.Response(200, json={"request_id": "spk-1"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://cloud-cdn.higgsfield.ai/talk.mp4"},
+                                  "cost": 0.8})
+
+        job = _speak_job(quality="high", duration=10)
+        r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), job,
+                        transport=httpx.MockTransport(handler)))
+        assert r.status is ResultStatus.OK, r.text
+        assert r.artifact_ref == "https://cloud-cdn.higgsfield.ai/talk.mp4" and r.cost == 0.8
+        assert seen["body"] == {
+            "input_image": {"type": "image_url", "image_url": "http://1.1.1.1/face.png"},
+            "input_audio": {"type": "audio_url", "audio_url": "http://1.1.1.1/speech.wav"},
+            "prompt": "warm, direct to camera",
+            "quality": "high", "duration": 10,
+        }
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_speak_omitted_knobs_are_omitted_from_body():
+    """quality/duration left unset must NOT appear in the body (API defaults apply);
+    a string duration from a JSON context ('10') is accepted and sent as int."""
+    import json as _json
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        seen = {}
+
+        def handler(req):
+            if req.method == "POST":
+                seen["body"] = _json.loads(req.content)
+                return httpx.Response(200, json={"request_id": "spk-2"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://x.example/t.mp4"}})
+
+        r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(),
+                        transport=httpx.MockTransport(handler)))
+        assert r.status is ResultStatus.OK, r.text
+        assert "quality" not in seen["body"] and "duration" not in seen["body"]
+
+        r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(duration="10"),
+                        transport=httpx.MockTransport(handler)))
+        assert r.status is ResultStatus.OK, r.text
+        assert seen["body"]["duration"] == 10
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_speak_missing_audio_url_terminal_no_request():
+    """audio_url is required for the speak payload; missing -> TERMINAL before any
+    HTTP call (nothing can be charged)."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def handler(req):   # any request at all is a test failure
+            raise AssertionError("no HTTP request may be made")
+        r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(audio_url=None),
+                        transport=httpx.MockTransport(handler)))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+        assert "audio_url" in r.text
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_speak_invalid_knobs_terminal_no_request():
+    """Invalid quality/duration are hard-rejected PRE-submit — silently defaulting a
+    paid knob would bill a render the caller didn't ask for. bool must not pass the
+    duration check (bool is an int subclass)."""
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        def handler(req):
+            raise AssertionError("no HTTP request may be made")
+        for ctx in ({"quality": "ultra"}, {"duration": 20}, {"duration": True},
+                    {"duration": 7.5}):
+            r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(**ctx),
+                            transport=httpx.MockTransport(handler)))
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, ctx
+            assert "invalid" in r.text, ctx
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_speak_rejects_unsafe_audio_url():
+    """audio_url gets the same SSRF guard as image_url — it is an untrusted URL handed
+    to a third party with our key attached."""
+    import os
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        r = asyncio.run(runner.invoke_higgsfield(
+            _speak_spec(), _speak_job(audio_url="http://127.0.0.1/steal.wav")))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+        assert "audio_url rejected" in r.text
+    finally:
+        del os.environ["HF_KEY"]
+
+
+def test_speak_dop_flat_body_regression():
+    """A higgsfield spec WITHOUT payload='speak' must still build the flat DoP body —
+    the seam may not change the default wire format."""
+    import json as _json
+    import os
+
+    import httpx
+    os.environ["HF_KEY"] = "id:secret"
+    try:
+        seen = {}
+
+        def handler(req):
+            if req.method == "POST":
+                seen["body"] = _json.loads(req.content)
+                return httpx.Response(200, json={"request_id": "req-flat"})
+            return httpx.Response(200, json={"status": "completed",
+                                  "video": {"url": "https://x.example/v.mp4"}})
+
+        r = asyncio.run(runner.invoke_higgsfield(_hf_spec(), _hf_job(),
+                        transport=httpx.MockTransport(handler)))
+        assert r.status is ResultStatus.OK, r.text
+        assert seen["body"] == {"prompt": "push-in", "image_url": "http://1.1.1.1/cat.png"}
+    finally:
+        del os.environ["HF_KEY"]
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
