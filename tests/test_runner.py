@@ -791,12 +791,13 @@ def test_speak_submit_poll_completed_nested_body():
         assert r.status is ResultStatus.OK, r.text
         assert seen["posts"] == 1   # exactly ONE charged submit, ever
         assert r.artifact_ref == "https://cloud-cdn.higgsfield.ai/talk.mp4" and r.cost == 0.8
-        assert seen["body"] == {
+        # `params` envelope confirmed by live 422 (2026-07-01): fields must be wrapped
+        assert seen["body"] == {"params": {
             "input_image": {"type": "image_url", "image_url": "http://1.1.1.1/face.png"},
             "input_audio": {"type": "audio_url", "audio_url": "http://1.1.1.1/speech.wav"},
             "prompt": "warm, direct to camera",
             "quality": "high", "duration": 10,
-        }
+        }}
     finally:
         del os.environ["HF_KEY"]
 
@@ -822,12 +823,12 @@ def test_speak_omitted_knobs_are_omitted_from_body():
         r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(),
                         transport=httpx.MockTransport(handler)))
         assert r.status is ResultStatus.OK, r.text
-        assert "quality" not in seen["body"] and "duration" not in seen["body"]
+        assert "quality" not in seen["body"]["params"] and "duration" not in seen["body"]["params"]
 
         r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(duration="10"),
                         transport=httpx.MockTransport(handler)))
         assert r.status is ResultStatus.OK, r.text
-        assert seen["body"]["duration"] == 10
+        assert seen["body"]["params"]["duration"] == 10
     finally:
         del os.environ["HF_KEY"]
 

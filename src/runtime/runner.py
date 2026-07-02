@@ -354,7 +354,10 @@ async def _hf_speak_body(job: Job, image_url: str, started: float):
     if reason:
         return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                       text=f"audio_url rejected: {reason}", ms=_ms(started))
-    body = {
+    # The generation fields live inside a `params` envelope — confirmed by a live 422
+    # on 2026-07-01 ({"type":"missing","loc":["body","params"]}): the JS SDK's client
+    # adds this wrapper around its helper types before POSTing.
+    params = {
         "input_image": {"type": "image_url", "image_url": image_url},
         "input_audio": {"type": "audio_url", "audio_url": audio_url},
         "prompt": job.prompt,
@@ -367,7 +370,7 @@ async def _hf_speak_body(job: Job, image_url: str, started: float):
             return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                           text=f"speak quality {quality!r} invalid "
                                f"(one of {_HF_SPEAK_QUALITIES})", ms=_ms(started))
-        body["quality"] = quality
+        params["quality"] = quality
     duration = job.context.get("duration")
     if duration is not None:
         # bool is an int subclass — True would pass `in (5, 10, 15)`-style coercion paths
@@ -376,8 +379,8 @@ async def _hf_speak_body(job: Job, image_url: str, started: float):
             return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                           text=f"speak duration {duration!r} invalid "
                                f"(one of {_HF_SPEAK_DURATIONS})", ms=_ms(started))
-        body["duration"] = int(duration)
-    return body
+        params["duration"] = int(duration)
+    return {"params": params}
 
 
 async def _hf_generate(client, *, base: str, application: str, key: str, prompt: str,
