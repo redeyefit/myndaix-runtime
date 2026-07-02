@@ -1382,6 +1382,8 @@ class PostgresLedger:
                                  "line_hash": lh, "reviewer_family": fam}
         changed = set(changed_paths)
         closed = opened = skipped = 0
+        opened_rows: list[dict] = []   # only the rows this call actually INSERTED (kilabz: the
+        # follow-up key-file must surface real inserts, not sticky-dismissed/duplicate findings)
         async with self._pool.acquire() as con:
             async with con.transaction():
                 # CLOSE: currently-'open' rows for this repo on a changed path whose ORIGIN ref (the
@@ -1444,7 +1446,10 @@ class PostgresLedger:
                         f["path"], f["line_hash"], f"review:{play}", tip_sha)
                     if ins is not None:
                         opened += 1
-        return {"closed": closed, "opened": opened, "skipped_dismissed": skipped}
+                        opened_rows.append({"finding_key": fk, "reviewer_family": fam,
+                                            "rule_tag": f["tag"], "path": f["path"]})
+        return {"closed": closed, "opened": opened, "skipped_dismissed": skipped,
+                "opened_rows": opened_rows}
 
     async def human_dismiss(self, finding_key_prefix: str, family_or_all: str, kind: str) -> dict:
         """The human's per-finding dismissal (the fp-vs-wontfix label). FAIL-CLOSED on an ambiguous or

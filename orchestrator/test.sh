@@ -17,6 +17,20 @@ cat > "$FAKE/.local/bin/mxr" <<'STUB'
 #!/usr/bin/env bash
 agent="$1"; prompt="$2"
 printf '%s\t%s\t%s\n' "$agent" "${MXR_TIMEOUT_S:-unset}" "$*" >> "$HOME/.myndaix/mxr-argv.log" 2>/dev/null || true   # PR-0a: argv (+ MXR_TIMEOUT_S) so tests can assert scope flags + review-call timeout
+# `mxr capture-record ...` / `mxr outcome-record ...` — instrumentation verbs (both --list-tags
+# source-of-truth + the record call). Handled BEFORE the agent case: their $1 is a verb, not an agent.
+case "$agent" in
+  capture-record)
+    if [[ "${2:-}" == "--list-tags" ]]; then printf 'fail-open\ntoctou-race\n'; exit 0; fi
+    exit 0 ;;   # record call: no-op stub (the real behavior is tested in python)
+  outcome-record)
+    if [[ "${2:-}" == "--list-tags" ]]; then printf 'fail-open\ntoctou-race\n'; exit 0; fi
+    # record call: log it (so tests can assert it fired) + emit a canned recorded-key line so the
+    # follow-up keys-file path is exercised, gated by STUB_OUTCOME_KEYS (empty -> nothing recorded).
+    printf 'outcome-record\t%s\n' "$*" >> "$HOME/.myndaix/outcome-argv.log" 2>/dev/null || true
+    [[ -n "${STUB_OUTCOME_KEYS:-}" ]] && printf '%s\n' "$STUB_OUTCOME_KEYS"
+    exit 0 ;;
+esac
 case "$prompt" in
   *READY*) [[ "${STUB_CANARY_FAIL:-}" == "$agent" ]] && exit 1; echo READY; exit 0 ;;
 esac
@@ -211,6 +225,50 @@ echo "33. GATE NEEDS-FIX -> verdict NEEDS-FIX, exit 1"; reset; rm -f "$ROOT/verd
 echo "34. GATE requires Oracle -> oracle-down is TRANSIENT (verdict ABORTED, exit 2 -> retry, NOT a permanent NEEDS-FIX)"; reset; rm -f "$ROOT/verdict.json"
   STUB_CANARY_FAIL=oracle STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "oracle-down under gate exits 2 (transient)"
   ck "transient verdict (distinct from a real NEEDS-FIX)" '"verdict":"ABORTED"' "$ROOT/verdict.json"
+
+# ====================== outcomes-ledger instrumentation (PR-B) ======================
+# OUTCOMES_ENABLED is its OWN flag (no CAPTURE coupling). Default OFF -> no finding: prompt, no
+# record. On -> finding: sentence in BOTH review prompts + outcome-record fires post-delivery. Gate
+# mode HARD-skips. The follow-up keys file appears ONLY when outcome-record surfaces keys.
+ORCHDIR="$FAKE/.myndaix/orchestrator"
+arm_outcomes(){ mkdir -p "$ORCHDIR"; : > "$ORCHDIR/OUTCOMES_ENABLED"; }
+olog(){ echo "$FAKE/.myndaix/outcome-argv.log"; }
+latest_outcomes_file(){ ls -t "$INBOX"/*-outcomes.md 2>/dev/null | head -1; }
+
+echo "35. OUTCOMES default OFF: no finding: prompt, no outcome-record call"; reset; STUB_TRIAGE="1. fix it" run
+  mlog="$FAKE/.myndaix/mxr-argv.log"
+  if grep -q "finding:<tag>" "$mlog" 2>/dev/null; then echo "  FAIL: finding: prompt emitted while OFF"; FAIL=$((FAIL+1)); else echo "  ok: no finding: prompt (default OFF)"; PASS=$((PASS+1)); fi
+  cknofile "$(olog)" "no outcome-record call when OUTCOMES_ENABLED absent"
+
+echo "36. OUTCOMES ON: finding: sentence in BOTH reviews only (not triage) + record fires on NEEDS-FIX"; reset; arm_outcomes; STUB_TRIAGE="1. fix it" run
+  mlog="$FAKE/.myndaix/mxr-argv.log"
+  nfind="$(grep -c "finding:<tag>" "$mlog" 2>/dev/null || true)"; [[ "$nfind" =~ ^[0-9]+$ ]] || nfind=0
+  if [[ "$nfind" -eq 2 ]]; then echo "  ok: finding: sentence reaches exactly kilabz + oracle (not triage)"; PASS=$((PASS+1)); else echo "  FAIL: want finding: in 2 review prompts, got $nfind"; FAIL=$((FAIL+1)); fi
+  ckfile "$(olog)" "outcome-record fired post-delivery on NEEDS-FIX"
+
+echo "37. OUTCOMES ON + PASS branch: CLOSE phase still records (runs on a clean PASS)"; reset; arm_outcomes; STUB_TRIAGE="PLAY_PASS" run
+  ckfile "$(olog)" "outcome-record fires on a clean PASS too (CLOSE-on-PASS)"
+
+echo "38. gate mode HARD-skips outcomes (no finding: prompt, no record)"; reset; arm_outcomes; STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
+  glog="$FAKE/.myndaix/mxr-argv.log"
+  if grep -q "finding:<tag>" "$glog" 2>/dev/null; then echo "  FAIL: finding: prompt injected into the merge GATE"; FAIL=$((FAIL+1)); else echo "  ok: gate mode injects NO finding: prompt"; PASS=$((PASS+1)); fi
+  cknofile "$(olog)" "gate mode fires NO outcome-record"
+
+echo "39. follow-up keys file written ONLY when keys recorded"; reset; arm_outcomes
+  STUB_OUTCOME_KEYS="$(printf 'deadbeef0123\tkilabz\tfail-open\tsrc/a.py')" STUB_TRIAGE="1. fix it" run
+  kf="$(latest_outcomes_file)"
+  ckfile "$kf" "keys file written when outcome-record surfaced a key"
+  ck "keys file lists the paste-ready dismiss command" "mxr outcome deadbeef0123 fp" "$kf"
+  ck "keys file lists the finding line" "finding:fail-open @ src/a.py" "$kf"
+
+echo "40. NO follow-up keys file when nothing recorded (empty outcome-record output)"; reset; arm_outcomes
+  STUB_TRIAGE="1. fix it" run   # STUB_OUTCOME_KEYS unset -> stub emits nothing -> no keys file
+  if ls "$INBOX"/*-outcomes.md >/dev/null 2>&1; then echo "  FAIL: keys file written with no recorded keys"; FAIL=$((FAIL+1)); else echo "  ok: no keys file when nothing recorded"; PASS=$((PASS+1)); fi
+
+echo "41. keys file does NOT touch the verdict file (verdict untouched)"; reset; arm_outcomes
+  STUB_OUTCOME_KEYS="$(printf 'cafebabe4567\toracle\ttoctou-race\tf.py')" STUB_TRIAGE="1. fix it" run
+  vf="$(ls -t "$INBOX"/*.md 2>/dev/null | grep -v -- '-outcomes.md' | head -1)"
+  if [[ -n "$vf" ]] && ! grep -q "cafebabe4567" "$vf"; then echo "  ok: verdict file has no injected keys (separate file)"; PASS=$((PASS+1)); else echo "  FAIL: keys leaked into the verdict file"; FAIL=$((FAIL+1)); fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
