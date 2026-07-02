@@ -1,4 +1,4 @@
-# Outcomes Ledger — DESIGN (v0.2)
+# Outcomes Ledger — DESIGN (v0.3)
 
 _The self-learning rung's missing primitive: the per-finding OUTCOME LABEL. One append-only
 Postgres table + computed SQL views on the existing spine. **v1 COLLECTS ONLY — no dial acts on
@@ -12,7 +12,16 @@ refuted. Headline fixes: path joined into `finding_key`; recording moved to EVER
 review (the v0.1 seam only fired on NEEDS-FIX, so clean-PASS fixes could never close); sticky
 dismissals; human labels outrank auto closes; finding keys surfaced in the delivered verdict
 (else the dismissal verb is dead-on-arrival and precision is identically 1.0); revert detection
-CUT from v1 as a theory-build. Status: awaiting cross-family review._
+CUT from v1 as a theory-build._
+
+_v0.3 folds the kilabz (codex) design review — NEEDS-REVISION, 6/6 findings accepted: dismissal
+keys move to a SEPARATE follow-up inbox file (the verdict is written before the recorder runs —
+annotating it post-hoc was impossible, and a pre-delivery step would re-introduce the stalled-
+call-delays-verdict hazard capture was explicitly moved post-delivery to avoid); migration DDL
+made idempotent (the migrator re-runs every boot); close scoping tightened to EXACT ref match;
+human dedupe made deterministic; `seq bigserial` added as the ordering key; `line_hash` stored
+as a column. Status: kilabz-approved shape, oracle (Gemini) pass rides the docs-only automerge
+gate on the design PR (or a manual dispatch from the Mini)._
 
 ## 1. What & why
 
@@ -38,10 +47,13 @@ EVERY delivered push review (play-review.sh, NOT gate mode) — PASS and NEEDS-F
      mxr outcome-record [--kilabz "$review" --oracle "$oracle_review"] -- <repo_path> <tip> <ref> <play> [changed...]
        PHASE 1 — CLOSE (runs on every review, incl. PLAY_PASS):
          for each 'open' finding of THIS repo whose path ∈ this diff's changed set,
-         where this review's ref matches the finding's ref OR is the default branch:
-           flagged line-hash no longer present in that file at <tip>
+         where this review's ref EXACTLY matches the finding's ref (v1 — no default-branch
+         closure: a main review must not close findings raised on unrelated feature branches
+         whose fix never merged; ancestry-proofed default-branch closure is a LATER refinement,
+         and the controller's backstop reviews main anyway, so main-raised findings — the
+         common case — close on main):
+           stored line_hash no longer present in that file at <tip>
              → INSERT 'applied_fixed' (outcome_source=auto_fix_landed)   [SonarQube auto-Fixed]
-           (never scoped cross-branch: an unrelated branch's tip can't mint a close)
        PHASE 2 — OPEN (NEEDS-FIX reviews only; reviews that PASS raised nothing actionable):
          parse per-family `finding:` lines → validate → line-hash at <tip> → INSERT 'open' rows
          SKIP any key whose latest state for that family is dismissed_* (sticky dismissals —
@@ -49,13 +61,21 @@ EVERY delivered push review (play-review.sh, NOT gate mode) — PASS and NEEDS-F
          key exists FOR). Re-raise after 'expired' or 'applied_fixed' is allowed (regression).
 
 human (Jefe, or Mack relaying the inbox — ONE command per finding)
-  └─ the DELIVERED VERDICT lists each finding's short key + a paste-ready command:
+  └─ outcome-record, AFTER recording, writes a SEPARATE small inbox file next to the verdict
+     ("outcome keys — <play>") listing each recorded finding's short key + a paste-ready command:
          mxr outcome <finding_key12> fp        # reviewer was WRONG → down-weights the class
          mxr outcome <finding_key12> wontfix   # reviewer was RIGHT, human declines → neutral
+     (kilabz BLOCKER: the verdict file is WRITTEN before the recorder runs — it cannot be
+     annotated post-hoc, and moving recording pre-delivery would re-introduce the stalled-call-
+     delays-verdict hazard capture was explicitly moved post-delivery to avoid. A follow-up
+     file keeps the verdict path untouched; Mack relays both together.)
      Without this surfacing, dismissal never happens solo and the fp side of precision stays
      empty forever — the dataset would be worthless. The verb FAILS CLOSED on a non-unique or
      <12-hex-char prefix (prints colliding full keys; grinding a 48-bit prefix collision into a
-     crafted diff line is no longer a mislabel, just an error message).
+     crafted diff line is no longer a mislabel, just an error message). A dismissal writes one
+     row per reviewer_family currently 'open' on that key, with the DETERMINISTIC
+     source_event 'human:<finding_key12>' — re-running the command is an index conflict no-op,
+     not a duplicate event (kilabz: 'human:<uuid>' would have broken the idempotency claim).
 
 expiry sweep (piggybacks the same outcome-record invocation, cheap SQL)
   └─ 'open' > OUTCOME_TTL_DAYS (default 30, flagged) → INSERT 'expired'
@@ -67,8 +87,15 @@ auto closes and re-opens never override it; latest-row-wins applies only among m
 
 ## 3. Schema (migration `0008_finding_outcome.sql` + `schema.sql` mirror, lockstep)
 
+All DDL is IDEMPOTENT (`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` /
+`CREATE OR REPLACE VIEW`) — `PostgresLedger.migrate()` re-runs every migration on every boot
+under the advisory lock, exactly like 0007 (kilabz HIGH; also the repo's own promoted
+`migration-append-only` skill). Sketch below omits the IF NOT EXISTS noise for readability:
+
 ```sql
 CREATE TABLE finding_outcome (
+    seq             bigserial,       -- monotonic EVENT ORDER: 'latest row' is by seq, not
+                                     -- created_at (timestamp ties) or uuid (unordered) — kilabz
     id              uuid PRIMARY KEY,
     finding_key     text NOT NULL,   -- sha256(repo_id \0 rule_tag \0 path \0 line_hash)
                                      -- path IS in the key: SonarQube issue identity is per-file
@@ -80,7 +107,10 @@ CREATE TABLE finding_outcome (
     rule_tag        text NOT NULL,   -- allowlisted capture taxonomy (same list, single source of truth)
     reviewer_family text NOT NULL CHECK (reviewer_family IN ('kilabz','oracle')),
     path            text NOT NULL,   -- validated ∈ the reviewed diff's changed-file set
-    source_event    text NOT NULL,   -- 'review:<play>' | 'human:<uuid>' | 'sweep:<utcday>'
+    line_hash       text NOT NULL,   -- stored, not just folded into the key: the CLOSE phase
+                                     -- checks "is this hash still in the file" — recomputing
+                                     -- candidate keys by scanning would be absurd (kilabz)
+    source_event    text NOT NULL,   -- 'review:<play>' | 'human:<finding_key12>' | 'sweep:<utcday>'
                                      -- (v0.1 had review_run_id NOT NULL — dismiss/sweep rows
                                      -- have no review run; idempotency was undefined for them)
     tip_sha         text NOT NULL,   -- the sha the line-hash was computed/checked at
@@ -147,7 +177,8 @@ counts — event-counting double-counts re-raises and lets churn distort the rat
 this and either reading broke a metric):
 
 ```sql
-CREATE VIEW finding_current AS ...;   -- one row per (finding_key, reviewer_family): resolved state
+CREATE VIEW finding_current AS ...;   -- one row per (finding_key, reviewer_family): resolved
+                                      -- state = latest-by-seq (human-terminal precedence first)
 CREATE VIEW finding_precision AS      -- per (rule_tag × reviewer_family), over ALL history:
   -- precision = applied_fixed / NULLIF(applied_fixed + dismissed_false_positive, 0)
   -- volume    = count(*) of current findings
