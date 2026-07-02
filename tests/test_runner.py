@@ -772,10 +772,11 @@ def test_speak_submit_poll_completed_nested_body():
     import httpx
     os.environ["HF_KEY"] = "id:secret"
     try:
-        seen = {}
+        seen = {"posts": 0}
 
         def handler(req):
             if req.method == "POST":
+                seen["posts"] += 1
                 assert req.url.path == "/v1/speak/higgsfield"
                 assert req.headers["Authorization"] == "Key id:secret"
                 seen["body"] = _json.loads(req.content)
@@ -788,6 +789,7 @@ def test_speak_submit_poll_completed_nested_body():
         r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), job,
                         transport=httpx.MockTransport(handler)))
         assert r.status is ResultStatus.OK, r.text
+        assert seen["posts"] == 1   # exactly ONE charged submit, ever
         assert r.artifact_ref == "https://cloud-cdn.higgsfield.ai/talk.mp4" and r.cost == 0.8
         assert seen["body"] == {
             "input_image": {"type": "image_url", "image_url": "http://1.1.1.1/face.png"},
@@ -859,8 +861,8 @@ def test_speak_invalid_knobs_terminal_no_request():
     try:
         def handler(req):
             raise AssertionError("no HTTP request may be made")
-        for ctx in ({"quality": "ultra"}, {"duration": 20}, {"duration": True},
-                    {"duration": 7.5}):
+        for ctx in ({"quality": "ultra"}, {"quality": ["mid"]}, {"duration": 20},
+                    {"duration": True}, {"duration": 7.5}):
             r = asyncio.run(runner.invoke_higgsfield(_speak_spec(), _speak_job(**ctx),
                             transport=httpx.MockTransport(handler)))
             assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, ctx
@@ -871,14 +873,21 @@ def test_speak_invalid_knobs_terminal_no_request():
 
 def test_speak_rejects_unsafe_audio_url():
     """audio_url gets the same SSRF guard as image_url — it is an untrusted URL handed
-    to a third party with our key attached."""
+    to a third party with our key attached. Parity cases mirror the image_url coverage:
+    loopback, RFC-1918, link-local/metadata IP, IPv4-mapped IPv6, non-http scheme.
+    (IP literals only — no DNS in tests.)"""
     import os
     os.environ["HF_KEY"] = "id:secret"
     try:
-        r = asyncio.run(runner.invoke_higgsfield(
-            _speak_spec(), _speak_job(audio_url="http://127.0.0.1/steal.wav")))
-        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
-        assert "audio_url rejected" in r.text
+        for bad in ("http://127.0.0.1/steal.wav",          # loopback
+                    "http://10.0.0.8/steal.wav",           # private (RFC-1918)
+                    "http://169.254.169.254/latest/x.wav",  # link-local / AWS IMDS
+                    "http://[::ffff:127.0.0.1]/steal.wav",  # IPv4-mapped IPv6 unwrap
+                    "file:///etc/passwd"):                  # non-http scheme
+            r = asyncio.run(runner.invoke_higgsfield(
+                _speak_spec(), _speak_job(audio_url=bad)))
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, bad
+            assert "audio_url rejected" in r.text, bad
     finally:
         del os.environ["HF_KEY"]
 

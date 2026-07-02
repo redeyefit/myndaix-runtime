@@ -340,9 +340,11 @@ async def _hf_speak_body(job: Job, image_url: str, started: float):
     knob is safe — and required: silently defaulting quality/duration would bill a
     render the caller didn't ask for. audio_url gets the same SSRF guard as image_url
     (it is an untrusted URL handed to a third party). Contract per the official
-    higgsfield-js SDK; a wrong shape fails closed as a 422 TERMINAL at submit,
-    pre-charge — which is also why a speak clip can never slip through the stitcher
-    (its flat DoP bodies are 422-rejected by this endpoint before any charge)."""
+    higgsfield-js SDK; a wrong shape is EXPECTED to be rejected at submit (4xx ->
+    TERMINAL fail-closed here, and Higgsfield's stated policy bills only successful
+    completions) — an external-API assumption, not a guarantee this code enforces.
+    The same assumption is why a stitcher shot-list can't silently produce a muted
+    speak clip: the stitcher's flat DoP bodies don't validate against this endpoint."""
     audio_url = job.context.get("audio_url")
     if not audio_url:
         return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
@@ -359,7 +361,9 @@ async def _hf_speak_body(job: Job, image_url: str, started: float):
     }
     quality = job.context.get("quality")
     if quality is not None:
-        if quality not in _HF_SPEAK_QUALITIES:
+        # explicit isinstance for contract symmetry with duration (a non-string already
+        # fails the `in` check, but the type requirement should be stated, not implied)
+        if not isinstance(quality, str) or quality not in _HF_SPEAK_QUALITIES:
             return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
                           text=f"speak quality {quality!r} invalid "
                                f"(one of {_HF_SPEAK_QUALITIES})", ms=_ms(started))

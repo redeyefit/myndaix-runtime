@@ -116,12 +116,15 @@ V1_ROSTER: list[AgentSpec] = [
     # body to the nested /v1/speak shape (built in runner._hf_speak_body). The API takes
     # AUDIO, not text+voice — TTS the script upstream and host the WAV. Endpoint +
     # payload contract are from the official higgsfield-js SDK (docs don't list Speak);
-    # unverified against the live API — a wrong shape fails closed as a 422 TERMINAL at
-    # submit, PRE-charge, so the first live call is the cheap validation. timeout_s=900
+    # unverified against the live API. A wrong shape is EXPECTED to be rejected at
+    # submit (4xx -> TERMINAL fail-closed, and Higgsfield's stated billing policy
+    # charges only successful completions) — an external-API assumption, NOT a
+    # guarantee this code enforces; the first live call is the validation. timeout_s=900
     # is unanchored (no render-time data for a 15s/high job; DoP=600) — tune after the
     # first real render. Speak clips must NOT be stitched (ffmpeg concat is -an, audio
-    # would be stripped) — structurally protected: the stitcher builds flat DoP bodies,
-    # which this endpoint 422-rejects pre-charge.
+    # would be stripped); the stitcher's flat DoP bodies don't validate against this
+    # endpoint (same assumption as above), so a muted speak clip can't slip through
+    # silently.
     AgentSpec(agent_id="speak", reach=Reach.API, authority=Authority.RESPONDER,
               model="speak-v2", role="talking-head video (portrait + audio lip-sync)",
               profile=Profile(timeout_s=900, cost_budget=5.0),
