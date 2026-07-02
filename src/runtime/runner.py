@@ -117,6 +117,14 @@ _HF_REQ_TIMEOUT_CAP_S = 30   # ceiling on any single submit/poll request (overal
 _HF_CANCEL_TIMEOUT_S = 5     # best-effort cancel POST must not hang the timeout return
 _HF_ACTIVE_STATES = ("queued", "in_progress")   # everything else nonempty -> terminal (design §7b)
 
+# Speak (talking-head) knob enums — from the official higgsfield-js SDK (src/helpers.ts:
+# SpeakVideoQuality, SpeakDuration). Validated PRE-submit with a hard reject: silently
+# coercing a paid knob (the _hf_opt_float philosophy) would bill the WRONG render — that
+# philosophy exists only because raising POST-charge is forbidden; before submit, failing
+# loudly is both safe and correct.
+_HF_SPEAK_QUALITIES = ("mid", "high")
+_HF_SPEAK_DURATIONS = (5, 10, 15)
+
 # Private / link-local IP ranges — blocked as image_url targets (SSRF defence)
 _PRIVATE_NETS = [
     ipaddress.ip_network("127.0.0.0/8"),
@@ -296,6 +304,17 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
                       text="higgsfield job missing 'image_url' (required for image->video)")
 
     started = time.monotonic()
+
+    # Payload family comes from ADAPTER DATA (a registry decision), never sniffed from the
+    # application path. "speak" builds the nested Speak body (portrait + WAV audio ->
+    # lip-synced talking head); default builds the flat DoP/motion body inside _hf_generate.
+    body = None
+    if a.get("payload") == "speak":
+        body_or_err = await _hf_speak_body(job, image_url, started)
+        if isinstance(body_or_err, Result):
+            return body_or_err
+        body = body_or_err
+
     # PROFILE timeout, not job.timeout_s: the spine doesn't apply Profile.timeout_s when it
     # builds the Job, so job.timeout_s is the dead 300s default. Read the source of truth.
     deadline = started + spec.profile.timeout_s
@@ -308,15 +327,66 @@ async def invoke_higgsfield(spec: AgentSpec, job: Job, *, transport=None) -> Res
             motion_id=job.context.get("motion_id"),
             motion_strength=job.context.get("motion_strength"),
             end_image_url=job.context.get("end_image_url"),
+            body=body,
             poll_interval=_hf_float(a.get("poll_interval_s"), _HF_POLL_INTERVAL_S),
             retry_backoff=_hf_float(a.get("poll_retry_backoff_s"), _HF_POLL_RETRY_BACKOFF_S),
             retry_max=_hf_int(a.get("poll_retry_max"), _HF_POLL_RETRY_MAX),
         )
 
 
+async def _hf_speak_body(job: Job, image_url: str, started: float):
+    """Build the nested /v1/speak body from job.context, or return a TERMINAL Result.
+    All rejections here are PRE-submit (nothing charged), so failing loudly on a bad
+    knob is safe — and required: silently defaulting quality/duration would bill a
+    render the caller didn't ask for. audio_url gets the same SSRF guard as image_url
+    (it is an untrusted URL handed to a third party). Contract per the official
+    higgsfield-js SDK; a wrong shape is EXPECTED to be rejected at submit (4xx ->
+    TERMINAL fail-closed here, and Higgsfield's stated policy bills only successful
+    completions) — an external-API assumption, not a guarantee this code enforces.
+    The same assumption is why a stitcher shot-list can't silently produce a muted
+    speak clip: the stitcher's flat DoP bodies don't validate against this endpoint."""
+    audio_url = job.context.get("audio_url")
+    if not audio_url:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text="speak job missing 'audio_url' (public WAV url; TTS the script "
+                           "upstream — the API takes audio, not text+voice)", ms=_ms(started))
+    reason = await _reject_unsafe_url(audio_url)
+    if reason:
+        return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                      text=f"audio_url rejected: {reason}", ms=_ms(started))
+    # The generation fields live inside a `params` envelope — confirmed by a live 422
+    # on 2026-07-01 ({"type":"missing","loc":["body","params"]}): the JS SDK's client
+    # adds this wrapper around its helper types before POSTing.
+    params = {
+        "input_image": {"type": "image_url", "image_url": image_url},
+        "input_audio": {"type": "audio_url", "audio_url": audio_url},
+        "prompt": job.prompt,
+    }
+    quality = job.context.get("quality")
+    if quality is not None:
+        # explicit isinstance for contract symmetry with duration (a non-string already
+        # fails the `in` check, but the type requirement should be stated, not implied)
+        if not isinstance(quality, str) or quality not in _HF_SPEAK_QUALITIES:
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                          text=f"speak quality {quality!r} invalid "
+                               f"(one of {_HF_SPEAK_QUALITIES})", ms=_ms(started))
+        params["quality"] = quality
+    duration = job.context.get("duration")
+    if duration is not None:
+        # bool is an int subclass — True would pass `in (5, 10, 15)`-style coercion paths
+        if isinstance(duration, bool) or not isinstance(duration, (int, str)) \
+                or str(duration) not in tuple(str(d) for d in _HF_SPEAK_DURATIONS):
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                          text=f"speak duration {duration!r} invalid "
+                               f"(one of {_HF_SPEAK_DURATIONS})", ms=_ms(started))
+        params["duration"] = int(duration)
+    return {"params": params}
+
+
 async def _hf_generate(client, *, base: str, application: str, key: str, prompt: str,
                        image_url: str, started: float, deadline: float,
                        motion_id=None, motion_strength=None, end_image_url=None,
+                       body: Optional[dict] = None,
                        poll_interval: float = _HF_POLL_INTERVAL_S,
                        retry_backoff: float = _HF_POLL_RETRY_BACKOFF_S,
                        retry_max: int = _HF_POLL_RETRY_MAX) -> Result:
@@ -332,7 +402,13 @@ async def _hf_generate(client, *, base: str, application: str, key: str, prompt:
 
     `started`/`deadline` are passed in (monotonic basis) so a multi-segment caller bounds
     each segment against the OVERALL job deadline. Optional motion_id/motion_strength drive
-    DoP camera presets; end_image_url anchors start+end-frame interpolation."""
+    DoP camera presets; end_image_url anchors start+end-frame interpolation.
+
+    `body`, when given, is a caller-built request body (e.g. the nested Speak shape from
+    _hf_speak_body) and replaces the flat DoP build below — the submit/poll/charge contract
+    is IDENTICAL either way, which is the point of the seam: one payload knob, zero forks
+    of the §5-A logic. The caller owns SSRF-guarding any extra URLs inside a custom body
+    (image_url/end_image_url are still guarded here)."""
     import httpx   # callers (invoke_higgsfield / invoke_stitch) gate on ImportError first
     # SSRF guard on every URL handed to Higgsfield (image_url + optional end frame).
     for u in (image_url, end_image_url):
@@ -344,14 +420,15 @@ async def _hf_generate(client, *, base: str, application: str, key: str, prompt:
 
     headers = {"Content-Type": "application/json", "Authorization": f"Key {key}"}
     submit_url = base.rstrip("/") + "/" + application.lstrip("/")
-    body = {"prompt": prompt, "image_url": image_url}
-    if motion_id:
-        body["motion_id"] = motion_id
-    ms_strength = _hf_opt_float(motion_strength)   # finite float or None (never raise mid-poll)
-    if ms_strength is not None:
-        body["motion_strength"] = ms_strength
-    if end_image_url:
-        body["end_image_url"] = end_image_url
+    if body is None:
+        body = {"prompt": prompt, "image_url": image_url}
+        if motion_id:
+            body["motion_id"] = motion_id
+        ms_strength = _hf_opt_float(motion_strength)   # finite float or None (never raise mid-poll)
+        if ms_strength is not None:
+            body["motion_strength"] = ms_strength
+        if end_image_url:
+            body["end_image_url"] = end_image_url
 
     # -- submit (pre-charge) --
     try:
