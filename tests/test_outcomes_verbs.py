@@ -1,7 +1,9 @@
 """outcomes-ledger ledger verbs (v0.3) against a real Postgres — the append-only state machine:
-record_findings (CLOSE applied_fixed + OPEN with sticky dismissals), human_dismiss (fail-closed
-prefix, human-terminal precedence), expire_open, outcome_stats. The pure identity/parser core is in
-test_outcomes.py.
+record_findings (CLOSE = a FILE-CONTENT hash check via present_hashes, NOT reviewer-re-flag; OPEN
+per (finding_key, reviewer_family) with sticky dismissals), human_dismiss (fail-closed prefix,
+human-terminal precedence, mislabel CORRECTION fp<->wontfix), expire_open, outcome_stats. Two-family
+(kilabz + oracle) independence is exercised throughout. The pure identity/parser core (incl.
+file_line_hashes) is in test_outcomes.py.
 
 Run:  LEDGER_TEST_DSN=postgresql://localhost/runtime_test PYTHONPATH=src python3 tests/test_outcomes_verbs.py
 """
@@ -36,6 +38,15 @@ def _finding(tag, path, content, family):
             "reviewer_family": family}
 
 
+def _present(**path_to_lines):
+    """Build the CLOSE-phase present_hashes {path: {line_hash,...}} the way the PR-B wiring will —
+    from the CONTENT of each file at tip_sha (via outcomes.file_line_hashes). Here we pass the file's
+    lines directly: _present(**{"src/a.py": ["return None", "x = 1"]}) -> {path: {hash,hash}}. A path
+    OMITTED entirely (or given []) means 'that line is gone' -> its findings close."""
+    return {path: {outcomes.line_hash(line) for line in lines}
+            for path, lines in path_to_lines.items()}
+
+
 async def _current(led, fk, fam):
     return await led._pool.fetchrow(
         "SELECT outcome, outcome_source FROM finding_current WHERE finding_key=$1 AND reviewer_family=$2",
@@ -56,70 +67,155 @@ async def test_open_phase_inserts_open_rows(led):
 async def test_idempotent_re_record_is_noop(led):
     await _truncate(led)
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
-    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
-    res2 = await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
+    pres = _present(**{"src/a.py": ["return None"]})   # the line is still in the file at tip
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f], pres)
+    res2 = await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f], pres)
     ok(res2["opened"] == 0, "re-recording the SAME review (same source_event) opens nothing (idempotent)")
+    ok(res2["closed"] == 0, "the line is still present -> not closed on the re-record")
     n = await led._pool.fetchval("SELECT count(*) FROM finding_outcome WHERE outcome='open'")
     ok(n == 1, "still exactly one open event (unique index dedup)")
 
 
-# ---- CLOSE phase ------------------------------------------------------------------------
+# ---- CLOSE phase — FILE-CONTENT hash check (design §2), NOT reviewer-re-flag ---------------
 async def test_close_phase_inserts_applied_fixed_when_line_gone(led):
     await _truncate(led)
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
-    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
-    # a LATER review of the same repo/ref whose diff touched src/a.py but no longer flags that line
-    # (open_findings for src/a.py is empty) -> the stored hash is gone -> applied_fixed.
-    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"], [])
+    # a LATER review whose diff touched src/a.py, and the stored line is GONE from the file at tip
+    # (present_hashes for src/a.py no longer contains it) -> applied_fixed.
+    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"],
+                                    [], _present(**{"src/a.py": ["something else entirely"]}))
     ok(res["closed"] == 1, "the vanished line is closed as applied_fixed")
     row = await _current(led, fk, "kilabz")
     ok(row["outcome"] == "applied_fixed" and row["outcome_source"] == "auto_fix_landed",
        "current state is applied_fixed via auto_fix_landed")
 
 
-async def test_close_skips_still_flagged_line(led):
+async def test_close_skips_still_present_line(led):
     await _truncate(led)
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
-    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
-    # the SAME line is still flagged this review -> present -> NOT closed (still open).
-    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"], [f])
-    ok(res["closed"] == 0, "a line still flagged is NOT closed")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
+    # the stored line is STILL in the file at tip -> NOT closed, even though this review re-raised it.
+    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"],
+                                    [f], _present(**{"src/a.py": ["return None"]}))
+    ok(res["closed"] == 0, "a line still present in the file is NOT closed")
 
 
-async def test_close_requires_exact_ref_and_changed_path(led):
+async def test_pass_review_does_not_false_close(led):
+    # THE FIX-1 CRITICAL: a PASS (or an unrelated-line) review of the same file raises NO finding for
+    # the still-real issue, yet the issue's line is STILL in the file. The old reviewer-re-flag logic
+    # would false-close it (empty open_findings -> "present" empty -> everything closes). The
+    # file-content check must keep it OPEN because the line is present.
     await _truncate(led)
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
-    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
-    # a review on a DIFFERENT ref must not close a main finding
-    r_ref = await led.record_findings("repoA", "feature/x", "tip2", "playX", ["src/a.py"], [])
-    ok(r_ref["closed"] == 0, "a different-ref review does NOT close (exact ref scoping)")
-    # a review that did NOT touch the finding's path must not close it
-    r_path = await led.record_findings("repoA", "main", "tip3", "playY", ["src/other.py"], [])
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
+    # a PLAY_PASS review: empty open_findings, but the file still contains the flagged line + an
+    # unrelated line the review actually looked at.
+    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"],
+                                    [], _present(**{"src/a.py": ["return None", "unrelated edit"]}))
+    ok(res["closed"] == 0, "a PASS review does NOT false-close a finding whose line is still present")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "open", "the real finding stays OPEN")
+
+
+async def test_close_whole_file_deleted_closes(led):
+    # the design-accepted whole-file-delete/rename case (§6): the path is absent from present_hashes
+    # (file.line_hashes returned the empty set) -> the finding closes.
+    await _truncate(led)
+    f = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
+    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"], [], {})  # deleted
+    ok(res["closed"] == 1, "a deleted file (path absent from present_hashes) closes its findings")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "applied_fixed", "current state applied_fixed")
+
+
+async def test_close_requires_changed_path(led):
+    await _truncate(led)
+    f = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
+    # a review that did NOT touch the finding's path must not close it (path not in changed set), even
+    # though present_hashes for src/a.py wouldn't contain the line.
+    r_path = await led.record_findings("repoA", "main", "tip3", "playY", ["src/other.py"], [], {})
     ok(r_path["closed"] == 0, "a review that didn't change the path does NOT close it")
+
+
+async def test_close_scopes_on_origin_ref_not_current(led):
+    # FIX 5: a finding opened on ref A must NOT be closed by a review on ref B even if the line is gone
+    # at B's tip. Close scopes on the finding's ORIGIN ref (its earliest open row), not a drifting
+    # current-row ref.
+    await _truncate(led)
+    f = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
+    # a review on a DIFFERENT ref, same path, line GONE at that ref's tip -> must NOT close the
+    # main-origin finding.
+    r_ref = await led.record_findings("repoA", "feature/x", "tip2", "playX", ["src/a.py"], [], {})
+    ok(r_ref["closed"] == 0, "a different-ref review does NOT close (origin-ref scoping)")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "open", "the main finding is still OPEN")
+    # ...but a review on the finding's OWN ref (main), line gone, DOES close it.
+    r_same = await led.record_findings("repoA", "main", "tip3", "playZ", ["src/a.py"], [], {})
+    ok(r_same["closed"] == 1, "a same-ref review with the line gone DOES close it")
 
 
 # ---- sticky dismissal + human-terminal precedence ---------------------------------------
 async def test_human_dismiss_and_sticky_reopen(led):
     await _truncate(led)
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
-    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
+    pres = _present(**{"src/a.py": ["return None"]})
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f], pres)
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
     res = await led.human_dismiss(fk[:12], "kilabz", "fp")
     ok(res.get("dismissed") == 1 and res["finding_key"] == fk, "human_dismiss wrote one fp row")
     row = await _current(led, fk, "kilabz")
     ok(row["outcome"] == "dismissed_false_positive", "current state is the human dismissal")
     # a LATER review re-flagging the SAME line must NOT re-open (sticky dismissal).
-    res2 = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"], [f])
+    res2 = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"], [f], pres)
     ok(res2["opened"] == 0 and res2["skipped_dismissed"] == 1, "a dismissed key does NOT re-open (sticky)")
     row2 = await _current(led, fk, "kilabz")
     ok(row2["outcome"] == "dismissed_false_positive", "still dismissed after the re-record")
 
 
+async def test_human_dismiss_correct_mislabel(led):
+    # FIX 3: a human can CORRECT a mislabel (fp -> wontfix). The correcting row has a distinct
+    # kind-qualified source_event so it INSERTS, and its higher seq wins in finding_current; the fp
+    # count in finding_precision drops back.
+    await _truncate(led)
+    f = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
+    r1 = await led.human_dismiss(fk[:12], "kilabz", "fp")
+    ok(r1["dismissed"] == 1, "first dismissal (fp) wrote a row")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_false_positive", "labelled fp")
+    prec_fp = await led._pool.fetchval(
+        "SELECT dismissed_false_positive FROM finding_precision WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
+    ok(prec_fp == 1, "precision view shows 1 fp before the correction")
+    # correct it to wontfix
+    r2 = await led.human_dismiss(fk[:12], "kilabz", "wontfix")
+    ok(r2["dismissed"] == 1, "the correction (wontfix) wrote a NEW row (distinct kind source_event)")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_wontfix",
+       "current state is the CORRECTED label (higher-seq human row wins)")
+    prec_fp2 = await led._pool.fetchval(
+        "SELECT dismissed_false_positive FROM finding_precision WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
+    ok((prec_fp2 or 0) == 0, "the correction drops the fp count in finding_precision (current-state read)")
+    # re-issuing the SAME kind is an idempotent no-op
+    r3 = await led.human_dismiss(fk[:12], "kilabz", "wontfix")
+    ok(r3["dismissed"] == 0, "re-issuing the same kind is an idempotent no-op (0 written)")
+
+
 async def test_human_terminal_precedence_over_later_machine_row(led):
     await _truncate(led)
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
-    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [f], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
     await led.human_dismiss(fk[:12], "kilabz", "wontfix")
     # force a LATER machine row (higher seq) for the same key directly — a close event that races in.
@@ -178,6 +274,65 @@ async def test_cross_file_collision_does_not_merge(led):
     ok((await _current(led, kb, "kilabz"))["outcome"] == "open", "b.py finding UNAFFECTED (separate history)")
 
 
+# ---- two-family independence (FIX 2 + FIX 4): kilabz AND oracle, per-family state -----------
+async def test_open_dedups_per_family_not_key(led):
+    # FIX 2: both families flag the SAME (repo,tag,path,content). The OPEN accumulator dedups by
+    # (finding_key, reviewer_family), so BOTH rows open — one family's row is not lost.
+    await _truncate(led)
+    fk_kila = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    fk_orac = _finding("fail-open", "src/a.py", "return None", "oracle")   # identical but oracle
+    res = await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                                    [fk_kila, fk_orac], _present(**{"src/a.py": ["return None"]}))
+    ok(res["opened"] == 2, "both families' identical finding opens 2 rows (per-family dedup)")
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", fk_kila["line_hash"])
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "open", "kilabz has an independent open row")
+    ok((await _current(led, fk, "oracle"))["outcome"] == "open", "oracle has an independent open row")
+
+
+async def test_per_family_dismissal_independent(led):
+    # FIX 4: dismiss kilabz's finding; oracle's stays open (per-family state).
+    await _truncate(led)
+    fk_kila = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    fk_orac = _finding("fail-open", "src/a.py", "return None", "oracle")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [fk_kila, fk_orac], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", fk_kila["line_hash"])
+    await led.human_dismiss(fk[:12], "kilabz", "fp")   # dismiss ONLY kilabz's
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_false_positive", "kilabz dismissed")
+    ok((await _current(led, fk, "oracle"))["outcome"] == "open", "oracle's finding is UNAFFECTED (open)")
+
+
+async def test_dismiss_all_families(led):
+    # 'all' dismisses every family currently open on the key (both here).
+    await _truncate(led)
+    fk_kila = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    fk_orac = _finding("fail-open", "src/a.py", "return None", "oracle")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [fk_kila, fk_orac], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", fk_kila["line_hash"])
+    res = await led.human_dismiss(fk[:12], "all", "wontfix")
+    ok(res["dismissed"] == 2, "'all' dismisses both families currently open on the key")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_wontfix", "kilabz dismissed")
+    ok((await _current(led, fk, "oracle"))["outcome"] == "dismissed_wontfix", "oracle dismissed")
+
+
+async def test_per_family_close_independent(led):
+    # per-family close independence: the line is gone -> BOTH families' findings close on the same
+    # review (each family's open row is evaluated on the same file-content set).
+    await _truncate(led)
+    fk_kila = _finding("fail-open", "src/a.py", "return None", "kilabz")
+    fk_orac = _finding("fail-open", "src/a.py", "return None", "oracle")
+    await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
+                              [fk_kila, fk_orac], _present(**{"src/a.py": ["return None"]}))
+    fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", fk_kila["line_hash"])
+    # oracle re-flags the same line this review, but the FILE no longer contains it -> both close
+    # (close is a file-content check, not a re-flag check — so re-flagging can't keep it open).
+    res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"], [], {})
+    ok(res["closed"] == 2, "both families' findings close when the line is gone from the file")
+    ok((await _current(led, fk, "kilabz"))["outcome"] == "applied_fixed", "kilabz closed")
+    ok((await _current(led, fk, "oracle"))["outcome"] == "applied_fixed", "oracle closed")
+
+
 # ---- expire_open ------------------------------------------------------------------------
 async def test_expire_open(led):
     await _truncate(led)
@@ -202,7 +357,8 @@ async def test_outcome_stats(led):
     await led.record_findings("repoA", "main", "t1", "p1", ["src/a.py", "src/b.py"], [f1, f2])
     k2 = outcomes.finding_key("repoA", "fail-open", "src/b.py", f2["line_hash"])
     await led.human_dismiss(k2[:12], "kilabz", "fp")                 # f2 -> fp
-    await led.record_findings("repoA", "main", "t2", "p2", ["src/a.py"], [])   # f1 -> applied_fixed
+    # f1's line ("line one") is GONE from src/a.py at t2 (present_hashes omits it) -> applied_fixed.
+    await led.record_findings("repoA", "main", "t2", "p2", ["src/a.py"], [], {})
     stats = await led.outcome_stats()
     ok(stats["open_count"] == 0, "no findings left open")
     row = next((r for r in stats["precision"] if r["rule_tag"] == "fail-open"

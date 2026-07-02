@@ -1307,18 +1307,30 @@ class PostgresLedger:
     # hashes to what git shows at tip, and human labels are terminal (design §2 precedence).
     async def record_findings(self, repo_id: str, ref: str, tip_sha: str, play: str,
                               changed_paths: list[str],
-                              open_findings: list[dict]) -> dict:
+                              open_findings: list[dict],
+                              present_hashes: Optional[dict[str, set[str]]] = None) -> dict:
         """The per-review recorder: CLOSE phase (runs on EVERY delivered review, incl. PLAY_PASS) +
         OPEN phase (NEEDS-FIX reviews that raised findings). One transaction; idempotent.
 
         CLOSE — for each currently-'open' finding of THIS repo whose `path` ∈ `changed_paths` AND
-        whose `ref` EXACTLY matches this review's ref, if the finding's stored `line_hash` is NO
-        LONGER present among the hashes this review resolved for that path at `tip_sha`, INSERT an
-        'applied_fixed' row (source_event 'review:<play>', outcome_source auto_fix_landed). EXACT ref
-        match (not default-branch closure) — a main review must not close a finding raised on an
-        unrelated feature branch whose fix never merged (design §2, v1 scope). The present-hash set is
-        derived from `open_findings` (the findings THIS review re-resolved), so a line still flagged
-        this review is NOT closed.
+        whose ORIGIN ref (the ref its EARLIEST 'open' row was raised on) EXACTLY matches this review's
+        ref, if the finding's stored `line_hash` is NO LONGER present in the FILE at `tip_sha`, INSERT
+        an 'applied_fixed' row (source_event 'review:<play>', outcome_source auto_fix_landed).
+
+        The present-set is the design's actual CLOSE contract (§2): `present_hashes[path]` = the SET of
+        line_hashes actually in that file at tip_sha (the caller computes it via
+        outcomes.file_line_hashes per changed path — git OBJECTS, never the worktree). It is NOT "the
+        reviewer re-flagged this line": a PASS review, or a review of an unrelated line in the same
+        file, raises no `finding:` for the still-real issue, yet the issue's line is STILL in the file
+        — so deriving 'present' from re-flags would false-close every open finding in a touched file.
+        A path MISSING from present_hashes (a deleted/renamed file, empty set) closes every finding in
+        it — the design-accepted whole-file-delete case (§6). In PR-A tests supply present_hashes
+        directly (keeps the verb DB-only, no git in postgres_store); PR-B wiring computes it per path.
+
+        ORIGIN-ref scoping (not finding_current's drifting latest-row ref): a finding opened on ref A
+        must not be closed by a review on ref B even if the line is gone at B's tip. EXACT ref match,
+        not default-branch closure — a main review must not close a finding raised on an unrelated
+        feature branch whose fix never merged (design §2, v1 scope).
 
         OPEN — for each finding in `open_findings` INSERT an 'open' row, SKIPPING any (finding_key,
         family) whose LATEST state is dismissed_* (sticky dismissals — a human 'this reviewer was
@@ -1328,32 +1340,48 @@ class PostgresLedger:
         `open_findings` is a list of resolved dicts from runtime.outcomes (the wiring layer already ran
         parse_finding_lines + resolve_and_hash, per family), each:
             {"tag", "path", "line_hash", "reviewer_family"}   (reviewer_family ∈ kilabz|oracle)
+        Dedup is per (finding_key, reviewer_family): both families flagging the SAME tag/path/line keep
+        INDEPENDENT rows (state is per family — precision IS the per-family measurement).
         Returns {"closed": n, "opened": n, "skipped_dismissed": n} for the caller to log. Fail-closed
         on a bad family via the DB CHECK; the caller has already validated tags/paths."""
-        # present hashes per (family, path) = the lines STILL flagged this review -> not closed.
-        present: dict[tuple[str, str], set[str]] = {}
-        by_key: dict[str, dict] = {}
+        present = present_hashes or {}
+        # OPEN accumulator keyed by (finding_key, reviewer_family): the same (tag,path,line) from BOTH
+        # families is TWO distinct rows, not one (per-family state is the whole measurement — dedup on
+        # finding_key alone would silently drop one family's row).
+        by_key: dict[tuple[str, str], dict] = {}
         for f in open_findings:
             fam, path, lh = f["reviewer_family"], f["path"], f["line_hash"]
-            present.setdefault((fam, path), set()).add(lh)
             fk = outcomes.finding_key(repo_id, f["tag"], path, lh)
-            by_key[fk] = {"tag": f["tag"], "path": path, "line_hash": lh, "reviewer_family": fam}
+            by_key[(fk, fam)] = {"finding_key": fk, "tag": f["tag"], "path": path,
+                                 "line_hash": lh, "reviewer_family": fam}
         changed = set(changed_paths)
         closed = opened = skipped = 0
         async with self._pool.acquire() as con:
             async with con.transaction():
-                # CLOSE: the current-state rows that are 'open' for this repo+ref on a changed path,
-                # whose stored line_hash is no longer in the present set for that (family, path).
+                # CLOSE: currently-'open' rows for this repo on a changed path whose ORIGIN ref (the
+                # ref on the finding's EARLIEST open row) equals this review's ref — scoped to origin,
+                # not finding_current's latest-row ref (a re-raise on a different ref must not move the
+                # close scope). Then close iff the stored line_hash is gone from the FILE at tip.
                 open_rows = await con.fetch(
                     """SELECT fc.finding_key, fc.reviewer_family, fc.rule_tag, fc.path, fc.line_hash
                          FROM finding_current fc
-                        WHERE fc.repo_id = $1 AND fc.ref = $2 AND fc.outcome = 'open'
-                          AND fc.path = ANY($3::text[])""",
+                         JOIN LATERAL (
+                             SELECT fo.ref
+                               FROM finding_outcome fo
+                              WHERE fo.finding_key = fc.finding_key
+                                AND fo.reviewer_family = fc.reviewer_family
+                                AND fo.outcome = 'open'
+                              ORDER BY fo.seq ASC
+                              LIMIT 1
+                         ) origin ON true
+                        WHERE fc.repo_id = $1 AND fc.outcome = 'open'
+                          AND fc.path = ANY($3::text[])
+                          AND origin.ref = $2""",
                     repo_id, ref, list(changed))
                 for r in open_rows:
-                    still = present.get((r["reviewer_family"], r["path"]), set())
-                    if r["line_hash"] in still:
-                        continue                                # line still flagged -> not fixed
+                    present_in_file = present.get(r["path"], set())
+                    if r["line_hash"] in present_in_file:
+                        continue                                # line still in the file -> not fixed
                     ins = await con.fetchval(
                         """INSERT INTO finding_outcome
                                (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
@@ -1366,13 +1394,14 @@ class PostgresLedger:
                         r["reviewer_family"], r["path"], r["line_hash"], f"review:{play}", tip_sha)
                     if ins is not None:
                         closed += 1
-                # OPEN: insert 'open' rows, skipping any key whose latest state for that family is
-                # dismissed_* (sticky). One state read per key via finding_current.
-                for fk, f in by_key.items():
+                # OPEN: insert 'open' rows per (finding_key, family), skipping any (key, family) whose
+                # latest state is dismissed_* (sticky). One state read per (key, family) via
+                # finding_current — both families' rows are independent (per-family dedup above).
+                for (fk, fam), f in by_key.items():
                     cur = await con.fetchrow(
                         """SELECT outcome FROM finding_current
                             WHERE finding_key = $1 AND reviewer_family = $2""",
-                        fk, f["reviewer_family"])
+                        fk, fam)
                     if cur is not None and cur["outcome"] in (
                             "dismissed_false_positive", "dismissed_wontfix"):
                         skipped += 1
@@ -1385,7 +1414,7 @@ class PostgresLedger:
                            ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
                                DO NOTHING
                            RETURNING id""",
-                        _new_id(), fk, repo_id, ref, f["tag"], f["reviewer_family"],
+                        _new_id(), fk, repo_id, ref, f["tag"], fam,
                         f["path"], f["line_hash"], f"review:{play}", tip_sha)
                     if ins is not None:
                         opened += 1
@@ -1397,11 +1426,22 @@ class PostgresLedger:
         full keys, so grinding a short-prefix collision is an error message, not a mislabel (design §2).
 
         `kind` ∈ fp|wontfix maps to dismissed_false_positive|dismissed_wontfix. `family_or_all` is
-        'kilabz'|'oracle'|'all' — a dismissal writes ONE row per reviewer_family currently 'open' on
-        that key (a human overrules whichever family raised it). DETERMINISTIC source_event
-        'human:<finding_key12>' — re-running the exact command is an index-conflict no-op, not a
-        duplicate event (a 'human:<uuid>' would break idempotency). Returns
-        {"dismissed": n, "finding_key": <full>} on success, or {"error": ..., "candidates": [...]}."""
+        'kilabz'|'oracle'|'all' — a dismissal writes ONE row per reviewer_family currently 'open' OR
+        already-dismissed on that key (a human overrules whichever family raised it, and can CORRECT a
+        prior mislabel: fp<->wontfix). DETERMINISTIC source_event 'human:<finding_key12>:<kind>' — the
+        kind is IN the event so a correcting DIFFERENT-kind row is a distinct unique-index tuple
+        (finding_key, reviewer_family, outcome, source_event) and INSERTS; the human row with the
+        higher seq wins in finding_current, so the corrected label takes. Re-issuing the SAME kind is
+        an idempotent ON CONFLICT DO NOTHING no-op.
+
+        Residual v1 limitation (rare, accepted): re-affirming the ORIGINAL kind after having corrected
+        AWAY from it (a flip-flop back, e.g. fp -> wontfix -> fp) won't re-win — the original fp row
+        already exists (ON CONFLICT DO NOTHING) and its seq is now stale (lower than the wontfix row),
+        so finding_current keeps showing wontfix. A distinct third label would win; a true flip-flop
+        back to an exact prior label is the one shape v1 can't re-terminalize. Documented, not fixed.
+
+        Returns {"dismissed": n, "finding_key": <full>} on success (n = rows WRITTEN this call; a
+        same-kind re-issue is 0), or {"error": ..., "candidates": [...]}."""
         prefix = (finding_key_prefix or "").strip().lower()
         if len(prefix) < 12 or any(c not in "0123456789abcdef" for c in prefix):
             return {"error": "prefix must be >= 12 hex chars", "candidates": []}
@@ -1428,17 +1468,21 @@ class PostgresLedger:
                     return {"error": "ambiguous prefix — refine it",
                             "candidates": [k["finding_key"] for k in keys]}
                 fk = keys[0]["finding_key"]
-                source_event = f"human:{fk[:12]}"
-                # write one dismissal per family CURRENTLY 'open' on this key (idempotent per family).
+                # kind IS in the source_event so a fp<->wontfix CORRECTION is a distinct unique tuple
+                # that inserts; re-issuing the SAME kind is an ON CONFLICT DO NOTHING no-op.
+                source_event = f"human:{fk[:12]}:{kind}"
+                # write one dismissal per family currently 'open' OR already-dismissed on this key
+                # (open -> first label; dismissed_* -> a correction). Idempotent per (family, kind).
                 dismissed = 0
                 for fam in families:
                     cur = await con.fetchrow(
                         """SELECT repo_id, ref, rule_tag, path, line_hash, tip_sha
                              FROM finding_current
-                            WHERE finding_key = $1 AND reviewer_family = $2 AND outcome = 'open'""",
+                            WHERE finding_key = $1 AND reviewer_family = $2
+                              AND outcome IN ('open','dismissed_false_positive','dismissed_wontfix')""",
                         fk, fam)
                     if cur is None:
-                        continue                        # not currently open for this family -> skip
+                        continue                        # not open/dismissed for this family -> skip
                     ins = await con.fetchval(
                         """INSERT INTO finding_outcome
                                (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,

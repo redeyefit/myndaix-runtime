@@ -88,6 +88,17 @@ def test_parse_non_numeric_line_reject():
     ok(O.parse_finding_lines("finding:fail-open @ src/a.py")[0] == [], "no ':' at all -> dropped")
 
 
+def test_parse_unicode_digit_line_dropped_not_raised():
+    # some Unicode digits pass str.isdigit() but RAISE in int() — e.g. superscript '²' (U+00B2) and
+    # '³' (U+00B3). ASCII-digit validation (re.fullmatch [0-9]+) must DROP them, never raise (the
+    # "never raises" contract). If the old isdigit()+int() path were live, this would throw.
+    for bad in ("²", "²³", "1²"):   # '²', '²³', '1²' (mixed)
+        found, dropped = O.parse_finding_lines(f"finding:fail-open @ src/a.py:{bad}")
+        ok(found == [] and dropped == 1, f"Unicode-digit line {bad!r} dropped (not raised)")
+    # a superscript that str.isdigit() accepts but int() rejects — prove the guard is what saves us
+    ok("²".isdigit() is True, "sanity: '²'.isdigit() is True (why isdigit() was unsafe)")
+
+
 def test_parse_last_at_split_with_hard_path():
     # design §4: the LAST ' @ ' splits fields (LEFT=tag, RIGHT=path:line); the path may contain
     # spaces, ':' and a bare '@'. Here the path has a bare '@', a ':' and a space; the split lands on
@@ -168,6 +179,43 @@ def test_resolve_reads_objects_not_worktree():
     files = {"tests/test_outcomes.py": "FAKE OBJECT LINE\n"}
     h = O.resolve_and_hash("/repo", "tip", "tests/test_outcomes.py", 1, [(1, 1)], run_git=_fake_git(files))
     ok(h == O.line_hash("FAKE OBJECT LINE"), "content comes from the git-object stub, not the working tree")
+
+
+# ---- file_line_hashes: the CLOSE-phase present-set primitive (design §2) -----------------
+def test_file_line_hashes_returns_all_line_hashes():
+    files = {"src/a.py": "def f():\n    return None\n    x = 1\n"}
+    got = O.file_line_hashes("/repo", "tip", "src/a.py", run_git=_fake_git(files))
+    ok(O.line_hash("def f():") in got, "a present line's hash is in the set")
+    ok(O.line_hash("return None") in got, "another present line's hash is in the set")
+    ok(O.line_hash("gone forever") not in got, "an absent line's hash is NOT in the set")
+    ok(len(got) == 3, "one hash per non-empty line (3 lines here)")
+
+
+def test_file_line_hashes_skips_empty_lines():
+    # trailing newline + a whitespace-only line -> empty normalizations must not enter the set.
+    files = {"src/a.py": "code\n\n   \nmore\n"}
+    got = O.file_line_hashes("/repo", "tip", "src/a.py", run_git=_fake_git(files))
+    ok(got == {O.line_hash("code"), O.line_hash("more")}, "only the two non-empty lines contribute")
+
+
+def test_file_line_hashes_missing_path_is_empty_set():
+    # a DELETED/renamed file (missing git object) -> empty set -> every finding in it closes
+    # (design-accepted whole-file-delete case §6).
+    files = {"src/a.py": "x\n"}
+    got = O.file_line_hashes("/repo", "tip", "src/missing.py", run_git=_fake_git(files))
+    ok(got == set(), "missing object (deleted/renamed file) -> empty set (findings close)")
+
+
+def test_file_line_hashes_no_run_git_is_empty_set():
+    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=None) == set(),
+       "no run_git injected -> empty set (pure; the wiring supplies the subprocess callable)")
+
+
+def test_file_line_hashes_reads_objects_not_worktree():
+    # same object-not-worktree guarantee as resolve_and_hash: content comes from the git stub.
+    files = {"tests/test_outcomes.py": "FAKE OBJECT LINE\n"}
+    got = O.file_line_hashes("/repo", "tip", "tests/test_outcomes.py", run_git=_fake_git(files))
+    ok(got == {O.line_hash("FAKE OBJECT LINE")}, "content comes from the git-object stub, not disk")
 
 
 def main():

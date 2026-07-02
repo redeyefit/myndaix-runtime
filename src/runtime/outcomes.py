@@ -31,7 +31,7 @@ from runtime.capture import RULE_TAG_TAXONOMY, is_allowed_tag  # single source o
 __all__ = [
     "OUTCOME_MAX_ROWS", "RULE_TAG_TAXONOMY", "is_allowed_tag",
     "normalize_line", "line_hash", "finding_key",
-    "parse_finding_lines", "resolve_and_hash",
+    "parse_finding_lines", "resolve_and_hash", "file_line_hashes",
 ]
 
 # Per-review row cap (design §4). The honest spam bound is tags × LINES in the diff (not × files),
@@ -130,7 +130,10 @@ def parse_finding_lines(review_text: str, allowed_tags=RULE_TAG_TAXONOMY) -> tup
             dropped += 1
             continue
         path, line_s = chunk[:colon].strip(), chunk[colon + 1:].strip()
-        if not path or not line_s.isdigit():    # non-numeric / empty line / empty path -> drop
+        # ASCII-digit validation (NOT str.isdigit()): some Unicode digits — superscripts, e.g. '²' —
+        # pass isdigit() but raise on int(), which would break the "never raises" contract. Require
+        # an all-[0-9] run so int() below is always safe.
+        if not path or not re.fullmatch(r"[0-9]+", line_s):   # non-ASCII-numeric / empty -> drop
             dropped += 1
             continue
         line = int(line_s)
@@ -182,3 +185,31 @@ def resolve_and_hash(repo_path: str, tip_sha: str, path: str, line: int,
     if not normalize_line(content):                 # empty / whitespace-only line -> drop
         return None
     return line_hash(content)
+
+
+def file_line_hashes(repo_path: str, tip_sha: str, path: str,
+                     run_git: Optional[Callable[[list[str]], Optional[str]]] = None) -> set[str]:
+    """The CLOSE-phase primitive (design §2): the SET of line_hashes present in `path` at `tip_sha`,
+    read from git OBJECTS (`git show <tip>:<path>`), NEVER the working tree — so a dirty checkout or a
+    post-review edit can't change the answer (same discipline as resolve_and_hash).
+
+    A stored finding closes (applied_fixed) iff its line_hash is NOT in this set — i.e. its exact
+    (whitespace-normalized) line content no longer appears ANYWHERE in the file at tip. This is the
+    design's real CLOSE contract; "the reviewer didn't re-flag it" is NOT (a PASS review, or a review
+    of an unrelated line in the same file, would false-close every open finding there).
+
+    Empty/whitespace-only lines are skipped (they normalize to '' and would collide across files;
+    resolve_and_hash never keys a finding on one, so none can be OPEN). A missing object — file DELETED
+    or renamed at tip, or a non-zero `git show` exit — returns the EMPTY set, so every finding in that
+    file closes: the design-accepted whole-file-delete/rename-reads-as-fixed case (§6). `run_git` is the
+    injected callable(argv) -> stdout|None so this stays pure + unit-testable."""
+    if run_git is None:
+        return set()
+    out = run_git(["-C", repo_path, "show", f"{tip_sha}:{path}"])
+    if out is None:                                 # missing object (deleted/renamed) -> empty set
+        return set()
+    hashes: set[str] = set()
+    for content in out.split("\n"):
+        if normalize_line(content):                 # skip empty/ws-only (never a keyed finding line)
+            hashes.add(line_hash(content))
+    return hashes

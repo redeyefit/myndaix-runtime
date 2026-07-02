@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS finding_outcome (
     reviewer_family text NOT NULL CHECK (reviewer_family IN ('kilabz','oracle')),
     path            text NOT NULL,   -- validated ∈ the reviewed diff's changed-file set
     line_hash       text NOT NULL,   -- sha256 of the normalized flagged-line CONTENT at tip_sha
-    source_event    text NOT NULL,   -- 'review:<play>' | 'human:<finding_key12>' | 'sweep:<utcday>'
+    source_event    text NOT NULL,   -- 'review:<play>' | 'human:<finding_key12>:<kind>' | 'sweep:<utcday>'
+                                     -- (kind ∈ fp|wontfix is IN the human event so a fp<->wontfix
+                                     -- correction is a distinct tuple that inserts, not a no-op)
     tip_sha         text NOT NULL,   -- the sha the line-hash was computed/checked at (NOT base_sha)
     outcome         text NOT NULL CHECK (outcome IN
                      ('open','applied_fixed','dismissed_false_positive',
