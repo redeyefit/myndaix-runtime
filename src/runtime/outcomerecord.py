@@ -86,7 +86,11 @@ def _run_git(argv: list[str]) -> str | None:
     so an untrusted path/sha can't inject. Bounded by a wall-clock timeout so a wedged git can't hang
     the recorder (the outer cap_run in play-review is the real bound, but be defensive here too)."""
     try:
-        r = subprocess.run(["git", *argv], capture_output=True, text=True, timeout=30)
+        # errors="replace": a binary/invalid-UTF-8 blob (git show on a non-text file) would else raise
+        # UnicodeDecodeError, which (OSError, SubprocessError) does NOT catch — breaking the verb's own
+        # "never raises" contract (kilabz). Tolerant decode: such a line just won't line-hash-match, safe.
+        r = subprocess.run(["git", *argv], capture_output=True, text=True,
+                           errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
@@ -176,19 +180,13 @@ async def record(repo_path: str, base: str, tip: str, ref: str, play: str,
                 log(f"expired {expired} over-TTL open finding(s)")
         except Exception as e:
             log(f"expire_open failed ({e}) — skipped (fail-open)")
-        # the keys to surface: only the findings that OPENED this review (NEEDS-FIX). Recompute each
-        # key from its (repo, tag, path, line_hash) — the same identity record_findings stored.
-        repo_id = os.path.basename(repo_path.rstrip("/")) or repo_path
+        # the keys to surface = ONLY the rows record_findings actually INSERTED this review (kilabz:
+        # building from open_findings would surface a sticky-dismissed or duplicate finding that
+        # opened NO new row -> a spurious *-outcomes.md follow-up). The ledger reports the real inserts.
         keys: list[dict] = []
-        seen: set[tuple[str, str]] = set()
-        for f in open_findings:
-            fk = outcomes.finding_key(repo_id, f["tag"], f["path"], f["line_hash"])
-            dedup = (fk, f["reviewer_family"])
-            if dedup in seen:                    # both families / dup lines -> one row per (key,family)
-                continue
-            seen.add(dedup)
-            keys.append({"key12": fk[:12], "family": f["reviewer_family"],
-                         "tag": f["tag"], "path": f["path"]})
+        for r in res.get("opened_rows", []):
+            keys.append({"key12": r["finding_key"][:12], "family": r["reviewer_family"],
+                         "tag": r["rule_tag"], "path": r["path"]})
         return keys
     finally:
         try:
