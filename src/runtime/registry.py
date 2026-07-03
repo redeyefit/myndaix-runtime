@@ -42,13 +42,19 @@ class AgentSpec(BaseModel):
 V1_ROSTER: list[AgentSpec] = [
     # CLI agents declare env_passthrough = their OWN auth key only (the rest of the pool's
     # env — incl. sibling agents' secrets — is scrubbed by runner._cli_env).
-    # CLAUDE AGENTS USE THE $HOME SUBSCRIPTION LOGIN (Claude Max), NOT an API key —
-    # env_passthrough=[] on purpose. The claude CLI PREFERS ANTHROPIC_API_KEY when one is in the
-    # env, so a stale/rotated key silently OVERRODE the working Max login and 401'd — which is why
-    # every controller review died at the lobster canary on the Mini ("401 Invalid authentication
-    # credentials"), surfaced 2026-07-02 by the outcomes-rung E2E test. Dropping the key from the
-    # allowlist makes the scrub remove it so claude falls through to the Max login (flat-rate,
-    # cost-aligned — same reason agy/oracle stays on OAuth). codex/agy still declare their own keys.
+    # CLAUDE AGENTS USE A LONG-LIVED SUBSCRIPTION TOKEN (Claude Max), NOT a metered API key.
+    # WHY not the plain Max login: claude's interactive Max login lives in the macOS KEYCHAIN,
+    # which the launchd POOL can't use reliably — the keychain token is stale in the daemon
+    # session while claude's file creds are only read when the keychain is absent. So every
+    # controller review died at the lobster canary on the Mini ("401 Invalid authentication
+    # credentials"), surfaced 2026-07-02 by the outcomes-rung E2E test. The dead-simple headless
+    # fix (Anthropic's own, `claude setup-token`): mint a LONG-LIVED token FROM THE SUBSCRIPTION
+    # (flat-rate, NOT a metered API key — philosophy-aligned) and hand it to claude via
+    # CLAUDE_CODE_OAUTH_TOKEN. claude sends it as a bearer token and tries it FIRST (verified:
+    # a set token is used before any keychain/file cred), so the stale keychain is never reached.
+    # Provision: `claude setup-token` on the Mini -> put the token in ~/.myndaix/.secrets as
+    # CLAUDE_CODE_OAUTH_TOKEN -> the scrub passes it through (declared below). Long-lived = no
+    # weekly re-auth churn (unlike the agy/keychain OAuth). codex/agy still declare their own keys.
     AgentSpec(agent_id="lobster", reach=Reach.CLI, authority=Authority.CONTROLLER,
               model="sonnet", role="orchestration/judgment",
               # PIN --model (the oracle lesson, agy below): a bare `claude -p` runs the HOST's
@@ -60,15 +66,15 @@ V1_ROSTER: list[AgentSpec] = [
               # model quota for hard work, not dollars.
               adapter={"kind": "cli", "argv": ["claude", "-p", "--model", "sonnet",
                        "--output-format", "text"],
-                       "prompt_channel": "stdin", "env_passthrough": []}),  # Max login, not API key
+                       "prompt_channel": "stdin", "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # long-lived subscription token
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
-                       "env_passthrough": []}),  # Max login, not API key (see roster header)
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token (roster header)
     AgentSpec(agent_id="mini", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="claude", role="pipeline builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
-                       "env_passthrough": []}),  # Max login, not API key (see roster header)
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token (roster header)
     AgentSpec(agent_id="kilabz", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gpt-5.5", role="code reviewer (read-only)",
               # PIN model + reasoning effort: without `-c model=...` codex runs the HOST's
