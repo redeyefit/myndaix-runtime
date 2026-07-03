@@ -517,6 +517,40 @@ async def test_oversized_single_commit_advances_and_flags(led: PostgresLedger) -
     assert len(recs) == 1 and recs[0]["base"] == big and recs[0]["head"] == small
 
 
+# -- a TRANSIENT rev-list failure (nonzero returncode) on an over-budget range must
+# -- DEFER, not advance-past-unreviewed (found by the autonomous review, 2026-07-03) ---
+async def test_transient_revlist_failure_defers_not_advances(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("revlist"); repo = make_repo("revlist")
+    C.MAX_REVIEW_LINES = 10
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    big = advance_lines(repo, "big.txt", 25)             # over budget -> reaches rev-list
+    real_git = C._git
+
+    def fake_git(rp, *args, **kw):                       # force ONLY rev-list to fail transiently
+        if args and args[0] == "rev-list":
+            return subprocess.CompletedProcess(
+                args=list(args), returncode=128, stdout="", stderr="fatal: transient")
+        return real_git(rp, *args, **kw)
+
+    before = {f.name for f in C.JEFE_INBOX.glob("*.md")} if C.JEFE_INBOX.exists() else set()
+    C._git = fake_git
+    try:
+        await C.process_repo(led, repo, [0])
+    finally:
+        C._git = real_git
+    assert records(seam) == [], "a transient rev-list failure must not dispatch"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] != big and cur["pending_sha"] is None, \
+        "a transient rev-list failure must DEFER, not advance past the unreviewed range"
+    assert not [f for f in C.JEFE_INBOX.glob("*.md")
+                if f.name not in before and big in f.read_text()], \
+        "a git hiccup must not be mislabelled 'too large, needs a human'"
+    await C.process_repo(led, repo, [0])                 # git healed -> the real advance+flag path
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == big, "once rev-list heals, the oversized range advances+flags"
+
+
 # -- a net-zero FIRST commit inside an over-budget range advances silently (no flag) --
 async def test_net_zero_prefix_advances_silently(led: PostgresLedger) -> None:
     await _truncate(led)

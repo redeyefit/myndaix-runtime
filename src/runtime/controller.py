@@ -490,10 +490,20 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
                   timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return ("defer", head, -1, -1)
-    commits = [c for c in rl.stdout.split() if _SHA_RE.match(c)] if rl.returncode == 0 else []
+    if rl.returncode != 0:
+        # a NONZERO rev-list (git lock, transient object/ref error) is NOT the force-push
+        # empty-result case below — that requires a SUCCESSFUL rev-list that is genuinely
+        # empty. Conflating them (the old `if rc==0 else []`) advanced the cursor PAST an
+        # unreviewed over-budget range on a transient git hiccup, mislabelled "too large,
+        # needs a human" — the exact never-skip-blind violation PR #61 fixed for the
+        # _diff_* paths, missed here. Defer + retry, like the exception branch above.
+        # (Found by the autonomous review of the PR#59+61 range, 2026-07-03.)
+        return ("defer", head, -1, -1)
+    commits = [c for c in rl.stdout.split() if _SHA_RE.match(c)]
     if not commits:
-        # backward force-push / rewritten history: NO walkable prefix, and a fail-open
-        # dispatch of this known-over-budget range is GUARANTEED to bounce off the very
+        # backward force-push / rewritten history: rev-list SUCCEEDED but base..head has no
+        # first-parent commits (head is not a descendant of base). NO walkable prefix, and a
+        # fail-open dispatch of this known-over-budget range is GUARANTEED to bounce off the
         # worker caps the controller arms (workflow #3) — advance-and-flag instead.
         return ("advance", head, total_l, total_b)
     best: tuple[str, int, int] = ("", 0, 0)
