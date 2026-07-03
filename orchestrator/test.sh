@@ -131,6 +131,11 @@ echo "9b. raised PLAY_REVIEW_CALL_TIMEOUT raises the stale floor (77-min lock is
   env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
   ck "1500s call timeout -> 77-min lock survives (skipped, not reaped)" "review SKIPPED"
   STUB_TRIAGE="PLAY_PASS" run; ck "same lock IS reaped under the default 4500s budget" "review PASS"
+echo "8c. oracle fast-skip: a dead oracle is skipped in SECONDS (reach-check), review proceeds on kilabz"; reset
+  STUB_CANARY_FAIL=oracle STUB_TRIAGE="PLAY_PASS" run; ck "review PASS on kilabz alone" "review PASS"
+  rj="$(ls -t "$RUNS"/*/play.jsonl 2>/dev/null | head -1)"
+  if grep -q "oracle-skipped-fast" "$rj" 2>/dev/null; then echo "  ok: fast-skip path taken (reach-check, not the 1200s wait)"; PASS=$((PASS+1)); else echo "  FAIL: oracle-skipped-fast not recorded"; FAIL=$((FAIL+1)); fi
+  if grep -q $'^oracle\t1200\t' "$FAKE/.myndaix/mxr-argv.log" 2>/dev/null; then echo "  FAIL: full oracle review call still fired"; FAIL=$((FAIL+1)); else echo "  ok: no 1200s oracle review call after a failed reach-check"; PASS=$((PASS+1)); fi
 echo "9c. margin is ENFORCED for explicit PLAY_STALE + leading-zero RCT is base-10"; reset; mkdir -p "$STATE/lock"
   touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock"   # 5100s old: > floor-sans-margin 5040, < enforced floor 5400
   env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 PLAY_STALE=5040 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
