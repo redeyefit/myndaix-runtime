@@ -111,6 +111,15 @@ echo "7b. a ~100KB diff (over the OLD 64KB cap, under the new) now REVIEWS"; res
 echo "7c. PLAY_MAX_DIFF knob still caps (env override)"; reset; head -c 5000 /dev/zero | tr '\0' 'z' > "$REPO/small.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm small; SMTIP="$(git -C "$REPO" rev-parse HEAD)"
   env HOME="$FAKE" PLAY_MAX_DIFF=1000 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$SMTIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF=1000 caps a 5KB diff" "ABORTED — diff"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
+echo "7d. changed-LINES cap FAILs fast (many small lines, way under the byte cap)"; reset; seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm lines; LNTIP="$(git -C "$REPO" rev-parse HEAD)"
+  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "3000 changed lines abort at the 2000 default" "changed lines"
+  git -C "$REPO" reset -q --hard "$TIP"   # restore (LNTIP object stays reachable for 7e/7f)
+echo "7e. PLAY_MAX_DIFF_LINES override raises the cap (same diff now reviews)"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=5000 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "5000-line cap lets the 3000-line diff review" "review PASS"
+echo "7f. non-numeric PLAY_MAX_DIFF_LINES falls back to the 2000 default"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=banana bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "garbage line cap still aborts the 3000-line diff" "changed lines"
+echo "7g. leading-zero PLAY_MAX_DIFF_LINES is base-10, not octal (08 would crash [[ -le ]])"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 3000-line diff cleanly" "changed lines"
 echo "8. contention records a visible skip"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"; ckfile "$STATE/SKIPPED-$TIP" "SKIPPED sentinel written"
 echo "8b. contention marks transient (push mode); gate contention does NOT"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run
   ckfile "$TMARKER" "push-mode contention writes the scoped transient marker"
