@@ -234,15 +234,16 @@ def test_roster_cli_agents_get_only_their_own_key():
     import os
     from runtime.registry import REGISTRY
     keys = {"ANTHROPIC_API_KEY": "ak", "OPENAI_API_KEY": "ok", "GEMINI_API_KEY": "gk",
-            "GOOGLE_API_KEY": "gok", "HF_KEY": "hf", "PERPLEXITY_API_KEY": "pk"}
+            "GOOGLE_API_KEY": "gok", "HF_KEY": "hf", "PERPLEXITY_API_KEY": "pk",
+            "CLAUDE_CODE_OAUTH_TOKEN": "cot"}
     for k, v in keys.items():
         os.environ[k] = v
     try:
-        # claude agents (lobster/mack/mini) use the $HOME Max subscription login (env_passthrough=[]),
-        # so the scrub gives them NONE of the secret keys — the strongest containment. A stale
-        # ANTHROPIC_API_KEY reaching them would OVERRIDE the Max login and 401 (the 2026-07-02
-        # lobster-canary bug that broke every controller review on the Mini).
-        expect = {"lobster": set(), "mack": set(), "mini": set(),
+        # claude agents (lobster/mack/mini) get ONLY CLAUDE_CODE_OAUTH_TOKEN — the long-lived Max
+        # SUBSCRIPTION token (headless-safe, unlike the keychain Max login) — and NOT ANTHROPIC_API_KEY
+        # (a stale key would 401; the 2026-07-02 lobster-canary bug). Every other secret is dropped.
+        expect = {"lobster": {"CLAUDE_CODE_OAUTH_TOKEN"}, "mack": {"CLAUDE_CODE_OAUTH_TOKEN"},
+                  "mini": {"CLAUDE_CODE_OAUTH_TOKEN"},
                   "kilabz": {"OPENAI_API_KEY"}, "codex": {"OPENAI_API_KEY"},
                   "oracle": {"GEMINI_API_KEY", "GOOGLE_API_KEY"}}
         for aid, own in expect.items():
