@@ -238,9 +238,13 @@ def test_roster_cli_agents_get_only_their_own_key():
     for k, v in keys.items():
         os.environ[k] = v
     try:
-        expect = {"lobster": {"ANTHROPIC_API_KEY"}, "mack": {"ANTHROPIC_API_KEY"},
-                  "mini": {"ANTHROPIC_API_KEY"}, "kilabz": {"OPENAI_API_KEY"},
-                  "codex": {"OPENAI_API_KEY"}, "oracle": {"GEMINI_API_KEY", "GOOGLE_API_KEY"}}
+        # claude agents (lobster/mack/mini) use the $HOME Max subscription login (env_passthrough=[]),
+        # so the scrub gives them NONE of the secret keys — the strongest containment. A stale
+        # ANTHROPIC_API_KEY reaching them would OVERRIDE the Max login and 401 (the 2026-07-02
+        # lobster-canary bug that broke every controller review on the Mini).
+        expect = {"lobster": set(), "mack": set(), "mini": set(),
+                  "kilabz": {"OPENAI_API_KEY"}, "codex": {"OPENAI_API_KEY"},
+                  "oracle": {"GEMINI_API_KEY", "GOOGLE_API_KEY"}}
         for aid, own in expect.items():
             env = runner._cli_env(REGISTRY[aid])
             leaked = set(keys) & set(env)         # which secret keys reached this agent

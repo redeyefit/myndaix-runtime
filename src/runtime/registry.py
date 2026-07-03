@@ -41,8 +41,14 @@ class AgentSpec(BaseModel):
 # v1 seed roster (data - expected to change). See DESIGN.md S5.
 V1_ROSTER: list[AgentSpec] = [
     # CLI agents declare env_passthrough = their OWN auth key only (the rest of the pool's
-    # env — incl. sibling agents' secrets — is scrubbed by runner._cli_env). claude/codex/agy
-    # also accept $HOME login; declaring the key keeps env-auth deploys working too.
+    # env — incl. sibling agents' secrets — is scrubbed by runner._cli_env).
+    # CLAUDE AGENTS USE THE $HOME SUBSCRIPTION LOGIN (Claude Max), NOT an API key —
+    # env_passthrough=[] on purpose. The claude CLI PREFERS ANTHROPIC_API_KEY when one is in the
+    # env, so a stale/rotated key silently OVERRODE the working Max login and 401'd — which is why
+    # every controller review died at the lobster canary on the Mini ("401 Invalid authentication
+    # credentials"), surfaced 2026-07-02 by the outcomes-rung E2E test. Dropping the key from the
+    # allowlist makes the scrub remove it so claude falls through to the Max login (flat-rate,
+    # cost-aligned — same reason agy/oracle stays on OAuth). codex/agy still declare their own keys.
     AgentSpec(agent_id="lobster", reach=Reach.CLI, authority=Authority.CONTROLLER,
               model="sonnet", role="orchestration/judgment",
               # PIN --model (the oracle lesson, agy below): a bare `claude -p` runs the HOST's
@@ -54,15 +60,15 @@ V1_ROSTER: list[AgentSpec] = [
               # model quota for hard work, not dollars.
               adapter={"kind": "cli", "argv": ["claude", "-p", "--model", "sonnet",
                        "--output-format", "text"],
-                       "prompt_channel": "stdin", "env_passthrough": ["ANTHROPIC_API_KEY"]}),
+                       "prompt_channel": "stdin", "env_passthrough": []}),  # Max login, not API key
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
-                       "env_passthrough": ["ANTHROPIC_API_KEY"]}),
+                       "env_passthrough": []}),  # Max login, not API key (see roster header)
     AgentSpec(agent_id="mini", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="claude", role="pipeline builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
-                       "env_passthrough": ["ANTHROPIC_API_KEY"]}),
+                       "env_passthrough": []}),  # Max login, not API key (see roster header)
     AgentSpec(agent_id="kilabz", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gpt-5.5", role="code reviewer (read-only)",
               # PIN model + reasoning effort: without `-c model=...` codex runs the HOST's
