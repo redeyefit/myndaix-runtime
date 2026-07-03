@@ -51,6 +51,7 @@ AUTHOR_ALLOWLIST = set(
 GH_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_GH_TIMEOUT", "30"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", "600"))
 REVIEW_MAX_DIFF = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF", "262144"))  # match play-review PLAY_MAX_DIFF
+REVIEW_MAX_DIFF_LINES = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", "2000"))  # match play-review PLAY_MAX_DIFF_LINES
 RATE_FLOOR = int(os.environ.get("MYNDAIX_AUTOMERGE_RATE_FLOOR", "100"))
 
 DRY_RUN = os.environ.get("MYNDAIX_AUTOMERGE_DRY_RUN") == "1"
@@ -442,6 +443,19 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
         log(f"PR#{n}: content diff failed — defer"); return None
     if len(content.stdout) > REVIEW_MAX_DIFF:
         return ("skipped", f"docs diff {len(content.stdout)}B over the {REVIEW_MAX_DIFF}B review cap — human")
+    # same mirror-wedge for the worker's CHANGED-LINES cap (PLAY_MAX_DIFF_LINES): a >2000-line
+    # docs PR under 256KB would gate-abort exit-2 "transient" EVERY tick forever (workflow #2)
+    # — pre-cap on the identical numstat metric and record the same terminal human skip.
+    ns = _git(repo["path"], "diff", "--numstat", "--no-ext-diff", f"{B}..{H}")
+    if ns.returncode != 0:
+        log(f"PR#{n}: numstat failed — defer"); return None
+    nlines = 0
+    for ln in ns.stdout.decode(errors="replace").splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 3:
+            nlines += sum(int(p) for p in parts[:2] if p.isdigit())
+    if nlines > REVIEW_MAX_DIFF_LINES:
+        return ("skipped", f"docs diff {nlines} changed lines over the {REVIEW_MAX_DIFF_LINES}-line review cap — human")
 
     # gate 3: CI — True=green / False=failed(terminal) / None=pending(defer)
     ci = _ci_green(repo, H)

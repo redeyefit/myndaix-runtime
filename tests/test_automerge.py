@@ -189,6 +189,43 @@ def test_uncapped_pr_reaches_the_review():
     ok(res == ("needs_fix", "review did not PASS — human"), "review verdict flows through")
 
 
+def test_line_precap_is_terminal_before_the_paid_review():
+    # a docs diff over the worker's CHANGED-LINES cap (PLAY_MAX_DIFF_LINES) would gate-abort
+    # exit-2 "transient" EVERY tick forever (workflow #2) — it must be a TERMINAL human skip
+    # here, before the paid review, exactly like the byte pre-cap above it.
+    H, M, B = "a" * 40, "b" * 40, "c" * 40
+    calls = []
+
+    def fake_git(path, *args, **kw):
+        a = args[0] if args else ""
+        if a == "rev-parse":
+            return _R(0, (H if "pr/" in args[1] else M).encode())
+        if a == "merge-base":
+            return _R(0, B.encode())
+        if a == "diff" and "--numstat" in args:
+            return _R(0, b"3000\t500\tdocs/big.md\n")   # 3500 changed lines, tiny bytes
+        return _R(0, b"stub")
+
+    monkey = {"_git": fake_git, "_merge_queue": lambda repo: False,
+              "parse_raw_z": lambda out: [], "classify_diff": lambda entries: (True, ""),
+              "_ci_green": lambda repo, head: True, "_count": lambda p: 0,
+              "_review_pass": lambda repo, b, h: calls.append((b, h)) or "pass"}
+    saved = {k: getattr(A, k) for k in monkey}
+    for k, v in monkey.items():
+        setattr(A, k, v)
+    try:
+        pr = {"number": 45, "headRefOid": H, "baseRefOid": M,
+              "author": {"login": "redeyefit"}, "isDraft": False,
+              "isCrossRepository": False, "mergeStateStatus": "CLEAN"}
+        res = A.evaluate_pr({"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}, pr, [0])
+    finally:
+        for k, v in saved.items():
+            setattr(A, k, v)
+    ok(isinstance(res, tuple) and res[0] == "skipped" and "changed lines" in res[1],
+       "over-line-cap docs PR records a TERMINAL human skip (no eternal transient re-gate)")
+    ok(calls == [], "the paid review is NOT called for an over-line-cap PR")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

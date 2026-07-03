@@ -38,6 +38,8 @@ MAX_DIFF_LINES="${PLAY_MAX_DIFF_LINES:-2000}"       # changed-lines cap (numstat
                                                     # disagree; manual pushes get the 2000 default. MUST stay the same
                                                     # metric as controller._diff_lines (numstat sum). Non-numeric -> default.
 [[ "$MAX_DIFF_LINES" =~ ^[0-9]+$ ]] || MAX_DIFF_LINES=2000
+MAX_DIFF_LINES=$((10#$MAX_DIFF_LINES))              # force base-10: a leading zero ("08"/"010") would
+                                                    # make [[ -le ]] arithmetic parse it as (invalid) octal
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
 STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 min. MUST exceed the worst-case
@@ -328,9 +330,11 @@ diff="$(git -C "$repo" diff "$base" "$tip" 2>/dev/null || true)"
 [[ "$(printf '%s' "$diff" | wc -c)" -le "$MAX_DIFF" ]] || abort diff "diff over ${MAX_DIFF}B — split the push (v0 review budget)"
 # changed-lines cap: bytes under-count what actually costs review time (a 100KB one-line blob is
 # cheap; 3400 one-char changed lines is not). Same numstat metric as controller._diff_lines; a
-# failed numstat sums to 0 = fail OPEN (the byte cap above already bounded the input).
+# failed numstat sums to 0 = fail OPEN (the byte cap above already bounded the input). The `|| true`
+# is LOAD-BEARING under set -e -o pipefail: a git failure fails the whole pipeline (awk still
+# prints 0) and would kill the worker OUTSIDE the abort path (no deliver, no marker) — kilabz #3.
 diff_lines="$(git -C "$repo" diff --numstat "$base" "$tip" 2>/dev/null \
-              | awk -F'\t' '{ if ($1 ~ /^[0-9]+$/) s+=$1; if ($2 ~ /^[0-9]+$/) s+=$2 } END { print s+0 }')"
+              | awk -F'\t' '{ if ($1 ~ /^[0-9]+$/) s+=$1; if ($2 ~ /^[0-9]+$/) s+=$2 } END { print s+0 }' || true)"
 [[ "$diff_lines" =~ ^[0-9]+$ ]] || diff_lines=0
 [[ "$diff_lines" -le "$MAX_DIFF_LINES" ]] || abort diff "diff spans ${diff_lines} changed lines (cap ${MAX_DIFF_LINES}) — one reviewer call would time out; split the push or raise PLAY_MAX_DIFF_LINES"
 

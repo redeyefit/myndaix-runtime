@@ -118,6 +118,8 @@ echo "7e. PLAY_MAX_DIFF_LINES override raises the cap (same diff now reviews)"; 
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=5000 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "5000-line cap lets the 3000-line diff review" "review PASS"
 echo "7f. non-numeric PLAY_MAX_DIFF_LINES falls back to the 2000 default"; reset
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=banana bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "garbage line cap still aborts the 3000-line diff" "changed lines"
+echo "7g. leading-zero PLAY_MAX_DIFF_LINES is base-10, not octal (08 would crash [[ -le ]])"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 3000-line diff cleanly" "changed lines"
 echo "8. contention records a visible skip"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"; ckfile "$STATE/SKIPPED-$TIP" "SKIPPED sentinel written"
 echo "8b. contention marks transient (push mode); gate contention does NOT"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run
   ckfile "$TMARKER" "push-mode contention writes the scoped transient marker"
