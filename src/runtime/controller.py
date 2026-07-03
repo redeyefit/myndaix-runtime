@@ -437,10 +437,14 @@ def _diff_bytes(repo: Repo, base: str, head: str) -> Optional[int]:
 def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, int, int]:
     """Pick what one dispatch should actually review. Returns (mode, sha, lines, bytes):
 
-      ("dispatch", head, n, b) — the whole range fits BOTH budgets (MAX_REVIEW_LINES
-                                 and MAX_REVIEW_BYTES), or sizing failed before any
-                                 budget was known exceeded (fail-open: the worker
-                                 sizes the diff itself; sizes are -1 = unknown).
+      ("dispatch", head, n, b) — the whole range is PROVEN to fit BOTH budgets
+                                 (MAX_REVIEW_LINES and MAX_REVIEW_BYTES). A dispatch
+                                 always carries real, verified sizes — an UNSIZED
+                                 range is never dispatched (kilabz PR#60 review: a
+                                 byte-fat one-liner whose _diff_bytes times out is
+                                 exactly what the byte cap exists to catch; a blind
+                                 dispatch bounces non-transiently and can climb back
+                                 to blocked).
       ("dispatch", mid, n, b)  — range over a budget: the LARGEST first-parent prefix
                                  base..mid that fits BOTH. The cursor walks the
                                  remainder on later ticks.
@@ -451,10 +455,11 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
                                  empty vs base (b == 0: play-review would abort on
                                  the empty diff; advance silently, mirroring the
                                  empty-range short-circuit).
-      ("defer", sha, -1, -1)   — sizing failed exactly where we'd otherwise skip a
-                                 commit unreviewed; do NOTHING this tick and retry
-                                 (dispatching a known-over-budget range would bounce
-                                 off the worker caps for sure — workflow #3).
+      ("defer", sha, n, b)     — sizing failed anywhere a dispatch/skip decision
+                                 depends on it (n/b may be -1 = unknown); do NOTHING
+                                 this tick and retry. Persistent defers surface via
+                                 the defer streak alert. One rule: never dispatch
+                                 blind, never skip blind.
 
     Both budgets matter (workflow #1): numstat lines under-count a long-line diff
     (a one-line 300KB minified file is 1 line), and the worker enforces a byte cap
@@ -466,14 +471,20 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
     fits = lambda n, b: n <= MAX_REVIEW_LINES and b <= MAX_REVIEW_BYTES
     total_l = _diff_lines(repo, base, head)
     if total_l is None:
-        return ("dispatch", head, -1, -1)                # sizing failed — fail open
+        return ("defer", head, -1, -1)                   # unsized — never dispatch blind
     total_b = _diff_bytes(repo, base, head)
-    if total_b is None:
-        if total_l <= MAX_REVIEW_LINES:
-            return ("dispatch", head, total_l, -1)       # lines fit, bytes unknown — fail open
-        total_b = -1                                     # lines already over — walk with bytes unknown
-    elif fits(total_l, total_b):
+    if total_b is not None and fits(total_l, total_b):
         return ("dispatch", head, total_l, total_b)
+    if total_b is None and total_l <= MAX_REVIEW_LINES:
+        # lines fit but the byte size is UNKNOWN — a byte-fat one-line diff (whose
+        # `git diff` is exactly what times _diff_bytes out) is the very case the byte
+        # cap catches, so a blind dispatch here would bounce non-transitively and can
+        # climb back to blocked (kilabz PR#60 review). Defer; the streak alert
+        # surfaces a persistent sizing failure.
+        return ("defer", head, total_l, -1)
+    if total_b is None:
+        total_b = -1                                     # lines already over — walk; every prefix
+                                                         # candidate is sized in BOTH dimensions
     try:
         rl = _git(repo.path, "rev-list", "--first-parent", "--reverse", f"{base}..{head}",
                   timeout=60)

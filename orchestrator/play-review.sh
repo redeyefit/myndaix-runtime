@@ -135,6 +135,11 @@ REVIEW_CALL_TIMEOUT="$RCT_PUSH"
 # worker with a smaller STALE would reap a live PUSH worker's lock. A too-small/non-numeric
 # PLAY_STALE would reap LIVE locks mid-review (kilabz R5) -> falls back to the floor.
 STALE_FLOOR=$((3*180 + 3*RCT_PUSH + 360))
+# NOTE: the single-bracket `[ -ge ]` below is the DECIMAL test builtin — a leading-zero
+# PLAY_STALE ("04800") does NOT octal-crash it (verified; only `[[ -ge ]]` arithmetic context
+# does). The 10# normalization is a belt so a future [ -> [[ edit can't regress it, matching
+# the RCT_PUSH/MAX_DIFF_LINES pattern above.
+[[ "$STALE" =~ ^[0-9]+$ ]] && STALE=$((10#$STALE))
 [[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge "$STALE_FLOOR" ] || STALE="$STALE_FLOOR"
 
 # --- GATE MODE (automerge DESIGN v0.3 §4): PLAY_GATE=1 runs this worker INLINE as a

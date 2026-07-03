@@ -587,6 +587,29 @@ async def test_persistent_defer_alerts_once_then_heals(led: PostgresLedger) -> N
     assert cur["reviewed_sha"] == big, "after sizing heals the oversized skip proceeds"
 
 
+# -- an UNSIZED range never dispatches, even when lines fit (kilabz PR#60 review):
+# -- a byte-fat one-liner whose _diff_bytes times out is exactly what the byte cap
+# -- catches — defer instead of dispatching blind ---------------------------------
+async def test_unsized_small_range_defers_not_dispatches(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("unsized"); repo = make_repo("unsized")
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    small = advance(repo, "tiny-change")                 # 2 changed lines — well under budget
+    saved = C._diff_bytes
+    C._diff_bytes = lambda *a, **k: None                 # byte sizing fails
+    try:
+        await C.process_repo(led, repo, [0])
+    finally:
+        C._diff_bytes = saved
+    assert records(seam) == [], "an unsized range must DEFER, never dispatch blind"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["pending_sha"] is None and cur["reviewed_sha"] != small, \
+        "defer must leave the cursor untouched (no claim, no blind advance)"
+    await C.process_repo(led, repo, [0])                 # sizing healed -> normal dispatch
+    recs = records(seam)
+    assert len(recs) == 1 and recs[0]["head"] == small
+
+
 # -- _diff_lines: binary files count 0 (reviewers see a one-line stub) ----------
 async def test_diff_lines_binary_counts_zero(led: PostgresLedger) -> None:
     fresh_seam("bin"); repo = make_repo("bin")
