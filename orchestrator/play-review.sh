@@ -31,6 +31,13 @@ BASE_REF="main"                                     # a new branch's first push 
 MAX_DIFF="${PLAY_MAX_DIFF:-262144}"                 # 256KB default, tunable per-push: PLAY_MAX_DIFF=N git push. Over-cap
                                                     # FAILS fast. The models eat the input fine; the real ceiling is the
                                                     # ~300s/agent budget, so a giant push can still time out — split those.
+MAX_DIFF_LINES="${PLAY_MAX_DIFF_LINES:-2000}"       # changed-lines cap (numstat added+deleted, binary files count 0): a
+                                                    # ~3400-line range timed kilabz out at the full 600s REVIEW_CALL_TIMEOUT
+                                                    # (2026-07-02) — abort in SECONDS instead of burning canary + 600s. The
+                                                    # controller passes its own chunk budget here so the two caps can't
+                                                    # disagree; manual pushes get the 2000 default. MUST stay the same
+                                                    # metric as controller._diff_lines (numstat sum). Non-numeric -> default.
+[[ "$MAX_DIFF_LINES" =~ ^[0-9]+$ ]] || MAX_DIFF_LINES=2000
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
 STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 min. MUST exceed the worst-case
@@ -319,6 +326,13 @@ done
 diff="$(git -C "$repo" diff "$base" "$tip" 2>/dev/null || true)"
 [[ -n "$diff" ]] || abort diff "empty/failed diff for ${base}..${tip}"
 [[ "$(printf '%s' "$diff" | wc -c)" -le "$MAX_DIFF" ]] || abort diff "diff over ${MAX_DIFF}B — split the push (v0 review budget)"
+# changed-lines cap: bytes under-count what actually costs review time (a 100KB one-line blob is
+# cheap; 3400 one-char changed lines is not). Same numstat metric as controller._diff_lines; a
+# failed numstat sums to 0 = fail OPEN (the byte cap above already bounded the input).
+diff_lines="$(git -C "$repo" diff --numstat "$base" "$tip" 2>/dev/null \
+              | awk -F'\t' '{ if ($1 ~ /^[0-9]+$/) s+=$1; if ($2 ~ /^[0-9]+$/) s+=$2 } END { print s+0 }')"
+[[ "$diff_lines" =~ ^[0-9]+$ ]] || diff_lines=0
+[[ "$diff_lines" -le "$MAX_DIFF_LINES" ]] || abort diff "diff spans ${diff_lines} changed lines (cap ${MAX_DIFF_LINES}) — one reviewer call would time out; split the push or raise PLAY_MAX_DIFF_LINES"
 
 # canary + diff passed → this is a real review; charge the daily cap now (not on aborts).
 # gate mode does NOT charge the push-review cap (it's a separate, capped concern).

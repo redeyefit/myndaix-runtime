@@ -85,6 +85,14 @@ def advance_empty(repo: C.Repo) -> str:
     return g(repo.path, "rev-parse", "HEAD").stdout.strip()
 
 
+def advance_lines(repo: C.Repo, fname: str, n: int) -> str:
+    """One commit adding exactly n changed lines (a NEW n-line file — pure adds)."""
+    (repo.path / fname).write_text("".join(f"line {i}\n" for i in range(n)))
+    g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", fname)
+    g(repo.path, "push", "-q", "origin", "main")
+    return g(repo.path, "rev-parse", "HEAD").stdout.strip()
+
+
 def head_of(repo: C.Repo) -> str:
     return g(repo.path, "rev-parse", "HEAD").stdout.strip()
 
@@ -98,6 +106,7 @@ def fresh_seam(name: str) -> Path:
     C.DISPATCH_OVERRIDE = str(base / "dispatched.jsonl")
     C.DRY_RUN = False
     C.MAX_DISPATCH_PER_TICK = 3
+    C.MAX_REVIEW_LINES = 1500                            # reset the chunking budget (chunk tests shrink it)
     C._gh_json = _make_gh(True)                          # reset to protected default (skill tests override)
     C.JEFE_INBOX = _TMP / "jefe"
     return Path(C.DISPATCH_OVERRIDE)
@@ -450,6 +459,101 @@ async def test_empty_diff_advances_without_review(led: PostgresLedger) -> None:
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["reviewed_sha"] == head2 and cur["pending_sha"] is None, "empty diff must advance, not dispatch"
     assert records(seam) == [], "an empty-diff head must NOT be dispatched (would wedge to BLOCKED)"
+
+
+# -- an over-budget multi-commit range dispatches the largest fitting PREFIX and
+# -- walks the remainder across ticks (the 2026-07-02 backlog wedge) ------------
+async def test_over_budget_range_chunks_and_walks(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("chunk"); repo = make_repo("chunk")
+    C.MAX_REVIEW_LINES = 10
+    base = head_of(repo)
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    c1 = advance_lines(repo, "a.txt", 6)                 # prefix base..c1 =  6 lines (fits)
+    c2 = advance_lines(repo, "b.txt", 6)                 # prefix base..c2 = 12 lines (over)
+    c3 = advance_lines(repo, "c.txt", 6)                 # full range      = 18 lines (over)
+    await C.process_repo(led, repo, [0])
+    recs = records(seam)
+    assert len(recs) == 1, f"expected one chunked dispatch, got {len(recs)}"
+    assert recs[0]["base"] == base and recs[0]["head"] == c1, \
+        "must dispatch the LARGEST prefix under budget (base..c1), not the full range"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["pending_sha"] == c1, "the ledger claim must be keyed on the chunk target"
+    (C.STATE / f"done-{c1}").write_text("")              # chunk 1 delivered
+    await C.process_repo(led, repo, [0])                 # advance to c1, dispatch next chunk
+    recs = records(seam)
+    assert len(recs) == 2 and recs[1]["base"] == c1 and recs[1]["head"] == c2
+    (C.STATE / f"done-{c2}").write_text("")              # chunk 2 delivered
+    await C.process_repo(led, repo, [0])                 # tail now fits -> full head
+    recs = records(seam)
+    assert len(recs) == 3 and recs[2]["base"] == c2 and recs[2]["head"] == c3
+    (C.STATE / f"done-{c3}").write_text("")
+    await C.process_repo(led, repo, [0])
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == c3, "the walk must converge on the true head"
+
+
+# -- a single over-budget commit cannot be split: advance past WITHOUT review + LOUD flag --
+async def test_oversized_single_commit_advances_and_flags(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("bigone"); repo = make_repo("bigone")
+    C.MAX_REVIEW_LINES = 10
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    big = advance_lines(repo, "big.txt", 25)             # one unsplittable 25-line commit
+    before = {f.name for f in C.JEFE_INBOX.glob("*.md")} if C.JEFE_INBOX.exists() else set()
+    await C.process_repo(led, repo, [0])
+    assert records(seam) == [], "an unsplittable oversized commit must NOT dispatch"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == big and cur["pending_sha"] is None, \
+        "the cursor must advance past the oversized commit (no wedge)"
+    alerts = [f for f in C.JEFE_INBOX.glob("*.md")
+              if f.name not in before and big in f.read_text()]
+    assert alerts, "skipping an UNREVIEWED commit must flag the human inbox"
+    assert "WITHOUT review" in alerts[0].read_text()
+    small = advance(repo, "follow-up")                   # the loop stays alive afterwards
+    await C.process_repo(led, repo, [0])
+    recs = records(seam)
+    assert len(recs) == 1 and recs[0]["base"] == big and recs[0]["head"] == small
+
+
+# -- a net-zero FIRST commit inside an over-budget range advances silently (no flag) --
+async def test_net_zero_prefix_advances_silently(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("netz"); repo = make_repo("netz")
+    C.MAX_REVIEW_LINES = 10
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    c1 = advance_empty(repo)                             # net-zero vs base
+    c2 = advance_lines(repo, "z.txt", 25)                # then an oversized single
+    before = {f.name for f in C.JEFE_INBOX.glob("*.md")} if C.JEFE_INBOX.exists() else set()
+    await C.process_repo(led, repo, [0])                 # tick 1: silent advance past c1
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == c1 and records(seam) == []
+    assert not [f for f in C.JEFE_INBOX.glob("*.md")
+                if f.name not in before and c1 in f.read_text()], \
+        "a net-zero skip must NOT alarm the inbox"
+    await C.process_repo(led, repo, [0])                 # tick 2: oversized c2 -> flag + advance
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == c2
+    assert [f for f in C.JEFE_INBOX.glob("*.md")
+            if f.name not in before and c2 in f.read_text()], "the oversized commit must flag"
+
+
+# -- _diff_lines: binary files count 0 (reviewers see a one-line stub) ----------
+async def test_diff_lines_binary_counts_zero(led: PostgresLedger) -> None:
+    fresh_seam("bin"); repo = make_repo("bin")
+    base = head_of(repo)
+    (repo.path / "blob.bin").write_bytes(bytes(range(256)) * 16)
+    g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", "bin")
+    tip = head_of(repo)
+    assert C._diff_lines(repo, base, tip) == 0, "binary numstat `-` must count 0, not crash"
+
+
+# -- the worker's line cap is slaved to the controller budget (caps can't disagree) --
+async def test_review_env_carries_line_cap(led: PostgresLedger) -> None:
+    fresh_seam("envcap")
+    C.MAX_REVIEW_LINES = 777
+    assert C._review_env()["PLAY_MAX_DIFF_LINES"] == "777", \
+        "_review_env must pass the controller budget as PLAY_MAX_DIFF_LINES"
 
 
 # -- repos.json that is valid JSON but not an object fails soft (workflow MAJOR) --

@@ -74,6 +74,18 @@ PENDING_STALE = int(os.environ.get("MYNDAIX_CONTROLLER_PENDING_STALE", "7200")) 
 # re-claimed into a second concurrent same-head dispatch. 7200 gives ~2 ticks of headroom.
 FETCH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_FETCH_TIMEOUT", "60"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
+# Per-dispatch review-size budget in CHANGED LINES (numstat added+deleted; binary files
+# count 0 — they reach the reviewers as one-line stubs). The models eat a big diff fine;
+# the real wall is the reviewer's ~600s call budget — a ~3400-line backlog range timed
+# kilabz out at exactly REVIEW_CALL_TIMEOUT (2026-07-02), burned 3 attempts and BLOCKED
+# the cursor. A range over budget is dispatched as the largest first-parent PREFIX that
+# fits (the cursor then walks the backlog across ticks); a single commit over budget on
+# its own cannot be split — it is advanced past WITHOUT review + flagged to the inbox.
+MAX_REVIEW_LINES = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_REVIEW_LINES", "1500"))
+# How many first-parent commits the chunker will size before giving up on finding a
+# bigger prefix. Only bounds work done per tick; anything past the boundary commit is
+# next ticks' problem anyway.
+CHUNK_WALK_CAP = int(os.environ.get("MYNDAIX_CONTROLLER_CHUNK_WALK", "50"))
 
 DRY_RUN = os.environ.get("MYNDAIX_CONTROLLER_DRY_RUN") == "1"
 TEST_MODE = os.environ.get("MYNDAIX_CONTROLLER_TEST_MODE") == "1"
@@ -154,6 +166,11 @@ def _review_env() -> dict:
         "MYNDAIX_DSN": DSN,
         "PLAY_SELF": str(PLAY_REVIEW),
         "PLAY_DISABLE_AUTOFIX": "1",
+        # keep the worker's changed-lines fail-fast in lockstep with the chunker's budget:
+        # the controller never dispatches a range over MAX_REVIEW_LINES, so a tighter
+        # worker-side default could bounce a valid chunk (a non-transient diff abort that
+        # climbs to the blocked ceiling). Passing our own budget makes agreement structural.
+        "PLAY_MAX_DIFF_LINES": str(MAX_REVIEW_LINES),
     }
     for k in ("SSH_AUTH_SOCK", "TMPDIR", "LANG"):
         if os.environ.get(k):
@@ -353,6 +370,71 @@ def trigger_review(repo: Repo, head: str, base: str) -> bool:
 # -- per-repo decision (level-triggered reconcile) -----------------------------
 def _done(sha: str) -> bool:
     return (STATE / f"done-{sha}").exists()
+
+
+def _diff_lines(repo: Repo, base: str, head: str) -> Optional[int]:
+    """Changed lines (added+deleted) of base..head per `git diff --numstat`. Binary
+    files (numstat `-`) count 0 — the reviewers see them as one-line stubs, so they
+    cost no review time. None on git failure (callers fail OPEN to the un-chunked
+    path: worst case is the old behavior). MUST stay the same metric as play-review's
+    PLAY_MAX_DIFF_LINES awk sum, or the worker could bounce a controller chunk."""
+    r = _git(repo.path, "diff", "--numstat", base, head)
+    if r.returncode != 0:
+        return None
+    total = 0
+    for ln in r.stdout.splitlines():
+        parts = ln.split("\t")
+        if len(parts) < 3:
+            continue
+        for p in parts[:2]:
+            if p.isdigit():
+                total += int(p)
+    return total
+
+
+def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, int]:
+    """Pick what one dispatch should actually review. Returns (mode, sha, lines):
+
+      ("dispatch", head, n)  — the whole range fits the MAX_REVIEW_LINES budget
+                               (or sizing failed: fail-open to the old behavior).
+      ("dispatch", mid, n)   — range over budget: the LARGEST first-parent prefix
+                               base..mid that fits (0 < n <= budget). The cursor
+                               walks the remainder on later ticks.
+      ("advance", sha, n)    — no prefix fits. sha is the FIRST commit past base:
+                               either over budget alone (an unsplittable big commit
+                               — a squash/PR merge; n > budget: skip it WITHOUT
+                               review + flag jefe) or net-zero vs base (n == 0:
+                               play-review would abort on the empty diff; advance
+                               silently, mirroring the empty-range short-circuit).
+
+    Prefix sizes are not monotonic (a later commit can revert an earlier one), so
+    every candidate within CHUNK_WALK_CAP is sized and the last fit wins."""
+    total = _diff_lines(repo, base, head)
+    if total is None or total <= MAX_REVIEW_LINES:
+        return ("dispatch", head, total if total is not None else -1)
+    rl = _git(repo.path, "rev-list", "--first-parent", "--reverse", f"{base}..{head}",
+              timeout=60)
+    commits = [c for c in rl.stdout.split() if _SHA_RE.match(c)] if rl.returncode == 0 else []
+    if not commits:
+        # no walkable first-parent path (force-push/disjoint history) — fail open
+        return ("dispatch", head, total)
+    best, best_n = "", 0
+    for c in commits[:CHUNK_WALK_CAP]:
+        if c == head:                                    # the full range is already known too big
+            continue
+        n = _diff_lines(repo, base, c)
+        if n is not None and 0 < n <= MAX_REVIEW_LINES:
+            best, best_n = c, n                          # keep the LAST (largest) fit
+    if best:
+        return ("dispatch", best, best_n)
+    first = commits[0]
+    n_first = _diff_lines(repo, base, first)
+    if n_first is None:
+        # sizing failed for the very commit we'd skip — advancing on an UNKNOWN size could
+        # silently skip a reviewable commit. Fail open to the old (un-chunked) behavior:
+        # worst case the dispatch times out and the blocked alert surfaces it loudly.
+        return ("dispatch", head, total)
+    return ("advance", first, n_first)
 
 
 def _transient_marker(repo: Repo, ref: str, sha: str) -> Path:
@@ -743,43 +825,98 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
             log(f"{rid}: no net diff {base[:8]}..{head[:8]} — advanced without review")
         return
 
-    # ceiling: stop chasing a head that has failed MAX_ATTEMPTS dispatches
-    if cur["pending_sha"] == head and cur["attempts"] >= MAX_ATTEMPTS and cur["state"] != "blocked":
+    # review-size budget: a range over MAX_REVIEW_LINES would time the reviewer out at its
+    # ~600s call budget — a NON-transient abort that burns attempts and BLOCKS the cursor
+    # (the 2026-07-02 backlog wedge). Dispatch the largest first-parent prefix that fits
+    # instead; everything downstream (ceiling/claim/pin/trigger) is keyed on the TARGET.
+    mode, target, tlines = _choose_review_target(repo, base, head)
+    if mode == "advance":
+        # no reviewable prefix: the first commit past base is either an unsplittable
+        # over-budget commit (flag — a human must review it) or net-zero vs base (silent).
+        # NOTE: like the empty-diff skip above, skip_to clears any pending row. Reaching
+        # here WITH a fresh in-flight pending requires the budget to have been re-tuned
+        # mid-flight (target choice is deterministic per base) — the in-flight worker
+        # still delivers its verdict to the inbox; only the cursor bookkeeping moves on.
+        oversized = tlines > MAX_REVIEW_LINES
+        if DRY_RUN:
+            log(f"{rid}: DRY-RUN would advance past {'oversized' if oversized else 'net-zero'} "
+                f"{target[:8]} ({tlines} lines) without review"); return
+        if not _pin(repo, _ctl_reviewed_ref(ref), target):
+            log(f"{rid}: cannot pin advance target {target[:8]} — skip this tick"); return
+        if await led.skip_to(rid, ref, target):
+            if oversized:
+                log(f"{rid}: {target[:8]} is {tlines} changed lines (budget {MAX_REVIEW_LINES}) "
+                    f"— advanced past WITHOUT review, flagged to jefe")
+                _alert_jefe(
+                    f"review backstop: {rid} commit too large — SKIPPED, needs a human",
+                    f"Commit {target} on {ref} spans {tlines} changed lines — over the "
+                    f"autonomous review budget ({MAX_REVIEW_LINES}; one reviewer call times "
+                    f"out around ~2000). It cannot be split below one commit, so the "
+                    f"controller advanced the cursor past it WITHOUT review to keep the "
+                    f"backstop unwedged.\n\n"
+                    f"This commit is UNREVIEWED by the backstop. Review it manually:\n"
+                    f"    git -C {repo.path} show --stat {target}\n"
+                    f"    git -C {repo.path} diff {base} {target}\n\n"
+                    f"If it was already PR-reviewed, nothing else to do. To let bigger "
+                    f"ranges through, raise MYNDAIX_CONTROLLER_MAX_REVIEW_LINES.")
+            else:
+                log(f"{rid}: net-zero prefix {target[:8]} — advanced without review")
+        return
+    if target != head:
+        log(f"{rid}: {base[:8]}..{head[:8]} over review budget — chunking to "
+            f"{target[:8]} ({tlines} lines); remainder follows on later ticks")
+
+    # ceiling: stop chasing a target that has failed MAX_ATTEMPTS dispatches. Keyed on the
+    # TARGET (== head for an in-budget range). A blocked CHUNK does not self-heal on a new
+    # push (the target is a function of the unchanged base), so mark_blocked must be LOUD.
+    if cur["pending_sha"] == target and cur["attempts"] >= MAX_ATTEMPTS and cur["state"] != "blocked":
         # marker-after-pass race: the worker's abort can land the marker AFTER this tick's
         # transient pass but before this check. Blocking then would re-wedge like the original
         # bug — the NEXT tick's pass consumes the marker, but a plain forgive couldn't repair a
         # 'blocked' row and the marker is gone. Re-check + forgive HERE instead of blocking,
         # then fall through so the decide pass below re-claims THIS tick.
-        if await _try_forgive_transient(led, repo, rid, ref, head):
-            log(f"{rid}: transient abort on {head[:8]} at the ceiling — attempt refunded "
+        if await _try_forgive_transient(led, repo, rid, ref, target):
+            log(f"{rid}: transient abort on {target[:8]} at the ceiling — attempt refunded "
                 f"instead of blocking")
         else:
-            if await led.mark_blocked(rid, ref, head, MAX_ATTEMPTS):
-                log(f"{rid}: BLOCKED {head[:8]} after {cur['attempts']} attempts — surfaced, backing off")
+            if await led.mark_blocked(rid, ref, target, MAX_ATTEMPTS):
+                log(f"{rid}: BLOCKED {target[:8]} after {cur['attempts']} attempts — surfaced, backing off")
+                _alert_jefe(
+                    f"review backstop: {rid} BLOCKED after {cur['attempts']} failed reviews",
+                    f"Review dispatches for {target} on {ref} ({rid}) failed "
+                    f"{cur['attempts']} times (non-transient) — the controller stopped "
+                    f"retrying. The review cursor is WEDGED at {base} until this clears.\n\n"
+                    f"Check the newest run under ~/.myndaix/orchestrator/runs/ (play.jsonl "
+                    f"+ *.err) for the abort stage. A new push clears a blocked full head "
+                    f"but NOT a blocked chunk of a backlog — if this is a chunk, fix the "
+                    f"cause (or raise MYNDAIX_CONTROLLER_MAX_REVIEW_LINES), then clear the "
+                    f"row: UPDATE review_cursor SET pending_sha=NULL, state='delivered', "
+                    f"attempts=0 WHERE repo_id='{rid}' AND ref='{ref}';")
             return
 
     if budget[0] >= MAX_DISPATCH_PER_TICK:
-        log(f"{rid}: per-tick dispatch budget reached — deferring {head[:8]} to next tick"); return
+        log(f"{rid}: per-tick dispatch budget reached — deferring {target[:8]} to next tick"); return
     if not DRY_RUN and _day_count() >= MAX_DISPATCH_PER_DAY:  # daily gate wraps ONLY dispatch, so the
         log(f"{rid}: daily dispatch budget reached — observing only"); return  # advance pass above always runs
 
     if DRY_RUN:
-        log(f"{rid}: DRY-RUN would dispatch review {base[:8]}..{head[:8]}"); return
+        log(f"{rid}: DRY-RUN would dispatch review {base[:8]}..{target[:8]}"); return
 
     stale_before = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=PENDING_STALE)
-    if not await led.claim_dispatch(rid, ref, head, stale_before):
+    if not await led.claim_dispatch(rid, ref, target, stale_before):
         log(f"{rid}: dispatch not claimed (in flight or blocked) — skip"); return
-    # anchor the in-flight head against gc BEFORE dispatch: a later force-push overwrites the head
-    # ref while this sha is still pending, so without its own ref gc could prune it before advance
-    # (codex MAJOR). If the anchor can't be written, do NOT dispatch unanchored — release + retry.
-    if not _pin(repo, _ctl_pending_ref(ref), head):
-        log(f"{rid}: could not pin pending {head[:8]} — releasing, will retry next tick")
-        await led.release_dispatch(rid, ref, head); return
-    if trigger_review(repo, head, base):
+    # anchor the in-flight target against gc BEFORE dispatch: a later force-push overwrites the
+    # head ref while this sha is still pending, so without its own ref gc could prune it before
+    # advance (codex MAJOR). If the anchor can't be written, do NOT dispatch unanchored — release
+    # + retry. (A chunk target is behind head, so it stays reachable anyway; the pin is uniform.)
+    if not _pin(repo, _ctl_pending_ref(ref), target):
+        log(f"{rid}: could not pin pending {target[:8]} — releasing, will retry next tick")
+        await led.release_dispatch(rid, ref, target); return
+    if trigger_review(repo, target, base):
         budget[0] += 1
         _charge_day()
     else:                                                # FRONT failed -> un-stick now, don't wait out PENDING_STALE
-        await led.release_dispatch(rid, ref, head)
+        await led.release_dispatch(rid, ref, target)
         log(f"{rid}: released dispatch after trigger failure — will retry next tick")
 
 
