@@ -13,11 +13,12 @@
 #  - The detached worker re-execs the WORKING-TREE copy of this script. Fine for
 #    your own repo; do NOT install on a clone whose worktree is untrusted.
 #    (A fixed install-path outside the repo is deferred hardening.)
-#  - Bounded by the runtime: the worker caps each agent at ~300s; the REVIEW calls
-#    wait up to REVIEW_CALL_TIMEOUT (default 600s push / 180s gate) for that to land
-#    INLINE — the old 180s mxr wait abandoned a slow review (verdict then only in the
-#    ledger). A diff over MAX_DIFF FAILS fast; an under-cap diff that still exceeds the
-#    agent's 300s exec cap aborts with a recoverable job id.
+#  - Bounded by the runtime: the pool caps each agent ATTEMPT at its profile timeout
+#    (kilabz 900s, others 300s); the REVIEW calls wait up to REVIEW_CALL_TIMEOUT
+#    (default 1200s push / 180s gate) for the reply to land INLINE — a shorter mxr wait
+#    abandons a slow review (verdict then only in the ledger). A diff over MAX_DIFF /
+#    MAX_DIFF_LINES FAILS fast; an under-cap diff that still exceeds the agent's exec
+#    cap aborts with a recoverable job id.
 # Design: docs/orchestrator-design.md. NO codex/builder stage in v0.
 set -euo pipefail
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -42,13 +43,11 @@ MAX_DIFF_LINES=$((10#$MAX_DIFF_LINES))              # force base-10: a leading z
                                                     # make [[ -le ]] arithmetic parse it as (invalid) octal
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
-STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 min. MUST exceed the worst-case
-                                                    # review runtime (canary + 3 review calls x REVIEW_CALL_TIMEOUT
-                                                    # 600s = ~1800s) so a slow-but-LIVE run isn't reaped mid-review.
-# VALIDATE: a non-numeric PLAY_STALE would abort the arithmetic compare under set -u; a too-small
-# value (e.g. -1, 60) would reap LIVE locks mid-review, recreating the race. Require a positive int
-# >= the 1800s review budget, else fall back to the 2700s default (kilabz R5).
-[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge 1800 ] || STALE=2700
+STALE="${PLAY_STALE:-}"                             # lock-reap threshold — DERIVED + validated in the WORKER
+                                                    # section, AFTER the review-call timeout is finalized, so a
+                                                    # raised PLAY_REVIEW_CALL_TIMEOUT can't outrun the reaper
+                                                    # (kilabz PR#60: a fixed floor let a live lock be reclaimed
+                                                    # mid-review under a raised call timeout).
 PRUNE_DAYS=14
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
 LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
@@ -110,13 +109,33 @@ mkdir -p "$run" "$STATE" "$INBOX"
 nonce="$(openssl rand -hex 16)"
 lock="$STATE/lock"
 
-# mxr SYNC-wait for the REVIEW calls (kilabz/oracle/lobster). The agent exec cap is ~300s, but
-# mxr's default 180s wait abandons a slow review before it finishes — the verdict then only lands
-# in the durable ledger (recoverable, but not inline). Wait generously in push-review mode; keep
-# GATE mode at the old 180s so 3 sequential calls still fit automerge's REVIEW_TIMEOUT total. The
-# CANARY keeps the fast 180s default (a dead agent must be detected quickly, not after 600s).
-REVIEW_CALL_TIMEOUT="${PLAY_REVIEW_CALL_TIMEOUT:-600}"
+# mxr SYNC-wait for the REVIEW calls (kilabz/oracle/lobster). The per-attempt exec cap is the
+# agent's PROFILE timeout (kilabz 900s for codex-xhigh; 300s default for the rest), but mxr's
+# default 180s wait abandons a slow review before it finishes — the verdict then only lands
+# in the durable ledger (recoverable, but not inline). Wait generously in push-review mode:
+# 1200s covers one full kilabz attempt (900s cap) + queue/startup margin — NOT multiple pool
+# retries; a review that busts its per-attempt cap twice still aborts recoverable (2026-07-03:
+# the old 600s wait expired UNDER two 300s-capped attempts while the third succeeded, stranding
+# a DONE reply in the ledger). Keep GATE mode at the old 180s so 3 sequential calls still fit
+# automerge's REVIEW_TIMEOUT total. The CANARY keeps the fast 180s default (a dead agent must
+# be detected quickly, not after 1200s). Non-numeric override -> the 1200 default.
+RCT_PUSH="${PLAY_REVIEW_CALL_TIMEOUT:-1200}"
+[[ "$RCT_PUSH" =~ ^[0-9]+$ ]] || RCT_PUSH=1200
+RCT_PUSH=$((10#$RCT_PUSH))                          # base-10: "09" would abort $(( )) as invalid octal,
+                                                    # "01500" would silently derive an UNSAFE octal floor (kilabz R2)
+REVIEW_CALL_TIMEOUT="$RCT_PUSH"
 [[ "${PLAY_GATE:-0}" == "1" ]] && REVIEW_CALL_TIMEOUT=180
+
+# STALE (lock-reap) — derived from the FINALIZED push-mode call timeout (kilabz PR#60 #2: a
+# raised PLAY_REVIEW_CALL_TIMEOUT with a fixed 4500s floor let the reaper reclaim a LIVE lock
+# mid-review). Floor = worst-case worker (3 canaries x 180 + 3 review calls x RCT_PUSH) PLUS
+# the 360s margin — the margin is part of the ENFORCED floor, not a default-only nicety, so an
+# explicit PLAY_STALE inside the margin window is rejected too (kilabz R2). RCT 1200 -> floor
+# 4500, the pre-derivation default. GATE mode keeps the SAME (push-sized) floor — a gate
+# worker with a smaller STALE would reap a live PUSH worker's lock. A too-small/non-numeric
+# PLAY_STALE would reap LIVE locks mid-review (kilabz R5) -> falls back to the floor.
+STALE_FLOOR=$((3*180 + 3*RCT_PUSH + 360))
+[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge "$STALE_FLOOR" ] || STALE="$STALE_FLOOR"
 
 # --- GATE MODE (automerge DESIGN v0.3 §4): PLAY_GATE=1 runs this worker INLINE as a
 # synchronous PASS/NEEDS-FIX gate for the docs-only auto-merge job. It reuses the whole
