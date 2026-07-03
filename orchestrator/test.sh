@@ -131,6 +131,13 @@ echo "9b. raised PLAY_REVIEW_CALL_TIMEOUT raises the stale floor (77-min lock is
   env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
   ck "1500s call timeout -> 77-min lock survives (skipped, not reaped)" "review SKIPPED"
   STUB_TRIAGE="PLAY_PASS" run; ck "same lock IS reaped under the default 4500s budget" "review PASS"
+echo "9c. margin is ENFORCED for explicit PLAY_STALE + leading-zero RCT is base-10"; reset; mkdir -p "$STATE/lock"
+  touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock"   # 5100s old: > floor-sans-margin 5040, < enforced floor 5400
+  env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 PLAY_STALE=5040 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
+  ck "PLAY_STALE inside the margin window is rejected (lock survives)" "review SKIPPED"
+  reset; mkdir -p "$STATE/lock"; touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock"
+  env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=01500 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
+  ck "RCT '01500' is base-10 (floor 5400, not octal 3036 -> lock survives)" "review SKIPPED"
 echo "10. embedded-whitespace token is NOT a pass"; reset; STUB_TRIAGE="P L A Y _ P A S S" run; ck "spaced token -> NEEDS-FIX" "review NEEDS-FIX"
 echo "11. unconfirmed push is NOT deduped"; reset; STUB_TRIAGE="PLAY_PASS" run "/tmp/no-such-remote-$$"; ck "still delivers PASS" "review PASS"; cknofile "$STATE/done-$TIP" "unconfirmed push not marked done"
 echo "12. delivery failure is NOT deduped"; reset; mkdir -p "$INBOX"; chmod 000 "$INBOX"; STUB_TRIAGE="PLAY_PASS" run; chmod 755 "$INBOX"; cknofile "$STATE/done-$TIP" "lost delivery not marked done"

@@ -121,19 +121,21 @@ lock="$STATE/lock"
 # be detected quickly, not after 1200s). Non-numeric override -> the 1200 default.
 RCT_PUSH="${PLAY_REVIEW_CALL_TIMEOUT:-1200}"
 [[ "$RCT_PUSH" =~ ^[0-9]+$ ]] || RCT_PUSH=1200
+RCT_PUSH=$((10#$RCT_PUSH))                          # base-10: "09" would abort $(( )) as invalid octal,
+                                                    # "01500" would silently derive an UNSAFE octal floor (kilabz R2)
 REVIEW_CALL_TIMEOUT="$RCT_PUSH"
 [[ "${PLAY_GATE:-0}" == "1" ]] && REVIEW_CALL_TIMEOUT=180
 
 # STALE (lock-reap) — derived from the FINALIZED push-mode call timeout (kilabz PR#60 #2: a
 # raised PLAY_REVIEW_CALL_TIMEOUT with a fixed 4500s floor let the reaper reclaim a LIVE lock
-# mid-review). Worst-case worker = 3 canaries x 180 + 3 review calls x RCT_PUSH; default adds
-# 360s margin (RCT 1200 -> floor 4140 -> default 4500, the pre-derivation value). GATE mode
-# keeps the SAME (push-sized) floor — a gate worker with a smaller STALE would reap a live
-# PUSH worker's lock. Explicit PLAY_STALE is honored only at/above the floor (a too-small
-# value would reap LIVE locks mid-review, recreating the race — kilabz R5); anything else,
-# including non-numeric, falls back to floor+margin.
-STALE_FLOOR=$((3*180 + 3*RCT_PUSH))
-[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge "$STALE_FLOOR" ] || STALE=$((STALE_FLOOR + 360))
+# mid-review). Floor = worst-case worker (3 canaries x 180 + 3 review calls x RCT_PUSH) PLUS
+# the 360s margin — the margin is part of the ENFORCED floor, not a default-only nicety, so an
+# explicit PLAY_STALE inside the margin window is rejected too (kilabz R2). RCT 1200 -> floor
+# 4500, the pre-derivation default. GATE mode keeps the SAME (push-sized) floor — a gate
+# worker with a smaller STALE would reap a live PUSH worker's lock. A too-small/non-numeric
+# PLAY_STALE would reap LIVE locks mid-review (kilabz R5) -> falls back to the floor.
+STALE_FLOOR=$((3*180 + 3*RCT_PUSH + 360))
+[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge "$STALE_FLOOR" ] || STALE="$STALE_FLOOR"
 
 # --- GATE MODE (automerge DESIGN v0.3 §4): PLAY_GATE=1 runs this worker INLINE as a
 # synchronous PASS/NEEDS-FIX gate for the docs-only auto-merge job. It reuses the whole
