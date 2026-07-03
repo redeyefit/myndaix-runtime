@@ -13,11 +13,12 @@
 #  - The detached worker re-execs the WORKING-TREE copy of this script. Fine for
 #    your own repo; do NOT install on a clone whose worktree is untrusted.
 #    (A fixed install-path outside the repo is deferred hardening.)
-#  - Bounded by the runtime: the worker caps each agent at ~300s; the REVIEW calls
-#    wait up to REVIEW_CALL_TIMEOUT (default 600s push / 180s gate) for that to land
-#    INLINE — the old 180s mxr wait abandoned a slow review (verdict then only in the
-#    ledger). A diff over MAX_DIFF FAILS fast; an under-cap diff that still exceeds the
-#    agent's 300s exec cap aborts with a recoverable job id.
+#  - Bounded by the runtime: the pool caps each agent ATTEMPT at its profile timeout
+#    (kilabz 900s, others 300s); the REVIEW calls wait up to REVIEW_CALL_TIMEOUT
+#    (default 1200s push / 180s gate) for the reply to land INLINE — a shorter mxr wait
+#    abandons a slow review (verdict then only in the ledger). A diff over MAX_DIFF /
+#    MAX_DIFF_LINES FAILS fast; an under-cap diff that still exceeds the agent's exec
+#    cap aborts with a recoverable job id.
 # Design: docs/orchestrator-design.md. NO codex/builder stage in v0.
 set -euo pipefail
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -42,13 +43,14 @@ MAX_DIFF_LINES=$((10#$MAX_DIFF_LINES))              # force base-10: a leading z
                                                     # make [[ -le ]] arithmetic parse it as (invalid) octal
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
-STALE="${PLAY_STALE:-2700}"                         # reap a lock older than 45 min. MUST exceed the worst-case
-                                                    # review runtime (canary + 3 review calls x REVIEW_CALL_TIMEOUT
-                                                    # 600s = ~1800s) so a slow-but-LIVE run isn't reaped mid-review.
+STALE="${PLAY_STALE:-4500}"                         # reap a lock older than 75 min. MUST exceed the worst-case
+                                                    # review runtime (2 canaries x 180s + 3 review calls x
+                                                    # REVIEW_CALL_TIMEOUT 1200s = 3960s) so a slow-but-LIVE run
+                                                    # isn't reaped mid-review.
 # VALIDATE: a non-numeric PLAY_STALE would abort the arithmetic compare under set -u; a too-small
 # value (e.g. -1, 60) would reap LIVE locks mid-review, recreating the race. Require a positive int
-# >= the 1800s review budget, else fall back to the 2700s default (kilabz R5).
-[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge 1800 ] || STALE=2700
+# >= the 3960s review budget, else fall back to the 4500s default (kilabz R5).
+[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge 3960 ] || STALE=4500
 PRUNE_DAYS=14
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
 LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
@@ -110,12 +112,17 @@ mkdir -p "$run" "$STATE" "$INBOX"
 nonce="$(openssl rand -hex 16)"
 lock="$STATE/lock"
 
-# mxr SYNC-wait for the REVIEW calls (kilabz/oracle/lobster). The agent exec cap is ~300s, but
-# mxr's default 180s wait abandons a slow review before it finishes — the verdict then only lands
-# in the durable ledger (recoverable, but not inline). Wait generously in push-review mode; keep
-# GATE mode at the old 180s so 3 sequential calls still fit automerge's REVIEW_TIMEOUT total. The
-# CANARY keeps the fast 180s default (a dead agent must be detected quickly, not after 600s).
-REVIEW_CALL_TIMEOUT="${PLAY_REVIEW_CALL_TIMEOUT:-600}"
+# mxr SYNC-wait for the REVIEW calls (kilabz/oracle/lobster). The per-attempt exec cap is the
+# agent's PROFILE timeout (kilabz 900s for codex-xhigh; 300s default for the rest), but mxr's
+# default 180s wait abandons a slow review before it finishes — the verdict then only lands
+# in the durable ledger (recoverable, but not inline). Wait generously in push-review mode:
+# 1200s covers one full kilabz attempt (900s cap) + queue/startup margin — NOT multiple pool
+# retries; a review that busts its per-attempt cap twice still aborts recoverable (2026-07-03:
+# the old 600s wait expired UNDER two 300s-capped attempts while the third succeeded, stranding
+# a DONE reply in the ledger). Keep GATE mode at the old 180s so 3 sequential calls still fit
+# automerge's REVIEW_TIMEOUT total. The CANARY keeps the fast 180s default (a dead agent must
+# be detected quickly, not after 1200s).
+REVIEW_CALL_TIMEOUT="${PLAY_REVIEW_CALL_TIMEOUT:-1200}"
 [[ "${PLAY_GATE:-0}" == "1" ]] && REVIEW_CALL_TIMEOUT=180
 
 # --- GATE MODE (automerge DESIGN v0.3 §4): PLAY_GATE=1 runs this worker INLINE as a

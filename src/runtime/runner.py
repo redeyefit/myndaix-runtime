@@ -179,14 +179,24 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
                           text=f"spawn failed: {e}", ms=_ms(started))
 
         comm = proc.communicate(stdin_data) if stdin_data is not None else proc.communicate()
+        # per-attempt exec cap: the spine's lease_job does NOT copy Profile.timeout_s onto the
+        # Job (job.timeout_s stays the dead 300s default — same gap invoke_stitch works around),
+        # so an agent whose declared profile allows longer was killed at 300s per attempt, the
+        # pool retried, and the caller's sync wait expired before the eventual success
+        # (2026-07-03: a kilabz codex-xhigh review took 3 attempts — 2 timeouts + 1 ok — and
+        # stranded a DONE reply in the ledger while play-review aborted). A DEFAULTED
+        # job.timeout_s defers to the agent's declared profile; an EXPLICIT job.timeout_s wins
+        # in BOTH directions (tests and callers can still shorten below the profile).
+        _job_default = type(job).model_fields["timeout_s"].default
+        exec_timeout = spec.profile.timeout_s if job.timeout_s == _job_default else job.timeout_s
         try:
-            out, err = await asyncio.wait_for(comm, timeout=job.timeout_s)
+            out, err = await asyncio.wait_for(comm, timeout=exec_timeout)
         except asyncio.TimeoutError:
             _kill_group(proc.pid)
             await _reap(proc)
             return Result(
                 status=ResultStatus.TIMEOUT, error_class=ErrorClass.RETRYABLE,
-                text=f"timeout after {job.timeout_s}s", ms=_ms(started),
+                text=f"timeout after {exec_timeout}s", ms=_ms(started),
             )
         except asyncio.CancelledError:
             # cancelled (lease lost mid-run / pool shutdown) -> kill the process group

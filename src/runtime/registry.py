@@ -80,9 +80,15 @@ V1_ROSTER: list[AgentSpec] = [
               # PIN model + reasoning effort: without `-c model=...` codex runs the HOST's
               # ~/.codex/config.toml model — true-by-luck on one machine, unverified on the
               # other. The reviewer family must be deterministic from the REPO on every host.
-              # gpt-5.5 stays (NOT the brief's 5.3-codex cost swap: codex auth here is
-              # flat-rate ChatGPT plan — `codex login status` — so the API-price argument is
-              # moot and a downgrade would be a pure review-quality loss).
+              # gpt-5.5 stays (NOT the brief's 5.3-codex cost swap: codex auth is a flat-rate
+              # ChatGPT subscription — Pro since 2026-07-03 (it sat on the FREE tier before,
+              # which is what drained mid-cycle) — so the API-price argument is moot and a
+              # downgrade would be a pure review-quality loss).
+              # timeout_s=900: xhigh on a real review diff regularly exceeds the dead 300s
+              # per-attempt default (2026-07-03: two killed attempts + one ok stranded a DONE
+              # reply in the ledger while play-review's wait expired). invoke_cli honors
+              # max(job.timeout_s, profile.timeout_s) — see runner exec_timeout.
+              profile=Profile(timeout_s=900),
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
                        "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",

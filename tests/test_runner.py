@@ -13,11 +13,12 @@ from runtime.contracts import Authority, ErrorClass, Job, Profile, Reach, Result
 from runtime.registry import AgentSpec
 
 
-def _spec(argv, channel="arg"):
+def _spec(argv, channel="arg", profile=None):
     return AgentSpec(
         agent_id="t", reach=Reach.CLI, authority=Authority.RESPONDER,
         model="none", role="test",
         adapter={"kind": "cli", "argv": argv, "prompt_channel": channel},
+        **({"profile": profile} if profile is not None else {}),
     )
 
 
@@ -49,6 +50,26 @@ def test_cli_timeout_is_killed():
     # sleep ignores stdin; 1s timeout fires well before the 30s sleep finishes.
     r = asyncio.run(runner.invoke_cli(_spec(["sleep", "30"], "stdin"), _job(prompt="x", timeout=1)))
     assert r.status is ResultStatus.TIMEOUT
+
+
+def test_cli_defaulted_job_uses_profile_timeout():
+    # a DEFAULTED job.timeout_s defers to the agent's declared profile (the spine never
+    # copies Profile.timeout_s onto the Job — the kilabz-xhigh 300s-cap kill, 2026-07-03).
+    # Short profile + defaulted job: sleep 30 must be killed at ~1s, proving the profile
+    # (not the dead 300s job default) is the effective per-attempt cap.
+    spec = _spec(["sleep", "30"], "stdin", profile=Profile(timeout_s=1))
+    job = Job(id=uuid.uuid4(), to_agent="t", prompt="x")          # timeout_s stays defaulted
+    r = asyncio.run(runner.invoke_cli(spec, job))
+    assert r.status is ResultStatus.TIMEOUT
+    assert "1s" in r.text
+
+
+def test_cli_explicit_job_timeout_beats_profile():
+    # an EXPLICIT job.timeout_s wins in BOTH directions — here it shortens below a big profile.
+    spec = _spec(["sleep", "30"], "stdin", profile=Profile(timeout_s=900))
+    r = asyncio.run(runner.invoke_cli(spec, _job(prompt="x", timeout=1)))
+    assert r.status is ResultStatus.TIMEOUT
+    assert "1s" in r.text
 
 
 # -- gate fix: a job WITHOUT a worktree must run in a fresh empty scratch cwd, NOT the serve

@@ -147,13 +147,13 @@ echo "16b. +learning Step 4: hint injected into BOTH reviews only (not triage); 
   reset; STUB_ARMED="ARMEDGATE" gate_run >/dev/null 2>&1 || true
   if grep -q "ARMEDGATE" "$FAKE/.myndaix/mxr-argv.log" 2>/dev/null; then echo "  FAIL: hint injected into the MERGE GATE (v0.3 §2 violation)"; FAIL=$((FAIL+1)); else echo "  ok: gate mode injects NO hint (the ! gate skip holds)"; PASS=$((PASS+1)); fi
 
-echo "16c. review-call mxr timeout: push reviews wait 600, canary stays fast, gate stays 180"; reset; STUB_TRIAGE="PLAY_PASS" run
+echo "16c. review-call mxr timeout: push reviews wait 1200, canary stays fast, gate stays 180"; reset; STUB_TRIAGE="PLAY_PASS" run
   tlog="$FAKE/.myndaix/mxr-argv.log"
-  if grep -q $'^kilabz\t600\t' "$tlog" && grep -q $'^oracle\t600\t' "$tlog" && grep -q $'^lobster\t600\t' "$tlog"; then
-    echo "  ok: all 3 push review calls wait 600s"; PASS=$((PASS+1)); else echo "  FAIL: push review calls not bumped to 600"; FAIL=$((FAIL+1)); fi
+  if grep -q $'^kilabz\t1200\t' "$tlog" && grep -q $'^oracle\t1200\t' "$tlog" && grep -q $'^lobster\t1200\t' "$tlog"; then
+    echo "  ok: all 3 push review calls wait 1200s (covers one full kilabz 900s attempt)"; PASS=$((PASS+1)); else echo "  FAIL: push review calls not bumped to 1200"; FAIL=$((FAIL+1)); fi
   if grep -q $'^kilabz\t180\t' "$tlog" && ! grep -q $'^kilabz\tunset\t' "$tlog"; then echo "  ok: canary EXPLICITLY clamped to 180 (no ambient MXR_TIMEOUT_S inherit)"; PASS=$((PASS+1)); else echo "  FAIL: canary not clamped to 180"; FAIL=$((FAIL+1)); fi
   reset; gate_run >/dev/null 2>&1 || true; glog="$FAKE/.myndaix/mxr-argv.log"
-  if grep -q $'^kilabz\t180\t' "$glog" && ! grep -q $'^kilabz\t600\t' "$glog"; then
+  if grep -q $'^kilabz\t180\t' "$glog" && ! grep -q $'^kilabz\t1200\t' "$glog"; then
     echo "  ok: gate review calls stay 180 (fit automerge total budget)"; PASS=$((PASS+1)); else echo "  FAIL: gate review-call timeout wrong"; FAIL=$((FAIL+1)); fi
 
 echo "17. PR-1a: front re-execs the FIXED installed worker, not the worktree copy"; reset
