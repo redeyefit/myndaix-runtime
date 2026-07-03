@@ -186,7 +186,12 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
         # (2026-07-03: a kilabz codex-xhigh review took 3 attempts — 2 timeouts + 1 ok — and
         # stranded a DONE reply in the ledger while play-review aborted). A DEFAULTED
         # job.timeout_s defers to the agent's declared profile; an EXPLICIT job.timeout_s wins
-        # in BOTH directions (tests and callers can still shorten below the profile).
+        # in both directions EXCEPT a value equal to the field default (300): the DB round-trip
+        # erases omitted-vs-explicit before the worker rebuilds the Job, so exactly-300 is
+        # indistinguishable from unset and defers to the profile (kilabz PR#60 #1 — KNOWN,
+        # accepted boundary; no spine caller sets job timeouts today, and a caller needing to
+        # cap a profiled agent near the default can use 299/301). model_fields_set can't help
+        # here for the same round-trip reason.
         _job_default = type(job).model_fields["timeout_s"].default
         exec_timeout = spec.profile.timeout_s if job.timeout_s == _job_default else job.timeout_s
         try:

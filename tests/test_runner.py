@@ -72,6 +72,18 @@ def test_cli_explicit_job_timeout_beats_profile():
     assert "1s" in r.text
 
 
+def test_cli_default_valued_timeout_defers_to_profile_known_boundary():
+    # KNOWN BOUNDARY (kilabz PR#60 #1, documented in invoke_cli): timeout_s set EXPLICITLY to
+    # the field default (300) is indistinguishable from omitted after the DB round-trip, so it
+    # defers to the profile. This test PINS the accepted behavior — if the Job contract ever
+    # gains an omitted-vs-explicit signal (e.g. Optional timeout), revisit both.
+    spec = _spec(["sleep", "30"], "stdin", profile=Profile(timeout_s=1))
+    default = Job.model_fields["timeout_s"].default
+    r = asyncio.run(runner.invoke_cli(spec, _job(prompt="x", timeout=default)))
+    assert r.status is ResultStatus.TIMEOUT
+    assert "1s" in r.text, "explicit default-valued timeout defers to the profile (accepted)"
+
+
 # -- gate fix: a job WITHOUT a worktree must run in a fresh empty scratch cwd, NOT the serve
 #    process's inherited cwd (the repo at base) — else a reviewer reads the wrong tree and calls
 #    real diff-findings "phantom". The scratch cwd is removed after the run.

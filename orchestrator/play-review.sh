@@ -43,14 +43,11 @@ MAX_DIFF_LINES=$((10#$MAX_DIFF_LINES))              # force base-10: a leading z
                                                     # make [[ -le ]] arithmetic parse it as (invalid) octal
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
-STALE="${PLAY_STALE:-4500}"                         # reap a lock older than 75 min. MUST exceed the worst-case
-                                                    # review runtime (2 canaries x 180s + 3 review calls x
-                                                    # REVIEW_CALL_TIMEOUT 1200s = 3960s) so a slow-but-LIVE run
-                                                    # isn't reaped mid-review.
-# VALIDATE: a non-numeric PLAY_STALE would abort the arithmetic compare under set -u; a too-small
-# value (e.g. -1, 60) would reap LIVE locks mid-review, recreating the race. Require a positive int
-# >= the 3960s review budget, else fall back to the 4500s default (kilabz R5).
-[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge 3960 ] || STALE=4500
+STALE="${PLAY_STALE:-}"                             # lock-reap threshold — DERIVED + validated in the WORKER
+                                                    # section, AFTER the review-call timeout is finalized, so a
+                                                    # raised PLAY_REVIEW_CALL_TIMEOUT can't outrun the reaper
+                                                    # (kilabz PR#60: a fixed floor let a live lock be reclaimed
+                                                    # mid-review under a raised call timeout).
 PRUNE_DAYS=14
 REPOS_JSON="${MYNDAIX_REPOS_JSON:-$ORCH/repos.json}"   # trusted repo map — read ONLY by the PLAY_AUTOFIX gate
 LSREMOTE_TIMEOUT="${PLAY_LSREMOTE_TIMEOUT:-15}"       # bound the push-confirm ls-remote so a dead remote can't wedge the held lock
@@ -121,9 +118,22 @@ lock="$STATE/lock"
 # the old 600s wait expired UNDER two 300s-capped attempts while the third succeeded, stranding
 # a DONE reply in the ledger). Keep GATE mode at the old 180s so 3 sequential calls still fit
 # automerge's REVIEW_TIMEOUT total. The CANARY keeps the fast 180s default (a dead agent must
-# be detected quickly, not after 1200s).
-REVIEW_CALL_TIMEOUT="${PLAY_REVIEW_CALL_TIMEOUT:-1200}"
+# be detected quickly, not after 1200s). Non-numeric override -> the 1200 default.
+RCT_PUSH="${PLAY_REVIEW_CALL_TIMEOUT:-1200}"
+[[ "$RCT_PUSH" =~ ^[0-9]+$ ]] || RCT_PUSH=1200
+REVIEW_CALL_TIMEOUT="$RCT_PUSH"
 [[ "${PLAY_GATE:-0}" == "1" ]] && REVIEW_CALL_TIMEOUT=180
+
+# STALE (lock-reap) — derived from the FINALIZED push-mode call timeout (kilabz PR#60 #2: a
+# raised PLAY_REVIEW_CALL_TIMEOUT with a fixed 4500s floor let the reaper reclaim a LIVE lock
+# mid-review). Worst-case worker = 3 canaries x 180 + 3 review calls x RCT_PUSH; default adds
+# 360s margin (RCT 1200 -> floor 4140 -> default 4500, the pre-derivation value). GATE mode
+# keeps the SAME (push-sized) floor — a gate worker with a smaller STALE would reap a live
+# PUSH worker's lock. Explicit PLAY_STALE is honored only at/above the floor (a too-small
+# value would reap LIVE locks mid-review, recreating the race — kilabz R5); anything else,
+# including non-numeric, falls back to floor+margin.
+STALE_FLOOR=$((3*180 + 3*RCT_PUSH))
+[[ "$STALE" =~ ^[0-9]+$ ]] && [ "$STALE" -ge "$STALE_FLOOR" ] || STALE=$((STALE_FLOOR + 360))
 
 # --- GATE MODE (automerge DESIGN v0.3 §4): PLAY_GATE=1 runs this worker INLINE as a
 # synchronous PASS/NEEDS-FIX gate for the docs-only auto-merge job. It reuses the whole

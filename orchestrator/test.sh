@@ -126,6 +126,11 @@ echo "8b. contention marks transient (push mode); gate contention does NOT"; res
   reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
   cknofile "$TMARKER" "gate-mode contention writes NO transient marker"
 echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock"; touch -t 202001010000 "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "reaps stale lock + reviews" "review PASS"
+echo "9b. raised PLAY_REVIEW_CALL_TIMEOUT raises the stale floor (77-min lock is LIVE, not reaped)"; reset; mkdir -p "$STATE/lock"
+  touch -t "$(date -v-77M +%Y%m%d%H%M.%S)" "$STATE/lock"   # 4620s old: > default 4500 STALE, < the raised floor (3*180+3*1500+360=5400)
+  env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
+  ck "1500s call timeout -> 77-min lock survives (skipped, not reaped)" "review SKIPPED"
+  STUB_TRIAGE="PLAY_PASS" run; ck "same lock IS reaped under the default 4500s budget" "review PASS"
 echo "10. embedded-whitespace token is NOT a pass"; reset; STUB_TRIAGE="P L A Y _ P A S S" run; ck "spaced token -> NEEDS-FIX" "review NEEDS-FIX"
 echo "11. unconfirmed push is NOT deduped"; reset; STUB_TRIAGE="PLAY_PASS" run "/tmp/no-such-remote-$$"; ck "still delivers PASS" "review PASS"; cknofile "$STATE/done-$TIP" "unconfirmed push not marked done"
 echo "12. delivery failure is NOT deduped"; reset; mkdir -p "$INBOX"; chmod 000 "$INBOX"; STUB_TRIAGE="PLAY_PASS" run; chmod 755 "$INBOX"; cknofile "$STATE/done-$TIP" "lost delivery not marked done"
