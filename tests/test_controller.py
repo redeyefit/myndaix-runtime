@@ -560,6 +560,33 @@ async def test_binary_only_prefix_dispatches_not_skipped(led: PostgresLedger) ->
     assert cur["pending_sha"] == c1
 
 
+# -- persistent sizing failure defers (never dispatch/advance blind) but ALERTS at
+# -- the streak threshold instead of wedging silently forever (kilabz R2 #2) ----
+async def test_persistent_defer_alerts_once_then_heals(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("defer"); repo = make_repo("defer")
+    C.MAX_REVIEW_LINES = 10
+    await C.process_repo(led, repo, [0])                 # seed baseline
+    big = advance_lines(repo, "big.txt", 25)             # over budget, unsplittable
+    before = {f.name for f in C.JEFE_INBOX.glob("*.md")} if C.JEFE_INBOX.exists() else set()
+    saved = C._diff_bytes
+    C._diff_bytes = lambda *a, **k: None                 # sizing fails every tick
+    try:
+        for _ in range(C.DEFER_ALERT_STREAK + 1):
+            await C.process_repo(led, repo, [0])
+    finally:
+        C._diff_bytes = saved
+    assert records(seam) == [], "unsized ranges must never dispatch (guaranteed bounce)"
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] != big, "unsized ranges must never advance blind"
+    stalled = [f for f in C.JEFE_INBOX.glob("*.md")
+               if f.name not in before and "stalled" in f.read_text()]
+    assert len(stalled) == 1, "a persistent defer must alert exactly ONCE at the threshold"
+    await C.process_repo(led, repo, [0])                 # sizing healed -> flag + advance
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["reviewed_sha"] == big, "after sizing heals the oversized skip proceeds"
+
+
 # -- _diff_lines: binary files count 0 (reviewers see a one-line stub) ----------
 async def test_diff_lines_binary_counts_zero(led: PostgresLedger) -> None:
     fresh_seam("bin"); repo = make_repo("bin")

@@ -415,10 +415,12 @@ def _diff_lines(repo: Repo, base: str, head: str) -> Optional[int]:
 
 def _diff_bytes(repo: Repo, base: str, head: str) -> Optional[int]:
     """Patch-text size in BYTES of base..head — the same metric as play-review's
-    PLAY_MAX_DIFF check (`git diff | wc -c`). 0 ⇔ a TRULY empty diff (unlike zero
-    numstat lines, which a binary/mode/rename-only change also produces). None on
-    any failure. Binary-mode subprocess on purpose: a patch can carry non-UTF-8
-    bytes, and _git's text-mode decode would raise on them."""
+    byte check, which measures $(git diff ...) i.e. AFTER bash command substitution
+    strips trailing newlines (kilabz R2: counting the raw stdout disagreed by one
+    byte exactly at the cap boundary). 0 ⇔ a TRULY empty diff (unlike zero numstat
+    lines, which a binary/mode/rename-only change also produces). None on any
+    failure. Binary-mode subprocess on purpose: a patch can carry non-UTF-8 bytes,
+    and _git's text-mode decode would raise on them."""
     try:
         r = subprocess.run(
             ["git", "-C", str(repo.path), "diff", base, head],
@@ -428,7 +430,7 @@ def _diff_bytes(repo: Repo, base: str, head: str) -> Optional[int]:
         return None
     if r.returncode != 0:
         return None
-    return len(r.stdout)
+    return len(r.stdout.rstrip(b"\n"))
 
 
 def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, int, int]:
@@ -545,6 +547,39 @@ def _bump_transient_streak(rid: str) -> int:
 def _reset_transient_streak(rid: str) -> None:
     try:
         _transient_streak_file(rid).unlink()
+    except OSError:
+        pass
+
+
+# defer streak: a "defer" from the chunker (sizing failed at the skip decision) is silent
+# and costs no attempt — persistent sizing failure (e.g. _diff_bytes timing out on a huge
+# generated file every tick) would otherwise wedge the cursor FOREVER with no ceiling and
+# no alert (kilabz R2). Mirror the transient-streak pattern: alert once at the threshold.
+DEFER_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_DEFER_STREAK", "3"))
+
+
+def _defer_streak_file(rid: str) -> Path:
+    return STATE / f"defer-streak-{_slug(rid)}"
+
+
+def _bump_defer_streak(rid: str) -> int:
+    f = _defer_streak_file(rid)
+    try:
+        n = int(f.read_text().strip() or "0")
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(n))
+    except OSError:
+        pass
+    return n
+
+
+def _reset_defer_streak(rid: str) -> None:
+    try:
+        _defer_streak_file(rid).unlink()
     except OSError:
         pass
 
@@ -912,7 +947,17 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     # trigger) is keyed on the TARGET.
     mode, target, tlines, tbytes = _choose_review_target(repo, base, head)
     if mode == "defer":
-        log(f"{rid}: could not size {target[:8]} for chunking — deferring to next tick"); return
+        log(f"{rid}: could not size {target[:8]} for chunking — deferring to next tick")
+        if _bump_defer_streak(rid) == DEFER_ALERT_STREAK and not DRY_RUN:
+            _alert_jefe(
+                f"review backstop: {rid} cannot size {target[:8]} — backstop stalled",
+                f"The chunker has failed to size {target} on {ref} for "
+                f"{DEFER_ALERT_STREAK} consecutive ticks (git diff/numstat failing or "
+                f"timing out — a huge generated file?). The review cursor is parked at "
+                f"{base} and nothing is being reviewed for {rid} until this clears. "
+                f"Try `git -C {repo.path} diff --numstat {base} {target}` by hand.")
+        return
+    _reset_defer_streak(rid)
     if mode == "advance":
         # no reviewable prefix: the target is either an unsplittable over-budget commit
         # (flag — a human must review it), a rewritten/force-pushed history with no
@@ -938,8 +983,10 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
                 f"reviewer call times out around ~2000 lines). (On a force-pushed/"
                 f"diverged history that is the REVIEW PATH size, which can far exceed "
                 f"the commit's own size.) It cannot be split into smaller reviewable "
-                f"steps, so the controller advanced the cursor past it WITHOUT review "
-                f"to keep the backstop unwedged.\n\n"
+                f"steps, so the controller is now advancing the cursor past it WITHOUT "
+                f"review to keep the backstop unwedged. (This alert is written BEFORE "
+                f"the advance so a skip can never be silent — a repeated copy of this "
+                f"alert means the advance failed and is being retried.)\n\n"
                 f"This range is UNREVIEWED by the backstop. Review it manually:\n"
                 f"    git -C {repo.path} show --stat {target}\n"
                 f"    git -C {repo.path} diff {base} {target}\n\n"
