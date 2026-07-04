@@ -48,23 +48,25 @@ def _int_env(name: str, default: int) -> int:
     # string that passes the regex but trips Python 3.11+'s int-str limit (kilabz r2). EVERY
     # module-level env knob below reads through this helper so a bad env var never blocks boot.
     val = os.environ.get(name, "")
-    if re.fullmatch(r"[0-9]+", val):
-        try:
-            return min(int(val), 2**31 - 1)   # cap an astronomical-but-valid value (oracle r3)
-        except ValueError:
-            return default
-    return default
+    if not re.fullmatch(r"[0-9]+", val):
+        return default
+    return 2**31 - 1 if len(val) > 10 else min(int(val), 2**31 - 1)  # len>10: cap + skip int()'s 4300 crash
 
 
 BASE_REF = "refs/heads/main"
 MAX_PER_TICK = _int_env("MYNDAIX_AUTOMERGE_MAX_TICK", 1)
 MAX_PER_DAY = _int_env("MYNDAIX_AUTOMERGE_MAX_DAY", 3)
 MAX_PER_AUTHOR_DAY = _int_env("MYNDAIX_AUTOMERGE_MAX_AUTHOR_DAY", 1)
-AUTHOR_ALLOWLIST = set(
-    filter(bool, os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit").split(",")))
-# filter(bool): drop "" so an empty/trailing-comma env can't put "" in the allowlist — a PR whose
-# author resolves to "" (null/missing login, automerge.py:417) would otherwise pass the gate and
-# auto-merge unauthorized code. Empty allowlist -> fail-CLOSED (nothing matches) (oracle r3).
+def _parse_authors(raw: str) -> set:
+    # strip + drop empties: "" (empty/trailing-comma env) must NOT enter the allowlist — a PR whose
+    # author resolves to "" (null/missing login, :417) would else pass the gate and auto-merge
+    # unauthorized code; and " bob" (padded env) must become "bob" or a legit author silently never
+    # matches. Empty result -> fail-CLOSED (oracle r3/r4). A standalone helper so the test hits the
+    # real init path, not a duplicated lambda (kilabz r4).
+    return {a.strip() for a in raw.split(",") if a.strip()}
+
+
+AUTHOR_ALLOWLIST = _parse_authors(os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit"))
 GH_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_GH_TIMEOUT", 30)
 REVIEW_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", 600)
 REVIEW_MAX_DIFF = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF", 262144)  # match play-review PLAY_MAX_DIFF

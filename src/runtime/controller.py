@@ -65,19 +65,17 @@ DEFAULT_WATCH_REF = "refs/heads/main"
 
 
 def _int_env(name: str, default: int) -> int:
-    # STRICT digit-only, mirroring play-review.sh's `^[0-9]+$`: Python's int() would otherwise accept
-    # "-1000"/"+5"/" 5 "/"5_0" that bash rejects, so the two sides of a SHARED knob
-    # (PLAY_REVIEW_CALL_TIMEOUT, PLAY_STALE) can't diverge. The try/except is a belt for the ONE
-    # digit-only string int() still rejects — >4300 digits trips Python 3.11+'s int-str limit
-    # (kilabz r2). ANY malformed value falls back to the default, so a bad launchd env var can never
-    # crash a service at import — so EVERY module-level env knob below reads through this helper.
+    # STRICT digit-only, mirroring play-review.sh's `^[0-9]+$` so the Python/bash sides of a SHARED
+    # knob (PLAY_REVIEW_CALL_TIMEOUT, PLAY_STALE) can't diverge (Python's int() would otherwise take
+    # "-1000"/"+5"/" 5 " that bash rejects). Capped to a sane machine int: any 11+ digit value
+    # already exceeds 2^31-1 AND a >4300-digit one would crash int() (Py3.11+ limit), so the length
+    # short-circuit prevents the crash AND caps in one step — no try/except needed. A malformed value
+    # falls back to the default, so a bad launchd env var can never crash a service at import; EVERY
+    # module-level env knob below reads through this helper.
     val = os.environ.get(name, "")
-    if re.fullmatch(r"[0-9]+", val):
-        try:
-            return min(int(val), 2**31 - 1)   # cap: a many-digit value parses fine but an
-        except ValueError:                    # astronomical timeout/count would hang downstream
-            return default                    # (sleep/range); no real knob approaches 2^31 (oracle r3)
-    return default
+    if not re.fullmatch(r"[0-9]+", val):
+        return default
+    return 2**31 - 1 if len(val) > 10 else min(int(val), 2**31 - 1)
 
 
 MAX_DISPATCH_PER_TICK = _int_env("MYNDAIX_CONTROLLER_MAX_DISPATCH", 3)

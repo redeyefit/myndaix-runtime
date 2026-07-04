@@ -248,13 +248,14 @@ def test_int_env_strict_digit_only():
     key = "MYNDAIX_TEST_AM_INT_ENV"
     saved = os.environ.get(key)
     try:
-        for bad in ["-1", "+9", " 9 ", "9_9", "nan", "", "9" * 5000]:  # last: >4300-digit int() limit
+        for bad in ["-1", "+9", " 9 ", "9_9", "nan", ""]:  # non-digit -> default
             os.environ[key] = bad
-            ok(A._int_env(key, 262144) == 262144, f"{bad[:12]!r} falls back to the default")
+            ok(A._int_env(key, 262144) == 262144, f"{bad!r} falls back to the default")
         os.environ[key] = "500"
         ok(A._int_env(key, 262144) == 500, "a clean digit string is honoured")
-        os.environ[key] = "9999999999"                   # valid digits, astronomical
-        ok(A._int_env(key, 262144) == 2**31 - 1, "an astronomically large value is capped at 2^31-1")
+        for big in ["9999999999", "9" * 5000]:           # astronomical (2nd trips int()'s 4300 limit)
+            os.environ[key] = big
+            ok(A._int_env(key, 262144) == 2**31 - 1, f"{big[:12]!r} caps at 2^31-1 (crash-proof)")
     finally:
         if saved is None:
             os.environ.pop(key, None)
@@ -262,13 +263,14 @@ def test_int_env_strict_digit_only():
             os.environ[key] = saved
 
 
-def test_author_allowlist_drops_empty():
-    # fail-CLOSED: an empty/trailing-comma MYNDAIX_AUTOMERGE_AUTHORS must not seed "" into the
-    # allowlist — a PR whose author resolves to "" (null login) would otherwise pass the gate.
-    allow = lambda v: set(filter(bool, v.split(",")))
-    ok("" not in allow(""), "empty env -> no '' in the allowlist (nothing auto-merges)")
-    ok("" not in allow("redeyefit,"), "trailing comma -> no '' bypass")
-    ok(allow("redeyefit,alice") == {"redeyefit", "alice"}, "real authors preserved")
+def test_parse_authors_strips_and_drops_empty():
+    # the REAL production parser (module uses _parse_authors for AUTHOR_ALLOWLIST). fail-CLOSED:
+    # "" must never enter the allowlist (a null-login PR would pass the gate), and padded names
+    # ("  bob") must normalise or a legit author silently never matches.
+    ok(A._parse_authors("") == set(), "empty env -> empty allowlist (nothing auto-merges)")
+    ok(A._parse_authors("redeyefit,") == {"redeyefit"}, "trailing comma -> no '' bypass")
+    ok(A._parse_authors("alice, bob") == {"alice", "bob"}, "whitespace-padded names are stripped")
+    ok(A._parse_authors("  ,  ") == set(), "all-whitespace/empty entries drop -> fail-closed")
     ok("" not in A.AUTHOR_ALLOWLIST, "the live module allowlist carries no '' entry")
 
 
