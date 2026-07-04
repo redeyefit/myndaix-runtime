@@ -179,3 +179,102 @@ the dial would do as labels accrue, which is the evidence needed to design PR-B 
   separate rung; flagged so promotion isn't mistaken for "optimize recall."
 - **D4:** calibration-note wording — does a suppress note risk the reviewer under-raising a real
   regression in that class? The note says "when confident," not "don't raise." Review the exact text.
+
+---
+
+## v0.2 — cross-family + adversarial review folds (2026-07-03)
+
+Reviewed by **kilabz** (codex), **oracle** (Gemini/Mini), and a **42-agent adversarial workflow**
+(4 lenses × refuter panels; 19 raw → 10 confirmed). Verdict: **NEEDS-REVISION — 2 BLOCKERs + 5
+MAJORs.** The SHADOW/ACT split and the calibration-note mechanism were BOTH endorsed by all three;
+the damage is in the ACT policy, and one realization reframes the whole rung.
+
+### The reframe (before the findings): the taxonomy has almost no suppressible class
+
+B1/B2 below expose that the live capture taxonomy (`capture.py:43-56`, the single source of truth
+`outcomes.py` imports) is **entirely correctness/security classes** — `fail-open`, `toctou-race`,
+`missing-file-lock`, `unsanitized-injection`, `missing-scoping`, `silent-error-suppression`,
+`migration-fail-open`, `python-in-bash-interp`, `macos-incompat`, `shared-marker-contention`,
+`swiftdata-thread-safety`, `swiftui-concurrency`. Under a **fail-closed** security policy (which
+B1 forces), essentially NONE of these is safe to auto-suppress — a noisy security detector is
+still a detector. So the honest conclusion: **the dial's real v1 value is the MEASUREMENT (per-
+class precision visibility, human-useful on its own), not auto-suppression** — which likely needs
+a benign/"style-nit" taxonomy TIER that does not exist yet before it has any eligible class. This
+sharpens the split: build SHADOW as a measurement surface; treat auto-ACT as a later step gated on
+BOTH accrued data AND a taxonomy that has something safe to suppress.
+
+### Findings folded
+
+**B1 — Security-tag exclusion incomplete + not code-owned (BLOCKER; workflow ×3 + kilabz).** The
+§4 default list omitted `fail-open`, `migration-fail-open`, `python-in-bash-interp` — all in the
+live taxonomy. `fail-open` is the ledger's FIRST recorded finding and this codebase's most
+safety-critical class; my design would have let it be armed for auto-suppression. **Fold: INVERT
+to a code-owned fail-closed allowlist** — a tag is suppressible ONLY if on a small `SUPPRESSIBLE`
+set defined in code; every other tag (all current ones, and any future taxonomy addition) is
+protected by default. Env may ADD protection, never remove it. Given the reframe above, the
+default `SUPPRESSIBLE` set is likely EMPTY until a benign tier exists.
+
+**B2 — ACT injection omits the `! gate` guard (BLOCKER; workflow).** §6 claims gate-mode is a
+no-op but the §3 injection spec never wrapped the note in `! gate` (as `outcome_intro`/`cap_intro`
+already are). A suppress note could leak into the automerge gate, breaking the "no automerge
+coupling" bright line. **Fold: the ACT note is HARD-gated `! gate`, explicit in the spec + a test.**
+
+**M1 — PROMOTE is broken; CUT it from v1 (MAJOR; workflow ×2 + feedback lens).** `applied_fixed`
+is written AUTOMATICALLY on line-hash disappearance (`postgres_store.py:1413-1424`) — refactor,
+churn, or whole-file delete all count, per the ledger design's own known-accepted noise. A
+high-churn class accrues `applied_fixed` with ZERO human labels → precision→1.0 → crosses CEILING
+→ promote armed on evidence no human touched. Promote has no security brake and needs no human
+label to inflate. **Fold: DROP the promote lever entirely in v1.** Suppress is the human-fed,
+defended, higher-value lever; promote's marginal upside isn't worth its runaway + auto-inflation
+risk. v1 is suppress-only.
+
+**M2 — the injection seam is a SINGLE shared string, not per-family (MAJOR; workflow).**
+`hint_intro`/`outcome_intro`/`cap_intro` are single bash scalars interpolated IDENTICALLY into
+both the kilabz (`play-review.sh:455`) and oracle (`:476`) prompts. The precision signal is
+per-family (`finding_precision GROUP BY … reviewer_family`). Reusing the shared seam would inject
+kilabz's calibration into oracle's prompt and vice-versa — cross-wiring the exact per-family
+signal the ledger separates. **Fold: PR-B introduces TWO NEW per-family objective variables
+(`kilabz_dial_intro`, `oracle_dial_intro`); the design no longer claims to "just mirror
+hint_intro."**
+
+**M3 — the recency/accumulator trap: the dial can't self-correct (MAJOR; oracle + kilabz, the
+convergent HIGH).** All-time precision `applied_fixed/(applied_fixed+dismissed_fp)` anchors a class
+to its historical failures: a class that racks up 10 early FPs, gets suppressed, then calibrates
+to 100% still computes `3/(3+10)=23%` and stays suppressed forever, raising too rarely to dilute
+the history. **Fold: the dial policy reads a RECENCY WINDOW (last N labeled events per class, or a
+decay), computed from the append-only log directly — NOT the all-time `finding_precision` view.**
+This reconciles the COLLECT rung's deliberate no-window choice (§5 of the ledger design: keep all
+scarce history) with the control-loop need: the RAW ledger keeps everything; the DIAL reads a
+window of it.
+
+**M4 — the dial corrupts its own measurement (MAJOR; feedback lens).** Acting on a tag changes how
+the reviewer raises it, so precision-under-note stops measuring reviewer skill and measures the
+note's own effect. **Fold: a PROBE channel — a sampled fraction of reviews withhold the note (the
+control group) so note-free precision keeps being measured; SHADOW distinguishes note-active vs
+note-free rows.** Also mandate: LOG which dials were active per review (auditability). Both go in
+the ACT spec.
+
+**Statistical stability + anti-poisoning (MEDIUM; both reviewers).** Raw precision over 10 labels
+is a noisy point estimate; one misunderstood PR's 12 bulk-dismissals shouldn't trigger repo-wide
+suppression, and decoy-PR FP injection could bias the ledger. **Fold into the arm gate:** require a
+**Wilson lower confidence bound** below FLOOR (not the point estimate), a **minimum absolute FP
+count**, and **distinct-PR / author-diversity** of the labels (not raw labeled count). SHADOW
+surfaces label provenance (author/PR spread) so the human arms on a longitudinal pattern.
+
+**Arm authority + path safety (MEDIUM; kilabz + workflow).** Flag-files + env aren't a real human
+boundary. **Fold:** the security classification is code-owned/fail-closed (above); an arm records
+actor + timestamp + the policy snapshot it was armed against; `rule_tag`/`reviewer_family` are
+validated against the allowlist + a strict slug BEFORE they become prompt text or a flag-file path
+component (no `/`/`..` in a tag reaching a path).
+
+### Meta-conclusion
+
+The mechanism (SHADOW measurement + calibration-note ACT) is sound and endorsed; the POLICY needed
+real work, now done: **suppress-only, fail-closed code-owned security, recency-windowed, Wilson-
+gated, per-family, probe-instrumented, gate-guarded.** The reframe is the bigger takeaway — at the
+current all-correctness taxonomy, auto-suppression likely has NO safe class, so **v1's deliverable
+is the MEASUREMENT surface** (per-class precision, human-useful for un-armed judgment), and
+auto-acting waits on data AND a benign-tag tier. Recommended build: **PR-A SHADOW (measurement +
+recency + provenance, zero acting)** when we choose to; **PR-B ACT** only after SHADOW shows stable
+signal Jefe agrees with AND the taxonomy question is resolved. Nothing regresses meanwhile — the
+un-armed backstop already delivers (it found the rev-list bug on its first review).
