@@ -1102,8 +1102,9 @@ async def test_int_env_strict_digit_only(led: PostgresLedger) -> None:
         for bad in ["-1000", "+5", " 5 ", "5_0", "abc", "", "0x10", "1.5", "5\n"]:  # non-digit -> default
             os.environ[key] = bad
             assert C._int_env(key, 42) == 42, f"{bad!r} must fall back (bash rejects it too)"
-        for good, val in [("0", 0), ("7", 7), ("08", 8), ("1200", 1200)]:  # 08: base-10, like 10#08
-            os.environ[key] = good
+        for good, val in [("0", 0), ("7", 7), ("08", 8), ("1200", 1200),
+                          ("00000000003", 3), ("0" * 15 + "5", 5), ("0" * 11, 0)]:  # zero-padding
+            os.environ[key] = good                       # must strip BEFORE the len cap (r5 regression)
             assert C._int_env(key, 42) == val, f"{good!r} -> {val}"
         for big in ["9999999999", "9" * 5000]:           # digit-only but astronomical (2nd trips int()'s
             os.environ[key] = big                        # 4300-digit limit) -> capped via the len>10 path

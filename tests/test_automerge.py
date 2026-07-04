@@ -253,6 +253,8 @@ def test_int_env_strict_digit_only():
             ok(A._int_env(key, 262144) == 262144, f"{bad!r} falls back to the default")
         os.environ[key] = "500"
         ok(A._int_env(key, 262144) == 500, "a clean digit string is honoured")
+        os.environ[key] = "0" * 15 + "5"                 # zero-padded: strip BEFORE the len cap (r5)
+        ok(A._int_env(key, 262144) == 5, "a leading-zero-padded small value is NOT capped")
         for big in ["9999999999", "9" * 5000]:           # astronomical (2nd trips int()'s 4300 limit)
             os.environ[key] = big
             ok(A._int_env(key, 262144) == 2**31 - 1, f"{big[:12]!r} caps at 2^31-1 (crash-proof)")

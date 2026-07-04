@@ -67,14 +67,16 @@ DEFAULT_WATCH_REF = "refs/heads/main"
 def _int_env(name: str, default: int) -> int:
     # STRICT digit-only, mirroring play-review.sh's `^[0-9]+$` so the Python/bash sides of a SHARED
     # knob (PLAY_REVIEW_CALL_TIMEOUT, PLAY_STALE) can't diverge (Python's int() would otherwise take
-    # "-1000"/"+5"/" 5 " that bash rejects). Capped to a sane machine int: any 11+ digit value
-    # already exceeds 2^31-1 AND a >4300-digit one would crash int() (Py3.11+ limit), so the length
-    # short-circuit prevents the crash AND caps in one step — no try/except needed. A malformed value
-    # falls back to the default, so a bad launchd env var can never crash a service at import; EVERY
-    # module-level env knob below reads through this helper.
+    # "-1000"/"+5"/" 5 " that bash rejects). Capped to a sane machine int: 2^31-1 is 10 digits, so
+    # any 11+ SIGNIFICANT-digit value exceeds it AND a >4300-digit one would crash int() (Py3.11+
+    # limit) — the length short-circuit caps both without ever calling int() on a huge string. Strip
+    # leading zeros FIRST or a padded small value ("00000000003") wrongly hits the cap (oracle+kilabz
+    # r5). A malformed value falls back to the default, so a bad launchd env var can never crash a
+    # service at import; EVERY module-level env knob below reads through this helper.
     val = os.environ.get(name, "")
     if not re.fullmatch(r"[0-9]+", val):
         return default
+    val = val.lstrip("0") or "0"
     return 2**31 - 1 if len(val) > 10 else min(int(val), 2**31 - 1)
 
 

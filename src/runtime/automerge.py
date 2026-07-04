@@ -50,6 +50,7 @@ def _int_env(name: str, default: int) -> int:
     val = os.environ.get(name, "")
     if not re.fullmatch(r"[0-9]+", val):
         return default
+    val = val.lstrip("0") or "0"                          # strip padding first, else "00000003" caps (r5)
     return 2**31 - 1 if len(val) > 10 else min(int(val), 2**31 - 1)  # len>10: cap + skip int()'s 4300 crash
 
 
