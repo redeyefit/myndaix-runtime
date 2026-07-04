@@ -1123,7 +1123,11 @@ async def test_chunker_sizes_each_commit_once(led: PostgresLedger) -> None:
     # the memoized size — so _diff_lines/_diff_bytes(base, head) each run exactly ONCE (was 2x).
     repo = make_repo("memo")
     base = C._git(repo.path, "rev-parse", "HEAD").stdout.strip()
-    head = advance(repo, "x" * (C.MAX_REVIEW_BYTES + 5000))   # one byte-fat line, over the BYTE cap
+    # commit a byte-fat file with a SHORT message — passing the big content as `git commit -m` (what
+    # advance() does) blows Linux's 128KB per-arg limit (E2BIG on CI; macOS ARG_MAX is higher).
+    (repo.path / "f.txt").write_text("x" * (C.MAX_REVIEW_BYTES + 5000) + "\n")
+    g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", "byte-fat")
+    head = g(repo.path, "rev-parse", "HEAD").stdout.strip()
     calls = {"l": 0, "b": 0}
     real_l, real_b = C._diff_lines, C._diff_bytes
     C._diff_lines = lambda r, b, h: (calls.__setitem__("l", calls["l"] + 1), real_l(r, b, h))[1]
