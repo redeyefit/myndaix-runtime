@@ -1,6 +1,14 @@
 # Deploying myndaix-runtime
 
-## TL;DR
+There are **two deploy targets**, and a change can touch either or both:
+1. **`serve`** — the worker pool + API (Python under `src/`, run as a launchd service). Covered
+   just below.
+2. **the orchestrator** — the autonomous review loop (`play-review.sh` + the `controller`). It has
+   its OWN deploy surfaces; see [Orchestrator deploy](#orchestrator-deploy-the-review-loop). A change
+   to `orchestrator/play-review.sh` does NOT ship by pulling code + restarting serve — the worker
+   runs a TRUSTED INSTALLED COPY, not the repo tree.
+
+## TL;DR (serve)
 
 `serve` now **auto-applies pending migrations on startup**, so the old footgun is gone:
 you can deploy new code and just (re)start `serve` — it migrates the schema before it
@@ -12,6 +20,55 @@ MYNDAIX_DSN=postgresql://localhost/runtime PYTHONPATH=src python3 -m runtime.ser
 # [serve] schema migrations ensured (idempotent): 0001_add_job_context.sql
 # [serve] MyndAIX runtime up: 4-worker pool draining ...
 ```
+
+On a host where `serve` runs under launchd (the Mini), restart it with:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime
+```
+
+## Orchestrator deploy (the review loop)
+
+The autonomous review loop deploys across **THREE surfaces**. A deploy that updates only some of
+them is a **half-deploy** — it looks done but runs a mix of old and new code. This bit us
+2026-07-02: `play-review.sh` was updated but the repo tree was left on a stale branch, so the
+`controller` half of the same PR silently didn't ship. Update ALL THREE:
+
+1. **Repo working tree — must be on `main` at `origin/main`.** Both the `serve` pool and the
+   `controller` launchd job import Python (`src/runtime/controller.py`, `registry.py`, `runner.py`)
+   FROM this tree via `PYTHONPATH`. The `controller` spawns fresh each launchd tick, so it picks up
+   tree changes on the next tick automatically; `serve` is long-lived and needs the restart above.
+   **The Mini is a PULL-ONLY MIRROR** — it must never carry a local commit or sit on a feature
+   branch on `main`. Verify with `git branch --show-current` (want `main`) + `git log -1`.
+
+2. **`$ORCH/play-review.sh` (and `play-fix.sh`) — the TRUSTED INSTALLED COPY.** The pre-push hook
+   and the controller re-exec the worker from `$ORCH` (`PLAY_SELF=$HOME/.myndaix/orchestrator/
+   play-review.sh`), NOT the repo copy — a defense so a push that edits the worktree script can't
+   run as the worker. So a `play-review.sh` change ships ONLY when you copy it in:
+
+   ```bash
+   cp orchestrator/play-review.sh ~/.myndaix/orchestrator/play-review.sh
+   ```
+
+   (When autofix is armed, `orchestrator/autofix-arm.sh arm` does this cp for BOTH scripts + re-runs
+   its gates — prefer it on an autofix host. Run it only from a clean, up-to-date `main` checkout.)
+
+3. **`serve` restart** — `launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime`, to reload
+   `registry.py`/`runner.py` into the long-lived pool (e.g. an agent profile-timeout or adapter
+   change). Skipped only if the deploy touched nothing serve imports.
+
+**The full Mini deploy, one line** (covers all three surfaces):
+
+```bash
+cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
+  && cp orchestrator/play-review.sh ~/.myndaix/orchestrator/play-review.sh \
+  && launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime
+```
+
+**Verify the deploy landed** (read-only): `git log -1` (the merge sha), a `grep` for the new code in
+BOTH the repo `src/runtime/controller.py` AND the installed `$ORCH/play-review.sh`, and a fresh serve
+pid (`launchctl print gui/$(id -u)/ai.myndaix.runtime | grep pid`). A claimed deploy that skipped the
+`cp` runs the OLD worker; one that skipped the branch/pull runs the OLD controller.
 
 ## Why this exists
 
