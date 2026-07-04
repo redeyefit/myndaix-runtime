@@ -66,13 +66,29 @@ MAX_DISPATCH_PER_TICK = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DISPATCH", "3
 MAX_DISPATCH_PER_DAY = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DAY", "20"))
 MAX_ATTEMPTS = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", "3"))
 TRANSIENT_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_TRANSIENT_STREAK", "3"))
-PENDING_STALE = int(os.environ.get("MYNDAIX_CONTROLLER_PENDING_STALE", "7200"))  # 2 h
-# Must exceed BOTH the play-review worst-case worker runtime (STALE lock budget 4500s: 2 canaries
-# x 180 + 3 review calls x 1200) AND the tick interval (3600s): the worker now OUTLIVES the
-# dispatching tick (it is nohup-detached and the plist sets AbandonProcessGroup, so launchd no
-# longer reaps it on tick exit). A PENDING_STALE equal to the interval left zero margin — a worker
-# still running at the next tick could be re-claimed into a second concurrent same-head dispatch.
-# 7200 still clears the stretched 4500s worker budget with ~45 min of headroom.
+# PENDING_STALE must exceed BOTH the play-review worst-case worker runtime AND the tick interval
+# (3600s): the worker OUTLIVES the dispatching tick (nohup-detached + AbandonProcessGroup, so
+# launchd no longer reaps it on tick exit), and a stale row reclaimed while its worker is still
+# live becomes a second concurrent same-head dispatch. The worker's lock budget is NOT fixed —
+# play-review.sh derives STALE_FLOOR = 3*180 + 3*RCT + 360 from PLAY_REVIEW_CALL_TIMEOUT (and takes
+# max with an explicit PLAY_STALE). A hardcoded 7200 silently under-floors once RCT is raised past
+# ~2100 (RCT=2500 -> floor 8400 > 7200 -> reaps a LIVE worker). So mirror the worker's derivation
+# from the SAME shared env and never sit below it (kilabz self-review 2026-07-03; same class as the
+# PR#60 STALE floor). At the RCT=1200 default the floor is 4500, so the 7200 default is unchanged.
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+def _worker_lock_floor(rct: int) -> int:
+    # mirror play-review.sh STALE_FLOOR: 3 canaries x 180 + 3 review calls (each up to rct) + 360 margin
+    return 3 * 180 + 3 * rct + 360
+_WORKER_LOCK_FLOOR = _worker_lock_floor(_int_env("PLAY_REVIEW_CALL_TIMEOUT", 1200))
+PENDING_STALE = max(
+    _int_env("MYNDAIX_CONTROLLER_PENDING_STALE", 7200),   # 2 h default
+    _WORKER_LOCK_FLOOR,                                    # RCT-derived worker budget
+    _int_env("PLAY_STALE", 0),                             # an explicit worker STALE override
+)
 FETCH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_FETCH_TIMEOUT", "60"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
 # Per-dispatch review-size budget in CHANGED LINES (numstat added+deleted; binary files
@@ -198,9 +214,15 @@ def _review_env() -> dict:
 
 
 def _git(repo: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    # errors="replace": a non-UTF-8 filename in numstat/rev-list output (or a repo with
+    # core.quotePath=false) would otherwise raise UnicodeDecodeError — a ValueError, NOT an
+    # OSError, so the callers' `except (TimeoutExpired, OSError)` miss it and the tick dies
+    # instead of honouring their "None on ANY failure" contract (oracle self-review 2026-07-03,
+    # same class automerge.py already guards). Replacement chars never corrupt the ASCII we
+    # parse (numstat counts, SHAs, remote URLs).
     return subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, env=_git_env(), timeout=timeout, check=False,
+        capture_output=True, text=True, errors="replace", env=_git_env(), timeout=timeout, check=False,
     )
 
 
@@ -523,8 +545,14 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
         log(f"chunker: no fitting prefix within the first {CHUNK_WALK_CAP} of "
             f"{len(commits)} commits ({base[:8]}..{head[:8]}) — falling back on the first commit")
     first = commits[0]
-    n_first = _diff_lines(repo, base, first)
-    b_first = _diff_bytes(repo, base, first)
+    if first == head and total_b >= 0:
+        # single first-parent commit over budget: base..first == base..head, already sized at the
+        # top. Reuse it — but only when total_b is a REAL size, not the -1 "bytes unknown, walk
+        # anyway" sentinel (a re-run there still gets its one more chance to size) (oracle self-review).
+        n_first, b_first = total_l, total_b
+    else:
+        n_first = _diff_lines(repo, base, first)
+        b_first = _diff_bytes(repo, base, first)
     if n_first is None or b_first is None:
         # sizing failed for the very commit we'd skip — advancing on an UNKNOWN size could
         # silently skip a reviewable commit, and dispatching the known-over-budget range

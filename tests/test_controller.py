@@ -1067,6 +1067,31 @@ async def test_tick_self_migrates_before_indexing(led: PostgresLedger) -> None:
         C.REPOS_JSON, C.LOCK, C.STATE, C.DRY_RUN, C.JEFE_INBOX, C._gh_json = saved
 
 
+async def test_pending_stale_floors_on_worker_lock_budget(led: PostgresLedger) -> None:
+    # the controller must NOT reap a pending row while its worker's lock could still be live.
+    # play-review's STALE_FLOOR grows with PLAY_REVIEW_CALL_TIMEOUT, so the old fixed 7200
+    # under-floored once RCT was raised past ~2100 (RCT=2500 -> 8400) and a LIVE worker could be
+    # re-dispatched. PENDING_STALE now derives the same floor from the same env (self-review #2).
+    assert C._worker_lock_floor(1200) == 4500, "default RCT -> the pre-derivation 4500 floor"
+    assert C._worker_lock_floor(2500) == 8400, "raised RCT grows the floor PAST the old fixed 7200"
+    assert C.PENDING_STALE >= C._WORKER_LOCK_FLOOR, "the live constant never sits below the worker floor"
+    assert C.PENDING_STALE >= 7200, "the 2h default is preserved at the RCT=1200 default"
+
+
+async def test_git_survives_non_utf8_output(led: PostgresLedger) -> None:
+    # a non-UTF-8 filename (core.quotePath=false) or blob makes git emit bytes strict UTF-8 can't
+    # decode; _git must NOT raise UnicodeDecodeError — a ValueError the callers' (TimeoutExpired,
+    # OSError) guard misses, which would kill the whole tick instead of honouring their "None on
+    # ANY failure" contract (self-review #1). APFS can't hold an invalid-UTF-8 FILENAME, so we
+    # exercise the shared _git decode path via a blob with raw invalid bytes; the fix covers both.
+    repo = make_repo("utf8")
+    sha = subprocess.run(["git", "-C", str(repo.path), "hash-object", "-w", "--stdin"],
+                         input=b"\xff\xfe bad \x80 bytes", capture_output=True).stdout.decode().strip()
+    r = C._git(repo.path, "cat-file", "-p", sha)          # pre-fix: raises UnicodeDecodeError here
+    assert r.returncode == 0, "cat-file on a non-UTF-8 blob succeeds instead of crashing the tick"
+    assert "�" in r.stdout, "the undecodable bytes become the replacement char, not an exception"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

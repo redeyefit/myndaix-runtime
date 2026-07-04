@@ -226,6 +226,22 @@ def test_line_precap_is_terminal_before_the_paid_review():
     ok(calls == [], "the paid review is NOT called for an over-line-cap PR")
 
 
+def test_gate_env_forwards_diff_caps():
+    # §3's pre-check enforces REVIEW_MAX_DIFF_LINES/REVIEW_MAX_DIFF; the gate worker env MUST carry
+    # the SAME values as PLAY_MAX_DIFF_LINES/PLAY_MAX_DIFF — else a raised automerge cap passes the
+    # pre-check, then the worker aborts at its own default (the retry-forever wedge the caps kill).
+    saved = (A.REVIEW_MAX_DIFF_LINES, A.REVIEW_MAX_DIFF)
+    A.REVIEW_MAX_DIFF_LINES, A.REVIEW_MAX_DIFF = 5000, 999999
+    try:
+        env = A._gate_env("/tmp/verdict.json", "am-test")
+    finally:
+        A.REVIEW_MAX_DIFF_LINES, A.REVIEW_MAX_DIFF = saved
+    ok(env.get("PLAY_MAX_DIFF_LINES") == "5000", "gate forwards the automerge line cap to the worker")
+    ok(env.get("PLAY_MAX_DIFF") == "999999", "gate forwards the automerge byte cap to the worker")
+    ok(env.get("PLAY_GATE") == "1" and env.get("PLAY_DISABLE_AUTOFIX") == "1",
+       "gate env still carries the gate + autofix-off flags")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

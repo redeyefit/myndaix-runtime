@@ -313,6 +313,19 @@ def _ci_green(repo: dict, head: str) -> Optional[bool]:
     return True
 
 
+def _gate_env(vpath, run_id: str) -> dict:
+    """Env for the inline play-review --gate worker. Forwards the SAME diff caps §3's pre-check
+    enforced (PLAY_MAX_DIFF_LINES/PLAY_MAX_DIFF <- REVIEW_MAX_DIFF_LINES/REVIEW_MAX_DIFF): without
+    them a raised MYNDAIX_AUTOMERGE_MAX_DIFF* passes the pre-check, then the worker falls back to
+    its OWN defaults and ABORTS — recreating the terminal-skip-vs-retry-forever mismatch these caps
+    exist to kill (kilabz self-review 2026-07-03)."""
+    env = dict(_git_env())
+    env.update({"PLAY_GATE": "1", "PLAY_GATE_VERDICT": str(vpath), "PLAY_GATE_RUN_ID": run_id,
+                "PLAY_DISABLE_AUTOFIX": "1", "MYNDAIX_DSN": DSN, "PLAY_SELF": str(PLAY_REVIEW),
+                "PLAY_MAX_DIFF_LINES": str(REVIEW_MAX_DIFF_LINES), "PLAY_MAX_DIFF": str(REVIEW_MAX_DIFF)})
+    return env
+
+
 def _review_pass(repo: dict, B: str, H: str) -> str:
     """Synchronous play-review --gate. Returns 'pass' | 'needs_fix' (terminal model rejection)
     | 'transient' (abort/contention/timeout/oracle-down — retry next tick, NOT a permanent
@@ -329,9 +342,7 @@ def _review_pass(repo: dict, B: str, H: str) -> str:
     except OSError as e:
         log(f"  review: cannot create a fresh gate dir ({e}) — transient"); return "transient"
     vpath = gate_dir / "verdict.json"
-    env = dict(_git_env())
-    env.update({"PLAY_GATE": "1", "PLAY_GATE_VERDICT": str(vpath), "PLAY_GATE_RUN_ID": run_id,
-                "PLAY_DISABLE_AUTOFIX": "1", "MYNDAIX_DSN": DSN, "PLAY_SELF": str(PLAY_REVIEW)})
+    env = _gate_env(vpath, run_id)
     try:
         rc = subprocess.run([str(PLAY_REVIEW), "--worker", str(repo["path"]), B, H, BASE_REF, ""],
                             cwd=str(repo["path"]), env=env, timeout=REVIEW_TIMEOUT, check=False).returncode
