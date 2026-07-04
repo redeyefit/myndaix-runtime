@@ -62,10 +62,28 @@ PLAY_REVIEW = Path(os.environ.get("PLAY_SELF", str(ORCH / "play-review.sh")))
 LOCK = ORCH / "controller.lock"                          # an flock'd FILE, not a dir
 
 DEFAULT_WATCH_REF = "refs/heads/main"
-MAX_DISPATCH_PER_TICK = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DISPATCH", "3"))
-MAX_DISPATCH_PER_DAY = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_DAY", "20"))
-MAX_ATTEMPTS = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", "3"))
-TRANSIENT_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_TRANSIENT_STREAK", "3"))
+
+
+def _int_env(name: str, default: int) -> int:
+    # STRICT digit-only, mirroring play-review.sh's `^[0-9]+$`: Python's int() would otherwise accept
+    # "-1000"/"+5"/" 5 "/"5_0" that bash rejects, so the two sides of a SHARED knob
+    # (PLAY_REVIEW_CALL_TIMEOUT, PLAY_STALE) can't diverge. The try/except is a belt for the ONE
+    # digit-only string int() still rejects — >4300 digits trips Python 3.11+'s int-str limit
+    # (kilabz r2). ANY malformed value falls back to the default, so a bad launchd env var can never
+    # crash a service at import — so EVERY module-level env knob below reads through this helper.
+    val = os.environ.get(name, "")
+    if re.fullmatch(r"[0-9]+", val):
+        try:
+            return int(val)
+        except ValueError:
+            return default
+    return default
+
+
+MAX_DISPATCH_PER_TICK = _int_env("MYNDAIX_CONTROLLER_MAX_DISPATCH", 3)
+MAX_DISPATCH_PER_DAY = _int_env("MYNDAIX_CONTROLLER_MAX_DAY", 20)
+MAX_ATTEMPTS = _int_env("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", 3)
+TRANSIENT_ALERT_STREAK = _int_env("MYNDAIX_CONTROLLER_TRANSIENT_STREAK", 3)
 # PENDING_STALE must exceed BOTH the play-review worst-case worker runtime AND the tick interval
 # (3600s): the worker OUTLIVES the dispatching tick (nohup-detached + AbandonProcessGroup, so
 # launchd no longer reaps it on tick exit), and a stale row reclaimed while its worker is still
@@ -75,14 +93,6 @@ TRANSIENT_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_TRANSIENT_STREAK
 # ~2100 (RCT=2500 -> floor 8400 > 7200 -> reaps a LIVE worker). So mirror the worker's derivation
 # from the SAME shared env and never sit below it (kilabz self-review 2026-07-03; same class as the
 # PR#60 STALE floor). At the RCT=1200 default the floor is 4500, so the 7200 default is unchanged.
-def _int_env(name: str, default: int) -> int:
-    # STRICT digit-only, mirroring play-review.sh's `^[0-9]+$` validation so the Python and bash
-    # sides of a SHARED knob (PLAY_REVIEW_CALL_TIMEOUT, PLAY_STALE) can never diverge — Python's
-    # int() would otherwise accept "-1000"/"+5"/" 5 "/"5_0" that bash rejects, computing a nonsense
-    # (even negative) floor (oracle self-review). Any malformed value falls back to the default,
-    # so a bad launchd env var can never crash a service at import.
-    val = os.environ.get(name, "")
-    return int(val) if re.fullmatch(r"[0-9]+", val) else default
 def _worker_lock_floor(rct: int) -> int:
     # mirror play-review.sh STALE_FLOOR: 3 canaries x 180 + 3 review calls (each up to rct) + 360 margin
     return 3 * 180 + 3 * rct + 360
@@ -92,8 +102,8 @@ PENDING_STALE = max(
     _WORKER_LOCK_FLOOR,                                    # RCT-derived worker budget
     _int_env("PLAY_STALE", 0),                             # an explicit worker STALE override
 )
-FETCH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_FETCH_TIMEOUT", "60"))
-REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
+FETCH_TIMEOUT = _int_env("MYNDAIX_CONTROLLER_FETCH_TIMEOUT", 60)
+REVIEW_TIMEOUT = _int_env("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", 60)
 # Per-dispatch review-size budget in CHANGED LINES (numstat added+deleted; binary files
 # count 0 — they reach the reviewers as one-line stubs). The models eat a big diff fine;
 # the real wall is the reviewer's ~600s call budget — a ~3400-line backlog range timed
@@ -127,7 +137,7 @@ TEST_MODE = os.environ.get("MYNDAIX_CONTROLLER_TEST_MODE") == "1"
 DISPATCH_OVERRIDE = os.environ.get("MYNDAIX_CONTROLLER_DISPATCH_OVERRIDE", "")
 
 # -- +learning rung (skill indexer, build plan Step 5) -------------------------
-GH_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_GH_TIMEOUT", "30"))
+GH_TIMEOUT = _int_env("MYNDAIX_CONTROLLER_GH_TIMEOUT", 30)
 SKILLS_DIR = "skills"
 SKILL_FILE = "SKILL.md"
 JEFE_INBOX = HOME / ".myndaix" / "bridge" / "inbox" / "jefe"

@@ -248,9 +248,9 @@ def test_int_env_strict_digit_only():
     key = "MYNDAIX_TEST_AM_INT_ENV"
     saved = os.environ.get(key)
     try:
-        for bad in ["-1", "+9", " 9 ", "9_9", "nan", ""]:
+        for bad in ["-1", "+9", " 9 ", "9_9", "nan", "", "9" * 5000]:  # last: >4300-digit int() limit
             os.environ[key] = bad
-            ok(A._int_env(key, 262144) == 262144, f"{bad!r} falls back to the default")
+            ok(A._int_env(key, 262144) == 262144, f"{bad[:12]!r} falls back to the default")
         os.environ[key] = "500"
         ok(A._int_env(key, 262144) == 500, "a clean digit string is honoured")
     finally:
