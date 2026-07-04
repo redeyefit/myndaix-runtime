@@ -1067,6 +1067,81 @@ async def test_tick_self_migrates_before_indexing(led: PostgresLedger) -> None:
         C.REPOS_JSON, C.LOCK, C.STATE, C.DRY_RUN, C.JEFE_INBOX, C._gh_json = saved
 
 
+async def test_pending_stale_floors_on_worker_lock_budget(led: PostgresLedger) -> None:
+    # the controller must NOT reap a pending row while its worker's lock could still be live.
+    # play-review's STALE_FLOOR grows with PLAY_REVIEW_CALL_TIMEOUT, so the old fixed 7200
+    # under-floored once RCT was raised past ~2100 (RCT=2500 -> 8400) and a LIVE worker could be
+    # re-dispatched. PENDING_STALE now derives the same floor from the same env (self-review #2).
+    assert C._worker_lock_floor(1200) == 4500, "default RCT -> the pre-derivation 4500 floor"
+    assert C._worker_lock_floor(2500) == 8400, "raised RCT grows the floor PAST the old fixed 7200"
+    assert C.PENDING_STALE >= C._WORKER_LOCK_FLOOR, "the live constant never sits below the worker floor"
+    assert C.PENDING_STALE >= 7200, "the 2h default is preserved at the RCT=1200 default"
+
+
+async def test_git_survives_non_utf8_output(led: PostgresLedger) -> None:
+    # a non-UTF-8 filename (core.quotePath=false) or blob makes git emit bytes strict UTF-8 can't
+    # decode; _git must NOT raise UnicodeDecodeError — a ValueError the callers' (TimeoutExpired,
+    # OSError) guard misses, which would kill the whole tick instead of honouring their "None on
+    # ANY failure" contract (self-review #1). APFS can't hold an invalid-UTF-8 FILENAME, so we
+    # exercise the shared _git decode path via a blob with raw invalid bytes; the fix covers both.
+    repo = make_repo("utf8")
+    sha = subprocess.run(["git", "-C", str(repo.path), "hash-object", "-w", "--stdin"],
+                         input=b"\xff\xfe bad \x80 bytes", capture_output=True).stdout.decode().strip()
+    r = C._git(repo.path, "cat-file", "-p", sha)          # pre-fix: raises UnicodeDecodeError here
+    assert r.returncode == 0, "cat-file on a non-UTF-8 blob succeeds instead of crashing the tick"
+    assert "�" in r.stdout, "the undecodable bytes become the replacement char, not an exception"
+
+
+async def test_int_env_strict_digit_only(led: PostgresLedger) -> None:
+    # _int_env mirrors play-review.sh's ^[0-9]+$: values Python's int() accepts but bash rejects
+    # (negative / +sign / whitespace / underscore / non-numeric) must FALL BACK to the default, so
+    # the two sides of a shared knob never diverge and a bad launchd value can't crash a service.
+    key = "MYNDAIX_TEST_INT_ENV_PROBE"
+    saved = os.environ.get(key)
+    try:
+        for bad in ["-1000", "+5", " 5 ", "5_0", "abc", "", "0x10", "1.5", "5\n"]:  # non-digit -> default
+            os.environ[key] = bad
+            assert C._int_env(key, 42) == 42, f"{bad!r} must fall back (bash rejects it too)"
+        for good, val in [("0", 0), ("7", 7), ("08", 8), ("1200", 1200),
+                          ("00000000003", 3), ("0" * 15 + "5", 5), ("0" * 11, 0)]:  # zero-padding
+            os.environ[key] = good                       # must strip BEFORE the len cap (r5 regression)
+            assert C._int_env(key, 42) == val, f"{good!r} -> {val}"
+        for big in ["9999999999", "9" * 5000]:           # digit-only but astronomical (2nd trips int()'s
+            os.environ[key] = big                        # 4300-digit limit) -> capped via the len>10 path
+            assert C._int_env(key, 42) == 2**31 - 1, f"{big[:12]!r} caps (crash-proof), not default"
+        os.environ.pop(key, None)
+        assert C._int_env(key, 42) == 42, "unset -> default"
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+
+async def test_chunker_sizes_each_commit_once(led: PostgresLedger) -> None:
+    # #6: the walk loop + single-commit fallback must not RE-size the same base..commit. A byte-fat
+    # single commit over budget is sized once at the top; the walk skips head; the fallback reuses
+    # the memoized size — so _diff_lines/_diff_bytes(base, head) each run exactly ONCE (was 2x).
+    repo = make_repo("memo")
+    base = C._git(repo.path, "rev-parse", "HEAD").stdout.strip()
+    # commit a byte-fat file with a SHORT message — passing the big content as `git commit -m` (what
+    # advance() does) blows Linux's 128KB per-arg limit (E2BIG on CI; macOS ARG_MAX is higher).
+    (repo.path / "f.txt").write_text("x" * (C.MAX_REVIEW_BYTES + 5000) + "\n")
+    g(repo.path, "add", "-A"); g(repo.path, "commit", "-q", "-m", "byte-fat")
+    head = g(repo.path, "rev-parse", "HEAD").stdout.strip()
+    calls = {"l": 0, "b": 0}
+    real_l, real_b = C._diff_lines, C._diff_bytes
+    C._diff_lines = lambda r, b, h: (calls.__setitem__("l", calls["l"] + 1), real_l(r, b, h))[1]
+    C._diff_bytes = lambda r, b, h: (calls.__setitem__("b", calls["b"] + 1), real_b(r, b, h))[1]
+    try:
+        mode, sha, n, b = C._choose_review_target(repo, base, head)
+    finally:
+        C._diff_lines, C._diff_bytes = real_l, real_b
+    assert mode == "advance" and sha == head, f"byte-fat single commit is advanced+flagged, got {mode}/{sha[:8]}"
+    assert calls["l"] == 1, f"_diff_lines(base,head) sized ONCE, not re-run in the fallback (got {calls['l']})"
+    assert calls["b"] == 1, f"_diff_bytes(base,head) sized ONCE, not re-run in the fallback (got {calls['b']})"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

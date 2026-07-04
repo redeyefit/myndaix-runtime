@@ -86,8 +86,9 @@ V1_ROSTER: list[AgentSpec] = [
               # downgrade would be a pure review-quality loss).
               # timeout_s=900: xhigh on a real review diff regularly exceeds the dead 300s
               # per-attempt default (2026-07-03: two killed attempts + one ok stranded a DONE
-              # reply in the ledger while play-review's wait expired). invoke_cli honors
-              # max(job.timeout_s, profile.timeout_s) — see runner exec_timeout.
+              # reply in the ledger while play-review's wait expired). invoke_cli uses THIS
+              # profile timeout when job.timeout_s is unset (== the 300s field default); an
+              # explicitly-set job.timeout_s wins in EITHER direction — see runner exec_timeout.
               profile=Profile(timeout_s=900),
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
                        "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",

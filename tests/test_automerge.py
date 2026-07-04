@@ -226,6 +226,56 @@ def test_line_precap_is_terminal_before_the_paid_review():
     ok(calls == [], "the paid review is NOT called for an over-line-cap PR")
 
 
+def test_gate_env_forwards_diff_caps():
+    # §3's pre-check enforces REVIEW_MAX_DIFF_LINES/REVIEW_MAX_DIFF; the gate worker env MUST carry
+    # the SAME values as PLAY_MAX_DIFF_LINES/PLAY_MAX_DIFF — else a raised automerge cap passes the
+    # pre-check, then the worker aborts at its own default (the retry-forever wedge the caps kill).
+    saved = (A.REVIEW_MAX_DIFF_LINES, A.REVIEW_MAX_DIFF)
+    A.REVIEW_MAX_DIFF_LINES, A.REVIEW_MAX_DIFF = 5000, 999999
+    try:
+        env = A._gate_env("/tmp/verdict.json", "am-test")
+    finally:
+        A.REVIEW_MAX_DIFF_LINES, A.REVIEW_MAX_DIFF = saved
+    ok(env.get("PLAY_MAX_DIFF_LINES") == "5000", "gate forwards the automerge line cap to the worker")
+    ok(env.get("PLAY_MAX_DIFF") == "999999", "gate forwards the automerge byte cap to the worker")
+    ok(env.get("PLAY_GATE") == "1" and env.get("PLAY_DISABLE_AUTOFIX") == "1",
+       "gate env still carries the gate + autofix-off flags")
+
+
+def test_int_env_strict_digit_only():
+    # a malformed launchd value for a diff cap (fallback intent) must default, not crash at import.
+    import os
+    key = "MYNDAIX_TEST_AM_INT_ENV"
+    saved = os.environ.get(key)
+    try:
+        for bad in ["-1", "+9", " 9 ", "9_9", "nan", ""]:  # non-digit -> default
+            os.environ[key] = bad
+            ok(A._int_env(key, 262144) == 262144, f"{bad!r} falls back to the default")
+        os.environ[key] = "500"
+        ok(A._int_env(key, 262144) == 500, "a clean digit string is honoured")
+        os.environ[key] = "0" * 15 + "5"                 # zero-padded: strip BEFORE the len cap (r5)
+        ok(A._int_env(key, 262144) == 5, "a leading-zero-padded small value is NOT capped")
+        for big in ["9999999999", "9" * 5000]:           # astronomical (2nd trips int()'s 4300 limit)
+            os.environ[key] = big
+            ok(A._int_env(key, 262144) == 2**31 - 1, f"{big[:12]!r} caps at 2^31-1 (crash-proof)")
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+
+def test_parse_authors_strips_and_drops_empty():
+    # the REAL production parser (module uses _parse_authors for AUTHOR_ALLOWLIST). fail-CLOSED:
+    # "" must never enter the allowlist (a null-login PR would pass the gate), and padded names
+    # ("  bob") must normalise or a legit author silently never matches.
+    ok(A._parse_authors("") == set(), "empty env -> empty allowlist (nothing auto-merges)")
+    ok(A._parse_authors("redeyefit,") == {"redeyefit"}, "trailing comma -> no '' bypass")
+    ok(A._parse_authors("alice, bob") == {"alice", "bob"}, "whitespace-padded names are stripped")
+    ok(A._parse_authors("  ,  ") == set(), "all-whitespace/empty entries drop -> fail-closed")
+    ok("" not in A.AUTHOR_ALLOWLIST, "the live module allowlist carries no '' entry")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

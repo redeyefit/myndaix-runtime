@@ -42,17 +42,37 @@ PLAY_REVIEW = Path(os.environ.get("PLAY_SELF", str(ORCH / "play-review.sh")))
 LOCK = ORCH / "automerge.lock"
 ENABLED_FLAG = ORCH / "AUTOMERGE_ENABLED"
 
+def _int_env(name: str, default: int) -> int:
+    # STRICT digit-only (mirrors play-review.sh + controller._int_env): a malformed launchd value
+    # must default, not crash the service at import. The try/except is the belt for a >4300-digit
+    # string that passes the regex but trips Python 3.11+'s int-str limit (kilabz r2). EVERY
+    # module-level env knob below reads through this helper so a bad env var never blocks boot.
+    val = os.environ.get(name, "")
+    if not re.fullmatch(r"[0-9]+", val):
+        return default
+    val = val.lstrip("0") or "0"                          # strip padding first, else "00000003" caps (r5)
+    return 2**31 - 1 if len(val) > 10 else min(int(val), 2**31 - 1)  # len>10: cap + skip int()'s 4300 crash
+
+
 BASE_REF = "refs/heads/main"
-MAX_PER_TICK = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_TICK", "1"))
-MAX_PER_DAY = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DAY", "3"))
-MAX_PER_AUTHOR_DAY = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_AUTHOR_DAY", "1"))
-AUTHOR_ALLOWLIST = set(
-    (os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit")).split(","))
-GH_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_GH_TIMEOUT", "30"))
-REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", "600"))
-REVIEW_MAX_DIFF = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF", "262144"))  # match play-review PLAY_MAX_DIFF
-REVIEW_MAX_DIFF_LINES = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", "2000"))  # match play-review PLAY_MAX_DIFF_LINES
-RATE_FLOOR = int(os.environ.get("MYNDAIX_AUTOMERGE_RATE_FLOOR", "100"))
+MAX_PER_TICK = _int_env("MYNDAIX_AUTOMERGE_MAX_TICK", 1)
+MAX_PER_DAY = _int_env("MYNDAIX_AUTOMERGE_MAX_DAY", 3)
+MAX_PER_AUTHOR_DAY = _int_env("MYNDAIX_AUTOMERGE_MAX_AUTHOR_DAY", 1)
+def _parse_authors(raw: str) -> set:
+    # strip + drop empties: "" (empty/trailing-comma env) must NOT enter the allowlist — a PR whose
+    # author resolves to "" (null/missing login, :417) would else pass the gate and auto-merge
+    # unauthorized code; and " bob" (padded env) must become "bob" or a legit author silently never
+    # matches. Empty result -> fail-CLOSED (oracle r3/r4). A standalone helper so the test hits the
+    # real init path, not a duplicated lambda (kilabz r4).
+    return {a.strip() for a in raw.split(",") if a.strip()}
+
+
+AUTHOR_ALLOWLIST = _parse_authors(os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit"))
+GH_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_GH_TIMEOUT", 30)
+REVIEW_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", 600)
+REVIEW_MAX_DIFF = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF", 262144)  # match play-review PLAY_MAX_DIFF
+REVIEW_MAX_DIFF_LINES = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", 2000)  # match play-review PLAY_MAX_DIFF_LINES
+RATE_FLOOR = _int_env("MYNDAIX_AUTOMERGE_RATE_FLOOR", 100)
 
 DRY_RUN = os.environ.get("MYNDAIX_AUTOMERGE_DRY_RUN") == "1"
 TEST_MODE = os.environ.get("MYNDAIX_AUTOMERGE_TEST_MODE") == "1"
@@ -313,6 +333,19 @@ def _ci_green(repo: dict, head: str) -> Optional[bool]:
     return True
 
 
+def _gate_env(vpath, run_id: str) -> dict:
+    """Env for the inline play-review --gate worker. Forwards the SAME diff caps §3's pre-check
+    enforced (PLAY_MAX_DIFF_LINES/PLAY_MAX_DIFF <- REVIEW_MAX_DIFF_LINES/REVIEW_MAX_DIFF): without
+    them a raised MYNDAIX_AUTOMERGE_MAX_DIFF* passes the pre-check, then the worker falls back to
+    its OWN defaults and ABORTS — recreating the terminal-skip-vs-retry-forever mismatch these caps
+    exist to kill (kilabz self-review 2026-07-03)."""
+    env = dict(_git_env())
+    env.update({"PLAY_GATE": "1", "PLAY_GATE_VERDICT": str(vpath), "PLAY_GATE_RUN_ID": run_id,
+                "PLAY_DISABLE_AUTOFIX": "1", "MYNDAIX_DSN": DSN, "PLAY_SELF": str(PLAY_REVIEW),
+                "PLAY_MAX_DIFF_LINES": str(REVIEW_MAX_DIFF_LINES), "PLAY_MAX_DIFF": str(REVIEW_MAX_DIFF)})
+    return env
+
+
 def _review_pass(repo: dict, B: str, H: str) -> str:
     """Synchronous play-review --gate. Returns 'pass' | 'needs_fix' (terminal model rejection)
     | 'transient' (abort/contention/timeout/oracle-down — retry next tick, NOT a permanent
@@ -329,9 +362,7 @@ def _review_pass(repo: dict, B: str, H: str) -> str:
     except OSError as e:
         log(f"  review: cannot create a fresh gate dir ({e}) — transient"); return "transient"
     vpath = gate_dir / "verdict.json"
-    env = dict(_git_env())
-    env.update({"PLAY_GATE": "1", "PLAY_GATE_VERDICT": str(vpath), "PLAY_GATE_RUN_ID": run_id,
-                "PLAY_DISABLE_AUTOFIX": "1", "MYNDAIX_DSN": DSN, "PLAY_SELF": str(PLAY_REVIEW)})
+    env = _gate_env(vpath, run_id)
     try:
         rc = subprocess.run([str(PLAY_REVIEW), "--worker", str(repo["path"]), B, H, BASE_REF, ""],
                             cwd=str(repo["path"]), env=env, timeout=REVIEW_TIMEOUT, check=False).returncode

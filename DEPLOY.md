@@ -61,14 +61,19 @@ them is a **half-deploy** — it looks done but runs a mix of old and new code. 
 
 ```bash
 cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
-  && cp orchestrator/play-review.sh ~/.myndaix/orchestrator/play-review.sh \
+  && cp orchestrator/play-review.sh orchestrator/play-fix.sh ~/.myndaix/orchestrator/ \
   && launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime
 ```
 
+Both worker scripts ship because the trusted installed surface is `$ORCH/play-review.sh` AND
+`$ORCH/play-fix.sh` — copying only the review script leaves a `play-fix.sh` change live-stale on the
+autofix host (the half-deploy this doc exists to prevent).
+
 **Verify the deploy landed** (read-only): `git log -1` (the merge sha), a `grep` for the new code in
-BOTH the repo `src/runtime/controller.py` AND the installed `$ORCH/play-review.sh`, and a fresh serve
-pid (`launchctl print gui/$(id -u)/ai.myndaix.runtime | grep pid`). A claimed deploy that skipped the
-`cp` runs the OLD worker; one that skipped the branch/pull runs the OLD controller.
+the repo `src/runtime/controller.py` AND in BOTH installed workers (`$ORCH/play-review.sh` and
+`$ORCH/play-fix.sh`), and a fresh serve pid (`launchctl print gui/$(id -u)/ai.myndaix.runtime | grep
+pid`). A claimed deploy that skipped the `cp` runs the OLD worker(s); one that skipped the branch/pull
+runs the OLD controller.
 
 ## Why this exists
 
