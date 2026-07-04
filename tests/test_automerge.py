@@ -242,6 +242,24 @@ def test_gate_env_forwards_diff_caps():
        "gate env still carries the gate + autofix-off flags")
 
 
+def test_int_env_strict_digit_only():
+    # a malformed launchd value for a diff cap (fallback intent) must default, not crash at import.
+    import os
+    key = "MYNDAIX_TEST_AM_INT_ENV"
+    saved = os.environ.get(key)
+    try:
+        for bad in ["-1", "+9", " 9 ", "9_9", "nan", ""]:
+            os.environ[key] = bad
+            ok(A._int_env(key, 262144) == 262144, f"{bad!r} falls back to the default")
+        os.environ[key] = "500"
+        ok(A._int_env(key, 262144) == 500, "a clean digit string is honoured")
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

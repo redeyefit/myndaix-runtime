@@ -76,10 +76,13 @@ TRANSIENT_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_TRANSIENT_STREAK
 # from the SAME shared env and never sit below it (kilabz self-review 2026-07-03; same class as the
 # PR#60 STALE floor). At the RCT=1200 default the floor is 4500, so the 7200 default is unchanged.
 def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
+    # STRICT digit-only, mirroring play-review.sh's `^[0-9]+$` validation so the Python and bash
+    # sides of a SHARED knob (PLAY_REVIEW_CALL_TIMEOUT, PLAY_STALE) can never diverge — Python's
+    # int() would otherwise accept "-1000"/"+5"/" 5 "/"5_0" that bash rejects, computing a nonsense
+    # (even negative) floor (oracle self-review). Any malformed value falls back to the default,
+    # so a bad launchd env var can never crash a service at import.
+    val = os.environ.get(name, "")
+    return int(val) if re.fullmatch(r"[0-9]+", val) else default
 def _worker_lock_floor(rct: int) -> int:
     # mirror play-review.sh STALE_FLOOR: 3 canaries x 180 + 3 review calls (each up to rct) + 360 margin
     return 3 * 180 + 3 * rct + 360
@@ -100,22 +103,22 @@ REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_CONTROLLER_REVIEW_TIMEOUT", "60"))
 # its own cannot be split — it is advanced past WITHOUT review + flagged to the inbox.
 # A zero/negative override would flip the backstop into advance-everything-WITHOUT-review
 # (workflow security lens) — clamp to the default instead, mirroring PLAY_STALE.
-MAX_REVIEW_LINES = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_REVIEW_LINES", "1500"))
-if MAX_REVIEW_LINES < 1:
+MAX_REVIEW_LINES = _int_env("MYNDAIX_CONTROLLER_MAX_REVIEW_LINES", 1500)   # _int_env: a malformed
+if MAX_REVIEW_LINES < 1:                                                    # value falls back, not crash
     MAX_REVIEW_LINES = 1500
 # Companion BYTE budget: lines under-count a long-line diff (a one-line 300KB minified
 # bundle is 1 numstat line) and the worker ALSO enforces a byte cap (PLAY_MAX_DIFF) —
 # a lines-only chunker would dispatch a chunk the worker bounces NON-transiently, which
 # burns attempts and blocks a chunk no push can clear (workflow #1). Both budgets are
 # passed through _review_env so controller and worker can never disagree on either cap.
-MAX_REVIEW_BYTES = int(os.environ.get("MYNDAIX_CONTROLLER_MAX_REVIEW_BYTES", "262144"))
+MAX_REVIEW_BYTES = _int_env("MYNDAIX_CONTROLLER_MAX_REVIEW_BYTES", 262144)
 if MAX_REVIEW_BYTES < 1:
     MAX_REVIEW_BYTES = 262144
 # How many first-parent commits the chunker will size before giving up on finding a
 # bigger prefix. Bounds per-tick work (2 local git calls per candidate). Past the cap a
 # revert-heavy history could hide a fitting prefix (kilabz #2) — the fallback then flags
 # the first commit to a human rather than searching unboundedly, and logs the truncation.
-CHUNK_WALK_CAP = int(os.environ.get("MYNDAIX_CONTROLLER_CHUNK_WALK", "200"))
+CHUNK_WALK_CAP = _int_env("MYNDAIX_CONTROLLER_CHUNK_WALK", 200)
 if CHUNK_WALK_CAP < 1:
     CHUNK_WALK_CAP = 200
 
@@ -420,7 +423,7 @@ def _diff_lines(repo: Repo, base: str, head: str) -> Optional[int]:
     callers decide fail-open vs defer). MUST stay the same metric as play-review's
     PLAY_MAX_DIFF_LINES awk sum, or the worker could bounce a controller chunk."""
     try:
-        r = _git(repo.path, "diff", "--numstat", base, head, timeout=60)
+        r = _git(repo.path, "diff", "--numstat", "--no-ext-diff", base, head, timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if r.returncode != 0:
@@ -446,7 +449,7 @@ def _diff_bytes(repo: Repo, base: str, head: str) -> Optional[int]:
     and _git's text-mode decode would raise on them."""
     try:
         r = subprocess.run(
-            ["git", "-C", str(repo.path), "diff", base, head],
+            ["git", "-C", str(repo.path), "diff", "--no-ext-diff", base, head],
             capture_output=True, env=_git_env(), timeout=60, check=False,
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -491,10 +494,24 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
     (a later commit can revert an earlier one), so every candidate within
     CHUNK_WALK_CAP is sized and the last fit wins."""
     fits = lambda n, b: n <= MAX_REVIEW_LINES and b <= MAX_REVIEW_BYTES
-    total_l = _diff_lines(repo, base, head)
+    # memoize per-commit sizing WITHIN this tick: the walk loop and the single-commit fallback
+    # otherwise re-size the same base..commit (up to two extra 60s git calls at the worst moment —
+    # an oversized range). A None (sizing FAILURE) is deliberately NOT cached, so a later call still
+    # gets its one retry — preserving the "bytes unknown -> try once more" behaviour (oracle #6).
+    _lc: dict = {}
+    _bc: dict = {}
+    def dl(c):
+        if _lc.get(c) is None:
+            _lc[c] = _diff_lines(repo, base, c)
+        return _lc[c]
+    def db(c):
+        if _bc.get(c) is None:
+            _bc[c] = _diff_bytes(repo, base, c)
+        return _bc[c]
+    total_l = dl(head)
     if total_l is None:
         return ("defer", head, -1, -1)                   # unsized — never dispatch blind
-    total_b = _diff_bytes(repo, base, head)
+    total_b = db(head)
     if total_b is not None and fits(total_l, total_b):
         return ("dispatch", head, total_l, total_b)
     if total_b is None and total_l <= MAX_REVIEW_LINES:
@@ -532,10 +549,10 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
     for c in commits[:CHUNK_WALK_CAP]:
         if c == head:                                    # the full range is already known too big
             continue
-        n = _diff_lines(repo, base, c)
+        n = dl(c)
         if n is None or n > MAX_REVIEW_LINES:
             continue
-        b = _diff_bytes(repo, base, c)
+        b = db(c)
         if b is None or b == 0 or b > MAX_REVIEW_BYTES:  # 0 bytes ⇔ truly empty prefix
             continue
         best = (c, n, b)                                 # keep the LAST (largest) fit
@@ -545,14 +562,8 @@ def _choose_review_target(repo: Repo, base: str, head: str) -> tuple[str, str, i
         log(f"chunker: no fitting prefix within the first {CHUNK_WALK_CAP} of "
             f"{len(commits)} commits ({base[:8]}..{head[:8]}) — falling back on the first commit")
     first = commits[0]
-    if first == head and total_b >= 0:
-        # single first-parent commit over budget: base..first == base..head, already sized at the
-        # top. Reuse it — but only when total_b is a REAL size, not the -1 "bytes unknown, walk
-        # anyway" sentinel (a re-run there still gets its one more chance to size) (oracle self-review).
-        n_first, b_first = total_l, total_b
-    else:
-        n_first = _diff_lines(repo, base, first)
-        b_first = _diff_bytes(repo, base, first)
+    n_first = dl(first)                                  # memoized: base..first was already sized in
+    b_first = db(first)                                  # the walk loop (or == base..head at the top)
     if n_first is None or b_first is None:
         # sizing failed for the very commit we'd skip — advancing on an UNKNOWN size could
         # silently skip a reviewable commit, and dispatching the known-over-budget range
@@ -605,7 +616,7 @@ def _reset_transient_streak(rid: str) -> None:
 # and costs no attempt — persistent sizing failure (e.g. _diff_bytes timing out on a huge
 # generated file every tick) would otherwise wedge the cursor FOREVER with no ceiling and
 # no alert (kilabz R2). Mirror the transient-streak pattern: alert once at the threshold.
-DEFER_ALERT_STREAK = int(os.environ.get("MYNDAIX_CONTROLLER_DEFER_STREAK", "3"))
+DEFER_ALERT_STREAK = _int_env("MYNDAIX_CONTROLLER_DEFER_STREAK", 3)
 
 
 def _defer_streak_file(rid: str) -> Path:
@@ -983,7 +994,7 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     # nothing-to-review short-circuit: base..head has no net diff (empty/revert-net-zero commit).
     # play-review aborts on an empty diff and never marks done, so dispatching would re-try to the
     # BLOCKED ceiling (workflow MAJOR). Advance straight past it instead.
-    if _git(repo.path, "diff", "--quiet", base, head).returncode == 0:
+    if _git(repo.path, "diff", "--quiet", "--no-ext-diff", base, head).returncode == 0:
         if DRY_RUN:
             log(f"{rid}: DRY-RUN would skip empty-diff {head[:8]} (advance, no review)"); return
         if _pin(repo, _ctl_reviewed_ref(ref), head) and await led.skip_to(rid, ref, head):

@@ -42,6 +42,13 @@ PLAY_REVIEW = Path(os.environ.get("PLAY_SELF", str(ORCH / "play-review.sh")))
 LOCK = ORCH / "automerge.lock"
 ENABLED_FLAG = ORCH / "AUTOMERGE_ENABLED"
 
+def _int_env(name: str, default: int) -> int:
+    # STRICT digit-only (mirrors play-review.sh + controller._int_env): a malformed launchd value
+    # for a cap with fallback intent must default, not crash the service at import (kilabz self-review).
+    val = os.environ.get(name, "")
+    return int(val) if re.fullmatch(r"[0-9]+", val) else default
+
+
 BASE_REF = "refs/heads/main"
 MAX_PER_TICK = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_TICK", "1"))
 MAX_PER_DAY = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DAY", "3"))
@@ -50,8 +57,8 @@ AUTHOR_ALLOWLIST = set(
     (os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit")).split(","))
 GH_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_GH_TIMEOUT", "30"))
 REVIEW_TIMEOUT = int(os.environ.get("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", "600"))
-REVIEW_MAX_DIFF = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF", "262144"))  # match play-review PLAY_MAX_DIFF
-REVIEW_MAX_DIFF_LINES = int(os.environ.get("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", "2000"))  # match play-review PLAY_MAX_DIFF_LINES
+REVIEW_MAX_DIFF = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF", 262144)  # match play-review PLAY_MAX_DIFF
+REVIEW_MAX_DIFF_LINES = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", 2000)  # match play-review PLAY_MAX_DIFF_LINES
 RATE_FLOOR = int(os.environ.get("MYNDAIX_AUTOMERGE_RATE_FLOOR", "100"))
 
 DRY_RUN = os.environ.get("MYNDAIX_AUTOMERGE_DRY_RUN") == "1"

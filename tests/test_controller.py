@@ -1092,6 +1092,48 @@ async def test_git_survives_non_utf8_output(led: PostgresLedger) -> None:
     assert "�" in r.stdout, "the undecodable bytes become the replacement char, not an exception"
 
 
+async def test_int_env_strict_digit_only(led: PostgresLedger) -> None:
+    # _int_env mirrors play-review.sh's ^[0-9]+$: values Python's int() accepts but bash rejects
+    # (negative / +sign / whitespace / underscore / non-numeric) must FALL BACK to the default, so
+    # the two sides of a shared knob never diverge and a bad launchd value can't crash a service.
+    key = "MYNDAIX_TEST_INT_ENV_PROBE"
+    saved = os.environ.get(key)
+    try:
+        for bad in ["-1000", "+5", " 5 ", "5_0", "abc", "", "0x10", "1.5", "5\n"]:
+            os.environ[key] = bad
+            assert C._int_env(key, 42) == 42, f"{bad!r} must fall back (bash rejects it too)"
+        for good, val in [("0", 0), ("7", 7), ("08", 8), ("1200", 1200)]:  # 08: base-10, like 10#08
+            os.environ[key] = good
+            assert C._int_env(key, 42) == val, f"{good!r} -> {val}"
+        os.environ.pop(key, None)
+        assert C._int_env(key, 42) == 42, "unset -> default"
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
+
+async def test_chunker_sizes_each_commit_once(led: PostgresLedger) -> None:
+    # #6: the walk loop + single-commit fallback must not RE-size the same base..commit. A byte-fat
+    # single commit over budget is sized once at the top; the walk skips head; the fallback reuses
+    # the memoized size — so _diff_lines/_diff_bytes(base, head) each run exactly ONCE (was 2x).
+    repo = make_repo("memo")
+    base = C._git(repo.path, "rev-parse", "HEAD").stdout.strip()
+    head = advance(repo, "x" * (C.MAX_REVIEW_BYTES + 5000))   # one byte-fat line, over the BYTE cap
+    calls = {"l": 0, "b": 0}
+    real_l, real_b = C._diff_lines, C._diff_bytes
+    C._diff_lines = lambda r, b, h: (calls.__setitem__("l", calls["l"] + 1), real_l(r, b, h))[1]
+    C._diff_bytes = lambda r, b, h: (calls.__setitem__("b", calls["b"] + 1), real_b(r, b, h))[1]
+    try:
+        mode, sha, n, b = C._choose_review_target(repo, base, head)
+    finally:
+        C._diff_lines, C._diff_bytes = real_l, real_b
+    assert mode == "advance" and sha == head, f"byte-fat single commit is advanced+flagged, got {mode}/{sha[:8]}"
+    assert calls["l"] == 1, f"_diff_lines(base,head) sized ONCE, not re-run in the fallback (got {calls['l']})"
+    assert calls["b"] == 1, f"_diff_bytes(base,head) sized ONCE, not re-run in the fallback (got {calls['b']})"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:
