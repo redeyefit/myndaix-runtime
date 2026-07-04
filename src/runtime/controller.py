@@ -74,9 +74,9 @@ def _int_env(name: str, default: int) -> int:
     val = os.environ.get(name, "")
     if re.fullmatch(r"[0-9]+", val):
         try:
-            return int(val)
-        except ValueError:
-            return default
+            return min(int(val), 2**31 - 1)   # cap: a many-digit value parses fine but an
+        except ValueError:                    # astronomical timeout/count would hang downstream
+            return default                    # (sleep/range); no real knob approaches 2^31 (oracle r3)
     return default
 
 

@@ -253,11 +253,23 @@ def test_int_env_strict_digit_only():
             ok(A._int_env(key, 262144) == 262144, f"{bad[:12]!r} falls back to the default")
         os.environ[key] = "500"
         ok(A._int_env(key, 262144) == 500, "a clean digit string is honoured")
+        os.environ[key] = "9999999999"                   # valid digits, astronomical
+        ok(A._int_env(key, 262144) == 2**31 - 1, "an astronomically large value is capped at 2^31-1")
     finally:
         if saved is None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = saved
+
+
+def test_author_allowlist_drops_empty():
+    # fail-CLOSED: an empty/trailing-comma MYNDAIX_AUTOMERGE_AUTHORS must not seed "" into the
+    # allowlist — a PR whose author resolves to "" (null login) would otherwise pass the gate.
+    allow = lambda v: set(filter(bool, v.split(",")))
+    ok("" not in allow(""), "empty env -> no '' in the allowlist (nothing auto-merges)")
+    ok("" not in allow("redeyefit,"), "trailing comma -> no '' bypass")
+    ok(allow("redeyefit,alice") == {"redeyefit", "alice"}, "real authors preserved")
+    ok("" not in A.AUTHOR_ALLOWLIST, "the live module allowlist carries no '' entry")
 
 
 def main():

@@ -50,7 +50,7 @@ def _int_env(name: str, default: int) -> int:
     val = os.environ.get(name, "")
     if re.fullmatch(r"[0-9]+", val):
         try:
-            return int(val)
+            return min(int(val), 2**31 - 1)   # cap an astronomical-but-valid value (oracle r3)
         except ValueError:
             return default
     return default
@@ -61,7 +61,10 @@ MAX_PER_TICK = _int_env("MYNDAIX_AUTOMERGE_MAX_TICK", 1)
 MAX_PER_DAY = _int_env("MYNDAIX_AUTOMERGE_MAX_DAY", 3)
 MAX_PER_AUTHOR_DAY = _int_env("MYNDAIX_AUTOMERGE_MAX_AUTHOR_DAY", 1)
 AUTHOR_ALLOWLIST = set(
-    (os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit")).split(","))
+    filter(bool, os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "redeyefit").split(",")))
+# filter(bool): drop "" so an empty/trailing-comma env can't put "" in the allowlist — a PR whose
+# author resolves to "" (null/missing login, automerge.py:417) would otherwise pass the gate and
+# auto-merge unauthorized code. Empty allowlist -> fail-CLOSED (nothing matches) (oracle r3).
 GH_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_GH_TIMEOUT", 30)
 REVIEW_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", 600)
 REVIEW_MAX_DIFF = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF", 262144)  # match play-review PLAY_MAX_DIFF

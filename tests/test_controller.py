@@ -1105,6 +1105,8 @@ async def test_int_env_strict_digit_only(led: PostgresLedger) -> None:
         for good, val in [("0", 0), ("7", 7), ("08", 8), ("1200", 1200)]:  # 08: base-10, like 10#08
             os.environ[key] = good
             assert C._int_env(key, 42) == val, f"{good!r} -> {val}"
+        os.environ[key] = "9999999999"                   # ~10e9 > 2^31-1: valid digits, astronomical
+        assert C._int_env(key, 42) == 2**31 - 1, "an astronomically large value is capped, not passed"
         os.environ.pop(key, None)
         assert C._int_env(key, 42) == 42, "unset -> default"
     finally:
