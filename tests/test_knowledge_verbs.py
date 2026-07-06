@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import os
 
+from runtime import knowledgerecord
 from runtime.ledger.postgres_store import PostgresLedger
 
 DSN = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
@@ -49,9 +50,10 @@ async def test_sync_insert_skip_change(led):
     await _truncate(led)
     d = _doc("a.md", "# A\nhiggsfield pricing brief", doc_date="2026-06-08")
     r1 = await led.knowledge_sync("research", [d])
-    ok(r1 == {"inserted": 1, "tombstoned": 0, "unchanged": 0}, "first sync inserts")
+    ok(r1 == {"inserted": 1, "tombstoned": 0, "unchanged": 0, "skipped_oversize": []}, "first sync inserts")
     r2 = await led.knowledge_sync("research", [d])
-    ok(r2 == {"inserted": 0, "tombstoned": 0, "unchanged": 1}, "re-sync is a no-op (idempotent)")
+    ok(r2 == {"inserted": 0, "tombstoned": 0, "unchanged": 1, "skipped_oversize": []},
+       "re-sync is a no-op (idempotent)")
     d2 = _doc("a.md", "# A\nedited body")
     r3 = await led.knowledge_sync("research", [d2])
     ok(r3["inserted"] == 1, "changed sha appends a new event")
@@ -59,6 +61,38 @@ async def test_sync_insert_skip_change(led):
     ok(row["content_sha"] == d2["content_sha"], "current view shows the latest event")
     n = await led._pool.fetchval("SELECT count(*) FROM knowledge_doc")
     ok(n == 2, "append-only: both events retained")
+
+
+async def test_oversize_doc_is_skipped_not_wedging_the_sync(led):
+    # spine-audit MED: a doc whose body yields a >1MB tsvector (the GENERATED column's hard limit —
+    # the body BYTE cap does NOT bound it for token-dense content) must be SKIPPED via a per-doc
+    # savepoint, NOT abort the whole one-transaction sync (which would re-hit it every run and wedge
+    # the derived index). Real trigger: ~70k unique tokens -> ~1.12MB tsvector -> sqlstate 54000.
+    await _truncate(led)
+    good = _doc("good.md", "# Good\nhiggsfield pricing brief", doc_date="2026-06-08")
+    poison = _doc("poison.md", " ".join(f"w{i:010d}" for i in range(70000)), doc_date="2026-06-09")
+    res = await led.knowledge_sync("research", [good, poison])
+    ok(res["inserted"] == 1, "the good doc is indexed despite the poison doc in the same sync")
+    ok(res["skipped_oversize"] == ["poison.md"], "the oversize doc is reported skipped, not fatal")
+    ok((await _current(led, "research", "good.md"))["status"] == "active",
+       "the good doc's active row survived (the poison doc did NOT abort the transaction)")
+    ok(await _current(led, "research", "poison.md") is None,
+       "the poison doc has no active row (never indexed, correctly)")
+    res2 = await led.knowledge_sync("research", [good, poison])
+    ok(res2["unchanged"] == 1 and res2["skipped_oversize"] == ["poison.md"],
+       "re-sync is stable: good unchanged, poison skipped again (no wedge, no re-fatal)")
+
+
+async def test_format_hits_strips_control_chars(led):
+    # spine-audit LOW: the plain (non-fenced, default `mxr recall`) branch printed corpus title +
+    # headline straight to the terminal — an ESC in an H1 could spoof/hide output. Both branches must
+    # strip C0/DEL incl. ESC (which the headline's \s+ collapse does NOT touch).
+    hit = [{"path": "x.md", "doc_date": "2026-01-01",
+            "title": "T\x1b[31mHIDDEN\x1b[0m", "headline": "body\x1b]0;evil\x07 text"}]
+    plain = knowledgerecord.format_hits("fts", hit, fenced=False, nonce="n")
+    ok("\x1b" not in plain and "\x07" not in plain, "plain recall output carries no control/ANSI bytes")
+    fenced = knowledgerecord.format_hits("fts", hit, fenced=True, nonce="n")
+    ok("\x1b" not in fenced and "\x07" not in fenced, "fenced recall output stripped too")
 
 
 async def test_sync_tombstone_and_restore_identical(led):

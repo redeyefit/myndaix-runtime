@@ -57,6 +57,8 @@ async def _sync(led: PostgresLedger, scope: str) -> dict:
     for w in walk.warnings:
         log(f"{scope}: {w}")
     res = await led.knowledge_sync(scope, [dataclasses.asdict(d) for d in walk.docs])
+    for p in res.get("skipped_oversize", []):
+        log(f"{scope}: SKIPPED {p} — body too large to index (>1MB tsvector); not recallable until shrunk")
     res["md_docs"] = len(walk.docs)
     res["artifacts"] = len(walk.artifacts)
     return res
@@ -68,9 +70,11 @@ async def ingest(scope: str) -> int:
         res = await _sync(led, scope)
     finally:
         await led.close()
+    skipped = len(res.get("skipped_oversize", []))
     print(f"{scope}: {res['md_docs']} md docs on disk — "
           f"inserted {res['inserted']}, tombstoned {res['tombstoned']}, "
-          f"unchanged {res['unchanged']}")
+          f"unchanged {res['unchanged']}"
+          + (f", skipped {skipped} (oversize)" if skipped else ""))
     return 0
 
 
@@ -83,10 +87,14 @@ async def rebuild(scope: str) -> int:
             log(f"{scope}: {w}")
         res = await led.knowledge_rebuild(
             scope, [dataclasses.asdict(d) for d in walk.docs])
+        for p in res.get("skipped_oversize", []):
+            log(f"{scope}: SKIPPED {p} — body too large to index (>1MB tsvector)")
     finally:
         await led.close()
+    skipped = len(res.get("skipped_oversize", []))
     print(f"{scope}: rebuilt — tombstoned {res['tombstoned']} then re-ingested {res['inserted']} "
-          f"({len(walk.docs)} md docs on disk)")
+          f"({len(walk.docs)} md docs on disk"
+          + (f", skipped {skipped} oversize" if skipped else "") + ")")
     return 0
 
 
@@ -140,7 +148,10 @@ def format_hits(rung: str, hits: list[dict], *, fenced: bool, nonce: str) -> str
         date = h.get("doc_date") or "undated"
         lossy = " [lossy]" if h.get("lossy") else ""
         head = re.sub(r"\s+", " ", str(h.get("headline") or "")).strip()
-        body = f"{h['path']} ({date}){lossy}\n  {h.get('title','')}\n  {head}"
+        # strip C0/DEL (incl. ESC, which \s+ above does NOT touch) from the corpus-derived title +
+        # headline on BOTH branches — the plain branch (default `mxr recall`) prints straight to the
+        # terminal, so an escape sequence in an H1 title could spoof/hide output (audit LOW).
+        body = _C0_DEL.sub("", f"{h['path']} ({date}){lossy}\n  {h.get('title','')}\n  {head}")
         if fenced:
             out.append(_fence("recall-hit", body, nonce))
         else:
