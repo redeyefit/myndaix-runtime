@@ -1637,6 +1637,16 @@ class PostgresLedger:
                         inserted += 1
                     else:
                         skipped.append(d["path"])             # oversize tsvector: kept OUT of the index, not fatal
+                        if prev and prev[1] == "active":
+                            # a doc that indexed fine BEFORE and only now oversizes would keep its old
+                            # active row and recall would silently serve STALE content (kilabz HIGH).
+                            # Archive it so "skipped" genuinely means not-recallable, not stale-recallable.
+                            await con.execute(
+                                """INSERT INTO knowledge_doc
+                                       (id, scope, path, body, content_sha, status)
+                                   VALUES ($1,$2,$3,'','absent','archived')""",
+                                _new_id(), scope, d["path"])
+                            tombstoned += 1
                 if tombstone_missing:
                     for path, (_, status) in cur.items():
                         if status == "active" and path not in seen:

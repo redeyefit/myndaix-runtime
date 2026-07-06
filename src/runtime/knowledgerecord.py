@@ -34,8 +34,14 @@ from runtime.ledger.postgres_store import PostgresLedger
 DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 RECALL_DEFAULT_K = 8
 
-# play-review.sh clean() reproduced (skillselect._C0_DEL): C0 minus \t\n\r, plus DEL.
-_C0_DEL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Terminal-hardened control strip: C0 (minus \t\n\r) + DEL + C1 (U+0080-009F). Stricter than
+# play-review.sh's clean()/skillselect._C0_DEL — C1 includes the single-byte CSI (U+009B) that drives
+# ANSI on some UTF-8 terminals without a leading ESC (both review families flagged this).
+_C0_DEL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# Defang a corpus line that mimics the untrusted-region fence marker — belt-and-suspenders beyond the
+# unguessable per-run nonce: replace the leading '='s of a "===BEGIN/END UNTRUSTED" so a forged fence
+# can't even structurally appear inside a hit body (both families: don't rely on the objective alone).
+_FENCE_MARKER = re.compile(r"=+(\s*(?:BEGIN|END)\s+UNTRUSTED)", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -152,6 +158,7 @@ def format_hits(rung: str, hits: list[dict], *, fenced: bool, nonce: str) -> str
         # headline on BOTH branches — the plain branch (default `mxr recall`) prints straight to the
         # terminal, so an escape sequence in an H1 title could spoof/hide output (audit LOW).
         body = _C0_DEL.sub("", f"{h['path']} ({date}){lossy}\n  {h.get('title','')}\n  {head}")
+        body = _FENCE_MARKER.sub(r"#\1", body)               # neutralize any forged fence marker in the hit
         if fenced:
             out.append(_fence("recall-hit", body, nonce))
         else:

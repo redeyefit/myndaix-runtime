@@ -437,7 +437,7 @@ async def test_curate_prompt_binds_the_fence_nonce(led):
             return True, "ok"
         await _round_trip(Path(td), behave, op="lint")
         p = seen.get("prompt", "")
-        ok("ends ONLY at an ===END UNTRUSTED nonce=" in p,
+        ok("ENDS ONLY at a line" in p and "===END UNTRUSTED nonce=" in p,
            "objective binds the recall fence to the run nonce (not the bare marker string)")
 
 
