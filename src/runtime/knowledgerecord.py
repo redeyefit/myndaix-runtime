@@ -160,6 +160,10 @@ def format_hits(rung: str, hits: list[dict], *, fenced: bool, nonce: str) -> str
         # headline on BOTH branches — the plain branch (default `mxr recall`) prints straight to the
         # terminal, so an escape sequence in an H1 title could spoof/hide output (audit LOW).
         body = _C0_DEL.sub("", f"{h['path']} ({date}){lossy}\n  {h.get('title','')}\n  {head}")
+        # normalize CR to LF FIRST: _C0_DEL keeps \r, but re's (?m)^ anchors only after \n, so a
+        # `\r`-prefixed forged fence would slip past the defang yet a CR-normalizing terminal would
+        # still render it as its own line. This also kills the bare-CR line-overwrite vector (kilabz r3).
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
         body = _FENCE_MARKER.sub(r"\1#\2", body)             # neutralize any forged fence-shaped line in the hit
         if fenced:
             out.append(_fence("recall-hit", body, nonce))
