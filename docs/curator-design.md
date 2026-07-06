@@ -1,111 +1,139 @@
 # Curator v1 — DESIGN (research/ → the first folder-agent)
 
-_Status: v0.2 — cross-family round 1 folded (oracle: 2 BLOCKER + 2 MAJOR; kilabz: 4 BLOCKER +
-9 MAJOR; both families converged on the recall paradox and the Write/Edit-authority illusion).
-For round-2 review, then Jefe plan approval. Prior-art + in-repo recon: workflow `wf_357e9782`
-(2026-07-05). Review history at the bottom._
+_Status: v0.3 — cross-family rounds 1+2 folded (r1: oracle 2B+2M, kilabz 4B+9M; r2: kilabz 4B+7M,
+oracle 3B+3M — r2 drove the STAGED-WORKSPACE model and the evidence-gated Write decision).
+For round-3 review, then Jefe plan approval. Recon: workflow `wf_357e9782` (2026-07-05).
+Review history at the bottom._
 
 ## What
 
 A **curator** agent — the librarian of the `~/research` corpus, NOT the field researcher. Invoked
 on demand (`mxr curate "…"`), it answers "do we already know X?" with citations before anything
-gets re-researched, files new reports per corpus conventions, maintains a single `index.md` (the
-map of the corpus), cross-links related briefs, and reports duplicates, dead directions, and
-gaps. Five pieces: (1) a `knowledge_doc` tsvector table + `mxr knowledge-ingest` / `mxr recall`
-verbs (deterministic, no LLM), (2) **`mxr curate` — a deterministic guard verb** that runs recall
-first, snapshots the corpus, dispatches the LLM, then diff-audits and auto-reverts noncompliant
-writes, (3) one `curator` AgentSpec row in the registry, (4) a fail-closed `workdir` adapter key
-in the runner, (5) a repo-tracked **curator constitution** injected at dispatch — the reusable
-piece you point at any future corpus folder.
+gets re-researched, files new reports per corpus conventions, maintains `index.md` (the map of
+the corpus), cross-links related briefs, and reports duplicates, dead directions, and gaps.
+Five pieces: (1) a `knowledge_doc` tsvector table + `mxr knowledge-ingest` / `mxr recall` verbs
+(deterministic, no LLM), (2) **`mxr curate` — a deterministic guard verb built on a staged
+workspace**: copy-in a filtered corpus snapshot, run the LLM there, validate and promote only
+allowed changes back, (3) one `curator` AgentSpec row in the registry, (4) a fail-closed
+`workdir` adapter key in the runner (pointing at the runtime-built staging dir, never the live
+folder), (5) a repo-tracked **curator constitution** injected at dispatch — the reusable piece
+you point at any future corpus folder.
 
 ## Why
 
 The named pain (Jefe, 2026-07-04): *"I gather reports and don't reopen them."* Without a
 librarian the corpus rots — re-research, orphan reports, grows-but-never-compounds. The survey
-confirms it: 15 real documents across FOUR scattered locations, no index, dead directions
-distinguishable only by timestamps, 5 orphan strays. The curator's v1 value is **retrieval +
-compounding, which needs zero standing authority** — and it proves the folder→agent shape for
-every later folder (`ask/` → dispatcher, `runtime-engine/` → producer).
+confirms it: 15 real documents across FOUR locations, no index, dead directions distinguishable
+only by timestamps, 5 orphan strays. The curator's v1 value is **retrieval + compounding, which
+needs zero standing authority** — and it proves the folder→agent shape for every later folder.
 
-## Architecture: LLM judgment inside a deterministic cage
+## Architecture: LLM judgment inside a staged, deterministic cage
 
-The safety model is NOT "prompt rules + tool flags" (round 1 killed that): tool allowlists are a
-belt, and the **hard boundary is a deterministic pre/post guard around every run** — the same
-idiom as the rest of the runtime (mechanical gates decide; the LLM is never trusted to self-report).
+Two rounds of cross-family review killed both naive enforcement stories ("prompt rules + tool
+flags" in r1; "in-place git guard" in r2). v0.3's model: **the agent never touches the live
+corpus at all.** It works in a disposable staging copy; a deterministic guard decides what, if
+anything, comes back.
 
-**`mxr curate "<task>"` (special verb, `src/runtime/curate.py`) does, in order:**
-1. **Scope resolve (fail-closed):** scope→root comes from a STATIC allowlist
-   (`{'research': ~/research}` in code/env); never derived from input. Unknown scope = hard error.
-2. **Freshness refresh (bounded, best-effort):** the ingest primitive (walk + sha compare +
-   append rows/tombstones) under a per-scope advisory **try-lock**; lock busy → skip and mark
-   "index may be stale" in the output. Deterministic; ~ms at 15 files.
-3. **Recall pre-injection:** run the recall ladder on the task text; top-k hits injected into the
-   curator's prompt as a **nonce-fenced UNTRUSTED region** (skillselect's `_fence`). This
-   resolves round-1's converged BLOCKER — the agent never needs to run `mxr` itself; for mid-task
-   follow-ups it uses `Grep`/`Read` inside the folder, which at this scale IS local search
-   (deliberate v1 choice, not degradation).
-4. **Git baseline:** `~/research` is a local-only git repo (no remote, no branches — mandatory,
-   round 1 unanimous). Commit any human drift as `curate-baseline`. This is the rollback point.
-5. **Dispatch:** submit the pool job to the `curator` agent (prompt = repo-tracked constitution +
-   task + fenced recall hits; `workdir` = the scope root). Wait on the ledger like `mxr` does.
-6. **Diff audit (the actual enforcement):** `git status`/`diff --name-status` against baseline.
-   ALLOWED: new files matching `^[a-z0-9][a-z0-9._-]*\.md$` (no slashes, no dot-segments,
-   top-level only) and modification of exactly `index.md`. ANY other change — edits to existing
-   briefs, `CLAUDE.md`, `.claude/**`, `.git/**`, deletions, renames, non-md creations —
-   → `git reset --hard` to baseline and the run is reported **NONCOMPLIANT** with the offending
-   diff. Compliant runs are committed `curate: <task slug>`.
-7. **Report:** the agent's reply + a deterministic `OPERATIONS:` section generated FROM THE DIFF
-   (the model's own claims are narrative only, never the audit record).
+**`mxr curate "<task>"` (special verb, `src/runtime/curate.py`), all mutation steps under ONE
+per-scope advisory lock (baseline → promote → commit; the LLM wait itself doesn't block reads):**
 
-**Merge semantics under this guard:** the FILE op is dedupe-first, but merging into an existing
-brief is **draft-only** — the curator writes `<target>-merge-draft.md` (a new file) + a proposal;
-a human applies it. v1 mutative authority over existing content is exactly zero, enforced by
-revert, not by trust.
+1. **Scope resolve (fail-closed):** scope→root from a STATIC allowlist in code/env. Unknown
+   scope = hard error — everywhere, ingest AND recall (r2: empty-on-unknown was a fail-open
+   footgun; misconfiguration must never look like "no knowledge").
+2. **Freshness refresh (bounded):** the ingest primitive (walk + sha + append rows/tombstones)
+   under the lock. Recall-only paths use try-lock and mark "index may be stale" if busy.
+3. **Recall pre-injection:** run the recall ladder on the task text; top-k hits go into the
+   prompt as nonce-fenced UNTRUSTED regions (r1 converged BLOCKER: the agent has no `mxr`; for
+   mid-task follow-ups it uses `Grep`/`Read` inside the staging copy — deliberate v1 local
+   search).
+4. **Stage-in:** build a fresh scratch workspace containing ONLY the ingest-eligible file set
+   (same noise-globs; regular files only — symlinks/hardlinks/non-regular entries are never
+   copied) + `index.md`. A sha manifest of the live corpus is recorded for CAS at promote time.
+   No dotfiles, no `.claude*`, no `.git`, no logs — the read boundary IS the copy (r2 kilabz
+   BLOCKER: reply text and new files are exfil channels; secrets-bearing noise never enters the
+   workspace). Nothing config-loadable exists in the cwd (r2 oracle BLOCKER: corpus-local
+   `.claude.json`/`.env` injection — defused because the runtime builds the cwd). This PRESERVES
+   PR #39's fresh-controlled-cwd rule rather than reopening it.
+5. **Dispatch:** pool job to the `curator` agent, `workdir` = the staging dir, prompt =
+   repo-tracked constitution + task + fenced recall hits. Wait on the ledger.
+6. **Promote (the enforcement):** diff staging against the stage-in manifest.
+   ALLOWED: new files matching `^[a-z0-9][a-z0-9._-]*\.md$` (top-level, no dot-segments,
+   regular non-symlink files) passing deterministic content checks — size cap 256KB, valid
+   UTF-8, no NULs, secret-pattern + `scan_injection` scan (reused from the skills rung), no
+   nonce-fence-lookalike regions, `[[links]]` resolve to real corpus files; and modification of
+   exactly `index.md` passing structural validation — every corpus file listed, every entry
+   points at an existing file, non-empty (a 0-byte "edit" fails completeness — r2 oracle).
+   ANYTHING else → the run is **NONCOMPLIANT**: nothing is promoted, the staging dir is kept for
+   inspection, the offending diff is reported. Compliant changes are applied to the live corpus
+   by atomic per-file rename, CAS-checked against the manifest (live corpus changed underneath →
+   abort promote, report conflict — human mid-run edits are never clobbered, r2 oracle
+   UNDER-ENG), then committed with **per-file `git add`** (human drift is NEVER folded into
+   curator commits — r2 kilabz; a dirty repo is reported, not silently blessed) using hardened
+   git invocations (`-c core.hooksPath=` — no hook execution).
+7. **Report:** the agent's reply + a deterministic `OPERATIONS:` section generated from the
+   promote diff (model claims are narrative, never the audit record) + compliance status.
 
-## The folder→agent shape (revised)
+**Crash/timeout semantics (r2 oracle MAJOR):** agent writes only ever land in staging, so a
+SIGKILL'd job, a host restart, or a dead guard process leaves the live corpus UNTOUCHED — worst
+case is an orphaned staging dir (namespaced `curate-<scope>-<play>`, swept by the existing
+disk-cleanup job). A crash inside the promote loop leaves atomically-renamed valid files
+uncommitted and visibly pending in `git status`; COMPLIANT is only ever reported after commit.
 
-An agent = a registry row; its policy = a **repo-tracked constitution**
-(`src/runtime/prompts/curator_constitution.md`) injected at dispatch — versioned, PR-gated,
-reviewable, and NOT writable by the agent (round-1 kilabz BLOCKER: policy inside the writable
-corpus = persistent self-modification hole). `~/research/CLAUDE.md` stays a thin human-facing
-usage note; the guard reverts any agent write to it.
+**Out-of-tree writes — the residual, closed by a ship gate (r2 oracle BLOCKER):** `Write`/`Edit`
+accept absolute paths, and staging alone cannot stop a write to `~/.zshrc`. The claude CLI's
+headless permission model is expected to deny file writes outside the cwd in the deny-by-default
+mode; that expectation is NOT trusted — it is a **mandatory enforcement test and SHIP GATE**:
+invoke the real curator config and attempt, at minimum — Bash, WebFetch/WebSearch, absolute-path
+write, `../` traversal, symlink-target write, `.git`/hidden-path write, overwrite of an existing
+staged brief, delete-by-overwrite — asserting denial or guard rejection for each, re-run per
+claude-CLI upgrade (pinned in tests). **If the CLI cannot prove out-of-tree denial, v1 ships
+read-only** (Write/Edit dropped from the allowlist; FILE degrades to propose-only) — this is the
+evidence-gated resolution of the r2 cross-family split on open call #1.
 
-- **Registry row:** `curator` — reach=CLI, authority=WORKSPACE_ACTOR, model `sonnet` (alias, not
-  a frozen ID — registry precedent, noted), adapter `{kind: cli, argv: [claude, -p, --model,
-  sonnet, --output-format, text, <tool flags — see enforcement test>], prompt_channel: stdin,
-  env_passthrough: [CLAUDE_CODE_OAUTH_TOKEN], workdir: <scope root>}`, timeout_s 600.
-- **Tool flags are a belt, not the boundary:** intended surface Read/Glob/Grep/Write/Edit, with
-  an explicit disallow list (Bash, WebSearch, WebFetch, Task/agents, all MCP). Round 1 flagged
-  `--allowedTools` semantics as pre-approval-not-confinement: the BUILD includes an
-  **enforcement test** that invokes the real curator config headless, instructs it to run Bash /
-  fetch a URL / edit `CLAUDE.md`, and asserts denial + guard revert. If the flag layer proves
-  leaky, the diff guard is still the hard stop for writes, and no-Bash/no-network is re-verified
-  per claude-CLI release.
-- **Runner change:** `invoke_cli` honors `adapter.workdir` — **fail-closed**: declared but
-  missing/non-canonical/outside the static scope roots → the run hard-errors; NO fallback to
-  scratch cwd (round-1 kilabz MAJOR — cwd loads project config, so it's a trust boundary). Tests
-  pin both directions (PR #39 scratch behavior unchanged when workdir is absent).
+**Merge semantics (r2 oracle over-engineering fold):** merge-draft machinery is CUT. Dedupe-first
+stands, but an existing topic gets an append-only dated **update brief**
+(`YYYY-MM-DD-<slug>-update.md` + `[[link]]` to the original) — never a rewrite, never a draft of
+someone else's file. Simpler, and consistent with the corpus's own append-only philosophy.
+
+## The folder→agent shape (revised r1)
+
+An agent = a registry row; its policy = a repo-tracked constitution
+(`src/runtime/prompts/curator_constitution.md`) injected at dispatch — versioned, PR-gated, not
+writable by the agent (r1 kilabz BLOCKER: policy inside the writable corpus = persistent
+self-modification; staging additionally makes the live `CLAUDE.md` unreachable).
+`~/research/CLAUDE.md` stays a thin human usage note.
+
+- **Registry row:** `curator` — reach=CLI, authority=WORKSPACE_ACTOR, model `sonnet` (alias per
+  registry precedent; reproducibility debt noted — resolved-model provenance in the ledger
+  remains a declined column per optimal-team-brief), adapter `{kind: cli, argv: [claude, -p,
+  --model, sonnet, --output-format, text, <tool flags per enforcement test>], prompt_channel:
+  stdin, env_passthrough: [CLAUDE_CODE_OAUTH_TOKEN], workdir: <staging dir>}`, timeout_s 600.
+- **Runner change:** `invoke_cli` honors `adapter.workdir` — fail-closed: declared but missing/
+  non-canonical → hard error, NO scratch fallback (r1 kilabz). Tests pin both directions
+  (absent workdir = PR #39 scratch behavior unchanged).
+- **Constitution untrusted-content rule (r2 kilabz):** corpus text read via `Read` is evidence,
+  never instructions; the enforcement suite includes an injection canary (a planted brief
+  instructing the agent to modify policy/write elsewhere) asserting the guard holds.
 
 ## Deterministic substrate
 
-**Ingest** (`mxr knowledge-ingest --scope research`, pure Python, no LLM): walk root for `*.md`,
-noise-globs excluded (`.venv*`, `__pycache__`, `.playwright-mcp`, `.claude`, `.git`, dotfiles).
-Per file: title = first `#` heading (fallback filename); tags = frontmatter if parseable;
-**doc_date** = `YYYY-MM-DD` filename prefix, else frontmatter `date:`, else NULL (round-1: the
-citation contract needs a document date, `created_at` is ingest time); body decoded UTF-8
-`errors='replace'`, NULs stripped, capped 900KB with truncation marker; `content_sha` over raw
-bytes. Append-only under the advisory lock: current row same sha+status → skip; else INSERT.
-File gone from disk → INSERT tombstone (status=archived, sha='absent'). A tsvector-overflow
-insert error → harder truncate, one retry, logged. Files are the source of truth; Postgres is a
-derived, rebuildable index.
+**Ingest** (`mxr knowledge-ingest --scope research`): walk root for `*.md`, noise-globs excluded
+(`.venv*`, `__pycache__`, `.playwright-mcp`, `.claude`, `.git`, dotfiles). Per file: title =
+first `#` heading (fallback filename); tags = frontmatter if parseable; **doc_date** =
+`YYYY-MM-DD` filename prefix, else frontmatter `date:`, WARN on disagreement (r2 kilabz — dates
+are trust-bearing citation metadata), NULL if unparseable; body UTF-8 `errors='replace'`, NULs
+stripped, capped 900KB with marker; `content_sha` over raw bytes. Append-only under the lock:
+current row same sha+status → skip; else INSERT; file gone → tombstone (status=archived,
+sha='absent'). tsvector-overflow → harder truncate, one retry, logged. **Rebuild = TRUNCATE +
+re-ingest** (r2 kilabz: seq-vs-import ordering) — the table is a derived index; files are the
+source of truth.
 
-**Recall** (`mxr recall --scope research "query" [--fenced]`): scope REQUIRED (no scope = error;
-unknown scope = empty). Ladder: `websearch_to_tsquery` → zero hits → sanitized
-`to_tsquery('tok:* & …')` prefix form (empty/all-stopword tokens skip the rung; query capped
-512 chars) → zero hits → `ILIKE` substring with `%`/`_` escaped. Queries run against the
-**active view only** (round-1: tombstones must be invisible). Rank `ts_rank_cd(tsv, q, 1)`;
-`ts_headline` on the top-k only. `--fenced` nonce-fences every hit — REQUIRED on any path into a
-prompt (curate.py uses it).
+**Recall** (`mxr recall --scope research "query" [--fenced]`): scope REQUIRED; unknown scope =
+hard error. Ladder: `websearch_to_tsquery` → sanitized `to_tsquery('tok:* & …')` prefix (empty/
+all-stopword tokens skip the rung; query capped 512 chars) → `ILIKE` with `%`/`_` escaped.
+Queries hit the **active view only**. Rank `ts_rank_cd(tsv, q, 1)`; `ts_headline` on top-k only.
+`--fenced` nonce-fences every hit — required on any path into a prompt. Test matrix includes
+all-stopword, punctuation-only, quoted-phrase, and wildcard-escape queries (r2 kilabz).
 
 ## Schema (`0009_knowledge.sql` + `schema.sql` mirror, lockstep)
 
@@ -117,7 +145,7 @@ CREATE TABLE IF NOT EXISTS knowledge_doc (
     path        text NOT NULL,            -- relative, traversal-checked at ingest
     title       text NOT NULL DEFAULT '',
     tags        text NOT NULL DEFAULT '',
-    doc_date    date,                     -- from filename/frontmatter; NULL if unparseable
+    doc_date    date,                     -- filename/frontmatter; NULL if unparseable
     body        text NOT NULL,
     content_sha text NOT NULL,            -- sha256 raw bytes; 'absent' = tombstone
     status      text NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
@@ -134,106 +162,115 @@ CREATE OR REPLACE VIEW knowledge_doc_active AS
     SELECT * FROM knowledge_doc_current WHERE status = 'active';
 ```
 
-Append-only mirrors `finding_outcome`: INSERT-only, computed current view. Idempotency =
-compare-before-insert under the lock (NOT a unique index — a (scope,path,sha) unique index
-swallows restore-after-archive of identical content, leaving a ghost tombstone current). 2-arg
-`to_tsvector('english', …)` required (1-arg is not IMMUTABLE).
+Append-only mirrors `finding_outcome`: INSERT-only, computed views. Idempotency =
+compare-before-insert under the lock (a (scope,path,sha) unique index would swallow
+restore-after-archive of identical content). 2-arg `to_tsvector('english', …)` (IMMUTABLE).
 
 ## Curator operations (constitution-defined, guard-enforced)
 
-- **QUERY** — read the fenced recall hits, `Read` the top files, answer with `path (doc_date)`
-  citations; state known / partially known / unknown. Propose (not perform) filing the answer
-  back when it fills a real gap.
-- **FILE** — dedupe-first against recall hits + index; a genuinely new topic → new
-  `YYYY-MM-DD-<slug>.md` + `[[wikilinks]]` + index.md updated in the same run (mandatory step);
-  an existing topic → `-merge-draft.md` + proposal (never edits the original).
-- **LINT (v1 = deterministic-first)** — reports: exact duplicates (same sha), ghost `[[links]]`,
-  index↔file-listing mismatches, orphans, un-indexed artifacts. Semantic judgments
-  (near-duplicates, dead-direction candidates, gaps as concept+evidence+suggested-title) are
-  clearly-labeled SUGGESTIONS, triaged P1/P2/P3, P3 orphans explicitly ignored. LINT works from
-  `index.md` + recall metadata first and drills into at most a handful of files per pass
-  (scales past the ~80KB the corpus is today). Contradictions are FLAGGED, never auto-resolved.
-  Gaps never auto-create pages.
+- **QUERY** — read fenced recall hits, `Read` top files in staging, answer with
+  `path (doc_date)` citations; known / partially known / unknown. Propose (not perform) filing
+  the answer back when it fills a real gap.
+- **FILE** — dedupe-first; new topic → `YYYY-MM-DD-<slug>.md` + `[[wikilinks]]` + index updated
+  in the same run; existing topic → dated **update brief** linking the original (no rewrites).
+- **LINT (deterministic-first)** — reports: exact duplicates (sha), ghost `[[links]]`,
+  index↔file mismatches, orphans, un-indexed artifacts. Semantic judgments (near-dups,
+  dead-direction candidates, gaps as concept+evidence+suggested-title) are labeled SUGGESTIONS,
+  P1/P2/P3, P3 orphans ignored. Works from `index.md` + recall metadata first, drills into a
+  handful of files per pass. Contradictions FLAGGED, never auto-resolved. Gaps never auto-create.
+
+**On `index.md` mutability (r2 oracle, refuted-with-rationale):** the index is a regenerable MAP
+for humans, not a ledger — append-only discipline applies to `knowledge_doc`, not a README.
+Guard-side structural validation + diff visibility + git revert bound the damage a compliant
+vandal edit can do; a fully computed index (DB-derived skeleton, LLM descriptions as data) is
+the v2 option if index churn is ever observed.
 
 ## Edge cases
 
-- Empty corpus → ingest 0, recall exits 0 "no hits", curate still functions (empty fence).
-- File >1MB / invalid UTF-8 / NULs → truncate-with-marker, decode-replace, strip; never a crash.
-- Non-md artifacts (json/png/py) → not FTS-indexed; curator lists them in `index.md`.
-- Malformed frontmatter → soft-parse fallbacks (heading/filename/NULL date).
-- Over-specified query → the ladder + constitution guidance ("2–3 terms, OR-expand synonyms at
-  query time" — replaces Postgres synonym-file machinery).
-- Concurrent curate/ingest/recall → per-scope advisory lock; try-lock on read paths; append-only
-  makes interleavings safe. Guard commits serialize on the lock too.
-- Corpus root missing/not a dir/unknown scope → hard error, zero partial writes.
-- Agent times out mid-write → guard's diff audit still runs on the job's terminal state; partial
-  writes are reverted unless compliant.
+- Empty corpus → ingest 0, recall "no hits" (exit 0), curate functions with an empty fence.
+- Oversize / invalid UTF-8 / NUL bodies → truncate-with-marker, decode-replace, strip.
+- Non-md artifacts → not FTS-indexed; listed in `index.md` by the curator.
+- Malformed frontmatter → soft-parse fallbacks; filename/frontmatter date disagreement → WARN.
+- Over-specified query → ladder + constitution guidance (2–3 terms, OR-expand synonyms).
+- Concurrent curates → serialized on the scope lock for all mutation steps; recall stays
+  try-lock read-only. Two curates cannot interleave baseline/promote (r2 oracle git-race dead
+  by construction: no shared mutable baseline, promotes serialize).
+- Human edits mid-run → CAS conflict on promote → abort + report; never clobbered, never reset.
+- Job SIGKILL / host restart / guard death → live corpus untouched; orphaned staging swept.
+- Corpus root missing / unknown scope → hard error, zero partial writes.
 
 ## Security surface
 
-- **Corpus text is untrusted** (briefs quote the web). Paths into prompts are fenced (`--fenced`
-  everywhere curate.py injects). The curator reading its own corpus via `Read` is its normal
-  evidence-gathering — the defense there is not fencing but the **authority bound**: no Bash, no
-  network, no dispatch, and every write subject to revert. Worst case = a poisoned reply +
-  noncompliant write that gets reverted; a poisoned COMPLIANT write (a new lying .md + index
-  line) is visible in the deterministic OPERATIONS diff and trivially `git revert`-able.
-- **Read-exposure residual:** Read/Glob/Grep can see hidden/noise files ingest excludes (e.g.
-  `.playwright-mcp` logs may carry tokens). Mitigation: deny-path config where the CLI supports
-  it + constitution rule; residual accepted for v1 because the agent has NO exfil channel (no
-  network/Bash) — a token could only surface in its reply text, which lands in the local ledger/
-  inbox. Flagged for the round-2 reviewers to re-judge.
-- **Self-modification closed:** policy is repo-tracked + injected; agent writes to `CLAUDE.md` /
-  `.claude/**` / `.git/**` are auto-reverted. (Round-1 kilabz BLOCKER — folded.)
-- **Path traversal:** ingest realpath-checks every entry against the static root; stored paths
-  relative; new-file names validated by the guard regex (no slashes/dot-segments).
-- **Scope fail-closed:** static allowlist; write paths hard-error, read paths return empty.
-- **Shell safety:** all verbs take input via `sys.argv`; nothing interpolated into shells.
+- **Corpus text is untrusted** (briefs quote the web). Prompt-bound paths are fenced; the
+  curator reading staged files via `Read` is evidence-gathering bounded by: filtered stage-in
+  (no secrets-bearing noise in the workspace), no Bash/network/dispatch, promote-side content
+  checks (secret patterns, `scan_injection`, link validation), and the injection-canary test.
+  Worst case: a poisoned COMPLIANT artifact = a lying new `.md` + index line — visible in the
+  deterministic OPERATIONS diff, `git revert`-able, and containing no readable secrets by
+  construction of the stage-in set.
+- **Out-of-tree writes** → enforcement ship gate + read-only fallback (see Architecture).
+- **Self-modification closed:** policy repo-tracked + injected; live `CLAUDE.md`/`.claude`/
+  `.git` unreachable (not staged) and unpromotable (guard).
+- **Path traversal:** ingest realpath-checks entries against the static root; promote validates
+  name regex + regular-file-ness; stage-in copies regular files only.
+- **Scope fail-closed:** static allowlist; unknown scope hard-errors on every verb.
+- **Shell safety:** all verbs take input via `sys.argv`; hardened git (`-c core.hooksPath=`);
+  nothing interpolated into shells.
 
 ## Files
 
 - **Create:** `src/runtime/ledger/migrations/0009_knowledge.sql`, `src/runtime/knowledge.py`
-  (pure walk/parse/sha/validate), `src/runtime/knowledgerecord.py` (ingest/recall verbs),
-  `src/runtime/curate.py` (guard verb), `src/runtime/prompts/curator_constitution.md`, tests
-  (pure + DB + guard + the tool-enforcement test), `~/research/index.md` (first curator run),
-  `~/research` git init + baseline (deploy step, Jefe's folder — done with him).
-- **Modify:** `src/runtime/ledger/schema.sql`, `src/runtime/cli.py` (verbs), `src/runtime/
-  registry.py` (curator row), `src/runtime/runner.py` (fail-closed workdir), `~/research/
-  CLAUDE.md` (thin usage note pointing at the constitution).
+  (pure walk/parse/sha/validate), `src/runtime/knowledgerecord.py` (ingest/recall verbs —
+  naming mirrors `outcomes.py`/`outcomerecord.py`), `src/runtime/curate.py` (guard verb),
+  `src/runtime/prompts/curator_constitution.md`, tests (pure + DB + guard/promote + the
+  enforcement ship gate + injection canary), `~/research/index.md` (first curator run),
+  `~/research` git init + baseline (deploy step, with Jefe).
+- **Modify:** `src/runtime/ledger/schema.sql`, `src/runtime/cli.py`, `src/runtime/registry.py`
+  (curator row), `src/runtime/runner.py` (fail-closed workdir), `~/research/CLAUDE.md` (thin
+  note), disk-cleanup config if needed for staging sweep.
 
-## Deliberately NOT built (each gated, per acting-rungs-gate-on-data)
+## Deliberately NOT built (gated)
 
 - Scheduled tick / file-watcher → gate: on-demand use proves something is worth waking for.
-- Auto-dispatching field research on gaps → gate: the authority ladder; v1 flags only.
-- Agent-performed edits/moves/deletes of existing files → gate: a clean additive track record
-  (the guard's compliance log IS that evidence, rung-style).
-- pgvector / embeddings / chunking / synonym files / typed link ontologies → gate: a FELT
-  "phrased-it-differently" miss (memory-second-brain §5); pg_trgm noted as the cheap substring
-  upgrade if ILIKE ever hurts.
-- Khoj / Onyx / LlamaIndex / Dataview-style adopted infra → wrong altitude (recon).
+- Auto-dispatching research on gaps → gate: authority ladder; v1 flags only.
+- Agent edits/moves/deletes of existing files (incl. merge-drafts, cut in r2) → gate: clean
+  additive track record (the guard's compliance log IS the evidence, rung-style).
+- OS-level sandboxing (sandbox-exec) → gate: only if the CLI enforcement test proves leaky AND
+  read-only v1 is insufficient.
+- pgvector / embeddings / chunking / synonym files / typed ontologies / computed-index
+  machinery → gate: felt misses (memory-second-brain §5); pg_trgm noted as the ILIKE upgrade.
+- Khoj / Onyx / LlamaIndex / Dataview-style infra → wrong altitude (recon).
 - Mini-side curator, phone recall, additional corpora → after `research/` proves the shape.
 
-## Open calls — round-1 verdicts (both reviewers) + resolution
+## Open calls — final resolutions after two rounds
 
-1. **Additive-Write vs read-only** → **Write ENABLED, guard-enforced** (oracle: yes; kilabz: only
-   with hard enforcement — the diff-audit + revert is that enforcement).
-2. **git init** → **MANDATORY** + baseline commit + wrapper-level diff audit (unanimous;
-   "init alone is not rollback" folded — the guard does baseline/audit/commit).
-3. **Recall freshness** → **YES**, specified: bounded ingest-primitive refresh, try-lock,
-   best-effort with explicit staleness note.
-4. **Model pin** → sonnet accepted; alias-not-frozen-ID noted (registry precedent).
-5. **Standalone `knowledge_doc`** → **YES** (unanimous — derived FTS index, not the facts ledger).
+1. **Additive-Write vs read-only** → **EVIDENCE-GATED**: Write enabled iff the enforcement ship
+   gate (out-of-tree/absolute/symlink/overwrite matrix) passes on the real CLI config;
+   otherwise v1 ships read-only + propose-only. (r2 kilabz conditional-yes and r2 oracle
+   revert-to-read-only impose the same condition; the test decides, not opinion.)
+2. **git init** → MANDATORY, as audit substrate + promote-commit target; rollback duties moved
+   OFF git (staging discard) per r2; hardened invocations, per-file adds, no drift blessing.
+3. **Recall freshness** → YES: bounded ingest-primitive refresh; hard-error scope semantics;
+   try-lock staleness note on read paths.
+4. **Model pin** → sonnet alias (registry precedent); provenance column stays declined.
+5. **Standalone `knowledge_doc`** → YES (unanimous, both rounds).
 
 ## Review history
 
-- **v0.1 → round 1 (2026-07-05):** oracle (agy/Gemini) 2 BLOCKER + 2 MAJOR + 1 MINOR + 1 NIT;
-  kilabz (codex) 4 BLOCKER + 9 MAJOR + 3 MINOR + 1 NIT. FOLDED: recall paradox (converged) →
-  guard pre-injection; constitution self-modification hole → repo-tracked policy; Write/Edit
-  authority illusion (converged) → deterministic diff-audit + revert + draft-only merges;
-  workdir fail-open → hard error; tombstones in current view → active view; missing doc_date;
-  static scope allowlist; model-generated OPERATIONS → diff-generated; slug validation; UTF-8/
-  NUL/tsvector-overflow handling; ladder bounds + ILIKE escaping; LINT → deterministic-first.
-  REFUTED/PUSHED BACK: oracle's "fenced file-reader" (a workspace actor reads its own corpus as
-  evidence; defense = authority bound + guard, and a fenced Read would break the job) and
-  oracle's 13.5MB LINT math (corpus is ~80KB; the metadata-first rule folded anyway on
-  principle); kilabz's "silently degrades to ad hoc Grep" (in-folder Grep at this scale is the
-  deliberate v1 local search, now documented).
+- **v0.1 → r1 (2026-07-05):** oracle 2B+2M+1MIN+1NIT; kilabz 4B+9M+3MIN+1NIT. Folded: recall
+  paradox → guard pre-injection; constitution self-modification → repo-tracked policy;
+  Write/Edit authority illusion → diff-audit; workdir fail-open → hard error; tombstone view;
+  doc_date; static scope allowlist; diff-generated OPERATIONS; slug validation; UTF-8/NUL/
+  overflow; ladder bounds; LINT deterministic-first. Refuted: fenced file-reader (workspace
+  actor reads its own evidence; a fenced Read breaks the job); 13.5MB LINT math (corpus ~80KB).
+- **v0.2 → r2 (2026-07-05):** kilabz 4B+7M+3MIN+1NIT; oracle 3B+3M. Folded: **staged-workspace
+  model** (kills read-exposure exfil, corpus-config injection, PR #39 reversal, git-reset
+  insufficiency, symlink class, concurrent-baseline races, human-drift destruction, crash/
+  SIGKILL bypass — eight findings, one mechanism); out-of-tree writes → enforcement SHIP GATE +
+  read-only fallback; unknown-scope hard-error everywhere; per-file adds + CAS promote; content
+  compliance checks (secrets/scan_injection/links); merge-drafts CUT for append-only update
+  briefs; index 0-byte vandalism → completeness validation; doc_date disagreement WARN;
+  rebuild=truncate+reingest; FTS test matrix. Refuted: computed-index-not-mutable-file (a map
+  is regenerable, not a ledger; v2 option recorded); `knowledgerecord.py` split "premature"
+  (mirrors `outcomes.py`/`outcomerecord.py` convention exactly); ledger model-provenance column
+  (declined on record in optimal-team-brief).
