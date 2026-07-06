@@ -278,3 +278,60 @@ def ilike_pattern(query: str) -> str:
     """%-wrapped ILIKE pattern with %/_/\\ escaped (wildcards in the query are literal)."""
     q = query[:QUERY_CAP_CHARS].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{q}%"
+
+
+# ---- deterministic index skeleton (the design's v2 "computed index"; a base the curator enriches)
+def _first_prose_line(body: str) -> str:
+    """First substantive line after the title/frontmatter — the deterministic one-line hook the
+    curator later replaces with a judged summary. Never a heading, fence, or list marker."""
+    in_fm = False
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "---":                    # frontmatter fence toggle
+            in_fm = not in_fm
+            continue
+        if in_fm or line.startswith(("#", "===", "```", "|", ">", "-", "*")):
+            continue
+        return re.sub(r"\s+", " ", line)[:140]
+    return ""
+
+
+def build_index_md(walk: WalkResult, *, title: str = "Research Corpus Index") -> str:
+    """Pure: render a deterministic map-of-content from a corpus walk. Docs grouped by YYYY-MM
+    (newest first), then an Undated group, then a non-md Assets list. Wikilinks use the .md
+    basename (matches the curator's link grammar). This is a SKELETON — the curator enriches each
+    hook with judgment and re-groups by topic; it is explicitly NOT a substitute for that."""
+    groups: dict[str, list[DocRecord]] = {}
+    undated: list[DocRecord] = []
+    for d in walk.docs:
+        if d.doc_date:
+            groups.setdefault(d.doc_date[:7], []).append(d)
+        else:
+            undated.append(d)
+    out = [f"# {title}", "",
+           "_Auto-generated skeleton (`mxr knowledge-index`). One-line hooks are the first prose "
+           "line of each brief — the curator replaces them with judged summaries and regroups by "
+           "topic._", ""]
+    for ym in sorted(groups, reverse=True):
+        out.append(f"## {ym}")
+        for d in sorted(groups[ym], key=lambda x: x.path, reverse=True):
+            stem = Path(d.path).stem
+            hook = _first_prose_line(d.body) or d.title
+            out.append(f"- [[{stem}]] ({d.doc_date}) — {hook}")
+        out.append("")
+    if undated:
+        out.append("## Undated")
+        for d in sorted(undated, key=lambda x: x.path):
+            stem = Path(d.path).stem
+            hook = _first_prose_line(d.body) or d.title
+            out.append(f"- [[{stem}]] — {hook}")
+        out.append("")
+    assets = [a for a in walk.artifacts if not a.lower().endswith(".md")]
+    if assets:
+        out.append("## Assets (not full-text indexed)")
+        for a in sorted(assets):
+            out.append(f"- {a}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"

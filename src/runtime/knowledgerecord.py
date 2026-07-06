@@ -90,6 +90,20 @@ async def rebuild(scope: str) -> int:
     return 0
 
 
+def index_skeleton(scope: str) -> int:
+    """`mxr knowledge-index --scope X` — emit a deterministic map-of-content skeleton to stdout
+    (no LLM, no folder write). Walks the corpus, groups by month, one prose-line hook per brief +
+    an Assets list. The curator enriches it with judgment; useful STANDALONE when the live curator
+    is unavailable (e.g. credit-blocked). Redirect it into the corpus yourself, or let the curator
+    own index.md once enabled."""
+    root = knowledge.resolve_scope(scope)            # ValueError -> exit 2
+    walk = knowledge.walk_corpus(root)
+    for w in walk.warnings:
+        log(f"{scope}: {w}")
+    sys.stdout.write(knowledge.build_index_md(walk))
+    return 0
+
+
 async def recall_hits(led: PostgresLedger, scope: str, query: str, k: int,
                       *, refresh: bool = True) -> tuple[str, list[dict]]:
     """The ladder against the ACTIVE view. Returns (rung_name, hits). Refresh-first is the
@@ -173,6 +187,16 @@ def recall_main(argv: list) -> int:
         log("empty query"); return 2
     try:
         return asyncio.run(recall(a.scope, a.query, max(1, min(a.k, 50)), a.fenced))
+    except ValueError as e:
+        log(str(e)); return 2
+
+
+def index_main(argv: list) -> int:
+    p = argparse.ArgumentParser(prog="knowledge-index")
+    _scope_arg(p)
+    a = p.parse_args(argv[1:])
+    try:
+        return index_skeleton(a.scope)
     except ValueError as e:
         log(str(e)); return 2
 

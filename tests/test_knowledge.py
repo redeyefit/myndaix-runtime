@@ -160,6 +160,36 @@ def test_index_violations():
 
 
 # ---- recall helpers ---------------------------------------------------------------------------
+def test_build_index_md():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "2026-07-04-wedge.md").write_text(
+            "---\ndate: 2026-07-04\n---\n# Wedge\n\nMarket wedge research for construction comms.\n")
+        (root / "2026-06-08-scraper.md").write_text("# Scraper\n\nModel update scraper notes.\n")
+        (root / "higgsfield-dop.md").write_text("# DoP motions\n\nCamera preset shortlist.\n")
+        (root / "catalog.json").write_text("{}")
+        walk = knowledge.walk_corpus(root)
+        md = knowledge.build_index_md(walk)
+        ok(md.startswith("# Research Corpus Index"), "titled index")
+        ok("## 2026-07" in md and "## 2026-06" in md, "grouped by month")
+        ok(md.index("## 2026-07") < md.index("## 2026-06"), "newest month first")
+        ok("[[2026-07-04-wedge]] (2026-07-04) — Market wedge research for construction comms."
+           in md, "dated entry: wikilink + date + prose hook")
+        ok("## Undated" in md and "[[higgsfield-dop]] — Camera preset shortlist." in md,
+           "undated group uses prose hook, no date")
+        ok("## Assets (not full-text indexed)" in md and "- catalog.json" in md,
+           "assets listed separately")
+        ok("catalog.json" not in md.split("## Assets")[0], "asset not in the doc groups")
+
+
+def test_first_prose_line():
+    ok(knowledge._first_prose_line("---\ndate: x\n---\n# Title\n\nReal first line.\n")
+       == "Real first line.", "skips frontmatter + heading")
+    ok(knowledge._first_prose_line("# Only A Heading\n## Sub\n") == "", "no prose -> empty")
+    ok(knowledge._first_prose_line("# T\n- a list item\n> quote\nprose here")
+       == "prose here", "skips list/quote markers")
+
+
 def test_query_helpers():
     ok(knowledge.prefix_tokens("Higgsfield API pricing!") == ["higgsfield", "api", "pricing"],
        "prefix tokens sanitized + lowered")
