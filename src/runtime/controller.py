@@ -422,8 +422,19 @@ def trigger_review(repo: Repo, head: str, base: str) -> bool:
 
 
 # -- per-repo decision (level-triggered reconcile) -----------------------------
-def _done(sha: str) -> bool:
-    return (STATE / f"done-{sha}").exists()
+def _done_marker(repo: Repo, ref: str, sha: str) -> Path:
+    # Scoped done-<repo>-<ref>-<sha>: a bare done-<sha> was GLOBAL — the SAME bug class already
+    # fixed for _transient_marker below. This marker drives the cursor ADVANCE (marks code as
+    # reviewed), so a collision is worse than the transient one: two watched repos sharing a commit
+    # sha (forks/mirrors), or a force-push re-introducing a sha against a DIFFERENT base within
+    # PRUNE_DAYS, could cross-claim "reviewed $sha" and advance the cursor PAST unreviewed code.
+    # Scoped identically to _transient_marker so the worker's mark_done ("done-$marker_slug-$tip")
+    # matches; _slug MUST stay identical to the worker's bash substitution (contract-tested).
+    return STATE / f"done-{_slug(Path(repo.path).name)}-{_slug(ref)}-{sha}"
+
+
+def _done(repo: Repo, ref: str, sha: str) -> bool:
+    return _done_marker(repo, ref, sha).exists()
 
 
 def _diff_lines(repo: Repo, base: str, head: str) -> Optional[int]:
@@ -935,7 +946,7 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     # (branch-move-proof) without ls-remote or a PLAY_FORCE_DONE bypass.
     if cur and cur["pending_sha"]:
         ps = cur["pending_sha"]
-        if _done(ps):
+        if _done(repo, ref, ps):
             # anchor the new base against gc BEFORE advancing onto it; if the object is
             # somehow gone, don't advance onto an unpinnable sha (would wedge cat-file).
             if not _pin(repo, _ctl_reviewed_ref(ref), ps):
@@ -953,7 +964,7 @@ async def process_repo(led: PostgresLedger, repo: Repo, budget: list[int]) -> No
     # non-transient failures. A streak of forgives without a delivery surfaces the outage to
     # Jefe ONCE (== so re-alerts need a new streak), but NEVER blocks — retrying a canary is
     # cheap and self-heals when the pool does.
-    if cur and cur["pending_sha"] and not _done(cur["pending_sha"]):
+    if cur and cur["pending_sha"] and not _done(repo, ref, cur["pending_sha"]):
         ps = cur["pending_sha"]
         if await _try_forgive_transient(led, repo, rid, ref, ps):
             log(f"{rid}: transient abort on {ps[:8]} — attempt refunded, slot released")

@@ -32,6 +32,10 @@ BASE_REF="main"                                     # a new branch's first push 
 MAX_DIFF="${PLAY_MAX_DIFF:-262144}"                 # 256KB default, tunable per-push: PLAY_MAX_DIFF=N git push. Over-cap
                                                     # FAILS fast. The models eat the input fine; the real ceiling is the
                                                     # ~300s/agent budget, so a giant push can still time out — split those.
+[[ "$MAX_DIFF" =~ ^[0-9]+$ ]] || MAX_DIFF=262144
+MAX_DIFF=$((10#$MAX_DIFF))                          # base-10: a leading-zero PLAY_MAX_DIFF ("0300000") would octal-shrink
+                                                    # the cap, or (with an 8/9 digit) crash the [[ -le ]] test — same
+                                                    # trap already closed for MAX_DIFF_LINES/RCT_PUSH below.
 MAX_DIFF_LINES="${PLAY_MAX_DIFF_LINES:-2000}"       # changed-lines cap (numstat added+deleted, binary files count 0): a
                                                     # ~3400-line range timed kilabz out at the full 600s REVIEW_CALL_TIMEOUT
                                                     # (2026-07-02) — abort in SECONDS instead of burning canary + 600s. The
@@ -43,6 +47,8 @@ MAX_DIFF_LINES=$((10#$MAX_DIFF_LINES))              # force base-10: a leading z
                                                     # make [[ -le ]] arithmetic parse it as (invalid) octal
 ERR_CAP=1000000
 DAILY_CAP="${PLAY_DAILY_CAP:-50}"                   # override per-run: PLAY_DAILY_CAP=N git push
+[[ "$DAILY_CAP" =~ ^[0-9]+$ ]] || DAILY_CAP=50
+DAILY_CAP=$((10#$DAILY_CAP))                         # base-10: "09" would crash the [[ -ge ]] arithmetic (octal trap)
 STALE="${PLAY_STALE:-}"                             # lock-reap threshold — DERIVED + validated in the WORKER
                                                     # section, AFTER the review-call timeout is finalized, so a
                                                     # raised PLAY_REVIEW_CALL_TIMEOUT can't outrun the reaper
@@ -163,6 +169,10 @@ clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }   # strip C0 + DEL; 
 
 deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits the fallback
   local subj="$1" body="$2" f="$INBOX/$(date +%Y%m%d%H%M%S)-$play.md" msg
+  # strip C0/DEL (incl. ESC) from the reviewer/triage LLM output before it lands in the jefe
+  # inbox file — the diff steering that text is untrusted, and the verdict is later cat'd/relayed
+  # in a terminal, so an escape sequence could repaint/hide the report. Mirrors play-fix deliver().
+  body="$(printf '%s' "$body" | clean)"
   if ! printf '# %s\n\nplay: %s\nref: %s\nrange: %s..%s\n\n===BEGIN VERDICT nonce=%s===\n%s\n===END VERDICT nonce=%s===\n' \
         "$subj" "$play" "$ref" "$base" "$tip" "$nonce" "$body" "$nonce" > "$f" 2>/dev/null; then
     printf '[%s] INBOX WRITE FAILED — verdict follows:\n%s\n' "$play" "$body" >&2
@@ -227,7 +237,7 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
 # captured ONCE in the main flow (never re-calls confirm_pushed — a 2nd ls-remote under the held
 # lock can wedge all reviews). pre-push fires before git confirms acceptance, so a rejected push
 # must stay re-reviewable.
-mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$tip" 2>/dev/null || true; }
+mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true; }
 
 # autofix_fire — PLAY_AUTOFIX bridge: auto-trigger play-fix.sh on a NEEDS-FIX verdict. Fail-CLOSED:
 # every guard must pass or it no-ops (the always-present manual hint is the fallback). It NEVER
@@ -330,7 +340,7 @@ find "$STATE" -maxdepth 1 -type f -mtime +"$PRUNE_DAYS" -delete 2>/dev/null || t
 
 # --- dedupe (only SUCCESS marks done; transient aborts intentionally retry next push) ---
 #     gate mode skips this: it needs a FRESH verdict for THIS run (automerge dedups itself).
-if ! gate && [[ -e "$STATE/done-$tip" ]]; then note dedupe "already reviewed $tip"; exit 0; fi
+if ! gate && [[ -e "$STATE/done-$marker_slug-$tip" ]]; then note dedupe "already reviewed $tip"; exit 0; fi
 
 # --- daily cap: numeric-guarded check now; CHARGE only when a real review runs ---
 #     gate mode is decoupled from the push-review DAILY_CAP (automerge has its own caps).
