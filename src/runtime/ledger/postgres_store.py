@@ -1567,3 +1567,177 @@ class PostgresLedger:
             "precision": [dict(r) for r in prec],
             "open_count": open_n,
         }
+
+    # ---- knowledge (the curator rung's derived FTS index) — docs/curator-design.md v0.4 ---------
+    # Append-only + computed views (finding_outcome's discipline). Files are the source of truth;
+    # these verbs keep the DERIVED index in step. Per-scope mutual exclusion = a 2-int advisory
+    # lock (constant, hashtext(scope)) so concurrent ingests/curates serialize per corpus, not
+    # globally. Idempotency = compare-current-before-insert (NOT a unique index — that would ghost
+    # a restore-after-archive of identical content).
+
+    _KNOWLEDGE_LOCK_KEY = 0x6D78724B    # 'mxrK' (int4) — key1 of the (key1, hashtext(scope)) pair
+
+    @staticmethod
+    def _knowledge_date(iso: Optional[str]) -> Optional[_dt.date]:
+        """Defensive ISO->date: a filename like 2026-13-99-x.md parses the REGEX but not a real
+        date — store NULL rather than crash the ingest."""
+        if not iso:
+            return None
+        try:
+            return _dt.date.fromisoformat(iso)
+        except ValueError:
+            return None
+
+    async def knowledge_sync(self, scope: str, docs: list[dict],
+                             *, tombstone_missing: bool = True) -> dict:
+        """Bring the derived index in step with a walked corpus: INSERT a new event row per
+        changed/new doc, tombstone rows for docs gone from disk, skip unchanged (idempotent —
+        a re-run inserts nothing). `docs`: knowledge.DocRecord dicts. All appends, in ONE
+        transaction under the per-scope advisory xact lock."""
+        inserted = tombstoned = unchanged = 0
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                                  self._KNOWLEDGE_LOCK_KEY, scope)
+                cur = {r["path"]: (r["content_sha"], r["status"]) for r in await con.fetch(
+                    "SELECT path, content_sha, status FROM knowledge_doc_current WHERE scope = $1",
+                    scope)}
+                seen: set[str] = set()
+                for d in docs:
+                    seen.add(d["path"])
+                    prev = cur.get(d["path"])
+                    if prev == (d["content_sha"], "active"):
+                        unchanged += 1
+                        continue
+                    await con.execute(
+                        """INSERT INTO knowledge_doc
+                               (id, scope, path, title, tags, doc_date, body, content_sha,
+                                status, lossy)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)""",
+                        _new_id(), scope, d["path"], d.get("title", ""), d.get("tags", ""),
+                        self._knowledge_date(d.get("doc_date")), d.get("body", ""),
+                        d["content_sha"], bool(d.get("lossy")))
+                    inserted += 1
+                if tombstone_missing:
+                    for path, (_, status) in cur.items():
+                        if status == "active" and path not in seen:
+                            await con.execute(
+                                """INSERT INTO knowledge_doc
+                                       (id, scope, path, body, content_sha, status)
+                                   VALUES ($1,$2,$3,'','absent','archived')""",
+                                _new_id(), scope, path)
+                            tombstoned += 1
+        return {"inserted": inserted, "tombstoned": tombstoned, "unchanged": unchanged}
+
+    async def knowledge_rebuild_tombstones(self, scope: str) -> int:
+        """The admin rebuild's first half (mxr knowledge-rebuild): archive-tombstone EVERY active
+        doc in the scope — all appends, never TRUNCATE (the derived table still honors the ledger
+        discipline). The verb re-ingests from disk right after."""
+        n = 0
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                                  self._KNOWLEDGE_LOCK_KEY, scope)
+                for r in await con.fetch(
+                        "SELECT path FROM knowledge_doc_active WHERE scope = $1", scope):
+                    await con.execute(
+                        """INSERT INTO knowledge_doc
+                               (id, scope, path, body, content_sha, status)
+                           VALUES ($1,$2,$3,'','absent','archived')""",
+                        _new_id(), scope, r["path"])
+                    n += 1
+        return n
+
+    async def knowledge_recall_fts(self, scope: str, query: str, k: int) -> list[dict]:
+        """Ladder rung 1: websearch_to_tsquery (never raises on arbitrary text — the right entry
+        point for LLM-issued queries). ts_rank_cd(...,1) = cover density with mild length damping;
+        ts_headline ONLY over the top-k subselect (computing it pre-LIMIT re-parses every row —
+        the classic FTS perf bug)."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT path, title, doc_date, lossy, rank,
+                          ts_headline('english', body, q,
+                                      'MaxWords=30, MinWords=10, MaxFragments=2') AS headline
+                     FROM (SELECT path, title, doc_date, lossy, body, q,
+                                  ts_rank_cd(tsv, q, 1) AS rank
+                             FROM knowledge_doc_active,
+                                  websearch_to_tsquery('english', $2) AS q
+                            WHERE scope = $1 AND tsv @@ q
+                            ORDER BY rank DESC, path
+                            LIMIT $3) hits""",
+                scope, query, k)
+        return [dict(r) for r in rows]
+
+    async def knowledge_recall_prefix(self, scope: str, tokens: list[str], k: int) -> list[dict]:
+        """Ladder rung 2 (zero FTS hits): prefix-match sanitized tokens — to_tsquery is the only
+        parser that can express `tok:*`, and it ONLY ever sees knowledge.prefix_tokens output
+        (conservative charset), never raw query text."""
+        if not tokens:
+            return []
+        tsq = " & ".join(f"{t}:*" for t in tokens)
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT path, title, doc_date, lossy, rank,
+                          ts_headline('english', body, q,
+                                      'MaxWords=30, MinWords=10, MaxFragments=2') AS headline
+                     FROM (SELECT path, title, doc_date, lossy, body, q,
+                                  ts_rank_cd(tsv, q, 1) AS rank
+                             FROM knowledge_doc_active,
+                                  to_tsquery('english', $2) AS q
+                            WHERE scope = $1 AND tsv @@ q
+                            ORDER BY rank DESC, path
+                            LIMIT $3) hits""",
+                scope, tsq, k)
+        return [dict(r) for r in rows]
+
+    async def knowledge_recall_ilike(self, scope: str, pattern: str, k: int) -> list[dict]:
+        """Ladder rung 3 (still nothing): substring over title+body — catches code tokens/paths
+        (`play-review`, `mxr`) that FTS lexemes structurally can't. Pattern comes pre-escaped from
+        knowledge.ilike_pattern. Seq scan is fine at this scale; pg_trgm is the recorded upgrade."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                r"""SELECT path, title, doc_date, lossy,
+                           NULL::float AS rank, left(body, 200) AS headline
+                      FROM knowledge_doc_active
+                     WHERE scope = $1
+                       AND (title ILIKE $2 ESCAPE '\' OR body ILIKE $2 ESCAPE '\')
+                     ORDER BY doc_date DESC NULLS LAST, path
+                     LIMIT $3""",
+                scope, pattern, k)
+        return [dict(r) for r in rows]
+
+    def knowledge_scope_lock(self, scope: str) -> "_KnowledgeScopeLock":
+        """Session-scoped per-corpus mutex for the curate PROMOTE window (filesystem + git writes
+        coordinate through the SAME advisory key pair the sync verbs use, so a promote and an
+        ingest can never interleave). Usage: `async with led.knowledge_scope_lock(scope): ...`.
+        NOT held across the LLM wait — design v0.4 lock discipline."""
+        return _KnowledgeScopeLock(self._pool, self._KNOWLEDGE_LOCK_KEY, scope)
+
+
+class _KnowledgeScopeLock:
+    """Holds one pooled connection with pg_advisory_lock(key, hashtext(scope)) for the duration
+    of the `async with` block; unlock + release are guaranteed on exit."""
+
+    def __init__(self, pool: asyncpg.Pool, key: int, scope: str):
+        self._pool, self._key, self._scope = pool, key, scope
+        self._con: Optional[asyncpg.Connection] = None
+
+    async def __aenter__(self) -> "_KnowledgeScopeLock":
+        self._con = await self._pool.acquire()
+        try:
+            await self._con.execute("SELECT pg_advisory_lock($1, hashtext($2))",
+                                    self._key, self._scope)
+        except Exception:
+            await self._pool.release(self._con)
+            self._con = None
+            raise
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._con is not None:
+            try:
+                await self._con.execute("SELECT pg_advisory_unlock($1, hashtext($2))",
+                                        self._key, self._scope)
+            finally:
+                await self._pool.release(self._con)
+                self._con = None

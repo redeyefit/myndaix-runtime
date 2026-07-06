@@ -127,6 +127,67 @@ def test_cli_with_worktree_runs_there_and_is_preserved():
         shutil.rmtree(wt, ignore_errors=True)
 
 
+# -- staging_cwd (curator): a per-agent, namespace-BOUND cwd. Honored ONLY for a staging_cwd
+#    adapter AND only inside the staging root; every other agent ignores context.workdir (the
+#    PR #39 scratch-cwd invariant stays closed). Fail-closed to TERMINAL, never scratch-fallback.
+
+def _staging_spec():
+    return AgentSpec(agent_id="curator", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["/bin/pwd"], "prompt_channel": "stdin",
+                              "staging_cwd": True})
+
+
+def test_staging_cwd_runs_in_declared_staging_dir(monkeypatch=None):
+    import runtime.runner as R
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        wd = os.path.join(sroot, "curate-x")
+        os.mkdir(wd)
+        job = _job()
+        job.context = {"workdir": wd}
+        r = asyncio.run(R.invoke_cli(_staging_spec(), job))
+        assert r.status is ResultStatus.OK, r.text
+        assert os.path.realpath(r.text.strip()) == os.path.realpath(wd)
+        assert os.path.isdir(wd)                             # runner must NOT remove the staged dir
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+
+
+def test_staging_cwd_rejects_out_of_namespace():
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    outside = tempfile.mkdtemp(prefix="mdx-test-outside.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        for bad in (outside, os.path.join(sroot, "..", "escape"), "", sroot):
+            job = _job()
+            job.context = {"workdir": bad}
+            r = asyncio.run(runner.invoke_cli(_staging_spec(), job))
+            # a workdir outside the namespace (or the root itself) is TERMINAL — never a scratch
+            # fallback (a curator without its staged corpus must fail, not answer from nothing).
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, \
+                f"workdir {bad!r} should be rejected, got {r.status}"
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_staging_cwd_flag_absent_ignores_workdir():
+    # the invariant: an agent WITHOUT staging_cwd never honors context.workdir — it still gets a
+    # fresh scratch cwd (PR #39). Prevents a future roster row from opting into an arbitrary cwd.
+    serve_cwd = os.path.realpath(os.getcwd())
+    job = _job()
+    job.context = {"workdir": "/etc"}
+    r = asyncio.run(runner.invoke_cli(_spec(["/bin/pwd"], "stdin"), job))
+    assert r.status is ResultStatus.OK, r.text
+    ran_in = os.path.realpath(r.text.strip())
+    assert ran_in != "/etc" and ran_in != serve_cwd
+    assert os.path.basename(ran_in).startswith("mdx-cli-cwd.")
+
+
 # -- P2 env scrub: a CLI subprocess must NOT inherit sibling agents' secrets ----
 
 def _printenv_run(spec):
