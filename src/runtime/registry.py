@@ -131,27 +131,27 @@ V1_ROSTER: list[AgentSpec] = [
               # opt into an arbitrary cwd (PR #39 invariant; curator-design v0.4 r3). The REAL
               # write boundary is the guard's diff-audit + the runtime-authored path-scoped
               # .claude/settings.json it writes into staging; these argv flags are the belt.
-              # TOOL CONTROL (BUILD FINDING 2026-07-06, gate-proven). Every tool name is its OWN
-              # argv element — a single space-joined string parses as ONE tool name matching
-              # nothing (the shipped-but-non-functional bug). Two non-obvious facts learned by
-              # probing the real CLI: (1) --allowedTools is a pre-APPROVAL list, NOT a hard
-              # whitelist — Write/Edit are DEFAULT-AVAILABLE in headless -p even when omitted, so
-              # read-only REQUIRES an explicit --disallowedTools Write Edit (omitting them let the
-              # agent write). (2) claude's cwd-confinement stops BASH escaping, but the Write TOOL
-              # can write an absolute out-of-tree path — so a naive "allow Write" leaks; Write-
-              # enablement needs real path-scoping (the staging settings.json tried this via
-              # Write(./**) but its Read(/**) deny-glob self-denied in-tree reads — so NO settings
-              # is authored, and Write stays GATED pending a working scope). Bash/WebFetch/Task are
-              # hard-denied. SHIPPING READ-ONLY (proven safe+functional: read works; write/bash/net/
-              # out-of-tree all denied). Enabling Write is NOT a simple flag flip — see the design
-              # BUILD FINDING for the open Write-tool-path-scoping problem.
+              # TOOL CONFINEMENT (BUILD FINDING 2026-07-06, gate-proven under a HOSTILE HOME;
+              # cross-family reviewed). Every tool name is its OWN argv element. Three layers:
+              #  1. `--tools Read Glob Grep` — the HARD built-in whitelist (NOT --allowedTools,
+              #     which is only pre-APPROVAL: Write/Bash are default-available under it). --tools
+              #     makes ONLY these three built-ins exist; write/bash/net are unavailable. Proven
+              #     to hold even when an inherited ~/.claude/settings.json allows everything.
+              #  2. `--strict-mcp-config` — ignore ALL inherited MCP servers (the operator's real
+              #     ~/.claude.json has ~22, incl. filesystem/firecrawl/github — a read-only-sandbox
+              #     BYPASS; the cross-family BLOCKER). Proven: a hostile MCP server is NOT spawned.
+              #  3. scratch_home (runner) — an EMPTY throwaway HOME (claude auths via the env token),
+              #     so NO inherited ~/.claude settings/hooks/MCP-config load at all (belt; also
+              #     blocks inherited HOOKS that 1+2 don't cover).
+              # SHIPPING READ-ONLY (write/bash/net/out-of-tree/MCP all denied; in-tree read works).
+              # TO ENABLE WRITE: add "Write", "Edit" to --tools — but that reopens the out-of-tree
+              # Write-TOOL leak (Write isn't cwd-confined like Bash), so Write stays GATED pending a
+              # working path-scope (the promote guard only bounds IN-tree; see design BUILD FINDING).
               profile=Profile(timeout_s=600),
               adapter={"kind": "cli",
                        "argv": ["claude", "-p", "--model", "sonnet", "--output-format", "text",
-                                "--allowedTools", "Read", "Glob", "Grep",
-                                "--disallowedTools", "Write", "Edit", "Bash", "WebFetch",
-                                "WebSearch", "Task", "NotebookEdit"],
-                       "prompt_channel": "stdin", "staging_cwd": True,
+                                "--tools", "Read", "Glob", "Grep", "--strict-mcp-config"],
+                       "prompt_channel": "stdin", "staging_cwd": True, "scratch_home": True,
                        "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
               model="sonar-pro+claude", role="research (read-only)",

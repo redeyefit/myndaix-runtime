@@ -117,11 +117,13 @@ def stage_in(root: Path, walk: knowledge.WalkResult, *, op: str) -> tuple[Path, 
 
     NO .claude/settings.json is authored (BUILD FINDING 2026-07-06, gate-proven): its
     Read(/**)/Write(/**) deny-globs matched in-tree files too (claude resolves to absolute paths)
-    and self-denied the agent's own read/write. Tool confinement is the registry's SEPARATE-ARG
-    --allowedTools whitelist, which is authoritative — it shadows any inherited parent
-    ~/.claude/settings.json (a permissive global can't add Bash back) and can't be widened by a
-    staging settings.json. Out-of-tree writes are denied by claude's cwd-confinement; the
-    deterministic promote guard is the real write boundary."""
+    and self-denied the agent's own read/write. Tool confinement lives in the registry adapter:
+    the HARD `--tools Read Glob Grep` built-in whitelist (write/bash/net tools don't exist for the
+    agent — holds even under a hostile inherited ~/.claude/settings.json), `--strict-mcp-config`
+    (no inherited MCP servers), and the runner's scratch_home (empty HOME → no inherited settings/
+    hooks/MCP). Read-only means out-of-tree writes are moot (no write tool); the deterministic
+    promote guard is the write boundary if/when Write is enabled (cwd-confinement only bounds
+    Bash, NOT the Write tool)."""
     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
     tok = uuid.uuid4().hex[:8]
     ts = _dt.datetime.now().strftime("%Y%m%d%H%M%S")

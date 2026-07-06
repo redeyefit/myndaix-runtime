@@ -90,29 +90,37 @@ _SCRATCH_HOME_SEED = {"codex": (".codex", ("auth.json", "config.toml"))}
 
 
 def _make_scratch_home(spec: AgentSpec, env: dict[str, str]) -> tuple[dict[str, str], Optional[str]]:
-    """For an agent declaring adapter.scratch_home, run it under a private throwaway HOME
-    seeded with ONLY its auth material — so a workspace-actor that writes code (codex fix
-    stage) can't read the operator's ~/.ssh, ~/.aws, ~/.myndaix, or other host dotfiles via
-    an injected fix-list. Returns (env, scratch_dir_to_cleanup_or_None). Falls back to the
-    unmodified env if the auth source is missing (auth would fail either way; don't half-break)."""
+    """For an agent declaring adapter.scratch_home, run it under a private throwaway HOME so it
+    can't read the operator's ~/.ssh/~/.aws/~/.myndaix (codex fix stage) AND — for the curator —
+    can't INHERIT the operator's ~/.claude customizations: MCP servers (22 of them, incl.
+    filesystem/firecrawl/github — a read-only-sandbox bypass), hooks, and permission grants
+    (cross-family review BLOCKER 2026-07-06). Two modes by seed:
+      - SEEDED (codex): copy the agent's auth files into the scratch HOME (env key alone 401s).
+      - EMPTY (claude/curator): no seed — claude auths via CLAUDE_CODE_OAUTH_TOKEN (env), so an
+        EMPTY HOME is the isolation (nothing under ~/.claude to inherit).
+    Returns (env, scratch_dir_to_cleanup_or_None). A seeded agent with missing auth falls back
+    unmodified (auth would fail either way; don't half-break)."""
     if not spec.adapter.get("scratch_home"):
         return env, None
+    home = tempfile.mkdtemp(prefix="mdx-scratchhome-")
     cfgdir, files = _SCRATCH_HOME_SEED.get(spec.agent_id, (None, ()))
-    real = os.environ.get("CODEX_HOME") if spec.agent_id == "codex" else None
-    real = real or (os.path.join(os.path.expanduser("~"), cfgdir) if cfgdir else None)
-    if not real or not os.path.isfile(os.path.join(real, files[0] if files else "")):
-        return env, None                       # no auth to seed -> leave env as-is (fail visibly later)
-    home = tempfile.mkdtemp(prefix="mdx-fixhome-")
-    dst = os.path.join(home, cfgdir)
-    os.makedirs(dst, mode=0o700, exist_ok=True)
-    for f in files:
-        src = os.path.join(real, f)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(dst, f))
+    if cfgdir:                                   # SEEDED mode (codex): copy auth into the scratch HOME
+        real = os.environ.get("CODEX_HOME") if spec.agent_id == "codex" else None
+        real = real or os.path.join(os.path.expanduser("~"), cfgdir)
+        if not os.path.isfile(os.path.join(real, files[0] if files else "")):
+            shutil.rmtree(home, ignore_errors=True)
+            return env, None                     # no auth to seed -> leave env as-is
+        dst = os.path.join(home, cfgdir)
+        os.makedirs(dst, mode=0o700, exist_ok=True)
+        for f in files:
+            src = os.path.join(real, f)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(dst, f))
+    # else EMPTY mode: nothing seeded — the empty HOME IS the isolation (claude auths via env token)
     env = dict(env)
     env["HOME"] = home
-    # force the agent to resolve its config under the scratch HOME, not a host override
-    for k in ("CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+    # force config resolution under the scratch HOME, not a host override
+    for k in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
         env.pop(k, None)
     return env, home
 
