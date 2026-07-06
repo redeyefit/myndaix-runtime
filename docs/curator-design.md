@@ -1,8 +1,10 @@
 # Curator v1 — DESIGN (research/ → the first folder-agent)
 
-_Status: v0.3 — cross-family rounds 1+2 folded (r1: oracle 2B+2M, kilabz 4B+9M; r2: kilabz 4B+7M,
-oracle 3B+3M — r2 drove the STAGED-WORKSPACE model and the evidence-gated Write decision).
-For round-3 review, then Jefe plan approval. Recon: workflow `wf_357e9782` (2026-07-05).
+_Status: v0.4 — cross-family rounds 1+2+3 folded (r1/r2 reshaped the architecture: staged
+workspace + evidence-gated Write; r3 was architecture-clean — spec tightening only: path-scoped
+staging permissions, reads in the ship gate, lock released during LLM wait, tombstone rebuild).
+DESIGN CONVERGED — remaining contested claims are build-time test questions (the ship gate), not
+doc questions. Awaiting Jefe plan approval. Recon: workflow `wf_357e9782` (2026-07-05).
 Review history at the bottom._
 
 ## What
@@ -34,8 +36,10 @@ flags" in r1; "in-place git guard" in r2). v0.3's model: **the agent never touch
 corpus at all.** It works in a disposable staging copy; a deterministic guard decides what, if
 anything, comes back.
 
-**`mxr curate "<task>"` (special verb, `src/runtime/curate.py`), all mutation steps under ONE
-per-scope advisory lock (baseline → promote → commit; the LLM wait itself doesn't block reads):**
+**`mxr curate "<task>"` (special verb, `src/runtime/curate.py`). Lock discipline (r3 oracle):
+the per-scope advisory lock is held for snapshot/refresh, RELEASED during the LLM wait (a 600s
+corpus freeze for a read-mostly system is an anti-pattern), and re-acquired for CAS + promote +
+commit — the CAS makes the long hold redundant; concurrent promotes still serialize:**
 
 1. **Scope resolve (fail-closed):** scope→root from a STATIC allowlist in code/env. Unknown
    scope = hard error — everywhere, ingest AND recall (r2: empty-on-unknown was a fail-open
@@ -47,13 +51,21 @@ per-scope advisory lock (baseline → promote → commit; the LLM wait itself do
    mid-task follow-ups it uses `Grep`/`Read` inside the staging copy — deliberate v1 local
    search).
 4. **Stage-in:** build a fresh scratch workspace containing ONLY the ingest-eligible file set
-   (same noise-globs; regular files only — symlinks/hardlinks/non-regular entries are never
-   copied) + `index.md`. A sha manifest of the live corpus is recorded for CAS at promote time.
-   No dotfiles, no `.claude*`, no `.git`, no logs — the read boundary IS the copy (r2 kilabz
-   BLOCKER: reply text and new files are exfil channels; secrets-bearing noise never enters the
-   workspace). Nothing config-loadable exists in the cwd (r2 oracle BLOCKER: corpus-local
-   `.claude.json`/`.env` injection — defused because the runtime builds the cwd). This PRESERVES
-   PR #39's fresh-controlled-cwd rule rather than reopening it.
+   (same noise-globs; regular files with `st_nlink == 1` only — symlinks AND multi-linked
+   regular files are skipped with a warning, r3 kilabz: hardlinks are regular files) +
+   `index.md` + a runtime-generated `MANIFEST.txt` (deterministic listing of ALL corpus
+   artifacts incl. non-md names/sizes, so the agent can index assets it cannot read). Canonical
+   path policy applies at stage-in and ingest: NFC-normalize, reject control chars/newlines in
+   names (skip + warn), case-insensitive collision → warn, first wins (APFS is
+   case-insensitive). A sha manifest of the live corpus is recorded for CAS at promote time.
+   No dotfiles, no `.claude*` from the corpus, no `.git`, no logs — the read boundary IS the
+   copy (r2 kilabz BLOCKER: reply text and new files are exfil channels). The runtime then
+   writes its OWN `.claude/settings.json` into staging with **path-scoped permissions**
+   (`allow: Read(./**), Write(./**), Edit(./**), Glob, Grep; deny: Bash, WebFetch, WebSearch,
+   Task, all MCP`) — trusted config because the runtime authored it (r3: a bare `Write`
+   allowlist entry may pre-approve absolute paths; declarative path scoping is the native
+   mechanism, verified by the ship gate). Corpus-local config injection stays dead (r2 oracle)
+   and PR #39's fresh-controlled-cwd rule is preserved.
 5. **Dispatch:** pool job to the `curator` agent, `workdir` = the staging dir, prompt =
    repo-tracked constitution + task + fenced recall hits. Wait on the ledger.
 6. **Promote (the enforcement):** diff staging against the stage-in manifest.
@@ -65,13 +77,19 @@ per-scope advisory lock (baseline → promote → commit; the LLM wait itself do
    points at an existing file, non-empty (a 0-byte "edit" fails completeness — r2 oracle).
    ANYTHING else → the run is **NONCOMPLIANT**: nothing is promoted, the staging dir is kept for
    inspection, the offending diff is reported. Compliant changes are applied to the live corpus
-   by atomic per-file rename, CAS-checked against the manifest (live corpus changed underneath →
+   under a **promote journal** (r3 kilabz: per-file rename is atomic, the SET isn't — the
+   journal is written before the first apply and terminally marked after commit; a later curate
+   finding an unterminated journal reports the incomplete promote deterministically):
+   atomic per-file rename, CAS-checked against the manifest (live corpus changed underneath →
    abort promote, report conflict — human mid-run edits are never clobbered, r2 oracle
-   UNDER-ENG), then committed with **per-file `git add`** (human drift is NEVER folded into
-   curator commits — r2 kilabz; a dirty repo is reported, not silently blessed) using hardened
-   git invocations (`-c core.hooksPath=` — no hook execution).
+   UNDER-ENG). **Dirty-repo preflight (r3 kilabz):** dirty/untracked state is reported; promote
+   proceeds only if NO curator target path (new filenames + `index.md`) collides with a
+   dirty/untracked path — collision aborts. Commit is **per-file `git add`** (human drift is
+   NEVER folded into curator commits) using hardened git invocations (`-c core.hooksPath=`).
 7. **Report:** the agent's reply + a deterministic `OPERATIONS:` section generated from the
-   promote diff (model claims are narrative, never the audit record) + compliance status.
+   promote diff (model claims are narrative, never the audit record) + compliance status +
+   provenance line (`claude --version`, model argv — r3 both families: committed outputs need
+   auditable provenance; satisfied in the report, not a schema column).
 
 **Crash/timeout semantics (r2 oracle MAJOR):** agent writes only ever land in staging, so a
 SIGKILL'd job, a host restart, or a dead guard process leaves the live corpus UNTOUCHED — worst
@@ -79,16 +97,20 @@ case is an orphaned staging dir (namespaced `curate-<scope>-<play>`, swept by th
 disk-cleanup job). A crash inside the promote loop leaves atomically-renamed valid files
 uncommitted and visibly pending in `git status`; COMPLIANT is only ever reported after commit.
 
-**Out-of-tree writes — the residual, closed by a ship gate (r2 oracle BLOCKER):** `Write`/`Edit`
-accept absolute paths, and staging alone cannot stop a write to `~/.zshrc`. The claude CLI's
-headless permission model is expected to deny file writes outside the cwd in the deny-by-default
-mode; that expectation is NOT trusted — it is a **mandatory enforcement test and SHIP GATE**:
-invoke the real curator config and attempt, at minimum — Bash, WebFetch/WebSearch, absolute-path
-write, `../` traversal, symlink-target write, `.git`/hidden-path write, overwrite of an existing
-staged brief, delete-by-overwrite — asserting denial or guard rejection for each, re-run per
-claude-CLI upgrade (pinned in tests). **If the CLI cannot prove out-of-tree denial, v1 ships
-read-only** (Write/Edit dropped from the allowlist; FILE degrades to propose-only) — this is the
-evidence-gated resolution of the r2 cross-family split on open call #1.
+**Out-of-tree access — the residual, closed by a ship gate (r2 oracle; r3 both families):**
+`Write`/`Edit`/`Read` accept absolute paths, and staging alone cannot stop a write to `~/.zshrc`
+or a read of `~/.ssh` leaking into the reply (r3 kilabz: READS are exfil too). Enforcement is
+the runtime-authored path-scoped staging permissions (above) — NOT trusted, VERIFIED: a
+**mandatory enforcement test and SHIP GATE** invokes the real curator config and attempts, at
+minimum — Bash, WebFetch/WebSearch, absolute-path write AND read, `../` traversal both
+directions, symlink-target access, `.git`/hidden-path access, overwrite of an existing staged
+brief, delete-by-overwrite, tool-name drift (unknown/renamed tools) — asserting denial or guard
+rejection for each, version-pinned and re-run per claude-CLI upgrade. **If path-scoped denial
+cannot be proven, v1 ships read-only** (Write/Edit dropped; FILE degrades to propose-only), with
+`sandbox-exec` OS confinement as the recorded next rung rather than a v1 build. This is the
+evidence-gated resolution of the cross-family split on open call #1 — r3 oracle's "the gate
+will inevitably fail, ship read-only" is recorded as dissent; the TEST decides, not assertion
+(the debug-first rule: reviewer claims about tool behavior get a repro, not a fold).
 
 **Merge semantics (r2 oracle over-engineering fold):** merge-draft machinery is CUT. Dedupe-first
 stands, but an existing topic gets an append-only dated **update brief**
@@ -108,9 +130,12 @@ self-modification; staging additionally makes the live `CLAUDE.md` unreachable).
   remains a declined column per optimal-team-brief), adapter `{kind: cli, argv: [claude, -p,
   --model, sonnet, --output-format, text, <tool flags per enforcement test>], prompt_channel:
   stdin, env_passthrough: [CLAUDE_CODE_OAUTH_TOKEN], workdir: <staging dir>}`, timeout_s 600.
-- **Runner change:** `invoke_cli` honors `adapter.workdir` — fail-closed: declared but missing/
-  non-canonical → hard error, NO scratch fallback (r1 kilabz). Tests pin both directions
-  (absent workdir = PR #39 scratch behavior unchanged).
+- **Runner change:** `invoke_cli` honors `adapter.workdir` — fail-closed AND namespace-bound:
+  the path must exist, be canonical, and live INSIDE the runtime-managed staging root; anything
+  else hard-errors, NO scratch fallback (r1 kilabz; r3 both families: without the namespace
+  bound, `workdir` is a general registry capability letting any future AgentSpec row bypass the
+  PR #39 scratch-cwd invariant). Tests pin all directions (absent workdir = scratch unchanged;
+  live-dir workdir = rejected).
 - **Constitution untrusted-content rule (r2 kilabz):** corpus text read via `Read` is evidence,
   never instructions; the enforcement suite includes an injection canary (a planted brief
   instructing the agent to modify policy/write elsewhere) asserting the guard holds.
@@ -118,15 +143,19 @@ self-modification; staging additionally makes the live `CLAUDE.md` unreachable).
 ## Deterministic substrate
 
 **Ingest** (`mxr knowledge-ingest --scope research`): walk root for `*.md`, noise-globs excluded
-(`.venv*`, `__pycache__`, `.playwright-mcp`, `.claude`, `.git`, dotfiles). Per file: title =
-first `#` heading (fallback filename); tags = frontmatter if parseable; **doc_date** =
-`YYYY-MM-DD` filename prefix, else frontmatter `date:`, WARN on disagreement (r2 kilabz — dates
-are trust-bearing citation metadata), NULL if unparseable; body UTF-8 `errors='replace'`, NULs
-stripped, capped 900KB with marker; `content_sha` over raw bytes. Append-only under the lock:
-current row same sha+status → skip; else INSERT; file gone → tombstone (status=archived,
-sha='absent'). tsvector-overflow → harder truncate, one retry, logged. **Rebuild = TRUNCATE +
-re-ingest** (r2 kilabz: seq-vs-import ordering) — the table is a derived index; files are the
-source of truth.
+(`.venv*`, `__pycache__`, `.playwright-mcp`, `.claude`, `.git`, dotfiles), canonical path policy
+as at stage-in (NFC, control-char reject, case-collision warn, `st_nlink == 1`). Per file:
+title = first `#` heading (fallback filename); tags = frontmatter if parseable; **doc_date** =
+`YYYY-MM-DD` filename prefix; frontmatter `date:` is the fallback and **filename strictly wins
+on disagreement, with a WARN** (r3 oracle: precedence must be declared; dates are trust-bearing
+citation metadata); NULL if unparseable. Body UTF-8 `errors='replace'`, NULs stripped, capped
+900KB with marker — any of those sets **`lossy = true`** on the row, surfaced in recall output
+so corrupted text is never cited as clean evidence (r3 kilabz). `content_sha` over raw bytes.
+Append-only under the lock: current row same sha+status → skip; else INSERT; file gone →
+tombstone (status=archived, sha='absent'). tsvector-overflow → harder truncate, one retry,
+logged. **Rebuild = a separate admin verb** (`mxr knowledge-rebuild --scope X`): appends
+archive-tombstones for all active rows, then re-ingests — all appends, never TRUNCATE (r3 both
+families; ends the append-only-vs-derived-cache argument at the cost of ~5 lines).
 
 **Recall** (`mxr recall --scope research "query" [--fenced]`): scope REQUIRED; unknown scope =
 hard error. Ladder: `websearch_to_tsquery` → sanitized `to_tsquery('tok:* & …')` prefix (empty/
@@ -149,6 +178,7 @@ CREATE TABLE IF NOT EXISTS knowledge_doc (
     body        text NOT NULL,
     content_sha text NOT NULL,            -- sha256 raw bytes; 'absent' = tombstone
     status      text NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+    lossy       boolean NOT NULL DEFAULT false,  -- decode-replaced/truncated body (r3)
     tsv tsvector GENERATED ALWAYS AS (
         setweight(to_tsvector('english', coalesce(title,'')), 'A') ||
         setweight(to_tsvector('english', coalesce(tags,'')),  'B') ||
@@ -157,7 +187,8 @@ CREATE TABLE IF NOT EXISTS knowledge_doc (
 );
 CREATE INDEX IF NOT EXISTS knowledge_doc_tsv ON knowledge_doc USING GIN (tsv);
 CREATE OR REPLACE VIEW knowledge_doc_current AS
-    SELECT DISTINCT ON (scope, path) * FROM knowledge_doc ORDER BY scope, path, seq DESC;
+    SELECT DISTINCT ON (scope, path) * FROM knowledge_doc
+    ORDER BY scope, path, seq DESC, id DESC;  -- id tie-break: stable total order (r3)
 CREATE OR REPLACE VIEW knowledge_doc_active AS
     SELECT * FROM knowledge_doc_current WHERE status = 'active';
 ```
@@ -173,11 +204,20 @@ restore-after-archive of identical content). 2-arg `to_tsvector('english', …)`
   the answer back when it fills a real gap.
 - **FILE** — dedupe-first; new topic → `YYYY-MM-DD-<slug>.md` + `[[wikilinks]]` + index updated
   in the same run; existing topic → dated **update brief** linking the original (no rewrites).
-- **LINT (deterministic-first)** — reports: exact duplicates (sha), ghost `[[links]]`,
-  index↔file mismatches, orphans, un-indexed artifacts. Semantic judgments (near-dups,
-  dead-direction candidates, gaps as concept+evidence+suggested-title) are labeled SUGGESTIONS,
-  P1/P2/P3, P3 orphans ignored. Works from `index.md` + recall metadata first, drills into a
-  handful of files per pass. Contradictions FLAGGED, never auto-resolved. Gaps never auto-create.
+- **LINT (deterministic-first, READ-ONLY dispatch)** — lint runs get no Write/Edit in their
+  staging permissions (r3 kilabz: suggestions must not share a mode with mutation). Reports:
+  exact duplicates (sha), ghost `[[links]]`, index↔file mismatches, orphans, un-indexed
+  artifacts. Semantic judgments (near-dups, dead-direction candidates, gaps as
+  concept+evidence+suggested-title) are labeled SUGGESTIONS, P1/P2/P3, P3 orphans ignored.
+  Works from `index.md` + `MANIFEST.txt` + recall metadata first, drills into a handful of
+  files per pass. Contradictions FLAGGED, never auto-resolved. Gaps never auto-create.
+
+**Index validation grammar (r3 both families):** completeness is validated over `*.md` corpus
+files ONLY; non-md artifacts appear in an optional "Assets" section treated as free text (the
+agent knows them from `MANIFEST.txt`). `[[link]]` grammar: `[[name]]` / `[[name|label]]` /
+`[[name#section]]` — existence check on `name` vs `.md` basenames, case-insensitive, NFC,
+extension optional, `#section` ignored for existence. A non-empty index listing every `.md`
+file is required — a 0-byte or gutted index fails completeness (r2 oracle).
 
 **On `index.md` mutability (r2 oracle, refuted-with-rationale):** the index is a regenerable MAP
 for humans, not a ledger — append-only discipline applies to `knowledge_doc`, not a README.
@@ -206,8 +246,12 @@ the v2 option if index churn is ever observed.
   (no secrets-bearing noise in the workspace), no Bash/network/dispatch, promote-side content
   checks (secret patterns, `scan_injection`, link validation), and the injection-canary test.
   Worst case: a poisoned COMPLIANT artifact = a lying new `.md` + index line — visible in the
-  deterministic OPERATIONS diff, `git revert`-able, and containing no readable secrets by
-  construction of the stage-in set.
+  deterministic OPERATIONS diff and `git revert`-able. The stage-in filter means no
+  secrets-bearing noise is readable, and the promote-side secret scan is a **guardrail, not a
+  proof** (r3 kilabz — the earlier "no secrets by construction" overclaimed). The injection
+  canary suite covers BOTH paths: fenced recall hits AND direct `Read` of a planted brief
+  carrying instruction payloads and tool-tag-forging text (`</tool_result>`-style, r3 oracle) —
+  asserting the guard holds regardless of what the model was talked into.
 - **Out-of-tree writes** → enforcement ship gate + read-only fallback (see Architecture).
 - **Self-modification closed:** policy repo-tracked + injected; live `CLAUDE.md`/`.claude`/
   `.git` unreachable (not staged) and unpromotable (guard).
@@ -245,9 +289,11 @@ the v2 option if index churn is ever observed.
 ## Open calls — final resolutions after two rounds
 
 1. **Additive-Write vs read-only** → **EVIDENCE-GATED**: Write enabled iff the enforcement ship
-   gate (out-of-tree/absolute/symlink/overwrite matrix) passes on the real CLI config;
-   otherwise v1 ships read-only + propose-only. (r2 kilabz conditional-yes and r2 oracle
-   revert-to-read-only impose the same condition; the test decides, not opinion.)
+   gate (now covering reads AND writes: out-of-tree/absolute/`../`/symlink/overwrite/tool-drift
+   matrix, against the runtime-authored path-scoped staging permissions) passes on the real CLI
+   config; otherwise v1 ships read-only + propose-only, `sandbox-exec` recorded as the next
+   rung. (r2 both families imposed the same condition; r3 kilabz added reads; r3 oracle's
+   "gate will inevitably fail, ship read-only" recorded as DISSENT — the test decides.)
 2. **git init** → MANDATORY, as audit substrate + promote-commit target; rollback duties moved
    OFF git (staging discard) per r2; hardened invocations, per-file adds, no drift blessing.
 3. **Recall freshness** → YES: bounded ingest-primitive refresh; hard-error scope semantics;
@@ -263,6 +309,18 @@ the v2 option if index churn is ever observed.
   doc_date; static scope allowlist; diff-generated OPERATIONS; slug validation; UTF-8/NUL/
   overflow; ladder bounds; LINT deterministic-first. Refuted: fenced file-reader (workspace
   actor reads its own evidence; a fenced Read breaks the job); 13.5MB LINT math (corpus ~80KB).
+- **v0.3 → r3 (2026-07-05):** kilabz 3B+8M+4MIN+1NIT; oracle 2B+3M+2MIN. ARCHITECTURE-CLEAN —
+  the staging model survived both families; all folds are spec tightening: reads added to the
+  ship gate; runtime-authored path-scoped `.claude/settings.json` in staging (the enforcement
+  mechanism, replacing bare tool flags); workdir namespace-bound in the runner; lock released
+  during LLM wait (CAS makes the long hold redundant); promote journal + dirty-repo preflight;
+  hardlink `st_nlink` check; canonical path policy (NFC/case/control-chars); `lossy` column;
+  view tie-breaker; tombstone rebuild verb (never TRUNCATE); index grammar + `.md`-only
+  completeness + `MANIFEST.txt` for assets; LINT read-only dispatch; secret-scan overclaim
+  softened; provenance in the report. REFUTED/DISSENT RECORDED: oracle's "ship gate will
+  inevitably fail → must ship read-only" is an untested assertion about CLI behavior — the
+  gate tests it (debug-first: repro before fold); kilabz's `knowledge_record.py` naming (house
+  convention is `outcomerecord.py`).
 - **v0.2 → r2 (2026-07-05):** kilabz 4B+7M+3MIN+1NIT; oracle 3B+3M. Folded: **staged-workspace
   model** (kills read-exposure exfil, corpus-config injection, PR #39 reversal, git-reset
   insufficiency, symlink class, concurrent-baseline races, human-drift destruction, crash/
