@@ -1,11 +1,28 @@
 # Curator v1 — DESIGN (research/ → the first folder-agent)
 
-_Status: v0.4 — cross-family rounds 1+2+3 folded (r1/r2 reshaped the architecture: staged
-workspace + evidence-gated Write; r3 was architecture-clean — spec tightening only: path-scoped
-staging permissions, reads in the ship gate, lock released during LLM wait, tombstone rebuild).
-DESIGN CONVERGED — remaining contested claims are build-time test questions (the ship gate), not
-doc questions. Awaiting Jefe plan approval. Recon: workflow `wf_357e9782` (2026-07-05).
-Review history at the bottom._
+_Status: **BUILT + MERGED (v1.0, read-only), 2026-07-05.** Design converged over 3 cross-family
+DESIGN rounds (v0.1→v0.4); code converged over 3 cross-family CODE-review rounds (kilabz+oracle).
+Shipped READ-ONLY: Write is evidence-gated on the enforcement ship gate
+(tests/test_curator_enforcement.py), which is credit-blocked at build time — flip to Write via
+MYNDAIX_CURATOR_WRITE=1 + restoring Write/Edit to the registry argv once the gate passes.
+Recon: workflow `wf_357e9782`. Design + code review history at the bottom._
+
+## As-built (v1.0)
+
+- **Substrate:** migration `0009_knowledge.sql` + schema.sql mirror (append-only tsvector index,
+  current/active views); `src/runtime/knowledge.py` (pure walk/parse/validation);
+  `src/runtime/knowledgerecord.py` (`mxr knowledge-ingest` / `recall` / `knowledge-rebuild`).
+- **Guard:** `src/runtime/curate.py` (`mxr curate`) — stage filtered copy → runtime-authored
+  path-scoped `.claude` permissions → dispatch pool curator → promote validated changes via
+  scratch-index commit (CAS, journal, O_EXCL, O_NOFOLLOW). Read-only by default (propose-only).
+- **Roster/runner:** one `curator` AgentSpec row (staging_cwd, sonnet, read-only belt);
+  `runner.invoke_cli` honors `adapter.staging_cwd` fail-closed + namespace-bound.
+- **Policy:** `src/runtime/prompts/curator_constitution.md` (repo-tracked, injected at dispatch).
+- **Tests:** 54 curate + 25 knowledge-verb + 53 knowledge-pure + 4 runner staging-cwd +
+  enforcement ship gate (token-gated). Full suite 27/27 green.
+- **Pending (morning):** live curator run (LINT/FILE) blocked on the curator OAuth token's credit
+  balance; enforcement ship gate + Write-enable wait on the same. Mini deploy (serve restart to
+  apply 0009 + pick up the row) needs Jefe (classifier blocks Mack's ssh writes).
 
 ## What
 
