@@ -283,10 +283,14 @@ def ilike_pattern(query: str) -> str:
 # ---- deterministic index skeleton (the design's v2 "computed index"; a base the curator enriches)
 _LIST_MARKER_RE = re.compile(r"^(?:[-*+>]\s|\d+[.)]\s)")     # bullet/ordered/quote, trailing space
 _MD_INLINE_UNSAFE = re.compile(r"[<>\[\]|]")                 # neutralize link/HTML/table breakers
-# metadata-label line (`**Date:** ...`, `Status: ...`) — pseudo-frontmatter these briefs open with;
-# a useless hook. Requires a short Capitalized label + colon, optionally bold-wrapped. Keeps real
-# bold prose like `**Important** point` (no colon at the label close).
-_META_LABEL_RE = re.compile(r"^\*{0,2}[A-Z][A-Za-z0-9 /_-]{0,24}:\*{0,2}(?:\s|$)")
+_FENCE_OPEN_RE = re.compile(r"^(`{3,}|~{3,})")              # code-fence opener (char + length)
+_LINE_SCAN_CAP = 2000                                       # bound per-line analysis (body is ≤900KB)
+# metadata-label line (`**Date:** ...`) — pseudo-frontmatter these briefs open with; a useless
+# hook. WHITELIST of known preamble keys ONLY (kilabz re-review: a broad `Label:` skip would erase
+# real prose openers like `Conclusion:`/`Risk:`/`Thesis:`). Optional bold wrap; keeps real prose.
+_META_LABEL_RE = re.compile(
+    r"^\*{0,2}(?:Date|Status|Author|Updated|Source|Sources|Trigger|Tags|Owner|Related|"
+    r"Created|Last updated|Repo|Branch|Run|Version):\*{0,2}(?:\s|$)", re.IGNORECASE)
 
 
 def _md_oneline(text: str, cap: int = 140) -> str:
@@ -305,9 +309,9 @@ def _first_prose_line(body: str) -> str:
     MAJOR); fenced code blocks (```/~~~); ATX headings; bullet/ordered/quote list markers (trailing
     space required so `-10`/`**bold**` prose is NOT skipped: oracle MINOR); table/setext rules."""
     in_fm = False
-    in_fence = False
+    fence: str | None = None                 # the open fence marker (chars), or None
     for i, raw in enumerate(body.splitlines()):
-        line = raw.strip()
+        line = raw.strip()[:_LINE_SCAN_CAP]  # bound analysis; the hook is capped again in _md_oneline
         if not line:
             continue
         if line == "---":
@@ -318,14 +322,19 @@ def _first_prose_line(body: str) -> str:
             continue                         # a mid-doc `---` (horizontal rule) is just skipped
         if in_fm:
             continue
-        if line[:3] in ("```", "~~~"):       # code-fence toggle — skip the fence AND its content
-            in_fence = not in_fence
+        fm = _FENCE_OPEN_RE.match(line)      # code-fence: track char+length (kilabz re-review)
+        if fm:
+            marker = fm.group(1)
+            if fence is None:
+                fence = marker               # open
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = None                 # close only on same char, >= opener length
             continue
-        if in_fence:
+        if fence is not None:                # inside a fence -> not a hook
             continue
-        if (line.startswith(("#", "===")) or _LIST_MARKER_RE.match(line)
+        if (line.startswith(("#", "===", "|")) or _LIST_MARKER_RE.match(line)
                 or set(line) <= {"-", "="} or _META_LABEL_RE.match(line)):
-            continue                         # heading / list-marker / setext-or-hr rule / metadata
+            continue                         # heading / table-row / list / setext-hr / metadata
         hook = _md_oneline(line)
         if hook:
             return hook
@@ -344,18 +353,19 @@ def build_index_md(walk: WalkResult, *, title: str = "Research Corpus Index") ->
             groups.setdefault(d.doc_date[:7], []).append(d)
         else:
             undated.append(d)
-    # duplicate-stem warning (kilabz MAJOR): wikilinks resolve by basename, so two docs sharing a
-    # stem (e.g. a/foo.md + b/foo.md) produce an ambiguous [[foo]]. The v1 corpus is flat so this
-    # shouldn't happen; warn (into the walk's warnings) rather than silently emit a broken link.
+    def _link(d: DocRecord) -> str:
+        return _md_oneline(Path(d.path).stem, 120)          # strips [ ] < > | from the stem
+
+    # duplicate-stem warning (kilabz): wikilinks resolve by basename, so two docs sharing a stem
+    # (a/foo.md + b/foo.md) produce an ambiguous [[foo]]. Key on the SANITIZED/emitted stem (kilabz
+    # re-review — raw stems could differ while the emitted links collide). v1 corpus is flat so this
+    # shouldn't fire; warn rather than silently emit a colliding link.
     stems: dict[str, str] = {}
     for d in walk.docs:
-        s = Path(d.path).stem.lower()
+        s = _link(d).lower()
         if s in stems and stems[s] != d.path:
             walk.warnings.append(f"duplicate stem {s!r}: {d.path} vs {stems[s]} — [[{s}]] is ambiguous")
         stems[s] = d.path
-
-    def _link(d: DocRecord) -> str:
-        return _md_oneline(Path(d.path).stem, 120)          # strips [ ] < > | from the stem
 
     def _hook(d: DocRecord) -> str:
         return _first_prose_line(d.body) or _md_oneline(d.title)

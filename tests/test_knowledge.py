@@ -205,11 +205,22 @@ def test_first_prose_line():
        "numbered list item skipped")
     # metadata-label pseudo-frontmatter (this corpus opens briefs with **Date:**/**Status:**)
     ok(knowledge._first_prose_line("# T\n**Date:** 2026-07-04\n**Status:** draft\nreal summary here")
-       == "real summary here", "skips **Label:** metadata lines, keeps the real summary")
+       == "real summary here", "skips whitelisted **Label:** metadata, keeps the real summary")
     ok(knowledge._first_prose_line("# T\nStatus: exploratory\nthe actual point")
-       == "the actual point", "skips plain Label: metadata")
+       == "the actual point", "skips plain whitelisted Label: metadata")
     ok(knowledge._first_prose_line("# T\n**Bold** lead prose") == "**Bold** lead prose",
        "bold prose WITHOUT a label-colon is kept (not metadata)")
+    # kilabz re-review: the metadata skip is a WHITELIST — real prose openers must NOT be skipped
+    ok(knowledge._first_prose_line("# T\nConclusion: we should ship it") == "Conclusion: we should ship it",
+       "Conclusion: is real prose, NOT skipped (whitelist, not broad Label:)")
+    ok(knowledge._first_prose_line("# T\nRisk: the token expires") == "Risk: the token expires",
+       "Risk: kept (not a metadata key)")
+    # kilabz re-review: table-row regression — a leading table header must NOT become the hook
+    ok(knowledge._first_prose_line("# T\n| col a | col b |\n| --- | --- |\nreal prose")
+       == "real prose", "table rows skipped")
+    # kilabz re-review: fence char+length — a ``` fence containing ``` closes only on >= length
+    ok(knowledge._first_prose_line("# T\n````\n```\nstill in fence\n````\nafter") == "after",
+       "nested-backtick fence closes only on >= opener length")
 
 
 def test_md_oneline_sanitizes():
