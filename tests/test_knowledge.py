@@ -160,6 +160,105 @@ def test_index_violations():
 
 
 # ---- recall helpers ---------------------------------------------------------------------------
+def test_build_index_md():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "2026-07-04-wedge.md").write_text(
+            "---\ndate: 2026-07-04\n---\n# Wedge\n\nMarket wedge research for construction comms.\n")
+        (root / "2026-06-08-scraper.md").write_text("# Scraper\n\nModel update scraper notes.\n")
+        (root / "higgsfield-dop.md").write_text("# DoP motions\n\nCamera preset shortlist.\n")
+        (root / "catalog.json").write_text("{}")
+        walk = knowledge.walk_corpus(root)
+        md = knowledge.build_index_md(walk)
+        ok(md.startswith("# Research Corpus Index"), "titled index")
+        ok("## 2026-07" in md and "## 2026-06" in md, "grouped by month")
+        ok(md.index("## 2026-07") < md.index("## 2026-06"), "newest month first")
+        ok("[[2026-07-04-wedge]] (2026-07-04) — Market wedge research for construction comms."
+           in md, "dated entry: wikilink + date + prose hook")
+        ok("## Undated" in md and "[[higgsfield-dop]] — Camera preset shortlist." in md,
+           "undated group uses prose hook, no date")
+        ok("## Assets (not full-text indexed)" in md and "- catalog.json" in md,
+           "assets listed separately")
+        ok("catalog.json" not in md.split("## Assets")[0], "asset not in the doc groups")
+
+
+def test_first_prose_line():
+    ok(knowledge._first_prose_line("---\ndate: x\n---\n# Title\n\nReal first line.\n")
+       == "Real first line.", "skips frontmatter + heading")
+    ok(knowledge._first_prose_line("# Only A Heading\n## Sub\n") == "", "no prose -> empty")
+    ok(knowledge._first_prose_line("# T\n- a list item\n> quote\nprose here")
+       == "prose here", "skips list/quote markers")
+    # kilabz+oracle MAJOR: a mid-doc `---` horizontal rule must NOT toggle frontmatter
+    ok(knowledge._first_prose_line("# T\n\nfirst real prose\n\n---\n\nafter the rule")
+       == "first real prose", "mid-doc --- horizontal rule does not swallow prose")
+    ok(knowledge._first_prose_line("intro line\n---\nmore") == "intro line",
+       "--- not at top is a rule, not frontmatter")
+    # kilabz MAJOR: fenced code content is not a hook
+    ok(knowledge._first_prose_line("# T\n```\ncode line inside fence\n```\nreal prose")
+       == "real prose", "skips fenced code block content")
+    # oracle MINOR: bold/negative-number prose is NOT a list marker (needs trailing space)
+    ok(knowledge._first_prose_line("# T\n**Important** point here") == "**Important** point here",
+       "bold-leading prose kept (not misread as a list marker)")
+    ok(knowledge._first_prose_line("# T\n-10 degrees measured") == "-10 degrees measured",
+       "negative-number prose kept (no trailing space after -)")
+    ok(knowledge._first_prose_line("# T\n1. numbered item\nprose") == "prose",
+       "numbered list item skipped")
+    # metadata-label pseudo-frontmatter (this corpus opens briefs with **Date:**/**Status:**)
+    ok(knowledge._first_prose_line("# T\n**Date:** 2026-07-04\n**Status:** draft\nreal summary here")
+       == "real summary here", "skips whitelisted **Label:** metadata, keeps the real summary")
+    ok(knowledge._first_prose_line("# T\nStatus: exploratory\nthe actual point")
+       == "the actual point", "skips plain whitelisted Label: metadata")
+    ok(knowledge._first_prose_line("# T\n**Bold** lead prose") == "**Bold** lead prose",
+       "bold prose WITHOUT a label-colon is kept (not metadata)")
+    # kilabz re-review: the metadata skip is a WHITELIST — real prose openers must NOT be skipped
+    ok(knowledge._first_prose_line("# T\nConclusion: we should ship it") == "Conclusion: we should ship it",
+       "Conclusion: is real prose, NOT skipped (whitelist, not broad Label:)")
+    ok(knowledge._first_prose_line("# T\nRisk: the token expires") == "Risk: the token expires",
+       "Risk: kept (not a metadata key)")
+    # kilabz re-review: table-row regression — a leading table header must NOT become the hook
+    ok(knowledge._first_prose_line("# T\n| col a | col b |\n| --- | --- |\nreal prose")
+       == "real prose", "table rows skipped")
+    # kilabz re-review: fence char+length — a ``` fence containing ``` closes only on >= length
+    ok(knowledge._first_prose_line("# T\n````\n```\nstill in fence\n````\nafter") == "after",
+       "nested-backtick fence closes only on >= opener length")
+
+
+def test_md_oneline_sanitizes():
+    # oracle BLOCKER + kilabz MINOR: untrusted corpus content must be neutralized for md emission
+    ok("<" not in knowledge._md_oneline("bad <script>alert</script>"), "angle brackets stripped")
+    ok("[" not in knowledge._md_oneline("has [brackets] and ]]") and
+       "]" not in knowledge._md_oneline("has [brackets] and ]]"), "square brackets stripped")
+    ok("\n" not in knowledge._md_oneline("line one\nline two"), "newlines collapsed")
+    ok(knowledge._md_oneline("a" * 500).__len__() <= 140, "capped")
+
+
+def test_build_index_injection_and_edges():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # a malicious brief with fence-break + HTML + bracket-injection in the first prose line
+        (root / "2026-07-01-evil.md").write_text(
+            "# Evil\n\n<img src=x> ]] [[wormhole]] <script>x</script> pipe|break\n")
+        walk = knowledge.walk_corpus(root)
+        md = knowledge.build_index_md(walk)
+        ok("<script>" not in md and "<img" not in md, "HTML neutralized in the hook")
+        ok("]] [[wormhole]]" not in md, "wikilink-break sequence neutralized")
+        # empty corpus
+        with tempfile.TemporaryDirectory() as td2:
+            md2 = knowledge.build_index_md(knowledge.walk_corpus(Path(td2)))
+            ok("_No markdown briefs found._" in md2, "empty corpus gets explicit empty state")
+
+
+def test_build_index_frontmatter_date_sort():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # same month, one frontmatter-dated with a NON-date filename -> must still sort by date
+        (root / "aaa-early.md").write_text("---\ndate: 2026-05-02\n---\n# Early\nbody\n")
+        (root / "2026-05-20-late.md").write_text("# Late\nbody\n")
+        md = knowledge.build_index_md(knowledge.walk_corpus(root))
+        ok(md.index("2026-05-20-late") < md.index("aaa-early"),
+           "newest date first within month, even for a non-date filename (sort by doc_date)")
+
+
 def test_query_helpers():
     ok(knowledge.prefix_tokens("Higgsfield API pricing!") == ["higgsfield", "api", "pricing"],
        "prefix tokens sanitized + lowered")

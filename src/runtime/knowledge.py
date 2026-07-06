@@ -278,3 +278,121 @@ def ilike_pattern(query: str) -> str:
     """%-wrapped ILIKE pattern with %/_/\\ escaped (wildcards in the query are literal)."""
     q = query[:QUERY_CAP_CHARS].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{q}%"
+
+
+# ---- deterministic index skeleton (the design's v2 "computed index"; a base the curator enriches)
+_LIST_MARKER_RE = re.compile(r"^(?:[-*+>]\s|\d+[.)]\s)")     # bullet/ordered/quote, trailing space
+_MD_INLINE_UNSAFE = re.compile(r"[<>\[\]|]")                 # neutralize link/HTML/table breakers
+_FENCE_OPEN_RE = re.compile(r"^(`{3,}|~{3,})")              # code-fence opener (char + length)
+_LINE_SCAN_CAP = 2000                                       # bound per-line analysis (body is ≤900KB)
+# metadata-label line (`**Date:** ...`) — pseudo-frontmatter these briefs open with; a useless
+# hook. WHITELIST of known preamble keys ONLY (kilabz re-review: a broad `Label:` skip would erase
+# real prose openers like `Conclusion:`/`Risk:`/`Thesis:`). Optional bold wrap; keeps real prose.
+_META_LABEL_RE = re.compile(
+    r"^\*{0,2}(?:Date|Status|Author|Updated|Source|Sources|Trigger|Tags|Owner|Related|"
+    r"Created|Last updated|Repo|Branch|Run|Version):\*{0,2}(?:\s|$)", re.IGNORECASE)
+
+
+def _md_oneline(text: str, cap: int = 140) -> str:
+    """Sanitize an untrusted corpus/filename string for one-line markdown emission (kilabz+oracle):
+    collapse ALL whitespace (incl. newlines) to single spaces, neutralize inline markdown that
+    could break the list/wikilink/table or render as HTML (`< > [ ] |`), then cap. Cheap and
+    deterministic — the output is read by a human/curator, never executed."""
+    t = re.sub(r"\s+", " ", (text or "")[:cap * 3]).strip()
+    return _MD_INLINE_UNSAFE.sub(" ", t)[:cap].strip()
+
+
+def _first_prose_line(body: str) -> str:
+    """First substantive line after the title/frontmatter — the deterministic one-line hook the
+    curator later replaces with a judged summary. Skips: a LEADING `---` frontmatter block (only
+    when it opens the file — a later `---` is a horizontal rule, not frontmatter: kilabz+oracle
+    MAJOR); fenced code blocks (```/~~~); ATX headings; bullet/ordered/quote list markers (trailing
+    space required so `-10`/`**bold**` prose is NOT skipped: oracle MINOR); table/setext rules."""
+    in_fm = False
+    fence: str | None = None                 # the open fence marker (chars), or None
+    for i, raw in enumerate(body.splitlines()):
+        line = raw.strip()[:_LINE_SCAN_CAP]  # bound analysis; the hook is capped again in _md_oneline
+        if not line:
+            continue
+        if line == "---":
+            if i == 0:                       # opens frontmatter ONLY at the very top
+                in_fm = True
+            elif in_fm:                      # closes it
+                in_fm = False
+            continue                         # a mid-doc `---` (horizontal rule) is just skipped
+        if in_fm:
+            continue
+        fm = _FENCE_OPEN_RE.match(line)      # code-fence: track char+length (kilabz re-review)
+        if fm:
+            marker = fm.group(1)
+            if fence is None:
+                fence = marker               # open
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = None                 # close only on same char, >= opener length
+            continue
+        if fence is not None:                # inside a fence -> not a hook
+            continue
+        if (line.startswith(("#", "===", "|")) or _LIST_MARKER_RE.match(line)
+                or set(line) <= {"-", "="} or _META_LABEL_RE.match(line)):
+            continue                         # heading / table-row / list / setext-hr / metadata
+        hook = _md_oneline(line)
+        if hook:
+            return hook
+    return ""
+
+
+def build_index_md(walk: WalkResult, *, title: str = "Research Corpus Index") -> str:
+    """Pure: render a deterministic map-of-content from a corpus walk. Docs grouped by YYYY-MM
+    (newest first), then an Undated group, then a non-md Assets list. Wikilinks use the .md
+    basename (matches the curator's link grammar). This is a SKELETON — the curator enriches each
+    hook with judgment and re-groups by topic; it is explicitly NOT a substitute for that."""
+    groups: dict[str, list[DocRecord]] = {}
+    undated: list[DocRecord] = []
+    for d in walk.docs:
+        if d.doc_date:
+            groups.setdefault(d.doc_date[:7], []).append(d)
+        else:
+            undated.append(d)
+    def _link(d: DocRecord) -> str:
+        return _md_oneline(Path(d.path).stem, 120)          # strips [ ] < > | from the stem
+
+    # duplicate-stem warning (kilabz): wikilinks resolve by basename, so two docs sharing a stem
+    # (a/foo.md + b/foo.md) produce an ambiguous [[foo]]. Key on the SANITIZED/emitted stem (kilabz
+    # re-review — raw stems could differ while the emitted links collide). v1 corpus is flat so this
+    # shouldn't fire; warn rather than silently emit a colliding link.
+    stems: dict[str, str] = {}
+    for d in walk.docs:
+        s = _link(d).lower()
+        if s in stems and stems[s] != d.path:
+            walk.warnings.append(f"duplicate stem {s!r}: {d.path} vs {stems[s]} — [[{s}]] is ambiguous")
+        stems[s] = d.path
+
+    def _hook(d: DocRecord) -> str:
+        return _first_prose_line(d.body) or _md_oneline(d.title)
+
+    out = [f"# {_md_oneline(title, 120)}", "",
+           "_Auto-generated skeleton (`mxr knowledge-index`). One-line hooks are the first prose "
+           "line of each brief — the curator replaces them with judged summaries and regroups by "
+           "topic._", ""]
+    # newest date first WITHIN a month via (doc_date, path) desc — not path-only, so a
+    # frontmatter-dated file with a non-date filename still sorts chronologically (kilabz MINOR).
+    for ym in sorted(groups, reverse=True):
+        out.append(f"## {ym}")
+        for d in sorted(groups[ym], key=lambda x: (x.doc_date or "", x.path), reverse=True):
+            out.append(f"- [[{_link(d)}]] ({d.doc_date}) — {_hook(d)}")
+        out.append("")
+    if undated:
+        out.append("## Undated")
+        for d in sorted(undated, key=lambda x: x.path):
+            out.append(f"- [[{_link(d)}]] — {_hook(d)}")
+        out.append("")
+    assets = [a for a in walk.artifacts if not a.lower().endswith(".md")]
+    if assets:
+        out.append("## Assets (not full-text indexed)")
+        for a in sorted(assets):
+            out.append(f"- {_md_oneline(a, 200)}")           # strip newlines/brackets from names
+        out.append("")
+    if not walk.docs and not assets:                         # deterministic empty state (kilabz NIT)
+        out.append("_No markdown briefs found._")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"

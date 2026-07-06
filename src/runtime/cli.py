@@ -212,6 +212,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if raw and raw[0] == "recall":
         from runtime import knowledgerecord
         return knowledgerecord.recall_main(["recall", *raw[1:]])
+    if raw and raw[0] == "knowledge-index":
+        from runtime import knowledgerecord
+        return knowledgerecord.index_main(["knowledge-index", *raw[1:]])
     if raw and raw[0] == "curate":
         from runtime import curate
         return curate.main(["curate", *raw[1:]])
