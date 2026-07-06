@@ -68,9 +68,13 @@ def _curate_timeout() -> float:
 
 
 # ---- git (argv-form, hardened: hooks disabled, bounded) ----------------------------------------
-def _git(root: Path, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def _git(root: Path, argv: list[str], *, check: bool = True,
+         index_file: Optional[str] = None) -> subprocess.CompletedProcess:
+    env = os.environ
+    if index_file is not None:                       # commit from a scratch index (see promote)
+        env = dict(os.environ, GIT_INDEX_FILE=index_file)
     r = subprocess.run(["git", "-C", str(root), "-c", "core.hooksPath="] + argv,
-                       capture_output=True, text=True, errors="replace", timeout=60)
+                       capture_output=True, text=True, errors="replace", timeout=60, env=env)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(argv[:2])} failed: {(r.stderr or r.stdout).strip()[:300]}")
     return r
@@ -84,6 +88,11 @@ def git_preflight(root: Path) -> set[str]:
     if r.returncode != 0 or r.stdout.strip() != "true":
         raise RuntimeError(f"{root} is not a git repository — run `git init` + an initial commit "
                            "there first (the audit/rollback substrate is mandatory)")
+    # require a baseline commit: the scratch-index commit reads HEAD, and a rollback substrate
+    # with zero history is not a substrate. The deploy step is `git init` + an initial commit.
+    if _git(root, ["rev-parse", "--verify", "HEAD"], check=False).returncode != 0:
+        raise RuntimeError(f"{root} has no commits — make an initial `git commit` (the baseline) "
+                           "before running the curator")
     # core.quotePath=false: git C-quotes non-ASCII paths in --porcelain by default (e.g.
     # "pi\303\261ata.md"), and strip('"') would leave the octal-escaped string — a mismatch that
     # defeats the CAS `rel in dirty` collision check for such names (oracle code-review MINOR).
@@ -121,6 +130,10 @@ def stage_in(root: Path, walk: knowledge.WalkResult, *, op: str) -> tuple[Path, 
                 shutil.copyfileobj(sf, df)
         except OSError as e:
             log(f"stage-in skipped {d.path!r}: {e}")
+            try:                                     # a partial dst must not masquerade as staged
+                dst.unlink()
+            except OSError:
+                pass
             continue
         manifest[d.path] = d.content_sha
 
@@ -253,7 +266,14 @@ def promote_apply(root: Path, staging: Path, ch: Changes, manifest: dict[str, st
     file appearing after the check can never be overwritten); index.md is published with a FINAL
     compare-at-publish under O_EXCL-temp + rename (closes the modify TOCTOU: a human edit landing
     in the check→replace window aborts). ANY conflict aborts before that target is written; a
-    partial multi-file promote is journaled per applied file for deterministic recovery."""
+    partial multi-file promote is journaled per applied file for deterministic recovery.
+
+    ACCEPTED RESIDUALS (kilabz re-review PARTIAL, bounded by the scope advisory lock held across
+    the promote + git-recoverability, acceptable for a solo local corpus): (a) index.md is a
+    MODIFY so O_EXCL can't apply — a sub-microsecond hash-recompare→rename window remains; (b)
+    cross-file atomicity — a mid-apply failure can leave earlier files live+uncommitted, made
+    DETERMINISTICALLY DETECTABLE by the journal (never silent). Closing either fully needs a
+    heavier FS transaction than v1 warrants."""
     notes: list[str] = []
     targets = list(ch.new_files) + (["index.md"] if ch.index_modified else [])
     if not targets:
@@ -294,10 +314,10 @@ def promote_apply(root: Path, staging: Path, ch: Changes, manifest: dict[str, st
         for rel in ch.new_files:                      # NEW files: atomic no-clobber create
             data = (staging / rel).read_bytes()
             fd = os.open(root / rel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            try:
-                os.write(fd, data)
-            finally:
-                os.close(fd)
+            # buffered write => full-write-or-raise (kilabz re-review: a bare os.write can short-
+            # write and commit a truncated file). closefd=True closes the fd on exit.
+            with open(fd, "wb", closefd=True) as f:
+                f.write(data)
             applied.append(rel)
             _write_journal("applying")
         if ch.index_modified:                         # index MODIFY: temp + FINAL re-compare + rename
@@ -316,13 +336,33 @@ def promote_apply(root: Path, staging: Path, ch: Changes, manifest: dict[str, st
         _write_journal("applied-partial", error=str(e))
         return bool(applied), _partial_note(applied, f"promote FAILED mid-apply ({e})")
 
-    _git(root, ["add", "--"] + applied)               # per-file add: human drift is never folded in
-    # pathspec-SCOPED commit (oracle MAJOR): a bare `git commit -m` commits the WHOLE index.
-    r = _git(root, ["commit", "-m", f"curate({root.name}): {slug}", "--"] + applied, check=False)
+    # commit via a SCRATCH INDEX = HEAD + exactly `applied`, so the commit records neither the
+    # human's real staged index (oracle MAJOR: no whole-index sweep) NOR a re-read of the working
+    # tree at commit time via pathspec (kilabz re-review MAJOR: `git commit -- paths` re-reads the
+    # worktree). read-tree pins HEAD; add stages our files into the scratch index; the pathspec-
+    # less commit records THAT index exactly. The real index/worktree are untouched.
+    idx = str(staging / ".git-scratch-index")
+    try:
+        _git(root, ["read-tree", "HEAD"], index_file=idx)
+        _git(root, ["add", "--"] + applied, index_file=idx)
+        r = _git(root, ["commit", "-m", f"curate({root.name}): {slug}"], index_file=idx, check=False)
+    except RuntimeError as e:
+        _write_journal("applied-uncommitted", error=str(e)[:300])
+        return True, [f"applied {len(applied)} file(s) but COMMIT SETUP FAILED — files are live; "
+                      f"commit manually. {str(e)[:200]}"]
+    finally:
+        try:
+            os.unlink(idx)
+        except OSError:
+            pass
     if r.returncode != 0:
         _write_journal("applied-uncommitted", error=(r.stderr or r.stdout).strip()[:300])
-        return True, [f"applied {len(applied)} file(s) but COMMIT FAILED — files are live and "
-                      f"staged; commit manually. git: {(r.stderr or r.stdout).strip()[:200]}"]
+        return True, [f"applied {len(applied)} file(s) but COMMIT FAILED — files are live; commit "
+                      f"manually. git: {(r.stderr or r.stdout).strip()[:200]}"]
+    # resync the REAL index for OUR paths only (the scratch-index commit advanced HEAD without
+    # touching the real index, so those paths would otherwise show as phantom staged-deletions);
+    # `reset -- applied` touches only our paths, leaving any human-staged files alone.
+    _git(root, ["reset", "-q", "HEAD", "--"] + applied, check=False)
     sha = _git(root, ["rev-parse", "HEAD"]).stdout.strip()[:12]
     _write_journal("committed", commit=sha)
     notes.append(f"committed {sha}: {', '.join(applied)}")

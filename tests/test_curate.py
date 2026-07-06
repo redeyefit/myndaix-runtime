@@ -252,6 +252,51 @@ def test_promote_unsafe_target_refused():
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def test_promote_isolates_human_staged_index():
+    # oracle MAJOR + kilabz re-review: the commit must record ONLY our targets, never a file the
+    # human staged mid-run (scratch-index commit), and must leave that staged file staged.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        root.mkdir()
+        _mk_corpus(root)
+        # human stages an unrelated change
+        (root / "2026-06-08-alpha.md").write_text("# Alpha\nhuman edit staged\n")
+        subprocess.run(["git", "-C", str(root), "add", "2026-06-08-alpha.md"], check=True)
+        staging, manifest = _staged(root)
+        try:
+            (staging / "2026-07-05-new.md").write_text("# New\n[[2026-06-08-alpha]]\n")
+            (staging / "index.md").write_text((staging / "index.md").read_text()
+                                              + "- 2026-07-05-new.md — new\n")
+            ch = curate.classify_changes(staging, manifest, op="file")
+            applied, notes = curate.promote_apply(root, staging, ch, manifest, set(), slug="t")
+            ok(applied, "promote succeeded")
+            files_in_commit = subprocess.run(
+                ["git", "-C", str(root), "show", "--name-only", "--format=", "HEAD"],
+                capture_output=True, text=True).stdout.split()
+            ok("2026-06-08-alpha.md" not in files_in_commit,
+               "human-staged file NOT swept into the curate commit")
+            ok("2026-07-05-new.md" in files_in_commit, "our new file IS in the commit")
+            staged = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--name-only"],
+                                    capture_output=True, text=True).stdout
+            ok("2026-06-08-alpha.md" in staged, "human's staged change survives (still staged)")
+        finally:
+            import shutil
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_promote_requires_baseline_commit():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        root.mkdir()
+        _mk_corpus(root, git=False)
+        subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)   # repo, but NO commits
+        try:
+            curate.git_preflight(root)
+            ok(False, "no-baseline repo must be refused")
+        except RuntimeError as e:
+            ok("no commits" in str(e) or "baseline" in str(e), "no-baseline repo refused clearly")
+
+
 def test_promote_dirty_index_collision():
     # kilabz MAJOR: a dirty index.md is a target collision (was only checked for new_files).
     with tempfile.TemporaryDirectory() as td:
