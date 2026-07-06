@@ -141,16 +141,24 @@ V1_ROSTER: list[AgentSpec] = [
               #     ~/.claude.json has ~22, incl. filesystem/firecrawl/github — a read-only-sandbox
               #     BYPASS; the cross-family BLOCKER). Proven: a hostile MCP server is NOT spawned.
               #  3. scratch_home (runner) — an EMPTY throwaway HOME (claude auths via the env token),
-              #     so NO inherited ~/.claude settings/hooks/MCP-config load at all (belt; also
-              #     blocks inherited HOOKS that 1+2 don't cover).
-              # SHIPPING READ-ONLY (write/bash/net/out-of-tree/MCP all denied; in-tree read works).
+              #     so NO inherited ~/.claude settings/hooks/MCP-config load at all (belt).
+              #  4. `--safe-mode` — disable ALL customizations (project/local hooks, plugins,
+              #     commands, agents) that 1-3 don't cover (cross-family re-review BLOCKER: a hook
+              #     could run code outside the --tools whitelist). Proven functional (read works).
+              # RESIDUAL (read-only-accepted, documented): the Read tool is NOT path-scoped, so an
+              # injected brief could make it read an absolute host path (e.g. ~/.ssh) into the reply.
+              # Bounded by NO EXTERNAL CHANNEL (net/bash/MCP all denied) — a read can only surface in
+              # the operator's own local curate output, never exfiltrated. OS sandbox (sandbox-exec)
+              # scoping filesystem reads to the staging dir is the recorded next hardening rung.
+              # SHIPPING READ-ONLY (write/bash/net/out-of-tree-write/MCP all denied; in-tree read works).
               # TO ENABLE WRITE: add "Write", "Edit" to --tools — but that reopens the out-of-tree
               # Write-TOOL leak (Write isn't cwd-confined like Bash), so Write stays GATED pending a
               # working path-scope (the promote guard only bounds IN-tree; see design BUILD FINDING).
               profile=Profile(timeout_s=600),
               adapter={"kind": "cli",
                        "argv": ["claude", "-p", "--model", "sonnet", "--output-format", "text",
-                                "--tools", "Read", "Glob", "Grep", "--strict-mcp-config"],
+                                "--tools", "Read", "Glob", "Grep", "--strict-mcp-config",
+                                "--safe-mode"],
                        "prompt_channel": "stdin", "staging_cwd": True, "scratch_home": True,
                        "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
