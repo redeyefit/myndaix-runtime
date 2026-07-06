@@ -279,6 +279,12 @@ def promote_apply(root: Path, staging: Path, ch: Changes, manifest: dict[str, st
     if not targets:
         return False, ["no changes to promote"]
 
+    # HEAD must exist BEFORE any write (kilabz rr2): the scratch-index commit reads HEAD, so a
+    # no-baseline repo would otherwise apply files then fail at read-tree. curate() always runs
+    # git_preflight first; this makes promote_apply safe for a direct caller too.
+    if _git(root, ["rev-parse", "--verify", "HEAD"], check=False).returncode != 0:
+        return False, ["REFUSED: no baseline commit (run git_preflight / make an initial commit)"]
+
     # defense-in-depth: every sink re-validated here, not trusted from classify_changes.
     for rel in targets:
         if not _safe_target(root, rel):
@@ -361,9 +367,18 @@ def promote_apply(root: Path, staging: Path, ch: Changes, manifest: dict[str, st
                       f"manually. git: {(r.stderr or r.stdout).strip()[:200]}"]
     # resync the REAL index for OUR paths only (the scratch-index commit advanced HEAD without
     # touching the real index, so those paths would otherwise show as phantom staged-deletions);
-    # `reset -- applied` touches only our paths, leaving any human-staged files alone.
-    _git(root, ["reset", "-q", "HEAD", "--"] + applied, check=False)
+    # `reset -- applied` touches only our paths, leaving any human-staged files alone. A CHECKED
+    # reset (kilabz rr2): a silent failure would leave a stale index; the commit is durable, so we
+    # surface a note telling the human to `git reset` rather than pretend the state is clean.
     sha = _git(root, ["rev-parse", "HEAD"]).stdout.strip()[:12]
+    rr = _git(root, ["reset", "-q", "HEAD", "--"] + applied, check=False)
+    if rr.returncode != 0:
+        _write_journal("committed-index-desync", commit=sha,
+                       error=(rr.stderr or rr.stdout).strip()[:200])
+        notes.append(f"committed {sha}: {', '.join(applied)} — WARNING: index resync failed "
+                     f"(HEAD is correct; run `git reset` in the corpus to clear phantom entries): "
+                     f"{(rr.stderr or rr.stdout).strip()[:150]}")
+        return True, notes
     _write_journal("committed", commit=sha)
     notes.append(f"committed {sha}: {', '.join(applied)}")
     return True, notes
