@@ -122,6 +122,28 @@ V1_ROSTER: list[AgentSpec] = [
               adapter={"kind": "cli", "argv": ["agy", "--model", "Gemini 3.1 Pro (High)", "-p"],
                        "prompt_channel": "arg",
                        "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]}),
+    AgentSpec(agent_id="curator", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
+              model="sonnet", role="corpus librarian (research/ folder-agent)",
+              # The curator NEVER runs against the live corpus: `mxr curate` (curate.py) stages a
+              # filtered copy under $MYNDAIX_STAGING_ROOT and passes context.workdir; invoke_cli
+              # honors that ONLY because staging_cwd is declared here AND the path resolves inside
+              # the staging namespace (fail-closed, no scratch fallback) — a registry row can NOT
+              # opt into an arbitrary cwd (PR #39 invariant; curator-design v0.4 r3). The REAL
+              # write boundary is the guard's diff-audit + the runtime-authored path-scoped
+              # .claude/settings.json it writes into staging; these argv flags are the belt.
+              # Write authority is EVIDENCE-GATED on the enforcement ship gate
+              # (tests/test_curator_enforcement.py, re-run per claude upgrade). SHIPPING READ-ONLY:
+              # the gate is currently unproven (curator token credit-blocked at build time), so the
+              # argv belt omits Write/Edit AND curate.write_enabled() defaults OFF (FILE degrades to
+              # propose-only). TO ENABLE WRITE once the gate passes: add "Write Edit" back to
+              # --allowedTools here AND set MYNDAIX_CURATOR_WRITE=1 (design v0.4 open-call #1).
+              profile=Profile(timeout_s=600),
+              adapter={"kind": "cli",
+                       "argv": ["claude", "-p", "--model", "sonnet", "--output-format", "text",
+                                "--allowedTools", "Read Glob Grep",
+                                "--disallowedTools", "Bash WebFetch WebSearch Task NotebookEdit"],
+                       "prompt_channel": "stdin", "staging_cwd": True,
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
               model="sonar-pro+claude", role="research (read-only)",
               profile=Profile(cost_budget=5.0),

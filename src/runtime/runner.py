@@ -54,6 +54,13 @@ _CLI_ENV_BASE = (
 _CLI_ENV_PASSTHROUGH = "MYNDAIX_CLI_ENV_PASSTHROUGH"   # operator escape hatch: comma-separated extra var names
 
 
+def _staging_root() -> str:
+    """The ONE namespace a staging_cwd agent may run under (curate.py creates dirs here).
+    Must agree with curate.STAGING_ROOT — both read the same env override."""
+    return os.environ.get("MYNDAIX_STAGING_ROOT") or os.path.join(
+        os.path.expanduser("~"), ".myndaix", "orchestrator", "staging")
+
+
 def _cli_env(spec: AgentSpec) -> dict[str, str]:
     """Build the scrubbed environment for a CLI-agent subprocess: the operational
     baseline + the agent's own declared secret_ref + an operator-configured
@@ -157,6 +164,30 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     cwd = job.worktree_path or None
     scratch_cwd = None
     started = time.monotonic()
+    # staging-cwd agents (curator): the curate guard passes context.workdir = a staging dir IT
+    # created. Honored ONLY when the adapter declares staging_cwd AND the path is a real dir
+    # strictly inside the staging namespace — FAIL-CLOSED to a TERMINAL Result, never a scratch
+    # fallback (a curator without its staged corpus would answer from nothing) and never an
+    # arbitrary live dir (the PR #39 scratch-cwd invariant stays closed for every other agent:
+    # without the adapter flag, context.workdir is ignored entirely).
+    # UNCONDITIONAL over any worktree (oracle code-review BLOCKER): the curator is a
+    # WORKSPACE_ACTOR, so a dispatch carrying a repo_id would make the worker set job.worktree_path
+    # and (under a `cwd is None` guard) SKIP staging → the agent runs in the live worktree, past
+    # the guard boundary. A staging_cwd agent must NEVER run anywhere but its validated staging
+    # dir; a stray worktree_path is ignored (and would be a misconfiguration to pass one).
+    if adapter.get("staging_cwd"):
+        wd = (job.context or {}).get("workdir")
+        real = os.path.realpath(wd) if isinstance(wd, str) and wd else ""
+        sroot = os.path.realpath(_staging_root())
+        try:
+            inside = bool(real) and os.path.commonpath([real, sroot]) == sroot and real != sroot
+        except ValueError:                     # different drives / malformed
+            inside = False
+        if not (inside and os.path.isdir(real)):
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                          text=f"staging_cwd agent requires context.workdir inside "
+                               f"{sroot} (got {wd!r})", ms=_ms(started))
+        cwd = real
     try:
         try:
             # allocate the scratch cwd INSIDE the try so an mkdtemp OSError (e.g. ENOSPC) becomes a

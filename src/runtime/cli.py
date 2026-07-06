@@ -198,6 +198,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         from runtime import outcomerecord
         return outcomerecord.dismiss_main(["outcome", *raw[1:]])
 
+    # `mxr knowledge-ingest / recall / knowledge-rebuild / curate` — the curator rung
+    # (docs/curator-design.md v0.4). Same routing rationale as the verbs above (inherits
+    # venv/PYTHONPATH/DSN via mxr). Operator verbs: unknown scope is a HARD error (exit 2),
+    # never fail-open — misconfiguration must not read as "no knowledge". `curate` is the
+    # deterministic guard around the pool's curator agent (stage-in -> dispatch -> promote).
+    if raw and raw[0] == "knowledge-ingest":
+        from runtime import knowledgerecord
+        return knowledgerecord.ingest_main(["knowledge-ingest", *raw[1:]])
+    if raw and raw[0] == "knowledge-rebuild":
+        from runtime import knowledgerecord
+        return knowledgerecord.rebuild_main(["knowledge-rebuild", *raw[1:]])
+    if raw and raw[0] == "recall":
+        from runtime import knowledgerecord
+        return knowledgerecord.recall_main(["recall", *raw[1:]])
+    if raw and raw[0] == "curate":
+        from runtime import curate
+        return curate.main(["curate", *raw[1:]])
+
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')

@@ -247,3 +247,39 @@ SELECT rule_tag,
              ('applied_fixed','dismissed_false_positive')), 0)        AS precision
   FROM finding_current
  GROUP BY rule_tag, reviewer_family;
+
+-- ---- knowledge_doc: the curator rung's derived FTS index over a corpus folder (0009) ----------
+-- Append-only events + computed views (finding_outcome's discipline); files are the source of
+-- truth, this table is a derived, REBUILDABLE index (rebuild = tombstone sweep + re-ingest, never
+-- TRUNCATE). No (scope,path,sha) unique index ON PURPOSE (it would ghost a restore-after-archive
+-- of identical content); idempotency = compare-current-before-insert under a per-scope advisory
+-- lock. Design: docs/curator-design.md v0.4.
+CREATE TABLE knowledge_doc (
+    seq         bigserial,        -- monotonic event order ('latest' is by seq, not created_at)
+    id          uuid PRIMARY KEY, -- deterministic tie-break for the current view's total order
+    scope       text NOT NULL,    -- corpus id; static allowlist in code (unknown = hard error)
+    path        text NOT NULL,    -- relative to the corpus root, traversal-checked at ingest
+    title       text NOT NULL DEFAULT '',
+    tags        text NOT NULL DEFAULT '',
+    doc_date    date,             -- filename YYYY-MM-DD prefix wins, frontmatter date: fallback
+    body        text NOT NULL,    -- decoded errors='replace', NULs stripped, capped ~900KB
+    content_sha text NOT NULL,    -- sha256 of raw bytes; 'absent' marks a tombstone
+    status      text NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+    lossy       boolean NOT NULL DEFAULT false,  -- decode/truncation loss — surfaced in recall
+    tsv tsvector GENERATED ALWAYS AS (            -- 2-arg to_tsvector: IMMUTABLE (generated col)
+        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(tags,  '')), 'B') ||
+        setweight(to_tsvector('english', coalesce(body,  '')), 'D')) STORED,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX knowledge_doc_tsv_idx ON knowledge_doc USING GIN (tsv);
+CREATE INDEX knowledge_doc_cur_idx ON knowledge_doc (scope, path, seq DESC);
+
+CREATE OR REPLACE VIEW knowledge_doc_current AS
+SELECT DISTINCT ON (scope, path)
+       seq, id, scope, path, title, tags, doc_date, body, content_sha, status, lossy, tsv, created_at
+  FROM knowledge_doc
+ ORDER BY scope, path, seq DESC, id DESC;
+
+CREATE OR REPLACE VIEW knowledge_doc_active AS
+SELECT * FROM knowledge_doc_current WHERE status = 'active';
