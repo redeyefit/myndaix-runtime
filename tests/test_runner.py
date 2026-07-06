@@ -334,6 +334,28 @@ def test_scratch_home_noop_without_flag():
     assert scratch is None and env == {"HOME": "/real/home"}
 
 
+def test_scratch_home_empty_for_curator(tmpdir=None):
+    """A scratch_home agent with NO seed entry (curator: claude auths via the env token) runs
+    under an EMPTY throwaway HOME — so it can't inherit the operator's ~/.claude MCP servers /
+    hooks / settings (the cross-family read-only-bypass BLOCKER). Nothing is seeded; the empty
+    HOME IS the isolation."""
+    import os, shutil
+    spec = AgentSpec(agent_id="curator", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["claude"], "prompt_channel": "stdin",
+                              "scratch_home": True})
+    scratch = None
+    try:
+        env, scratch = runner._make_scratch_home(
+            spec, {"HOME": "/Users/real", "CLAUDE_CONFIG_DIR": "/Users/real/.claude"})
+        assert scratch and env["HOME"] == scratch and env["HOME"] != "/Users/real"
+        assert os.path.isdir(scratch) and not os.listdir(scratch)   # EMPTY — nothing inherited
+        assert "CLAUDE_CONFIG_DIR" not in env                       # host config override dropped
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_cli_env_operator_passthrough_escape_hatch():
     """$MYNDAIX_CLI_ENV_PASSTHROUGH lets the operator open a hole at deploy time (e.g. an
     env-based CLI auth key) without a source edit — comma-separated, whitespace-tolerant."""

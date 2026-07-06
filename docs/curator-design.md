@@ -35,14 +35,41 @@ Two bugs + one wrong assumption:
    lacks those tools entirely; the deterministic promote guard stays the real write boundary.
    With this config the gate PASSES (out-of-tree denied) AND the agent functions (in-tree read+write).
 
-**THE FIX (needs Jefe steer + cross-family review — it changes the reviewed enforcement story):**
-- registry curator argv → separate-arg allowedTools (read-only ships `Read Glob Grep`; Write adds
-  `Write Edit`). Drop `--disallowedTools` string (a whitelist is enough — unlisted tools are absent).
-- `curate.stage_in` → do NOT author `.claude/settings.json` (or if kept for defense-in-depth, allow-
-  only, NO deny-globs on `/**`). Keep the filtered stage-in + MANIFEST.
-- Re-run the gate on the corrected config (should pass safety + functionality), then flip Write.
-- Until then the curator AGENT (QUERY/FILE/LINT) does not function; the deterministic retrieval
-  verbs (recall/knowledge-index/ingest) are fully live and unaffected.
+**THE FIX — APPLIED 2026-07-06 (read-only), cross-family reviewed.** Deeper CLI probing corrected
+two of my own first-pass conclusions:
+- **`--allowedTools` is a pre-APPROVAL list, NOT a hard whitelist.** Write/Edit are DEFAULT-AVAILABLE
+  in headless `-p` even when omitted — so "read-only via omitting Write" LEAKED writes. Read-only
+  REQUIRES an explicit `--disallowedTools Write Edit Bash WebFetch WebSearch Task NotebookEdit`
+  (all SEPARATE argv elements — the one-string form parses as a single tool name matching nothing).
+- **claude's cwd-confinement stops BASH escaping, but the Write TOOL can write an absolute
+  out-of-tree path.** So a naive "allow Write + deny Bash" write-enabled config LEAKS out-of-tree
+  via the Write tool. The staging `settings.json` had tried to path-scope this (`Write(./**)`) but
+  its `Read(/**)` deny-glob self-denied in-tree reads → it's dropped entirely; the argv is the
+  control (it also shadows any inherited `~/.claude/settings.json`, verified).
+- **Applied (after 2 cross-family review rounds — both families caught a serious inherited-config
+  BLOCKER a solo ship would have missed):** the confinement is FOUR layers, gate-proven under a
+  deliberately HOSTILE inherited HOME (permissive settings + hostile MCP server + hostile
+  cwd-parent hook):
+  1. registry argv `--tools Read Glob Grep` — the HARD built-in whitelist (only these tools EXIST;
+     `--allowedTools` is only pre-approval and leaves Write default-available).
+  2. `--strict-mcp-config` — ignore ALL inherited MCP (the operator's ~/.claude.json has ~22
+     servers incl. filesystem/firecrawl/github — a full sandbox bypass; observably NOT spawned).
+  3. `--safe-mode` — disable project/local hooks/plugins/commands/agents (a cwd-parent PreToolUse
+     hook would run code outside the whitelist; observably does NOT fire).
+  4. runner `scratch_home` — an EMPTY throwaway HOME (claude auths via the env token) so nothing
+     under `~/.claude` is inherited at all.
+  **Gate PASSES all hard probes**: in-tree WRITE, Bash, WebFetch, inherited MCP, cwd-parent hook,
+  out-of-tree WRITE all DENIED; in-tree READ works. The curator AGENT (QUERY/LINT) functions
+  read-only.
+- **ACCEPTED RESIDUAL (read-only) — out-of-tree READ:** the `Read` tool is not path-scoped, so an
+  injected brief could make it read an absolute host path (e.g. `~/.ssh`) into the reply. BOUNDED
+  BY NO EXTERNAL CHANNEL (net/bash/MCP/write all denied) — a read can only surface in the invoking
+  operator's own local curate output, never be exfiltrated externally. OS-level filesystem
+  confinement (`sandbox-exec` scoping reads to the staging dir) is the recorded next hardening rung
+  — a Jefe risk-posture call (accept-with-no-external-channel vs build the sandbox).
+- **Write-ENABLEMENT remains GATED:** adding Write to `--tools` reopens the out-of-tree Write-tool
+  leak (Write isn't cwd-confined like Bash). Needs the same OS path-scoping as the read residual.
+- Deterministic verbs (recall/knowledge-index/ingest) are unaffected + fully live throughout.
 
 ## As-built (v1.0)
 

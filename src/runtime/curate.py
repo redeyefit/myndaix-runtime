@@ -56,9 +56,11 @@ OPS = ("query", "file", "lint")
 
 def write_enabled() -> bool:
     """Curator Write authority is EVIDENCE-GATED on the enforcement ship gate
-    (tests/test_curator_enforcement.py). Default OFF (read-only + propose-only) until the gate
-    proves out-of-tree denial on the live CLI; flip via MYNDAIX_CURATOR_WRITE=1 THEN add
-    Write/Edit back to the registry argv belt. See curator-design.md open-call #1."""
+    (tests/test_curator_enforcement.py). Default OFF: gates the PROMOTE path (agent file writes are
+    never promoted unless explicitly enabled — a belt even if the registry argv somehow allowed a
+    write). To ENABLE: add Write/Edit to the registry curator --allowedTools (SEPARATE args) AND set
+    MYNDAIX_CURATOR_WRITE=1, after the gate passes on the write-enabled config. Tool confinement is
+    the argv whitelist, NOT a staging settings.json (BUILD FINDING 2026-07-06)."""
     return os.environ.get("MYNDAIX_CURATOR_WRITE") == "1"
 
 
@@ -110,10 +112,18 @@ def git_preflight(root: Path) -> set[str]:
 
 # ---- stage-in -----------------------------------------------------------------------------------
 def stage_in(root: Path, walk: knowledge.WalkResult, *, op: str) -> tuple[Path, dict[str, str]]:
-    """Build the disposable workspace: eligible *.md copied by content, MANIFEST.txt listing ALL
-    artifacts (so the agent can index assets it cannot read), and the runtime-authored path-scoped
-    permissions. Returns (staging_dir, manifest {rel_path: sha}). Nothing config-loadable comes
-    from the corpus — the runtime authors the whole cwd."""
+    """Build the disposable workspace: eligible *.md copied by content + MANIFEST.txt listing ALL
+    artifacts (so the agent can index assets it cannot read). Returns (staging_dir, manifest).
+
+    NO .claude/settings.json is authored (BUILD FINDING 2026-07-06, gate-proven): its
+    Read(/**)/Write(/**) deny-globs matched in-tree files too (claude resolves to absolute paths)
+    and self-denied the agent's own read/write. Tool confinement lives in the registry adapter:
+    the HARD `--tools Read Glob Grep` built-in whitelist (write/bash/net tools don't exist for the
+    agent — holds even under a hostile inherited ~/.claude/settings.json), `--strict-mcp-config`
+    (no inherited MCP servers), and the runner's scratch_home (empty HOME → no inherited settings/
+    hooks/MCP). Read-only means out-of-tree writes are moot (no write tool); the deterministic
+    promote guard is the write boundary if/when Write is enabled (cwd-confinement only bounds
+    Bash, NOT the Write tool)."""
     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
     tok = uuid.uuid4().hex[:8]
     ts = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -154,19 +164,6 @@ def stage_in(root: Path, walk: knowledge.WalkResult, *, op: str) -> tuple[Path, 
         kind = "md" if rel.lower().endswith(".md") else "asset"
         lines.append(f"{rel}\t{size}\t{kind}")
     (staging / MANIFEST).write_text("\n".join(lines) + "\n")
-
-    allow = ["Read(./**)", "Glob", "Grep"]
-    if op != "lint" and write_enabled():            # LINT is always read-only (r3); FILE/QUERY get
-        allow += ["Write(./**)", "Edit(./**)"]      # Write ONLY when the ship gate has cleared it
-    settings = {"permissions": {
-        "allow": allow,
-        "deny": ["Bash", "WebFetch", "WebSearch", "Task", "NotebookEdit",
-                 "Read(/**)", "Write(/**)", "Edit(/**)",
-                 "Read(~/**)", "Write(~/**)", "Edit(~/**)"],
-    }}
-    cdir = staging / ".claude"
-    cdir.mkdir(mode=0o700)
-    (cdir / "settings.json").write_text(json.dumps(settings, indent=2))
     return staging, manifest
 
 
