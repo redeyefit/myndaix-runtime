@@ -137,16 +137,19 @@ async def test_recall_active_only(led):
 
 
 # ---- rebuild ----------------------------------------------------------------------------------
-async def test_rebuild_tombstones(led):
+async def test_rebuild_single_lock(led):
     await _truncate(led)
-    await led.knowledge_sync("research", [_doc("r1.md", "# r1"), _doc("r2.md", "# r2")])
-    n = await led.knowledge_rebuild_tombstones("research")
-    ok(n == 2, "rebuild sweep tombstones every active doc")
-    active = await led._pool.fetchval(
-        "SELECT count(*) FROM knowledge_doc_active WHERE scope='research'")
-    ok(active == 0, "nothing active after the sweep")
+    await led.knowledge_sync("research", [_doc("r1.md", "# r1 old"), _doc("r2.md", "# r2")])
+    # rebuild with a CHANGED r1 + dropped r2 + new r3, all under one lock (no empty-index window)
+    res = await led.knowledge_rebuild("research", [_doc("r1.md", "# r1 new"), _doc("r3.md", "# r3")])
+    ok(res["tombstoned"] == 2 and res["inserted"] == 2, "rebuild tombstones all active then reingests")
+    active = {r["path"] for r in await led._pool.fetch(
+        "SELECT path FROM knowledge_doc_active WHERE scope='research'")}
+    ok(active == {"r1.md", "r3.md"}, "active set = the freshly walked docs (r2 gone, r3 in)")
+    row = await _current(led, "research", "r1.md")
+    ok(row["content_sha"] == _doc("r1.md", "# r1 new")["content_sha"], "r1 rebuilt to new content")
     total = await led._pool.fetchval("SELECT count(*) FROM knowledge_doc")
-    ok(total == 4, "all appends — history retained, never TRUNCATE")
+    ok(total == 2 + 2 + 2, "all appends — full history retained, never TRUNCATE")
 
 
 async def main():

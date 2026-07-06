@@ -170,7 +170,12 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     # fallback (a curator without its staged corpus would answer from nothing) and never an
     # arbitrary live dir (the PR #39 scratch-cwd invariant stays closed for every other agent:
     # without the adapter flag, context.workdir is ignored entirely).
-    if cwd is None and adapter.get("staging_cwd"):
+    # UNCONDITIONAL over any worktree (oracle code-review BLOCKER): the curator is a
+    # WORKSPACE_ACTOR, so a dispatch carrying a repo_id would make the worker set job.worktree_path
+    # and (under a `cwd is None` guard) SKIP staging → the agent runs in the live worktree, past
+    # the guard boundary. A staging_cwd agent must NEVER run anywhere but its validated staging
+    # dir; a stray worktree_path is ignored (and would be a misconfiguration to pass one).
+    if adapter.get("staging_cwd"):
         wd = (job.context or {}).get("workdir")
         real = os.path.realpath(wd) if isinstance(wd, str) and wd else ""
         sroot = os.path.realpath(_staging_root())

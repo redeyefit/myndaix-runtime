@@ -77,13 +77,16 @@ async def ingest(scope: str) -> int:
 async def rebuild(scope: str) -> int:
     led = await PostgresLedger.connect(DSN)
     try:
-        knowledge.resolve_scope(scope)              # hard-error BEFORE tombstoning anything
-        n = await led.knowledge_rebuild_tombstones(scope)
-        res = await _sync(led, scope)
+        root = knowledge.resolve_scope(scope)       # hard-error BEFORE tombstoning anything
+        walk = knowledge.walk_corpus(root)          # walk FIRST, then one-lock tombstone+reingest
+        for w in walk.warnings:
+            log(f"{scope}: {w}")
+        res = await led.knowledge_rebuild(
+            scope, [dataclasses.asdict(d) for d in walk.docs])
     finally:
         await led.close()
-    print(f"{scope}: rebuilt — tombstoned {n} then re-ingested {res['inserted']} "
-          f"({res['md_docs']} md docs on disk)")
+    print(f"{scope}: rebuilt — tombstoned {res['tombstoned']} then re-ingested {res['inserted']} "
+          f"({len(walk.docs)} md docs on disk)")
     return 0
 
 

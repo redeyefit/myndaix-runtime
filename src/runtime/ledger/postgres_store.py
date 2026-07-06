@@ -1629,11 +1629,11 @@ class PostgresLedger:
                             tombstoned += 1
         return {"inserted": inserted, "tombstoned": tombstoned, "unchanged": unchanged}
 
-    async def knowledge_rebuild_tombstones(self, scope: str) -> int:
-        """The admin rebuild's first half (mxr knowledge-rebuild): archive-tombstone EVERY active
-        doc in the scope — all appends, never TRUNCATE (the derived table still honors the ledger
-        discipline). The verb re-ingests from disk right after."""
-        n = 0
+    async def knowledge_rebuild(self, scope: str, docs: list[dict]) -> dict:
+        """The admin rebuild (mxr knowledge-rebuild): tombstone + re-ingest under ONE xact lock so
+        recall never observes an empty active index between the phases (kilabz MINOR). All appends,
+        never TRUNCATE. `docs` are the freshly-walked knowledge.DocRecord dicts."""
+        tombstoned = inserted = 0
         async with self._pool.acquire() as con:
             async with con.transaction():
                 await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
@@ -1645,8 +1645,18 @@ class PostgresLedger:
                                (id, scope, path, body, content_sha, status)
                            VALUES ($1,$2,$3,'','absent','archived')""",
                         _new_id(), scope, r["path"])
-                    n += 1
-        return n
+                    tombstoned += 1
+                for d in docs:
+                    await con.execute(
+                        """INSERT INTO knowledge_doc
+                               (id, scope, path, title, tags, doc_date, body, content_sha,
+                                status, lossy)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)""",
+                        _new_id(), scope, d["path"], d.get("title", ""), d.get("tags", ""),
+                        self._knowledge_date(d.get("doc_date")), d.get("body", ""),
+                        d["content_sha"], bool(d.get("lossy")))
+                    inserted += 1
+        return {"tombstoned": tombstoned, "inserted": inserted}
 
     async def knowledge_recall_fts(self, scope: str, query: str, k: int) -> list[dict]:
         """Ladder rung 1: websearch_to_tsquery (never raises on arbitrary text — the right entry

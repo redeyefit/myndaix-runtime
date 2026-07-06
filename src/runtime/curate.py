@@ -84,7 +84,10 @@ def git_preflight(root: Path) -> set[str]:
     if r.returncode != 0 or r.stdout.strip() != "true":
         raise RuntimeError(f"{root} is not a git repository — run `git init` + an initial commit "
                            "there first (the audit/rollback substrate is mandatory)")
-    out = _git(root, ["status", "--porcelain"]).stdout
+    # core.quotePath=false: git C-quotes non-ASCII paths in --porcelain by default (e.g.
+    # "pi\303\261ata.md"), and strip('"') would leave the octal-escaped string — a mismatch that
+    # defeats the CAS `rel in dirty` collision check for such names (oracle code-review MINOR).
+    out = _git(root, ["-c", "core.quotePath=false", "status", "--porcelain"]).stdout
     return {line[3:].strip().strip('"') for line in out.splitlines() if line.strip()}
 
 
@@ -105,7 +108,20 @@ def stage_in(root: Path, walk: knowledge.WalkResult, *, op: str) -> tuple[Path, 
         dst = staging / d.path
         if dst.parent != staging:                   # v1 corpus is flat; belt for nested md
             dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(root / d.path, dst)         # copyfile: content copy, never links/metadata
+        # O_NOFOLLOW re-open at copy time (kilabz MAJOR): walk_corpus validated the entry, but a
+        # local race could swap it to a symlink before this copy, leaking outside-root content
+        # into staging. Opening the SOURCE with O_NOFOLLOW refuses a symlink at the final syscall.
+        try:
+            sfd = os.open(root / d.path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as e:                         # ELOOP (raced to a symlink) / gone -> skip it
+            log(f"stage-in skipped {d.path!r}: {e}")
+            continue
+        try:
+            with open(sfd, "rb", closefd=True) as sf, open(dst, "wb") as df:
+                shutil.copyfileobj(sf, df)
+        except OSError as e:
+            log(f"stage-in skipped {d.path!r}: {e}")
+            continue
         manifest[d.path] = d.content_sha
 
     lines = []
@@ -217,47 +233,105 @@ def classify_changes(staging: Path, manifest: dict[str, str], *, op: str) -> Cha
 
 
 # ---- promote apply ------------------------------------------------------------------------------
+def _safe_target(root: Path, rel: str) -> bool:
+    """Re-validate a sink path at promote time (kilabz MAJOR: promote_apply must not trust the
+    Changes object for path safety). Top-level basename only, index.md or a valid new name, and
+    the resolved parent is EXACTLY root (no traversal via a crafted rel)."""
+    if rel != "index.md" and not knowledge.valid_new_filename(rel):
+        return False
+    p = (root / rel)
+    try:
+        return p.resolve().parent == root.resolve() and p.name == rel
+    except OSError:
+        return False
+
+
 def promote_apply(root: Path, staging: Path, ch: Changes, manifest: dict[str, str],
                   dirty: set[str], *, slug: str) -> tuple[bool, list[str]]:
-    """Apply validated changes to the live corpus: journal -> CAS -> atomic per-file rename ->
-    per-file git add -> hardened commit -> terminal journal mark. Returns (applied, notes).
-    ANY CAS failure aborts before the first write (human mid-run edits are never clobbered)."""
+    """Apply validated changes to the live corpus under a promote journal. New files are published
+    with an ATOMIC NO-CLOBBER create (O_CREAT|O_EXCL — closes the create TOCTOU: a human/racing
+    file appearing after the check can never be overwritten); index.md is published with a FINAL
+    compare-at-publish under O_EXCL-temp + rename (closes the modify TOCTOU: a human edit landing
+    in the check→replace window aborts). ANY conflict aborts before that target is written; a
+    partial multi-file promote is journaled per applied file for deterministic recovery."""
     notes: list[str] = []
     targets = list(ch.new_files) + (["index.md"] if ch.index_modified else [])
     if not targets:
         return False, ["no changes to promote"]
 
-    # CAS: a new name must not exist live (tracked, untracked, or dirty); a modified index.md must
-    # be byte-identical live to what we staged from.
+    # defense-in-depth: every sink re-validated here, not trusted from classify_changes.
+    for rel in targets:
+        if not _safe_target(root, rel):
+            return False, [f"REFUSED unsafe promote target {rel!r}"]
+
+    # preflight collision → CLEAN abort (no partial): a new name already live, or ANY target
+    # dirty/untracked, is a human's in-flight work (kilabz MAJOR: index.md was previously only
+    # checked for new_files). This is best-effort UX; the O_EXCL create below is the ATOMIC guard
+    # that closes the residual check→write race.
+    for rel in targets:
+        if rel in dirty:
+            return False, [f"CONFLICT: target {rel!r} is dirty/untracked in the live corpus — "
+                           "aborted (human work wins)"]
     for rel in ch.new_files:
-        if (root / rel).exists() or rel in dirty:
-            return False, [f"CONFLICT: {rel!r} appeared in the live corpus mid-run — aborted "
-                           "before any write"]
-    if ch.index_modified:
+        if (root / rel).exists():
+            return False, [f"CONFLICT: {rel!r} appeared in the live corpus mid-run — "
+                           "aborted before any write"]
+    if ch.index_modified:                             # the index MODIFY: value-CAS vs stage-in base
         live = root / "index.md"
         live_sha = hashlib.sha256(live.read_bytes()).hexdigest() if live.exists() else None
         if live_sha != manifest.get("index.md"):
             return False, ["CONFLICT: live index.md changed mid-run (human edit wins) — aborted"]
 
     journal = staging / JOURNAL
-    journal.write_text(json.dumps({"targets": targets, "state": "applying",
-                                   "root": str(root)}, indent=2))
-    for rel in targets:
-        tmp = root / f".curate-tmp-{uuid.uuid4().hex[:8]}"
-        shutil.copyfile(staging / rel, tmp)
-        os.replace(tmp, root / rel)                  # atomic per-file publish
-    _git(root, ["add", "--"] + targets)              # per-file add: human drift is never folded in
-    r = _git(root, ["commit", "-m", f"curate({root.name}): {slug}"], check=False)
+    applied: list[str] = []
+
+    def _write_journal(state: str, **extra) -> None:
+        journal.write_text(json.dumps({"targets": targets, "applied": applied, "state": state,
+                                       "root": str(root), **extra}, indent=2))
+
+    _write_journal("applying")
+    try:
+        for rel in ch.new_files:                      # NEW files: atomic no-clobber create
+            data = (staging / rel).read_bytes()
+            fd = os.open(root / rel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            applied.append(rel)
+            _write_journal("applying")
+        if ch.index_modified:                         # index MODIFY: temp + FINAL re-compare + rename
+            live = root / "index.md"
+            now_sha = hashlib.sha256(live.read_bytes()).hexdigest() if live.exists() else None
+            if now_sha != manifest.get("index.md"):   # re-read immediately before publish (TOCTOU)
+                _write_journal("aborted-index-conflict")
+                return bool(applied), _partial_note(applied, "index.md changed at publish time — "
+                                                    "new files already landed; index NOT updated")
+            tmp = root / f".curate-tmp-{uuid.uuid4().hex[:8]}"
+            shutil.copyfile(staging / "index.md", tmp)
+            os.replace(tmp, live)                     # atomic publish
+            applied.append("index.md")
+            _write_journal("applying")
+    except OSError as e:
+        _write_journal("applied-partial", error=str(e))
+        return bool(applied), _partial_note(applied, f"promote FAILED mid-apply ({e})")
+
+    _git(root, ["add", "--"] + applied)               # per-file add: human drift is never folded in
+    # pathspec-SCOPED commit (oracle MAJOR): a bare `git commit -m` commits the WHOLE index.
+    r = _git(root, ["commit", "-m", f"curate({root.name}): {slug}", "--"] + applied, check=False)
     if r.returncode != 0:
-        journal.write_text(json.dumps({"targets": targets, "state": "applied-uncommitted",
-                                       "error": (r.stderr or r.stdout).strip()[:300]}, indent=2))
-        return True, [f"applied {len(targets)} file(s) but COMMIT FAILED — files are live and "
+        _write_journal("applied-uncommitted", error=(r.stderr or r.stdout).strip()[:300])
+        return True, [f"applied {len(applied)} file(s) but COMMIT FAILED — files are live and "
                       f"staged; commit manually. git: {(r.stderr or r.stdout).strip()[:200]}"]
     sha = _git(root, ["rev-parse", "HEAD"]).stdout.strip()[:12]
-    journal.write_text(json.dumps({"targets": targets, "state": "committed",
-                                   "commit": sha}, indent=2))
-    notes.append(f"committed {sha}: {', '.join(targets)}")
+    _write_journal("committed", commit=sha)
+    notes.append(f"committed {sha}: {', '.join(applied)}")
     return True, notes
+
+
+def _partial_note(applied: list[str], why: str) -> list[str]:
+    return [f"PARTIAL PROMOTE: {why}. Landed (uncommitted): {applied or 'none'}. "
+            "The promote journal records the exact state; `git status` shows the pending files."]
 
 
 def sweep_unterminated_journals() -> list[str]:
@@ -272,6 +346,8 @@ def sweep_unterminated_journals() -> list[str]:
         if not j.is_file():
             continue
         try:
+            if j.stat().st_size > 4096:              # a real journal is tiny; ignore garbage (oracle NIT)
+                continue
             state = json.loads(j.read_text()).get("state")
         except (OSError, ValueError):
             state = "unreadable"

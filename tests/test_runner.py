@@ -175,6 +175,36 @@ def test_staging_cwd_rejects_out_of_namespace():
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def test_staging_cwd_ignores_stray_worktree(monkeypatch=None):
+    # oracle code-review BLOCKER: the curator is a WORKSPACE_ACTOR, so a dispatch with a repo_id
+    # makes the worker set job.worktree_path FIRST. A staging_cwd agent must STILL be forced into
+    # its validated staging dir (never run in the worktree, past the guard). A stray worktree with
+    # no valid context.workdir must fail closed, not fall through to the worktree.
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    stray_wt = tempfile.mkdtemp(prefix="mdx-test-straywt.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        job = _job()
+        job.worktree_path = stray_wt                    # a worktree the worker would have set
+        job.context = {}                                # but NO valid staging workdir
+        r = asyncio.run(runner.invoke_cli(_staging_spec(), job))
+        assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, \
+            "staging_cwd + stray worktree, no staging workdir -> must fail closed, not use worktree"
+        # and WITH a valid staging workdir, it runs there, not in the stray worktree
+        wd = os.path.join(sroot, "curate-y")
+        os.mkdir(wd)
+        job2 = _job()
+        job2.worktree_path = stray_wt
+        job2.context = {"workdir": wd}
+        r2 = asyncio.run(runner.invoke_cli(_staging_spec(), job2))
+        assert r2.status is ResultStatus.OK, r2.text
+        assert os.path.realpath(r2.text.strip()) == os.path.realpath(wd), "ran in staging, not worktree"
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+        shutil.rmtree(stray_wt, ignore_errors=True)
+
+
 def test_staging_cwd_flag_absent_ignores_workdir():
     # the invariant: an agent WITHOUT staging_cwd never honors context.workdir — it still gets a
     # fresh scratch cwd (PR #39). Prevents a future roster row from opting into an arbitrary cwd.

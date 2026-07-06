@@ -211,6 +211,65 @@ def test_promote_apply_and_cas():
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def test_promote_toctou_new_file_no_clobber():
+    # kilabz BLOCKER: a human file appearing AFTER the check must never be clobbered by the
+    # promote. O_EXCL create makes the publish atomic-no-clobber even if `dirty` missed it.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        root.mkdir()
+        _mk_corpus(root)
+        staging, manifest = _staged(root)
+        try:
+            (staging / "2026-07-05-new.md").write_text("# curator version\n")
+            ch = curate.classify_changes(staging, manifest, op="file")
+            # simulate the race: file exists live but was NOT in the (empty) dirty set passed in
+            (root / "2026-07-05-new.md").write_text("HUMAN VERSION\n")
+            applied, notes = curate.promote_apply(root, staging, ch, manifest, set(), slug="t")
+            ok((root / "2026-07-05-new.md").read_text() == "HUMAN VERSION\n",
+               "O_EXCL refused to clobber the human file that raced in")
+            ok(not applied or "PARTIAL" in " ".join(notes) or any("FAIL" in n for n in notes),
+               "promote did not succeed silently over the human file")
+        finally:
+            import shutil
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_promote_unsafe_target_refused():
+    # kilabz MAJOR: promote_apply re-validates targets, does not trust Changes.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        root.mkdir()
+        _mk_corpus(root)
+        staging, manifest = _staged(root)
+        try:
+            ch = curate.Changes(new_files=["../evil.md"])
+            applied, notes = curate.promote_apply(root, staging, ch, manifest, set(), slug="t")
+            ok(not applied and any("unsafe" in n.lower() for n in notes),
+               "traversal target refused at promote time")
+            ok(not (Path(td) / "evil.md").exists(), "nothing written outside root")
+        finally:
+            import shutil
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_promote_dirty_index_collision():
+    # kilabz MAJOR: a dirty index.md is a target collision (was only checked for new_files).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "corpus"
+        root.mkdir()
+        _mk_corpus(root)
+        staging, manifest = _staged(root)
+        try:
+            (staging / "index.md").write_text((staging / "index.md").read_text() + "- extra\n")
+            ch = curate.classify_changes(staging, manifest, op="file")
+            applied, notes = curate.promote_apply(root, staging, ch, manifest, {"index.md"},
+                                                  slug="t")
+            ok(not applied and any("index.md" in n for n in notes), "dirty index.md aborts promote")
+        finally:
+            import shutil
+            shutil.rmtree(staging, ignore_errors=True)
+
+
 def test_journal_sweep():
     with tempfile.TemporaryDirectory() as td:
         old = curate.STAGING_ROOT
