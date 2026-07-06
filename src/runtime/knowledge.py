@@ -281,20 +281,54 @@ def ilike_pattern(query: str) -> str:
 
 
 # ---- deterministic index skeleton (the design's v2 "computed index"; a base the curator enriches)
+_LIST_MARKER_RE = re.compile(r"^(?:[-*+>]\s|\d+[.)]\s)")     # bullet/ordered/quote, trailing space
+_MD_INLINE_UNSAFE = re.compile(r"[<>\[\]|]")                 # neutralize link/HTML/table breakers
+# metadata-label line (`**Date:** ...`, `Status: ...`) — pseudo-frontmatter these briefs open with;
+# a useless hook. Requires a short Capitalized label + colon, optionally bold-wrapped. Keeps real
+# bold prose like `**Important** point` (no colon at the label close).
+_META_LABEL_RE = re.compile(r"^\*{0,2}[A-Z][A-Za-z0-9 /_-]{0,24}:\*{0,2}(?:\s|$)")
+
+
+def _md_oneline(text: str, cap: int = 140) -> str:
+    """Sanitize an untrusted corpus/filename string for one-line markdown emission (kilabz+oracle):
+    collapse ALL whitespace (incl. newlines) to single spaces, neutralize inline markdown that
+    could break the list/wikilink/table or render as HTML (`< > [ ] |`), then cap. Cheap and
+    deterministic — the output is read by a human/curator, never executed."""
+    t = re.sub(r"\s+", " ", (text or "")[:cap * 3]).strip()
+    return _MD_INLINE_UNSAFE.sub(" ", t)[:cap].strip()
+
+
 def _first_prose_line(body: str) -> str:
     """First substantive line after the title/frontmatter — the deterministic one-line hook the
-    curator later replaces with a judged summary. Never a heading, fence, or list marker."""
+    curator later replaces with a judged summary. Skips: a LEADING `---` frontmatter block (only
+    when it opens the file — a later `---` is a horizontal rule, not frontmatter: kilabz+oracle
+    MAJOR); fenced code blocks (```/~~~); ATX headings; bullet/ordered/quote list markers (trailing
+    space required so `-10`/`**bold**` prose is NOT skipped: oracle MINOR); table/setext rules."""
     in_fm = False
-    for raw in body.splitlines():
+    in_fence = False
+    for i, raw in enumerate(body.splitlines()):
         line = raw.strip()
         if not line:
             continue
-        if line == "---":                    # frontmatter fence toggle
-            in_fm = not in_fm
+        if line == "---":
+            if i == 0:                       # opens frontmatter ONLY at the very top
+                in_fm = True
+            elif in_fm:                      # closes it
+                in_fm = False
+            continue                         # a mid-doc `---` (horizontal rule) is just skipped
+        if in_fm:
             continue
-        if in_fm or line.startswith(("#", "===", "```", "|", ">", "-", "*")):
+        if line[:3] in ("```", "~~~"):       # code-fence toggle — skip the fence AND its content
+            in_fence = not in_fence
             continue
-        return re.sub(r"\s+", " ", line)[:140]
+        if in_fence:
+            continue
+        if (line.startswith(("#", "===")) or _LIST_MARKER_RE.match(line)
+                or set(line) <= {"-", "="} or _META_LABEL_RE.match(line)):
+            continue                         # heading / list-marker / setext-or-hr rule / metadata
+        hook = _md_oneline(line)
+        if hook:
+            return hook
     return ""
 
 
@@ -310,28 +344,45 @@ def build_index_md(walk: WalkResult, *, title: str = "Research Corpus Index") ->
             groups.setdefault(d.doc_date[:7], []).append(d)
         else:
             undated.append(d)
-    out = [f"# {title}", "",
+    # duplicate-stem warning (kilabz MAJOR): wikilinks resolve by basename, so two docs sharing a
+    # stem (e.g. a/foo.md + b/foo.md) produce an ambiguous [[foo]]. The v1 corpus is flat so this
+    # shouldn't happen; warn (into the walk's warnings) rather than silently emit a broken link.
+    stems: dict[str, str] = {}
+    for d in walk.docs:
+        s = Path(d.path).stem.lower()
+        if s in stems and stems[s] != d.path:
+            walk.warnings.append(f"duplicate stem {s!r}: {d.path} vs {stems[s]} — [[{s}]] is ambiguous")
+        stems[s] = d.path
+
+    def _link(d: DocRecord) -> str:
+        return _md_oneline(Path(d.path).stem, 120)          # strips [ ] < > | from the stem
+
+    def _hook(d: DocRecord) -> str:
+        return _first_prose_line(d.body) or _md_oneline(d.title)
+
+    out = [f"# {_md_oneline(title, 120)}", "",
            "_Auto-generated skeleton (`mxr knowledge-index`). One-line hooks are the first prose "
            "line of each brief — the curator replaces them with judged summaries and regroups by "
            "topic._", ""]
+    # newest date first WITHIN a month via (doc_date, path) desc — not path-only, so a
+    # frontmatter-dated file with a non-date filename still sorts chronologically (kilabz MINOR).
     for ym in sorted(groups, reverse=True):
         out.append(f"## {ym}")
-        for d in sorted(groups[ym], key=lambda x: x.path, reverse=True):
-            stem = Path(d.path).stem
-            hook = _first_prose_line(d.body) or d.title
-            out.append(f"- [[{stem}]] ({d.doc_date}) — {hook}")
+        for d in sorted(groups[ym], key=lambda x: (x.doc_date or "", x.path), reverse=True):
+            out.append(f"- [[{_link(d)}]] ({d.doc_date}) — {_hook(d)}")
         out.append("")
     if undated:
         out.append("## Undated")
         for d in sorted(undated, key=lambda x: x.path):
-            stem = Path(d.path).stem
-            hook = _first_prose_line(d.body) or d.title
-            out.append(f"- [[{stem}]] — {hook}")
+            out.append(f"- [[{_link(d)}]] — {_hook(d)}")
         out.append("")
     assets = [a for a in walk.artifacts if not a.lower().endswith(".md")]
     if assets:
         out.append("## Assets (not full-text indexed)")
         for a in sorted(assets):
-            out.append(f"- {a}")
+            out.append(f"- {_md_oneline(a, 200)}")           # strip newlines/brackets from names
+        out.append("")
+    if not walk.docs and not assets:                         # deterministic empty state (kilabz NIT)
+        out.append("_No markdown briefs found._")
         out.append("")
     return "\n".join(out).rstrip() + "\n"
