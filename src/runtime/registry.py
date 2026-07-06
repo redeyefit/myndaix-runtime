@@ -132,12 +132,15 @@ V1_ROSTER: list[AgentSpec] = [
               # write boundary is the guard's diff-audit + the runtime-authored path-scoped
               # .claude/settings.json it writes into staging; these argv flags are the belt.
               # Write authority is EVIDENCE-GATED on the enforcement ship gate
-              # (tests/test_curator_enforcement.py, re-run per claude upgrade) — if the gate ever
-              # fails, drop Write/Edit here and curate degrades to propose-only (design v0.4 #1).
+              # (tests/test_curator_enforcement.py, re-run per claude upgrade). SHIPPING READ-ONLY:
+              # the gate is currently unproven (curator token credit-blocked at build time), so the
+              # argv belt omits Write/Edit AND curate.write_enabled() defaults OFF (FILE degrades to
+              # propose-only). TO ENABLE WRITE once the gate passes: add "Write Edit" back to
+              # --allowedTools here AND set MYNDAIX_CURATOR_WRITE=1 (design v0.4 open-call #1).
               profile=Profile(timeout_s=600),
               adapter={"kind": "cli",
                        "argv": ["claude", "-p", "--model", "sonnet", "--output-format", "text",
-                                "--allowedTools", "Read Glob Grep Write Edit",
+                                "--allowedTools", "Read Glob Grep",
                                 "--disallowedTools", "Bash WebFetch WebSearch Task NotebookEdit"],
                        "prompt_channel": "stdin", "staging_cwd": True,
                        "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token

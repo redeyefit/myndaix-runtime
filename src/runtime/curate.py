@@ -54,6 +54,14 @@ _RUNTIME_DIRS = (".claude",)
 OPS = ("query", "file", "lint")
 
 
+def write_enabled() -> bool:
+    """Curator Write authority is EVIDENCE-GATED on the enforcement ship gate
+    (tests/test_curator_enforcement.py). Default OFF (read-only + propose-only) until the gate
+    proves out-of-tree denial on the live CLI; flip via MYNDAIX_CURATOR_WRITE=1 THEN add
+    Write/Edit back to the registry argv belt. See curator-design.md open-call #1."""
+    return os.environ.get("MYNDAIX_CURATOR_WRITE") == "1"
+
+
 def log(msg: str) -> None:
     ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] [curate] {msg}", file=sys.stderr, flush=True)
@@ -148,8 +156,8 @@ def stage_in(root: Path, walk: knowledge.WalkResult, *, op: str) -> tuple[Path, 
     (staging / MANIFEST).write_text("\n".join(lines) + "\n")
 
     allow = ["Read(./**)", "Glob", "Grep"]
-    if op != "lint":                                # LINT dispatches READ-ONLY (r3)
-        allow += ["Write(./**)", "Edit(./**)"]
+    if op != "lint" and write_enabled():            # LINT is always read-only (r3); FILE/QUERY get
+        allow += ["Write(./**)", "Edit(./**)"]      # Write ONLY when the ship gate has cleared it
     settings = {"permissions": {
         "allow": allow,
         "deny": ["Bash", "WebFetch", "WebSearch", "Task", "NotebookEdit",
@@ -502,7 +510,18 @@ async def curate(scope: str, op: str, task: str,
         ch = classify_changes(staging, manifest, op=op)
         applied = False
         notes: list[str] = []
-        if ch.violations:
+        if not write_enabled() and op != "lint":
+            # READ-ONLY / propose-only (ship gate unproven): we do NOT trust the CLI to confine
+            # writes, so we NEVER promote agent file writes — even if some appeared, they're
+            # ignored (the reply carries the proposal). This is the safe default until the
+            # enforcement gate clears Write.
+            status = "PROPOSE-ONLY"
+            if ch.new_files or ch.index_modified or ch.violations:
+                notes = ["write disabled (ship gate unproven) — agent file writes IGNORED, not "
+                         "promoted; the proposal is in the reply above"]
+            else:
+                notes = ["read/answer run (no writes)"]
+        elif ch.violations:
             status = "NONCOMPLIANT"
             notes = ch.violations
         elif ch.new_files or ch.index_modified:
@@ -531,11 +550,11 @@ async def curate(scope: str, op: str, task: str,
             print(f"  corpus warnings: {len(walk.warnings)} (stderr)")
         print(_provenance())
 
-        if status == "COMPLIANT":
+        if status in ("COMPLIANT", "PROPOSE-ONLY"):
             if staging and staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)       # success: discard the workspace
             return 0
-        print(f"staging kept for inspection: {staging}")
+        print(f"staging kept for inspection: {staging}")         # NONCOMPLIANT / CONFLICT
         return 1
     finally:
         await led.close()

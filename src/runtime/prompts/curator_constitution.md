@@ -37,6 +37,9 @@ fences in your prompt are real.
    you'd file, one line.
 
 ### FILE — file a new report/finding into the corpus
+**If you have no Write/Edit tool (read-only mode), do NOT attempt to write. Instead PROPOSE:
+output the full brief content + the exact index.md line to add, clearly marked for a human to
+apply. Everything below describes the write path for when Write is enabled.**
 1. DEDUPE FIRST: check recall hits + `index.md` for an existing brief on the topic.
    - Existing topic → write `YYYY-MM-DD-<topic>-update.md` linking the original with `[[...]]`.
    - New topic → write `YYYY-MM-DD-<slug>.md`.

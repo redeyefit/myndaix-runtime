@@ -69,14 +69,22 @@ def test_stage_in():
             ok(".secret-notes.md" not in man and not (staging / ".secret-notes.md").exists(),
                "hidden file neither staged nor listed")
             perms = json.loads((staging / ".claude" / "settings.json").read_text())["permissions"]
-            ok("Write(./**)" in perms["allow"] and "Bash" in perms["deny"],
-               "file-op permissions: path-scoped write allowed, Bash denied")
-            st2, _ = _staged(root, op="lint")
-            perms2 = json.loads((st2 / ".claude" / "settings.json").read_text())["permissions"]
-            ok("Write(./**)" not in perms2["allow"] and "Edit(./**)" not in perms2["allow"],
-               "lint dispatch is read-only (no Write/Edit)")
-            import shutil as _sh
-            _sh.rmtree(st2)
+            ok("Write(./**)" not in perms["allow"] and "Bash" in perms["deny"],
+               "read-only default (write gate OFF): no Write even for a file op; Bash denied")
+            os.environ["MYNDAIX_CURATOR_WRITE"] = "1"
+            try:
+                stw, _ = _staged(root, op="file")
+                permsw = json.loads((stw / ".claude" / "settings.json").read_text())["permissions"]
+                ok("Write(./**)" in permsw["allow"] and "Edit(./**)" in permsw["allow"],
+                   "gate ON: file op grants path-scoped Write/Edit")
+                stl, _ = _staged(root, op="lint")
+                permsl = json.loads((stl / ".claude" / "settings.json").read_text())["permissions"]
+                ok("Write(./**)" not in permsl["allow"],
+                   "lint dispatch is read-only even with the gate ON")
+                import shutil as _sh
+                _sh.rmtree(stw); _sh.rmtree(stl)
+            finally:
+                os.environ.pop("MYNDAIX_CURATOR_WRITE", None)
         finally:
             import shutil as _sh
             _sh.rmtree(staging, ignore_errors=True)
@@ -332,11 +340,13 @@ def test_journal_sweep():
 
 
 # ---- full round trip (DB + fake agent) ---------------------------------------------------------
-async def _round_trip(tmp: Path, agent_behavior, op="file"):
+async def _round_trip(tmp: Path, agent_behavior, op="file", write=True):
     root = tmp / "corpus"
     root.mkdir()
     _mk_corpus(root)
     os.environ[knowledge._ENV_SCOPES] = f"testscope={root}"
+    if write:
+        os.environ["MYNDAIX_CURATOR_WRITE"] = "1"        # exercise the promote path
     old_root, old_dsn = curate.STAGING_ROOT, curate.DSN
     curate.STAGING_ROOT = tmp / "staging"
     curate.DSN = DSN
@@ -354,6 +364,7 @@ async def _round_trip(tmp: Path, agent_behavior, op="file"):
         curate.STAGING_ROOT, curate.DSN = old_root, old_dsn
         kr.DSN = old_kr_dsn
         os.environ.pop(knowledge._ENV_SCOPES, None)
+        os.environ.pop("MYNDAIX_CURATOR_WRITE", None)
 
 
 async def test_curate_compliant_round_trip(led):
@@ -401,6 +412,23 @@ async def test_curate_agent_failure(led):
             return False, "pool exploded"
         rc, root = await _round_trip(Path(td), behave)
         ok(rc == 1, "agent failure surfaces as exit 1, nothing promoted")
+
+
+async def test_curate_readonly_propose_only(led):
+    # ship-gate posture: with write DISABLED, even a well-formed agent file write is NOT promoted
+    # (we don't trust CLI write-confinement until the enforcement gate clears it).
+    with tempfile.TemporaryDirectory() as td:
+        def behave(prompt, staging: Path):
+            (staging / "2026-07-05-epsilon.md").write_text("# Epsilon\nproposed\n")
+            return True, "here is the brief I propose"
+        rc, root = await _round_trip(Path(td), behave, write=False)
+        ok(rc == 0, f"read-only run exits 0 (got {rc})")
+        ok(not (root / "2026-07-05-epsilon.md").exists(),
+           "read-only: agent file write NOT promoted to the live corpus")
+        row = await led._pool.fetchrow(
+            "SELECT 1 FROM knowledge_doc_current WHERE scope='testscope' "
+            "AND path='2026-07-05-epsilon.md' AND status='active'")
+        ok(row is None, "nothing indexed in read-only mode")
 
 
 def main():
