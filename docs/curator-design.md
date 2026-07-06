@@ -7,6 +7,43 @@ Shipped READ-ONLY: Write is evidence-gated on the enforcement ship gate
 MYNDAIX_CURATOR_WRITE=1 + restoring Write/Edit to the registry argv once the gate passes.
 Recon: workflow `wf_357e9782`. Design + code review history at the bottom._
 
+## ⚠️ BUILD FINDING — gate run 2026-07-06 (needs a fix before the AGENT path works)
+
+Running the enforcement gate (on a working Max token — see the auth note) uncovered that the
+**curator agent path is non-functional as shipped**, and overturns the design's core enforcement
+assumption. Empirical results (real `claude` CLI, filesystem-observable probes):
+
+| config | in-tree read | in-tree write | out-of-tree write |
+|---|---|---|---|
+| one-string allowedTools (SHIPPED) + staged settings.json | blocked | blocked | denied |
+| separate-arg allowedTools + staged settings.json | blocked | blocked | denied |
+| **separate-arg allowedTools, NO settings.json** | **works** | **works** | **denied** |
+
+Two bugs + one wrong assumption:
+1. **Tool flags as a single space-joined string do NOT work** (`--allowedTools "Read Glob Grep"`
+   is parsed as one tool name matching nothing). They are variadic — need separate argv elements
+   (`--allowedTools Read Glob Grep`). As shipped the agent gets NO tools — even read-only
+   QUERY/LINT would fail. (The deterministic verbs `recall`/`knowledge-index`/`ingest` are
+   unaffected — they don't use the agent.)
+2. **The runtime-authored `.claude/settings.json` BREAKS the agent.** Its `Read(/**)`/`Write(/**)`
+   deny-globs match in-tree files too (claude resolves reads/writes to absolute paths → self-deny).
+   The design treated this settings.json as THE enforcement mechanism (design v0.4 §Architecture);
+   empirically it is redundant AND harmful.
+3. **Corrected config (functional AND safe): separate-arg `--allowedTools Read Glob Grep [Write
+   Edit]`, NO staged settings.json.** Enforcement is then: claude's built-in cwd-confinement denies
+   out-of-tree writes (verified); excluding Bash/WebFetch/Task from the whitelist means the agent
+   lacks those tools entirely; the deterministic promote guard stays the real write boundary.
+   With this config the gate PASSES (out-of-tree denied) AND the agent functions (in-tree read+write).
+
+**THE FIX (needs Jefe steer + cross-family review — it changes the reviewed enforcement story):**
+- registry curator argv → separate-arg allowedTools (read-only ships `Read Glob Grep`; Write adds
+  `Write Edit`). Drop `--disallowedTools` string (a whitelist is enough — unlisted tools are absent).
+- `curate.stage_in` → do NOT author `.claude/settings.json` (or if kept for defense-in-depth, allow-
+  only, NO deny-globs on `/**`). Keep the filtered stage-in + MANIFEST.
+- Re-run the gate on the corrected config (should pass safety + functionality), then flip Write.
+- Until then the curator AGENT (QUERY/FILE/LINT) does not function; the deterministic retrieval
+  verbs (recall/knowledge-index/ingest) are fully live and unaffected.
+
 ## As-built (v1.0)
 
 - **Substrate:** migration `0009_knowledge.sql` + schema.sql mirror (append-only tsvector index,
