@@ -35,14 +35,26 @@ Two bugs + one wrong assumption:
    lacks those tools entirely; the deterministic promote guard stays the real write boundary.
    With this config the gate PASSES (out-of-tree denied) AND the agent functions (in-tree read+write).
 
-**THE FIX (needs Jefe steer + cross-family review — it changes the reviewed enforcement story):**
-- registry curator argv → separate-arg allowedTools (read-only ships `Read Glob Grep`; Write adds
-  `Write Edit`). Drop `--disallowedTools` string (a whitelist is enough — unlisted tools are absent).
-- `curate.stage_in` → do NOT author `.claude/settings.json` (or if kept for defense-in-depth, allow-
-  only, NO deny-globs on `/**`). Keep the filtered stage-in + MANIFEST.
-- Re-run the gate on the corrected config (should pass safety + functionality), then flip Write.
-- Until then the curator AGENT (QUERY/FILE/LINT) does not function; the deterministic retrieval
-  verbs (recall/knowledge-index/ingest) are fully live and unaffected.
+**THE FIX — APPLIED 2026-07-06 (read-only), cross-family reviewed.** Deeper CLI probing corrected
+two of my own first-pass conclusions:
+- **`--allowedTools` is a pre-APPROVAL list, NOT a hard whitelist.** Write/Edit are DEFAULT-AVAILABLE
+  in headless `-p` even when omitted — so "read-only via omitting Write" LEAKED writes. Read-only
+  REQUIRES an explicit `--disallowedTools Write Edit Bash WebFetch WebSearch Task NotebookEdit`
+  (all SEPARATE argv elements — the one-string form parses as a single tool name matching nothing).
+- **claude's cwd-confinement stops BASH escaping, but the Write TOOL can write an absolute
+  out-of-tree path.** So a naive "allow Write + deny Bash" write-enabled config LEAKS out-of-tree
+  via the Write tool. The staging `settings.json` had tried to path-scope this (`Write(./**)`) but
+  its `Read(/**)` deny-glob self-denied in-tree reads → it's dropped entirely; the argv is the
+  control (it also shadows any inherited `~/.claude/settings.json`, verified).
+- **Applied:** registry curator argv = separate-arg `--allowedTools Read Glob Grep --disallowedTools
+  Write Edit Bash WebFetch WebSearch Task NotebookEdit`; `curate.stage_in` authors NO settings.json.
+  **Gate PASSES the read-only config** (in-tree READ works; in-tree WRITE, Bash, WebFetch, all
+  out-of-tree DENIED). The curator AGENT (QUERY/LINT) now functions read-only.
+- **Write-ENABLEMENT remains GATED (unresolved):** enabling the Write tool needs real out-of-tree
+  path-scoping (the Write tool isn't cwd-confined like Bash; the settings.json approach that could
+  scope it also breaks reads). That's a separate design task — do NOT flip Write until a config is
+  found that allows in-tree write, denies out-of-tree write, AND keeps reads working, gate-proven.
+- Deterministic verbs (recall/knowledge-index/ingest) are unaffected + fully live throughout.
 
 ## As-built (v1.0)
 

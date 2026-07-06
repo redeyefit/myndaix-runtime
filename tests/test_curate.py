@@ -59,32 +59,17 @@ def test_stage_in():
         staging, manifest = _staged(root)
         try:
             names = {p.name for p in staging.iterdir()}
-            ok(names == {"2026-06-08-alpha.md", "2026-06-20-beta.md", "index.md",
-                         "MANIFEST.txt", ".claude"},
-               f"staging holds md + manifest + runtime .claude only (got {names})")
+            # BUILD FINDING: NO .claude/settings.json (it self-denied in-tree access); tool
+            # confinement is the registry --allowedTools whitelist. Staging = md + MANIFEST only.
+            ok(names == {"2026-06-08-alpha.md", "2026-06-20-beta.md", "index.md", "MANIFEST.txt"},
+               f"staging holds md + manifest only, NO .claude settings (got {names})")
+            ok(not (staging / ".claude").exists(), "no runtime-authored settings.json (build finding)")
             ok(set(manifest) == {"2026-06-08-alpha.md", "2026-06-20-beta.md", "index.md"},
                "manifest = staged md shas")
             man = (staging / "MANIFEST.txt").read_text()
             ok("asset.json" in man and "\tasset" in man, "non-md artifact listed in MANIFEST")
             ok(".secret-notes.md" not in man and not (staging / ".secret-notes.md").exists(),
                "hidden file neither staged nor listed")
-            perms = json.loads((staging / ".claude" / "settings.json").read_text())["permissions"]
-            ok("Write(./**)" not in perms["allow"] and "Bash" in perms["deny"],
-               "read-only default (write gate OFF): no Write even for a file op; Bash denied")
-            os.environ["MYNDAIX_CURATOR_WRITE"] = "1"
-            try:
-                stw, _ = _staged(root, op="file")
-                permsw = json.loads((stw / ".claude" / "settings.json").read_text())["permissions"]
-                ok("Write(./**)" in permsw["allow"] and "Edit(./**)" in permsw["allow"],
-                   "gate ON: file op grants path-scoped Write/Edit")
-                stl, _ = _staged(root, op="lint")
-                permsl = json.loads((stl / ".claude" / "settings.json").read_text())["permissions"]
-                ok("Write(./**)" not in permsl["allow"],
-                   "lint dispatch is read-only even with the gate ON")
-                import shutil as _sh
-                _sh.rmtree(stw); _sh.rmtree(stl)
-            finally:
-                os.environ.pop("MYNDAIX_CURATOR_WRITE", None)
         finally:
             import shutil as _sh
             _sh.rmtree(staging, ignore_errors=True)
@@ -148,6 +133,9 @@ def test_classify_violations():
 def test_classify_ignores_runtime_artifacts():
     def m(s: Path):
         (s / "MANIFEST.txt").write_text("tampered")
+        # stage-in no longer authors .claude, but the guard still defensively ignores one if the
+        # agent creates it (it's in _RUNTIME_DIRS) — simulate that stray dir.
+        (s / ".claude").mkdir(exist_ok=True)
         (s / ".claude" / "settings.json").write_text("{}")
     ch = _classify_case(m)
     ok(not ch.violations and not ch.new_files, "runtime artifacts ignored (discarded, not flagged)")
