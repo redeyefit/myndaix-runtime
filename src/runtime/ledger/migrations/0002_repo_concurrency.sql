@@ -36,6 +36,16 @@ CREATE INDEX IF NOT EXISTS job_queued_idx
 -- hard count and the reconciler use, so a fresh migrate and the first reconcile
 -- agree. NULL repo_id is cap-EXEMPT and never gets a row. Idempotent via
 -- ON CONFLICT DO UPDATE = the recomputed count (absolute, not active+delta).
+--
+-- LOCK GUARD (core-audit HIGH): migrate() re-runs this backfill on EVERY serve boot AND every
+-- controller tick (behind the migrate() advisory lock), which serializes it only against OTHER
+-- migrate() calls — NOT against the live pool's lease_job / reclaim_expired / reconciler, which lock
+-- repo_concurrency rows in sorted repo_id order. This backfill's INSERT/UPDATE would otherwise acquire
+-- rc row locks in group-by / heap order, ABBA-deadlocking (40P01) a concurrent leaser/reconciler — the
+-- SAME hazard reconcile_repo_concurrency() prevents by locking every rc row FOR UPDATE in PK order
+-- FIRST. Mirror it here so the re-run can never clash-order against live leasing.
+SELECT repo_id FROM repo_concurrency ORDER BY repo_id FOR UPDATE;
+
 INSERT INTO repo_concurrency (repo_id, active)
 SELECT j.repo_id, count(*)
   FROM attempt a

@@ -635,14 +635,17 @@ class PostgresLedger:
                             WHERE a.id IN (SELECT id FROM o) RETURNING id
                        )
                        SELECT repo_id FROM o WHERE repo_id IS NOT NULL""")
-                if orphans:
-                    odec: dict[str, int] = {}
-                    for r in orphans:
-                        odec[r["repo_id"]] = odec.get(r["repo_id"], 0) + 1
-                    for rid in sorted(odec):      # counter LAST, repo_id order (deadlock-safe)
-                        await con.execute(
-                            "UPDATE repo_concurrency SET active = GREATEST(active - $2, 0) "
-                            "WHERE repo_id = $1", rid, odec[rid])
+                # Orphan heal already marked the dead attempts failed (above); ACCUMULATE their per-repo
+                # slot frees into repo_dec and apply them WITH the expired-lease frees in the ONE sorted
+                # rc loop at the end. Two SEPARATE sorted loops (orphan set THEN expired set) are each
+                # ordered but their UNION is not monotonic in repo_id — orphan {'zeta'} then expired
+                # {'alpha'} would lock rc['zeta'] before rc['alpha'] (descending) and can rc<->rc ABBA
+                # vs the reconciler/another reclaimer (core-audit: violated the single-lock-order
+                # invariant the module header claims). Merging keeps one ascending order. (orphans is
+                # already WHERE repo_id IS NOT NULL.)
+                repo_dec: dict[str, int] = {}
+                for r in orphans:
+                    repo_dec[r["repo_id"]] = repo_dec.get(r["repo_id"], 0) + 1
                 rows = await con.fetch(
                     """WITH expired AS (
                            SELECT a.id AS attempt_id, a.job_id, j.to_agent, j.repo_id
@@ -663,17 +666,15 @@ class PostgresLedger:
                        SELECT c.job_id, e.to_agent, e.repo_id
                          FROM closed c JOIN expired e ON e.attempt_id = c.id""",
                     self.RECLAIM_BATCH)
-                if not rows:
-                    return 0
-                # Split the expired batch: workspace_actors die (never replay a mutation);
-                # requeue-safe jobs requeue UNLESS they've hit the poison ceiling (a worker
-                # that keeps crashing mid-run would otherwise reclaim->requeue forever). The
-                # count includes the attempt the `closed` CTE just failed above (off-by-one
-                # intended), so the Nth crash is the one that dead-letters. Every closed
-                # attempt frees a repo slot (BOTH requeue and dead), so accumulate the
-                # per-repo decrement here (NULL repo_id is cap-exempt -> excluded).
+                # NO early return on empty rows: the orphan frees accumulated above must still be applied
+                # in the single sorted rc loop below (else an orphan-only tick leaks the healed slot).
+                # Split the expired batch: workspace_actors die (never replay a mutation); requeue-safe
+                # jobs requeue UNLESS they've hit the poison ceiling (a worker that keeps crashing mid-run
+                # would otherwise reclaim->requeue forever). The count includes the attempt the `closed`
+                # CTE just failed above (off-by-one intended), so the Nth crash is the one that
+                # dead-letters. Every closed attempt frees a repo slot (BOTH requeue and dead), so
+                # accumulate the per-repo decrement here (NULL repo_id is cap-exempt -> excluded).
                 requeue, dead, dead_reasons = [], [], {}
-                repo_dec: dict[str, int] = {}
                 for r in rows:
                     jid = r["job_id"]
                     if r["repo_id"] is not None:
@@ -704,9 +705,9 @@ class PostgresLedger:
                         await con.execute(
                             "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
                             _new_id(), jid, dead_reasons[jid])
-                # per-repo cap: counter LAST, applied per-repo in repo_id ORDER (so two
-                # concurrent reclaimers/the reconciler acquire rc rows in a consistent
-                # order -> no rc<->rc ABBA). GREATEST floors soft-cache drift at 0.
+                # per-repo cap: counter LAST, applied per-repo in repo_id ORDER over the MERGED orphan +
+                # expired frees (so this whole verb acquires rc rows in ONE consistent ascending order,
+                # never rc<->rc ABBA vs the reconciler/another reclaimer). GREATEST floors soft-cache drift at 0.
                 for rid in sorted(repo_dec):
                     await con.execute(
                         "UPDATE repo_concurrency SET active = GREATEST(active - $2, 0) "
