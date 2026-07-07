@@ -1,9 +1,14 @@
-# mxr review-context — de-linked reviewer snapshot (design v0.2)
+# mxr review-context — de-linked reviewer snapshot (design v0.3)
 
-**Status:** DESIGN v0.2 — r1 cross-family review FOLDED (kilabz: 2 HIGH + 5 MED; oracle: 2 CRITICAL
-+ 1 HIGH + 3 lower; strong convergence on agy-exclusion, fail-open split, chmod honesty). Oracle's
-export-ignore CRITICAL and the checkout-index fix were both VERIFIED empirically before folding.
-Awaiting r2 delta review, then Jefe approval before build.
+**Status:** DESIGN v0.3 — r1 AND r2 cross-family reviews FOLDED. r2's headline (convergent, both
+families): v0.2's `checkout-index` fold still ran git's CHECKOUT machinery, so in-tree
+`.gitattributes` mutate the exported bytes (VERIFIED: `* text eol=crlf` changed the staged bytes)
+and can reference host-configured smudge filters (LFS + in-tree `.lfsconfig` = host-side SSRF
+class), and committed symlinks materialize LIVE (VERIFIED: `escape-link -> /etc/hosts` came out as
+a real symlink). v0.3 = a RAW OBJECT EXPORTER (D1) which kills all three classes by construction;
+plus gate-mode fail-closed on unresolved tip, control-char-stripped degradation reason, 40-hex tip
+validation, and two documented residuals. One r2 ask DECLINED with rationale in §5 (kilabz "don't
+stage for kilabz either"). Awaiting r3, then Jefe approval before build.
 **Author:** Mack, 2026-07-06. **Scope:** myndaix-runtime (pool/runner/cli) + orchestrator/play-review.sh.
 
 ## 1. Problem + evidence
@@ -32,9 +37,13 @@ carries no history and its absence is never evidence.
 ```
 play-review.sh worker (or `mxr review` verb)
   │ 1. tip resolves locally?  ──no──► skip staging, inline-only (exactly today's behavior)
-  │ 2. stage (once per run, NO pipe — each step's exit asserted independently):
+  │ 2. stage (once per run; <tip> pre-validated ^[0-9a-f]{40}$ — the RESOLVED sha, never a ref
+  │    name, so a branch named `-u` can't inject flags [oracle r2]; every step's exit asserted):
   │      dir=$MYNDAIX_STAGING_ROOT/review-<ts>-<tok>/     (mkdir mode 0700, must not pre-exist)
-  │      GIT_INDEX_FILE=<tmp> git read-tree <tip>  &&  git checkout-index -a --prefix=$dir/
+  │      RAW EXPORT (D1): walk `git ls-tree -r -z <tip>`; per entry:
+  │        blob 100644/100755 → `git cat-file blob <sha>` → write bytes VERBATIM (no exec bit)
+  │        blob 120000 (symlink) → write the TARGET STRING as a regular file (inert)
+  │        commit 160000 (gitlink) → skip
   │      chmod -R a-w "$dir"
   │ 3. mxr <agent> <fenced prompt> --repo <basename> --base-ref <tip> --staged-workdir <dir>
   │      (v1: kilabz + lobster legs only; oracle stays inline-only — D5)
@@ -54,21 +63,33 @@ cli.submit → Job.context.workdir ──► runner.invoke_cli
 
 ## 3. Decisions
 
-**D1 [strong] — snapshot = temp-index `git checkout-index -a --prefix=<dir>/`, NOT `git archive`,
-NOT a git worktree.**
+**D1 [strong, revised twice — the review rounds drove it to ground] — snapshot = a RAW OBJECT
+EXPORTER: walk `git ls-tree -r -z <tip>`, write each blob's `git cat-file blob` bytes verbatim.
+NOT `git archive`, NOT `checkout-index`, NOT a worktree.**
 De-linked: no `.git`, nothing points back at the live repo — a worktree's `.git` file references the
 main repo's writable `.git/worktrees/<id>/`, which matters most for the least-confined agents.
 No live-repo lock interaction during reviews; no sweep()/attempt-lifecycle entanglement (sweep only
 reaps ledger-correlated `wt-*` dirs; RESPONDER jobs own none); cleanup = remove one dir.
-**Why not `git archive` (oracle r1 CRITICAL, VERIFIED 2026-07-06):** archive respects in-tree
-`.gitattributes export-ignore` — a hostile PR can silently HIDE whole directories from the snapshot
-(empirically reproduced). `checkout-index` against a temp index (`GIT_INDEX_FILE=<tmp> git read-tree
-<tip>`) dumps the tree exactly, ignores export attributes (empirically verified), has no pipe to
-mask a git failure, and reuses the PR #66 scratch-index prior art.
+**Why not `git archive` (oracle r1 CRITICAL, VERIFIED):** archive respects in-tree `.gitattributes
+export-ignore` — a hostile PR can silently HIDE whole directories from the snapshot (reproduced).
+**Why not `checkout-index` (kilabz r2 HIGH + oracle r2 CRITICAL, convergent, VERIFIED):** it runs
+git's CHECKOUT machinery, so in-tree `.gitattributes` still apply — `* text eol=crlf` mutated the
+staged bytes in test (silent divergence from the fenced diff), `ident`/`working-tree-encoding` do
+the same, and a `filter=` reference to a host-configured driver (git-lfs is commonly global; its
+in-tree `.lfsconfig` sets the URL) would execute HOST-side during staging — an SSRF/RCE-class hole
+on the orchestrator, outside any agent sandbox. It also materializes committed symlinks LIVE
+(VERIFIED: `escape-link -> /etc/hosts` came out as a real symlink), which kilabz r2 flagged
+independently: innocent relative reads would traverse out of the "de-linked" snapshot.
+**The raw exporter kills all three classes by construction:** blob bytes are written verbatim (no
+attr processing can run — nothing consults .gitattributes), mode-120000 symlink blobs are written
+as regular files CONTAINING the target string (inert; nothing to traverse), gitlinks are skipped,
+and no exec bits are set (reviewers read; nothing needs to run). Each step's exit is asserted; a
+final count check (files written == ls-tree blob count) makes partial exports loud.
 **Extraction invariants (kilabz r1):** the stager creates the dir itself (0700, must not pre-exist);
-tree content comes only from `checkout-index` (never user-supplied tar); `chmod -R a-w` after
-extraction makes the snapshot genuinely non-writable ("read-only" is otherwise only an agent-sandbox
-property); the runner's realpath/commonpath validation rejects symlinked escapes.
+`chmod -R a-w` after extraction makes the snapshot genuinely non-writable ("read-only" is otherwise
+only an agent-sandbox property); chmod/reaper traversal never follows symlinks (none exist by
+construction — belt anyway); the runner's realpath/commonpath validation rejects a symlinked
+staging root.
 Cost accepted: no git history in the snapshot (no log/blame/rename-detection/merge-base) — the
 review contract in §1 makes that explicit; a kilabz-only worktree upgrade behind the codex seatbelt
 is possible later, deliberately not built now.
@@ -142,15 +163,20 @@ verifies BOTH reviews' claims against real code before the verdict.
 ## 4. Edge cases + failure modes
 
 **Fallback policy is split by criticality (kilabz r1 MED-HIGH + oracle r1 downgrade-attack,
-convergent):**
-- **tip not resolvable locally** → inline-only everywhere (normal: cross-machine/manual legs).
-- **staging INFRASTRUCTURE failure after the tip resolved** (read-tree/checkout-index error,
-  timeout, ENOSPC, chmod failure):
+convergent; tightened in r2):**
+- **tip not resolvable locally** → pre-push/manual legs: inline-only (normal: cross-machine/manual).
+  `PLAY_GATE=1`: **fail CLOSED** (kilabz r2 — in gate mode the head was just fetched; an unresolved
+  tip is indistinguishable from "cannot build the required snapshot" and must not buy an inline-only
+  PLAY_PASS).
+- **staging INFRASTRUCTURE failure after the tip resolved** (export error, timeout, ENOSPC, chmod
+  failure, count-check mismatch):
   - `PLAY_GATE=1` (automerge): **fail CLOSED** — the gate verdict is ABORTED/NEEDS-FIX, never an
     inline-only PLAY_PASS. A PR that consistently breaks staging cannot buy itself a blinder gate.
   - pre-push human loop: **degrade LOUDLY** — the review runs inline-only AND the verdict header
     carries `reviewed WITHOUT snapshot (staging failed: <reason>)`, and the fallback is logged; a
-    degraded review can never masquerade as a contextualized one.
+    degraded review can never masquerade as a contextualized one. **`<reason>` is stripped of
+    control/ANSI chars via the existing `clean()`** (oracle r2: a file named `\r\e[2K...` echoed
+    into the header could erase the degradation warning on the human's terminal — log forging).
 - Every staging step's exit is asserted independently (no pipeline; oracle r1 CRITICAL #2 class) and
   the prompt's snapshot block is added ONLY when staging fully succeeded — a reviewer is never told
   it has a snapshot it doesn't have.
@@ -178,13 +204,27 @@ convergent):**
   claude tool whitelist are unchanged. For the UNCONFINED agent (agy) the r1 reviews established
   the opposite framing — a populated cwd IS a larger instruction surface — which is why oracle is
   excluded until its confinement rung (D5).
-- **Snapshot integrity:** content comes from `checkout-index` against the tip's tree (immune to
-  `.gitattributes export-ignore` hiding — verified), extracted into a 0700 dir the stager itself
-  created, then chmod'd `a-w`; no pipe can mask a git failure.
+- **Snapshot integrity:** raw object export — byte-exact blob content, immune to `export-ignore`
+  hiding AND to eol/ident/filter mutation AND to symlink materialization (all three verified; D1);
+  written into a 0700 dir the stager itself created, then chmod'd `a-w`; every step's exit asserted
+  plus a blob-count check.
 - **Path handling:** the runner remains the single trust boundary for workdir (fail-closed); the
-  worker/worktree path (`repo_id`-as-path for WORKSPACE_ACTOR) is untouched.
+  worker/worktree path (`repo_id`-as-path for WORKSPACE_ACTOR) is untouched. `<tip>` is validated
+  `^[0-9a-f]{40}$` before any git argv (oracle r2: a ref named `-u` must not inject flags).
 - **Env:** zero new env exposure — the snapshot needs no git inside the agent env; PATH/HOME/TMPDIR
   are already in the allowlist base; no secret is added.
+- **DECLINED (with rationale) — kilabz r2 "don't stage for kilabz until a no-exec rung exists":**
+  codex under `--sandbox read-only` CAN execute snapshot entry points, but with writes+net
+  OS-denied, an executed hostile script can only read host files and emit into the model context —
+  capability-identical to codex's Read, which is already un-path-scoped (the same accepted residual
+  as lobster's Read, #69). Exec adds convenience for an injector, not a new channel; the D4 no-exec
+  prompt line plus the confined-lobster triage and exact-match PLAY_PASS remain the working
+  boundary. Staging for kilabz is the point of the design; excluding it would reduce v1 to
+  lobster-only. Documented here so r3/Jefe can overrule.
+- **Documented pre-existing gap (oracle r2, agreed):** the UNCONFINED oracle can already discover
+  the live repo from an empty scratch cwd (the `--repo` basename + `$ORCH/repos.json` are
+  breadcrumbs) — the empty cwd is obscurity, not a boundary. This design neither widens nor fixes
+  it; it raises the priority of the agy confinement rung (§6 REJECT list keeps it out of scope).
 
 ## 6. Prior art — borrow / reject
 
@@ -221,14 +261,19 @@ worktrees. No remote-ref fetching.
   non-string} → TERMINAL; required+absent → TERMINAL (curator regression pin); staging_cwd declared
   (either mode) + job.worktree_path set → worktree NEVER used (kilabz r1 HIGH pin).
 - Verb: basename→repos.json resolution (and path-arg passthrough); tip-not-local → inline-only
-  fallback; **a file under `.gitattributes export-ignore` IS present in the snapshot** (the oracle
-  r1 CRITICAL pin); snapshot file set == `git ls-tree -r <tip>` name set; snapshot is non-writable
-  after staging; no `.git` in the snapshot; fence + nonce-collision belt; staging teardown on
-  success AND on error (trap), including chmod-before-remove.
+  fallback; tip validated 40-hex (a `-u`-named ref never reaches git argv — oracle r2); **a file
+  under `.gitattributes export-ignore` IS present in the snapshot** (oracle r1 pin); **an in-tree
+  `* text eol=crlf` + `ident` + `filter=bogus` fixture does NOT alter snapshot bytes and no filter
+  executes** (r2 convergent pin); **a committed symlink materializes as a regular file containing
+  the target string, and nothing in the snapshot is a symlink** (kilabz r2 pin); snapshot file set
+  == `git ls-tree -r <tip>` blob set; snapshot is non-writable after staging; no exec bits; no
+  `.git` in the snapshot; fence + nonce-collision belt; staging teardown on success AND on error
+  (trap), including chmod-before-remove.
 - `mxr get` (PR-3): full UUID, unique prefix, ambiguous prefix → error w/ candidates, <8 chars →
   error.
 - sync-wait (PR-3): env set → env wins; unset + profile → profile; neither → 180.
 - play-review: gate mode + staging-infra failure → fail-closed verdict (never inline PLAY_PASS);
-  push mode + staging failure → review completes inline AND the verdict header carries the
-  degradation marker; prompt gains the snapshot block only when staged; PLAY_PASS/verdict/fixlist
-  bytes unchanged (existing 84-check suite style).
+  gate mode + UNRESOLVED tip → fail-closed (kilabz r2 pin); push mode + staging failure → review
+  completes inline AND the verdict header carries the degradation marker with `<reason>` stripped of
+  control chars (oracle r2 log-forging pin); prompt gains the snapshot block only when staged;
+  PLAY_PASS/verdict/fixlist bytes unchanged (existing 84-check suite style).
