@@ -188,7 +188,8 @@ def resolve_and_hash(repo_path: str, tip_sha: str, path: str, line: int,
 
 
 def file_line_hashes(repo_path: str, tip_sha: str, path: str,
-                     run_git: Optional[Callable[[list[str]], Optional[str]]] = None) -> set[str]:
+                     run_git: Optional[Callable[[list[str]], Optional[str]]] = None
+                     ) -> Optional[set[str]]:
     """The CLOSE-phase primitive (design §2): the SET of line_hashes present in `path` at `tip_sha`,
     read from git OBJECTS (`git show <tip>:<path>`), NEVER the working tree — so a dirty checkout or a
     post-review edit can't change the answer (same discipline as resolve_and_hash).
@@ -199,17 +200,31 @@ def file_line_hashes(repo_path: str, tip_sha: str, path: str,
     of an unrelated line in the same file, would false-close every open finding there).
 
     Empty/whitespace-only lines are skipped (they normalize to '' and would collide across files;
-    resolve_and_hash never keys a finding on one, so none can be OPEN). A missing object — file DELETED
-    or renamed at tip, or a non-zero `git show` exit — returns the EMPTY set, so every finding in that
-    file closes: the design-accepted whole-file-delete/rename-reads-as-fixed case (§6). `run_git` is the
-    injected callable(argv) -> stdout|None so this stays pure + unit-testable."""
+    resolve_and_hash never keys a finding on one, so none can be OPEN).
+
+    THREE-STATE return (core-audit HIGH — a transient git error must NOT fabricate applied_fixed):
+      * a populated/empty set = git POSITIVELY answered. A genuinely-absent object (deleted/renamed at
+        tip, CONFIRMED via a successful ls-tree) -> the EMPTY set, so every finding in it closes (the
+        design-accepted whole-file-delete/rename case §6).
+      * None = presence could NOT be determined (a `git show` failure that is NOT a confirmed delete:
+        timeout, OSError, a momentary index.lock / mid-gc, or the object exists but was unreadable). The
+        caller MUST then leave the finding OPEN — collapsing a transient failure into 'absent' would
+        insert a false applied_fixed and permanently poison the outcomes ground-truth that gates autonomy.
+    `run_git` is the injected callable(argv) -> stdout|None so this stays pure + unit-testable."""
     if run_git is None:
-        return set()
+        return None                                 # no git injected -> can't determine -> don't close
     out = run_git(["-C", repo_path, "show", f"{tip_sha}:{path}"])
-    if out is None:                                 # missing object (deleted/renamed) -> empty set
-        return set()
-    hashes: set[str] = set()
-    for content in out.split("\n"):
-        if normalize_line(content):                 # skip empty/ws-only (never a keyed finding line)
-            hashes.add(line_hash(content))
-    return hashes
+    if out is not None:
+        hashes: set[str] = set()
+        for content in out.split("\n"):
+            if normalize_line(content):             # skip empty/ws-only (never a keyed finding line)
+                hashes.add(line_hash(content))
+        return hashes
+    # `git show` failed. Distinguish a GENUINE delete (close) from a TRANSIENT error (leave open) by
+    # POSITIVELY probing the tree: `git ls-tree` lists the path iff the object exists at tip.
+    listed = run_git(["-C", repo_path, "ls-tree", "--name-only", tip_sha, "--", path])
+    if listed is None:
+        return None                                 # ls-tree also failed -> transient/unknown -> don't close
+    if listed.strip() == "":
+        return set()                                # tree read OK + path absent -> genuinely deleted -> close (§6)
+    return None                                     # path IS in the tree but show failed -> unreadable/transient

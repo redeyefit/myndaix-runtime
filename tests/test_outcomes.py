@@ -129,13 +129,17 @@ def test_parse_empty_text():
 
 # ---- resolve_and_hash: hunk validation + git-object read (injected run_git) --------------
 def _fake_git(files):
-    """A run_git stub: files = {path: full_file_text}. Returns None for a missing object (like a
-    non-zero `git show` exit), else the file text — mirroring `git show <tip>:<path>` on stdout."""
+    """A run_git stub: files = {path: full_file_text}. `show` returns None for a missing object (like a
+    non-zero exit), else the file text. `ls-tree` lists the path iff it exists (mirrors real git), so
+    file_line_hashes can positively confirm a delete vs a transient show failure."""
     def run(argv):
-        # argv = ["-C", repo, "show", "<tip>:<path>"]
-        spec = argv[-1]
-        path = spec.split(":", 1)[1]
-        return files.get(path)
+        cmd = argv[2]                                   # ["-C", repo, <cmd>, ...]
+        if cmd == "show":                               # argv[-1] = "<tip>:<path>"
+            return files.get(argv[-1].split(":", 1)[1])
+        if cmd == "ls-tree":                            # argv[-1] = path; git lists it iff it's in the tree
+            path = argv[-1]
+            return (path + "\n") if path in files else ""
+        return None
     return run
 
 
@@ -206,9 +210,29 @@ def test_file_line_hashes_missing_path_is_empty_set():
     ok(got == set(), "missing object (deleted/renamed file) -> empty set (findings close)")
 
 
-def test_file_line_hashes_no_run_git_is_empty_set():
-    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=None) == set(),
-       "no run_git injected -> empty set (pure; the wiring supplies the subprocess callable)")
+def test_file_line_hashes_no_run_git_is_none():
+    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=None) is None,
+       "no run_git injected -> None (can't determine -> fail-closed, don't close)")
+
+
+def test_file_line_hashes_transient_show_failure_does_not_close():
+    # core-audit HIGH: `git show` fails (None) but the path EXISTS at tip (ls-tree lists it) -> the
+    # object was UNREADABLE (transient/mid-gc/lock), NOT deleted -> None, so the caller leaves the
+    # finding OPEN rather than fabricating an applied_fixed.
+    def stub(argv):
+        if argv[2] == "show":
+            return None                                 # transient read failure
+        if argv[2] == "ls-tree":
+            return "src/a.py\n"                          # but the path IS present in the tree
+        return None
+    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=stub) is None,
+       "show fails on an EXISTING path -> None (transient, do NOT close)")
+
+
+def test_file_line_hashes_git_unavailable_does_not_close():
+    # both show and ls-tree fail (git wedged / timeout / OSError -> None) -> can't determine -> None.
+    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=lambda _a: None) is None,
+       "show+ls-tree both fail -> None (fail-closed on a transient error)")
 
 
 def test_file_line_hashes_reads_objects_not_worktree():
