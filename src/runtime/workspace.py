@@ -56,14 +56,22 @@ class WorkspaceManager:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
+    def worktree_path(self, attempt_id: str) -> str:
+        """The DETERMINISTIC path create() uses for this attempt_id. Lets a caller know the worktree
+        path BEFORE create() runs — so cleanup can find it even if create is CANCELLED mid-run (the
+        to_thread offload made create an await point, and a cancellation there would else leave the
+        caller's worktree var unset while the thread still created the dir — oracle). Same wt-<attempt_id>
+        naming sweep() correlates by."""
+        return str(self.root / f"{_PREFIX}{attempt_id}")
+
     def create(self, repo_path: str, base_ref: str = "HEAD",
                attempt_id: Optional[str] = None) -> str:
         """git worktree add a fresh, isolated, detached checkout at base_ref.
         Returns the worktree path. The agent mutates only this directory. Naming
         by attempt_id lets sweep() correlate a leftover dir to its (closed) attempt;
         a random suffix is used only when no attempt_id is given (ad-hoc/tests)."""
-        name = f"{_PREFIX}{attempt_id}" if attempt_id else f"{_PREFIX}{uuid.uuid4().hex[:12]}"
-        wt = self.root / name
+        wt = (Path(self.worktree_path(attempt_id)) if attempt_id
+              else self.root / f"{_PREFIX}{uuid.uuid4().hex[:12]}")
         _git(["worktree", "add", "--detach", str(wt), base_ref], cwd=repo_path)
         return str(wt)
 

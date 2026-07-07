@@ -169,6 +169,9 @@ async def test_workspace_ops_do_not_block_the_event_loop():
     real = worker.WorkspaceManager()
 
     class BlockingWM:                                 # a WEDGED git: create() blocks its thread ~0.4s
+        def worktree_path(self, *a):
+            return real.worktree_path(*a)
+
         def create(self, *a):
             time.sleep(0.4)
             return real.create(*a)

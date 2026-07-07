@@ -98,8 +98,12 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
         # (as this did) meant a stalled/wedged git froze EVERY worker + the janitor + all heartbeats
         # until it returned — and expired leases could then be reclaimed and double-run (core-audit
         # HIGH). Offload to a thread so the loop keeps servicing others; _git's timeout frees the thread.
-        worktree = await asyncio.to_thread(wm.create, job.repo_id, job.base_ref or "HEAD", str(attempt_id))
+        # Assign `worktree` from the DETERMINISTIC path FIRST: if create's to_thread is cancelled
+        # mid-flight, the thread still creates the dir, so the finally must know the path to clean it
+        # (else it leaks until the next sweep) — oracle.
+        worktree = wm.worktree_path(str(attempt_id))
         job.worktree_path = worktree
+        await asyncio.to_thread(wm.create, job.repo_id, job.base_ref or "HEAD", str(attempt_id))
 
     try:
         try:
@@ -121,7 +125,11 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
         return result.status
     finally:
         if worktree is not None:
-            await asyncio.to_thread(wm.cleanup, job.repo_id, worktree)  # off-loop; live repo untouched
+            # shield: cleanup runs off-loop, but if process_attempt is being CANCELLED (pool shutdown)
+            # a bare `await` in this finally would raise CancelledError immediately and SKIP cleanup
+            # (oracle). shield schedules the cleanup as an independent task that runs to completion even
+            # as the cancel propagates out; sweep() is the ultimate backstop if the loop closes first.
+            await asyncio.shield(asyncio.to_thread(wm.cleanup, job.repo_id, worktree))
 
 
 async def run_one(ledger: "WorkerLedger", worker_id: str = "w1",
