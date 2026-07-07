@@ -1,14 +1,13 @@
-# mxr review-context — de-linked reviewer snapshot (design v0.3)
+# mxr review-context — de-linked reviewer snapshot (design v0.4)
 
-**Status:** DESIGN v0.3 — r1 AND r2 cross-family reviews FOLDED. r2's headline (convergent, both
-families): v0.2's `checkout-index` fold still ran git's CHECKOUT machinery, so in-tree
-`.gitattributes` mutate the exported bytes (VERIFIED: `* text eol=crlf` changed the staged bytes)
-and can reference host-configured smudge filters (LFS + in-tree `.lfsconfig` = host-side SSRF
-class), and committed symlinks materialize LIVE (VERIFIED: `escape-link -> /etc/hosts` came out as
-a real symlink). v0.3 = a RAW OBJECT EXPORTER (D1) which kills all three classes by construction;
-plus gate-mode fail-closed on unresolved tip, control-char-stripped degradation reason, 40-hex tip
-validation, and two documented residuals. One r2 ask DECLINED with rationale in §5 (kilabz "don't
-stage for kilabz either"). Awaiting r3, then Jefe approval before build.
+**Status:** DESIGN v0.4 — r1/r2/r3 cross-family reviews + 2 independent loop verdicts FOLDED.
+r3: oracle APPROVE; kilabz 1 CRITICAL (folded: the raw exporter must REIMPLEMENT git's path-safety
+checks it bypassed — D1 "hostile tree paths"). The r2 DECLINED item (kilabz "don't stage for kilabz
+either") was ACCEPTED as a residual by BOTH families in r3 (§5; Jefe can still overrule). v0.4 also
+folds the autonomous loop's independent findings on the v0.1/v0.2 pushes: staging lifetime vs job
+lifetime (teardown gated on terminal job state), tip==range-end validation, LFS pointer-stub prompt
+note, sync_wait derived from profile timeout, prefix-resolver hyphen normalization.
+Awaiting r4 confirmation, then Jefe approval before build.
 **Author:** Mack, 2026-07-06. **Scope:** myndaix-runtime (pool/runner/cli) + orchestrator/play-review.sh.
 
 ## 1. Problem + evidence
@@ -85,6 +84,14 @@ attr processing can run — nothing consults .gitattributes), mode-120000 symlin
 as regular files CONTAINING the target string (inert; nothing to traverse), gitlinks are skipped,
 and no exec bits are set (reviewers read; nothing needs to run). Each step's exit is asserted; a
 final count check (files written == ls-tree blob count) makes partial exports loud.
+**Hostile tree paths (kilabz r3 CRITICAL): bypassing checkout also bypassed git's `verify_path`
+checks — the exporter must REIMPLEMENT them.** `ls-tree` paths come from an untrusted tree; a
+hand-crafted tree object can contain entries named `..`, `.git` (any case, plus HFS/Unicode dot-git
+variants), duplicates, or case-colliding paths (silent overwrite on APFS case-insensitive). Per
+entry, BEFORE writing: reject absolute paths, any `..` component, any component that
+case-insensitively normalizes to `.git`; create files O_EXCL (no-overwrite → duplicates and case
+collisions fail loudly, never collapse); verify the final canonical path is strictly under the run
+dir. ANY violation = staging failure → the §4 policy (gate fails closed). Fixtures in §9.
 **Extraction invariants (kilabz r1):** the stager creates the dir itself (0700, must not pre-exist);
 `chmod -R a-w` after extraction makes the snapshot genuinely non-writable ("read-only" is otherwise
 only an agent-sandbox property); chmod/reaper traversal never follows symlinks (none exist by
@@ -150,13 +157,29 @@ verifies BOTH reviews' claims against real code before the verdict.
   → resolve repo (absolute path arg, or basename via `$ORCH/repos.json` — the documented ONLY safe
   basename→path source), verify tip resolves locally, stage snapshot, build the objective-above-fence
   prompt with the nonce-fenced `--range` diff, dispatch with scope + workdir + per-agent wait, print
-  the reply, clean staging (trap). This replaces the hand-embed workflow end-to-end.
-- Quick win 1: `mxr get <id>` accepts an id PREFIX (≥8 hex chars) — resolver against `j.id::text`,
-  copying the finding_key prefix pattern (`postgres_store.py:~1506`); ambiguous → error listing
-  candidates. Today `uuid.UUID(job_id)` (`cli.py:127`) rejects the very short-id `submit` prints.
-- Quick win 2: per-agent sync wait — `Profile.sync_wait_s` (kilabz 960 = one full 900s attempt +
-  margin; others default 180), consulted by `cli.submit` only when `MXR_TIMEOUT_S` is unset; env
-  always wins. Kills the stranded-reply-at-150s class.
+  the reply, clean staging. This replaces the hand-embed workflow end-to-end.
+  **tip/range coherence (loop verdict):** when `--range` is given, tip is DERIVED from its end
+  (`rev-parse B`); an explicit `--tip` that disagrees fails closed — the snapshot and the fenced
+  diff must describe the same commit.
+  **Teardown is gated on the JOB, not the caller's wait (loop verdict, raised twice):** a job can
+  outlive `MXR_TIMEOUT_S` (queue delay, retries, slow agent) — deleting the staged cwd on
+  sync-timeout would yank a RUNNING reviewer's cwd. Teardown happens only after the job reaches a
+  terminal state; on a stranded sync wait the dir is left for the age-reaper, whose TTL must exceed
+  worst-case job lifetime (derived: profile timeout × max attempts + queue margin — not a hand-set
+  constant).
+  **LFS note (loop verdict):** the exporter writes LFS-tracked files as their POINTER STUBS (raw
+  blob bytes). v1 adds one sentence to the D4 prompt block ("LFS-tracked files appear as small
+  pointer stubs — do not read them as corruption"); `git lfs checkout` post-processing is a
+  non-goal.
+- Quick win 1: `mxr get <id>` accepts an id PREFIX (≥8 hex chars) — resolver against `j.id::text`
+  (hyphens stripped from BOTH sides before matching, so an unhyphenated 12-char prefix works — loop
+  verdict), copying the finding_key prefix pattern (`postgres_store.py:~1506`); ambiguous → error
+  listing candidates. Today `uuid.UUID(job_id)` (`cli.py:127`) rejects the very short-id `submit`
+  prints.
+- Quick win 2: per-agent sync wait — `Profile.sync_wait_s`, DERIVED per agent from
+  `profile.timeout_s + margin` when unset (kilabz → 900+60; loop verdict: the two budgets must not
+  be hand-tuned apart), consulted by `cli.submit` only when `MXR_TIMEOUT_S` is unset; env always
+  wins. Kills the stranded-reply-at-150s class.
 - Per kilabz r1: the two quick wins ship as their OWN PR (PR-3), not bundled with the staging seam —
   they touch unrelated DB/API behavior and must not muddy the security review of the cwd change.
 
@@ -213,14 +236,14 @@ convergent; tightened in r2):**
   `^[0-9a-f]{40}$` before any git argv (oracle r2: a ref named `-u` must not inject flags).
 - **Env:** zero new env exposure — the snapshot needs no git inside the agent env; PATH/HOME/TMPDIR
   are already in the allowlist base; no secret is added.
-- **DECLINED (with rationale) — kilabz r2 "don't stage for kilabz until a no-exec rung exists":**
-  codex under `--sandbox read-only` CAN execute snapshot entry points, but with writes+net
-  OS-denied, an executed hostile script can only read host files and emit into the model context —
-  capability-identical to codex's Read, which is already un-path-scoped (the same accepted residual
-  as lobster's Read, #69). Exec adds convenience for an injector, not a new channel; the D4 no-exec
-  prompt line plus the confined-lobster triage and exact-match PLAY_PASS remain the working
-  boundary. Staging for kilabz is the point of the design; excluding it would reduce v1 to
-  lobster-only. Documented here so r3/Jefe can overrule.
+- **RESIDUAL, accepted by BOTH families (r3) — "kilabz can exec snapshot entry points":** codex
+  under `--sandbox read-only` CAN execute snapshot code, but with writes+net OS-denied an executed
+  hostile script can only read host files and emit into the model context — capability-identical to
+  codex's Read, which is already un-path-scoped (the same accepted residual as lobster's Read,
+  #69). Exec increases trigger surface, not authority class (kilabz r3 wording); the D4 no-exec
+  prompt line, confined-lobster triage, and exact-match PLAY_PASS remain the working boundary.
+  Raised twice (kilabz r2 + the loop's kilabz), declined with this rationale, then ACCEPTED by
+  oracle r3 and kilabz r3. Jefe can still overrule.
 - **Documented pre-existing gap (oracle r2, agreed):** the UNCONFINED oracle can already discover
   the live repo from an empty scratch cwd (the `--repo` basename + `$ORCH/repos.json` are
   breadcrumbs) — the empty cwd is obscurity, not a boundary. This design neither widens nor fixes
@@ -261,14 +284,19 @@ worktrees. No remote-ref fetching.
   non-string} → TERMINAL; required+absent → TERMINAL (curator regression pin); staging_cwd declared
   (either mode) + job.worktree_path set → worktree NEVER used (kilabz r1 HIGH pin).
 - Verb: basename→repos.json resolution (and path-arg passthrough); tip-not-local → inline-only
-  fallback; tip validated 40-hex (a `-u`-named ref never reaches git argv — oracle r2); **a file
-  under `.gitattributes export-ignore` IS present in the snapshot** (oracle r1 pin); **an in-tree
-  `* text eol=crlf` + `ident` + `filter=bogus` fixture does NOT alter snapshot bytes and no filter
-  executes** (r2 convergent pin); **a committed symlink materializes as a regular file containing
-  the target string, and nothing in the snapshot is a symlink** (kilabz r2 pin); snapshot file set
-  == `git ls-tree -r <tip>` blob set; snapshot is non-writable after staging; no exec bits; no
-  `.git` in the snapshot; fence + nonce-collision belt; staging teardown on success AND on error
-  (trap), including chmod-before-remove.
+  fallback; tip validated 40-hex (a `-u`-named ref never reaches git argv — oracle r2); tip derived
+  from `--range` end / mismatch fails closed (loop pin); **a file under `.gitattributes
+  export-ignore` IS present in the snapshot** (oracle r1 pin); **an in-tree `* text eol=crlf` +
+  `ident` + `filter=bogus` fixture does NOT alter snapshot bytes and no filter executes** (r2
+  convergent pin); **a committed symlink materializes as a regular file containing the target
+  string, and nothing in the snapshot is a symlink** (kilabz r2 pin); **hostile-tree-path fixtures
+  (kilabz r3 CRITICAL pin): entries with `../escape`, `.git/hook`, nested `x/.git/config`,
+  duplicates, and case-colliding names each fail staging closed, via hand-crafted `git mktree`
+  trees** — nothing is written outside the run dir, nothing overwritten; snapshot file set ==
+  `git ls-tree -r <tip>` blob set; snapshot is non-writable after staging; no exec bits; no `.git`
+  in the snapshot; fence + nonce-collision belt; staging teardown only after terminal job state
+  (stranded sync wait leaves the dir to the reaper — loop pin), on success AND on error, including
+  chmod-before-remove.
 - `mxr get` (PR-3): full UUID, unique prefix, ambiguous prefix → error w/ candidates, <8 chars →
   error.
 - sync-wait (PR-3): env set → env wins; unset + profile → profile; neither → 180.
