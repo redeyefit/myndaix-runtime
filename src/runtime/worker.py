@@ -92,19 +92,34 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
     worktree = None
     if spec and spec.authority is Authority.WORKSPACE_ACTOR and job.repo_id:
         wm = wm or WorkspaceManager()
-        # name the worktree by attempt_id so the janitor sweep can correlate a leftover
-        # dir to its (now-closed) attempt after a hard crash (PR-1c)
-        worktree = wm.create(job.repo_id, job.base_ref or "HEAD", str(attempt_id))
+        # Assign `worktree` from the DETERMINISTIC path (named by attempt_id, which sweep() correlates
+        # by) BEFORE create runs, so the finally's cleanup knows the path even if create fails/cancels
+        # after starting to make the dir (oracle).
+        worktree = wm.worktree_path(str(attempt_id))
         job.worktree_path = worktree
 
     try:
+        if worktree is not None:
+            # create INSIDE the try/finally so a TimeoutExpired (wedged git) OR a cancel during
+            # `git worktree add` still reaches cleanup (kilabz: create was outside the try -> its
+            # failure skipped cleanup and leaked the partial worktree). to_thread: workspace._git is a
+            # BLOCKING subprocess — running it on the event loop froze EVERY worker + the janitor + all
+            # heartbeats until git returned (and expired leases could then be reclaimed and double-run —
+            # core-audit HIGH). Off the loop, the loop keeps servicing others; _git's timeout frees the thread.
+            await asyncio.to_thread(wm.create, job.repo_id, job.base_ref or "HEAD", str(attempt_id))
+
         try:
             result = await _invoke(ledger, attempt_id, job, heartbeat_interval_s)
         except LostLease:
             return None  # reclaimed mid-run; agent cancelled, nothing to record
 
         if worktree is not None and result.status is ResultStatus.OK:
-            result.artifact_ref = wm.capture_diff(worktree)  # diff; never auto-merged
+            # RESIDUAL (accepted): a cancel DURING this to_thread abandons the diff thread, so the
+            # finally's cleanup can briefly run against the same worktree. Benign: the worktree is
+            # ISOLATED (live repo never touched), a cancelled attempt's artifact is discarded, git
+            # errors are caught (rmtree fallback), and sweep() reaps any leftover. Not worth fragile
+            # cross-thread serialization for a shutdown-only race with no data-integrity impact.
+            result.artifact_ref = await asyncio.to_thread(wm.capture_diff, worktree)  # diff; never auto-merged
 
         try:
             if result.status is ResultStatus.OK:
@@ -117,7 +132,11 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
         return result.status
     finally:
         if worktree is not None:
-            wm.cleanup(job.repo_id, worktree)  # live repo untouched, even on error/cancel
+            # shield: cleanup runs off-loop, but if process_attempt is being CANCELLED (pool shutdown)
+            # a bare `await` in this finally would raise CancelledError immediately and SKIP cleanup
+            # (oracle). shield schedules the cleanup as an independent task that runs to completion even
+            # as the cancel propagates out; sweep() is the ultimate backstop if the loop closes first.
+            await asyncio.shield(asyncio.to_thread(wm.cleanup, job.repo_id, worktree))
 
 
 async def run_one(ledger: "WorkerLedger", worker_id: str = "w1",

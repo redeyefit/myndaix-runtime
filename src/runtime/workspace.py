@@ -29,9 +29,28 @@ _ROOT_ENV = "MYNDAIX_WORKTREE_ROOT"
 _PREFIX = "wt-"                       # worktree dir = wt-<attempt_id>; sweep() keys off this
 
 
+def _git_timeout() -> int:
+    """Wall-clock cap for a single git worktree op. A wedged git (index.lock held, NFS/APFS I/O
+    stall, a huge add/diff, a credential/hook prompt) MUST NOT hang forever: core-audit HIGH found
+    _git had no timeout AND ran on the event loop, so one stall froze every worker + the janitor +
+    all heartbeats until git returned (indefinitely if truly wedged) — and expired leases could then
+    be reclaimed and DOUBLE-run. worker/pool now also run these off the loop (asyncio.to_thread), so
+    this timeout is what actually frees the thread. Default 120s; $MYNDAIX_WORKTREE_GIT_TIMEOUT overrides."""
+    v = os.environ.get("MYNDAIX_WORKTREE_GIT_TIMEOUT", "")
+    try:
+        n = int(v)                                    # int() (not v.isdigit(): that is True for Unicode
+    except ValueError:                                # digits like '²' that int() REJECTS -> would escape)
+        return 120
+    return n if n > 0 else 120                         # "0"/"00"/negative -> 120: never disable the guard
+
+
 def _git(args: list[str], cwd: str) -> str:
+    # stdin=DEVNULL + GIT_TERMINAL_PROMPT=0: a credential/auth prompt is one of the wedge causes above;
+    # this makes it fail INSTANTLY instead of blocking the full timeout (the timeout becomes a backstop,
+    # not the primary defense), and stops git inheriting the parent's stdin (fresh-eyes review).
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
-                          check=True).stdout
+                          check=True, timeout=_git_timeout(), stdin=subprocess.DEVNULL, env=env).stdout
 
 
 class WorkspaceManager:
@@ -45,14 +64,22 @@ class WorkspaceManager:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
+    def worktree_path(self, attempt_id: str) -> str:
+        """The DETERMINISTIC path create() uses for this attempt_id. Lets a caller know the worktree
+        path BEFORE create() runs — so cleanup can find it even if create is CANCELLED mid-run (the
+        to_thread offload made create an await point, and a cancellation there would else leave the
+        caller's worktree var unset while the thread still created the dir — oracle). Same wt-<attempt_id>
+        naming sweep() correlates by."""
+        return str(self.root / f"{_PREFIX}{attempt_id}")
+
     def create(self, repo_path: str, base_ref: str = "HEAD",
                attempt_id: Optional[str] = None) -> str:
         """git worktree add a fresh, isolated, detached checkout at base_ref.
         Returns the worktree path. The agent mutates only this directory. Naming
         by attempt_id lets sweep() correlate a leftover dir to its (closed) attempt;
         a random suffix is used only when no attempt_id is given (ad-hoc/tests)."""
-        name = f"{_PREFIX}{attempt_id}" if attempt_id else f"{_PREFIX}{uuid.uuid4().hex[:12]}"
-        wt = self.root / name
+        wt = (Path(self.worktree_path(attempt_id)) if attempt_id
+              else self.root / f"{_PREFIX}{uuid.uuid4().hex[:12]}")
         _git(["worktree", "add", "--detach", str(wt), base_ref], cwd=repo_path)
         return str(wt)
 
@@ -74,7 +101,7 @@ class WorkspaceManager:
         the live repo is never affected."""
         try:
             _git(["worktree", "remove", "--force", worktree_path], cwd=repo_path)
-        except subprocess.CalledProcessError:
+        except subprocess.SubprocessError:            # CalledProcessError OR TimeoutExpired (wedged git)
             shutil.rmtree(worktree_path, ignore_errors=True)
 
     def sweep(self, reapable_attempt_ids: Iterable[str]) -> int:
@@ -107,14 +134,14 @@ class WorkspaceManager:
                 try:
                     _git(["worktree", "remove", "--force", str(wt)], cwd=repo)
                     removed_ok = True
-                except subprocess.CalledProcessError:
+                except subprocess.SubprocessError:     # CalledProcessError OR TimeoutExpired
                     pass
             if not removed_ok:
                 shutil.rmtree(wt, ignore_errors=True)  # fallback: hard remove the orphan
                 if repo is not None:
                     try:
                         _git(["worktree", "prune"], cwd=repo)   # drop the now-stale admin entry
-                    except subprocess.CalledProcessError:
+                    except subprocess.SubprocessError:
                         pass
             patch = self.root / f"{wt.name}.patch"     # the captured-diff artifact, if any
             try:
