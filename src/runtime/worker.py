@@ -94,7 +94,11 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
         wm = wm or WorkspaceManager()
         # name the worktree by attempt_id so the janitor sweep can correlate a leftover
         # dir to its (now-closed) attempt after a hard crash (PR-1c)
-        worktree = wm.create(job.repo_id, job.base_ref or "HEAD", str(attempt_id))
+        # to_thread: workspace._git is a BLOCKING subprocess. Running it directly on the event loop
+        # (as this did) meant a stalled/wedged git froze EVERY worker + the janitor + all heartbeats
+        # until it returned — and expired leases could then be reclaimed and double-run (core-audit
+        # HIGH). Offload to a thread so the loop keeps servicing others; _git's timeout frees the thread.
+        worktree = await asyncio.to_thread(wm.create, job.repo_id, job.base_ref or "HEAD", str(attempt_id))
         job.worktree_path = worktree
 
     try:
@@ -104,7 +108,7 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
             return None  # reclaimed mid-run; agent cancelled, nothing to record
 
         if worktree is not None and result.status is ResultStatus.OK:
-            result.artifact_ref = wm.capture_diff(worktree)  # diff; never auto-merged
+            result.artifact_ref = await asyncio.to_thread(wm.capture_diff, worktree)  # diff; never auto-merged
 
         try:
             if result.status is ResultStatus.OK:
@@ -117,7 +121,7 @@ async def process_attempt(ledger: "WorkerLedger", attempt_id: Any,
         return result.status
     finally:
         if worktree is not None:
-            wm.cleanup(job.repo_id, worktree)  # live repo untouched, even on error/cancel
+            await asyncio.to_thread(wm.cleanup, job.repo_id, worktree)  # off-loop; live repo untouched
 
 
 async def run_one(ledger: "WorkerLedger", worker_id: str = "w1",

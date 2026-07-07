@@ -155,6 +155,50 @@ async def test_sqlite_context_round_trips_to_job():
     assert job2 is not None and job2.context == {}
 
 
+async def test_workspace_ops_do_not_block_the_event_loop():
+    # core-audit HIGH: the worktree git ops are BLOCKING and used to run on the event loop, freezing
+    # every worker + the janitor + all heartbeats until git returned. They now run via asyncio.to_thread
+    # — prove a BLOCKING wm.create lets a concurrent coroutine keep progressing (the loop is NOT frozen).
+    import time
+    _register_fixer()
+    repo = _init_repo()
+    ledger = Ledger()
+    await ledger.submit_job("test-fixer", "x", repo_id=repo)
+    attempt_id = await ledger.lease_job("w1", [])
+
+    real = worker.WorkspaceManager()
+
+    class BlockingWM:                                 # a WEDGED git: create() blocks its thread ~0.4s
+        def create(self, *a):
+            time.sleep(0.4)
+            return real.create(*a)
+
+        def capture_diff(self, *a):
+            return real.capture_diff(*a)
+
+        def cleanup(self, *a):
+            return real.cleanup(*a)
+
+    ticks = [0]
+
+    async def ticker():
+        for _ in range(60):
+            ticks[0] += 1
+            await asyncio.sleep(0.01)
+
+    t = asyncio.ensure_future(ticker())
+    await worker.process_attempt(ledger, attempt_id, wm=BlockingWM())
+    ticks_during = ticks[0]
+    t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    # If create() had blocked the loop for its 0.4s, the 0.01s ticker would have made ~0 progress
+    # during it. With to_thread the loop kept running -> the ticker advanced well past a handful.
+    assert ticks_during >= 10, f"event loop was blocked during the worktree op (ticks={ticks_during})"
+
+
 async def _main():
     passed = 0
     for _name, _fn in sorted(globals().items()):

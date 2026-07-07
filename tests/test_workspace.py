@@ -121,6 +121,48 @@ def test_sweep_fallback_hard_removes_when_repo_unrecoverable():
     assert removed == 1 and not Path(wt).exists()
 
 
+def test_git_timeout_parsing():
+    # core-audit HIGH: _git MUST carry a wall-clock timeout (a wedged git can't hang the pool). The
+    # cap is env-tunable but "0"/garbage fall back to the 120s default — the guard is never disabled.
+    import os
+    import runtime.workspace as W
+    saved = os.environ.get("MYNDAIX_WORKTREE_GIT_TIMEOUT")
+    try:
+        os.environ.pop("MYNDAIX_WORKTREE_GIT_TIMEOUT", None)
+        assert W._git_timeout() == 120, "default is 120s"
+        os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = "45"
+        assert W._git_timeout() == 45, "positive env override honored"
+        os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = "0"
+        assert W._git_timeout() == 120, "'0' never disables the guard -> default"
+        os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = "garbage"
+        assert W._git_timeout() == 120, "garbage -> default"
+    finally:
+        if saved is None:
+            os.environ.pop("MYNDAIX_WORKTREE_GIT_TIMEOUT", None)
+        else:
+            os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = saved
+
+
+def test_git_passes_timeout_to_subprocess():
+    # _git MUST hand subprocess.run a timeout so a wedged git is KILLED, not hung forever (core-audit).
+    import runtime.workspace as W
+    repo = _init_repo()
+    captured = {}
+    real_run = W.subprocess.run
+
+    def spy(*a, **kw):
+        captured.update(kw)
+        return real_run(*a, **kw)
+
+    W.subprocess.run = spy
+    try:
+        W._git(["rev-parse", "HEAD"], cwd=repo)              # a normal fast op
+        assert captured.get("timeout") == 120, \
+            f"_git must pass timeout=120 to subprocess.run (got {captured.get('timeout')})"
+    finally:
+        W.subprocess.run = real_run
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
