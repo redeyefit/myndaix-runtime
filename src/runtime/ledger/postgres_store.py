@@ -1349,9 +1349,13 @@ class PostgresLedger:
         reviewer re-flagged this line": a PASS review, or a review of an unrelated line in the same
         file, raises no `finding:` for the still-real issue, yet the issue's line is STILL in the file
         — so deriving 'present' from re-flags would false-close every open finding in a touched file.
-        A path MISSING from present_hashes (a deleted/renamed file, empty set) closes every finding in
-        it — the design-accepted whole-file-delete case (§6). In PR-A tests supply present_hashes
-        directly (keeps the verb DB-only, no git in postgres_store); PR-B wiring computes it per path.
+        present_hashes[path] is THREE-STATE (core-audit HIGH): an EMPTY set = the file is CONFIRMED
+        absent at tip (deleted/renamed) -> every finding in it closes (design-accepted §6); a populated
+        set closes only the findings whose line is gone; and None = presence could NOT be determined (a
+        transient git error) -> fail-CLOSED, leave the finding OPEN (a transient failure must never
+        fabricate an applied_fixed and poison the ground truth). A path absent from the dict is treated
+        as None (don't close). In PR-A tests supply present_hashes directly (keeps the verb DB-only, no
+        git in postgres_store); PR-B wiring computes it per path via outcomes.file_line_hashes.
 
         ORIGIN-ref scoping (not finding_current's drifting latest-row ref): a finding opened on ref A
         must not be closed by a review on ref B even if the line is gone at B's tip. EXACT ref match,
@@ -1407,7 +1411,13 @@ class PostgresLedger:
                           AND origin.ref = $2""",
                     repo_id, ref, list(changed))
                 for r in open_rows:
-                    present_in_file = present.get(r["path"], set())
+                    present_in_file = present.get(r["path"])
+                    if present_in_file is None:
+                        continue                                # presence UNDETERMINED (transient git error,
+                                                                # or path not supplied) -> fail-CLOSED: never
+                                                                # fabricate a close (core-audit HIGH). A
+                                                                # CONFIRMED-absent file is an empty set, which
+                                                                # still closes below.
                     if r["line_hash"] in present_in_file:
                         continue                                # line still in the file -> not fixed
                     ins = await con.fetchval(

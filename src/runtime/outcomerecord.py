@@ -160,9 +160,11 @@ async def record(repo_path: str, base: str, tip: str, ref: str, play: str,
         open_findings = (_resolve_family(repo_path, base, tip, kilabz, "kilabz")
                          + _resolve_family(repo_path, base, tip, oracle, "oracle"))
         # present_hashes for the CLOSE phase: the SET of line_hashes currently in each changed file at
-        # tip, read from git OBJECTS (never the worktree). A path missing/deleted -> empty set (that
-        # file's findings close — the design-accepted whole-file-delete case §6).
-        present: dict[str, set[str]] = {}
+        # tip, read from git OBJECTS (never the worktree). Three-state (core-audit HIGH): a set (empty =
+        # CONFIRMED-deleted -> close §6; populated = close only the vanished lines) OR None = presence
+        # could NOT be determined (transient git error) -> record_findings leaves the finding OPEN, so a
+        # git blip can't fabricate an applied_fixed and poison the ground truth.
+        present: dict[str, set[str] | None] = {}
         for path in changed_paths:
             present[path] = outcomes.file_line_hashes(repo_path, tip, path, run_git=_run_git)
         try:
