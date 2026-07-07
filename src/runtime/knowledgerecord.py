@@ -34,8 +34,16 @@ from runtime.ledger.postgres_store import PostgresLedger
 DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 RECALL_DEFAULT_K = 8
 
-# play-review.sh clean() reproduced (skillselect._C0_DEL): C0 minus \t\n\r, plus DEL.
-_C0_DEL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Terminal-hardened control strip: C0 (minus \t\n\r) + DEL + C1 (U+0080-009F). Stricter than
+# play-review.sh's clean()/skillselect._C0_DEL — C1 includes the single-byte CSI (U+009B) that drives
+# ANSI on some UTF-8 terminals without a leading ESC (both review families flagged this).
+_C0_DEL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# Defang a corpus LINE that mimics the untrusted-region fence marker — belt-and-suspenders beyond the
+# unguessable per-run nonce (both families: don't rely on the objective alone). Line-anchored (?m)^ +
+# ={3,} (the real fence is exactly '==='), so it neutralizes only genuine fence-shaped lines, not stray
+# '=' in content, and can't backtrack quadratically over a '='-run (anchored, one start per line, [ \t]
+# not broad \s — kilabz r2). Replaces the '==='s with '#', preserving leading indent.
+_FENCE_MARKER = re.compile(r"(?m)^([ \t]*)={3,}([ \t]*(?:BEGIN|END)[ \t]+UNTRUSTED)", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -57,6 +65,8 @@ async def _sync(led: PostgresLedger, scope: str) -> dict:
     for w in walk.warnings:
         log(f"{scope}: {w}")
     res = await led.knowledge_sync(scope, [dataclasses.asdict(d) for d in walk.docs])
+    for p in res.get("skipped_oversize", []):
+        log(f"{scope}: SKIPPED {p} — body too large to index (>1MB tsvector); not recallable until shrunk")
     res["md_docs"] = len(walk.docs)
     res["artifacts"] = len(walk.artifacts)
     return res
@@ -68,9 +78,11 @@ async def ingest(scope: str) -> int:
         res = await _sync(led, scope)
     finally:
         await led.close()
+    skipped = len(res.get("skipped_oversize", []))
     print(f"{scope}: {res['md_docs']} md docs on disk — "
           f"inserted {res['inserted']}, tombstoned {res['tombstoned']}, "
-          f"unchanged {res['unchanged']}")
+          f"unchanged {res['unchanged']}"
+          + (f", skipped {skipped} (oversize)" if skipped else ""))
     return 0
 
 
@@ -83,10 +95,14 @@ async def rebuild(scope: str) -> int:
             log(f"{scope}: {w}")
         res = await led.knowledge_rebuild(
             scope, [dataclasses.asdict(d) for d in walk.docs])
+        for p in res.get("skipped_oversize", []):
+            log(f"{scope}: SKIPPED {p} — body too large to index (>1MB tsvector)")
     finally:
         await led.close()
+    skipped = len(res.get("skipped_oversize", []))
     print(f"{scope}: rebuilt — tombstoned {res['tombstoned']} then re-ingested {res['inserted']} "
-          f"({len(walk.docs)} md docs on disk)")
+          f"({len(walk.docs)} md docs on disk"
+          + (f", skipped {skipped} oversize" if skipped else "") + ")")
     return 0
 
 
@@ -140,7 +156,15 @@ def format_hits(rung: str, hits: list[dict], *, fenced: bool, nonce: str) -> str
         date = h.get("doc_date") or "undated"
         lossy = " [lossy]" if h.get("lossy") else ""
         head = re.sub(r"\s+", " ", str(h.get("headline") or "")).strip()
-        body = f"{h['path']} ({date}){lossy}\n  {h.get('title','')}\n  {head}"
+        # strip C0/DEL (incl. ESC, which \s+ above does NOT touch) from the corpus-derived title +
+        # headline on BOTH branches — the plain branch (default `mxr recall`) prints straight to the
+        # terminal, so an escape sequence in an H1 title could spoof/hide output (audit LOW).
+        body = _C0_DEL.sub("", f"{h['path']} ({date}){lossy}\n  {h.get('title','')}\n  {head}")
+        # normalize CR to LF FIRST: _C0_DEL keeps \r, but re's (?m)^ anchors only after \n, so a
+        # `\r`-prefixed forged fence would slip past the defang yet a CR-normalizing terminal would
+        # still render it as its own line. This also kills the bare-CR line-overwrite vector (kilabz r3).
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        body = _FENCE_MARKER.sub(r"\1#\2", body)             # neutralize any forged fence-shaped line in the hit
         if fenced:
             out.append(_fence("recall-hit", body, nonce))
         else:

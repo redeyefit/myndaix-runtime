@@ -400,6 +400,45 @@ async def test_curate_agent_failure(led):
             return False, "pool exploded"
         rc, root = await _round_trip(Path(td), behave)
         ok(rc == 1, "agent failure surfaces as exit 1, nothing promoted")
+        # spine-audit MED: the agent-fail path used to leak the full-corpus-copy staging dir (only
+        # the success branch rmtree'd). The finally now reaps it on every non-inspection exit.
+        ok(not list((Path(td) / "staging").glob("curate-*")),
+           "staging is reaped on agent failure (no full-corpus-copy leak)")
+
+
+async def test_reap_old_staging(led):
+    # spine-audit MED: curate self-cleans staging dirs older than the age cutoff so a leaked or
+    # deliberately-kept (NONCOMPLIANT) workspace can't accumulate toward a disk-fill.
+    import time
+    with tempfile.TemporaryDirectory() as td:
+        old_root = curate.STAGING_ROOT
+        curate.STAGING_ROOT = Path(td) / "staging"
+        curate.STAGING_ROOT.mkdir()
+        try:
+            fresh = curate.STAGING_ROOT / "curate-fresh"
+            stale = curate.STAGING_ROOT / "curate-stale"
+            fresh.mkdir(); stale.mkdir()
+            old = time.time() - 10 * 86400                    # 10d old, past the 7d default
+            os.utime(stale, (old, old))
+            reaped = curate.reap_old_staging()
+            ok(reaped == 1 and stale.exists() is False, "a >7d staging dir is reaped")
+            ok(fresh.exists(), "a fresh staging dir is left alone")
+        finally:
+            curate.STAGING_ROOT = old_root
+
+
+async def test_curate_prompt_binds_the_fence_nonce(led):
+    # spine-audit MED (fence-forgery): the objective must anchor the untrusted-recall boundary to
+    # THIS run's nonce so a corpus brief that forges a "===END UNTRUSTED===" line can't break out.
+    seen = {}
+    with tempfile.TemporaryDirectory() as td:
+        def behave(prompt, staging: Path):
+            seen["prompt"] = prompt
+            return True, "ok"
+        await _round_trip(Path(td), behave, op="lint")
+        p = seen.get("prompt", "")
+        ok("ENDS ONLY at a line" in p and "===END UNTRUSTED nonce=" in p,
+           "objective binds the recall fence to the run nonce (not the bare marker string)")
 
 
 async def test_curate_readonly_propose_only(led):

@@ -1588,6 +1588,29 @@ class PostgresLedger:
         except ValueError:
             return None
 
+    async def _insert_active_knowledge_doc(self, con, scope: str, d: dict) -> bool:
+        """INSERT one active knowledge_doc row inside a SAVEPOINT. Returns True if stored, False if
+        SKIPPED because its body yields a >1MB tsvector — the GENERATED tsv column's hard limit, which
+        the body BYTE cap does NOT bound for token-dense content. The savepoint stops one such poison
+        doc from aborting the WHOLE one-transaction corpus sync (which would re-hit it every re-run and
+        permanently wedge the derived index for the scope). ONLY sqlstate 54000 is swallowed; anything
+        else re-raises. (A doc that was indexed fine before and only now oversizes keeps its last-good
+        active row — stale-but-present beats index-wide failure.)"""
+        try:
+            async with con.transaction():                     # nested -> SAVEPOINT: rollback here, outer xact lives
+                await con.execute(
+                    """INSERT INTO knowledge_doc
+                           (id, scope, path, title, tags, doc_date, body, content_sha, status, lossy)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)""",
+                    _new_id(), scope, d["path"], d.get("title", ""), d.get("tags", ""),
+                    self._knowledge_date(d.get("doc_date")), d.get("body", ""),
+                    d["content_sha"], bool(d.get("lossy")))
+            return True
+        except asyncpg.PostgresError as e:
+            if getattr(e, "sqlstate", None) == "54000":       # program_limit_exceeded: tsvector too long
+                return False
+            raise
+
     async def knowledge_sync(self, scope: str, docs: list[dict],
                              *, tombstone_missing: bool = True) -> dict:
         """Bring the derived index in step with a walked corpus: INSERT a new event row per
@@ -1603,21 +1626,27 @@ class PostgresLedger:
                     "SELECT path, content_sha, status FROM knowledge_doc_current WHERE scope = $1",
                     scope)}
                 seen: set[str] = set()
+                skipped: list[str] = []
                 for d in docs:
                     seen.add(d["path"])
                     prev = cur.get(d["path"])
                     if prev == (d["content_sha"], "active"):
                         unchanged += 1
                         continue
-                    await con.execute(
-                        """INSERT INTO knowledge_doc
-                               (id, scope, path, title, tags, doc_date, body, content_sha,
-                                status, lossy)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)""",
-                        _new_id(), scope, d["path"], d.get("title", ""), d.get("tags", ""),
-                        self._knowledge_date(d.get("doc_date")), d.get("body", ""),
-                        d["content_sha"], bool(d.get("lossy")))
-                    inserted += 1
+                    if await self._insert_active_knowledge_doc(con, scope, d):
+                        inserted += 1
+                    else:
+                        skipped.append(d["path"])             # oversize tsvector: kept OUT of the index, not fatal
+                        if prev and prev[1] == "active":
+                            # a doc that indexed fine BEFORE and only now oversizes would keep its old
+                            # active row and recall would silently serve STALE content (kilabz HIGH).
+                            # Archive it so "skipped" genuinely means not-recallable, not stale-recallable.
+                            await con.execute(
+                                """INSERT INTO knowledge_doc
+                                       (id, scope, path, body, content_sha, status)
+                                   VALUES ($1,$2,$3,'','absent','archived')""",
+                                _new_id(), scope, d["path"])
+                            tombstoned += 1
                 if tombstone_missing:
                     for path, (_, status) in cur.items():
                         if status == "active" and path not in seen:
@@ -1627,7 +1656,8 @@ class PostgresLedger:
                                    VALUES ($1,$2,$3,'','absent','archived')""",
                                 _new_id(), scope, path)
                             tombstoned += 1
-        return {"inserted": inserted, "tombstoned": tombstoned, "unchanged": unchanged}
+        return {"inserted": inserted, "tombstoned": tombstoned, "unchanged": unchanged,
+                "skipped_oversize": skipped}
 
     async def knowledge_rebuild(self, scope: str, docs: list[dict]) -> dict:
         """The admin rebuild (mxr knowledge-rebuild): tombstone + re-ingest under ONE xact lock so
@@ -1646,17 +1676,13 @@ class PostgresLedger:
                            VALUES ($1,$2,$3,'','absent','archived')""",
                         _new_id(), scope, r["path"])
                     tombstoned += 1
+                skipped: list[str] = []
                 for d in docs:
-                    await con.execute(
-                        """INSERT INTO knowledge_doc
-                               (id, scope, path, title, tags, doc_date, body, content_sha,
-                                status, lossy)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)""",
-                        _new_id(), scope, d["path"], d.get("title", ""), d.get("tags", ""),
-                        self._knowledge_date(d.get("doc_date")), d.get("body", ""),
-                        d["content_sha"], bool(d.get("lossy")))
-                    inserted += 1
-        return {"tombstoned": tombstoned, "inserted": inserted}
+                    if await self._insert_active_knowledge_doc(con, scope, d):
+                        inserted += 1
+                    else:
+                        skipped.append(d["path"])             # oversize tsvector: unindexable, skip (don't wedge)
+        return {"tombstoned": tombstoned, "inserted": inserted, "skipped_oversize": skipped}
 
     async def knowledge_recall_fts(self, scope: str, query: str, k: int) -> list[dict]:
         """Ladder rung 1: websearch_to_tsquery (never raises on arbitrary text — the right entry
