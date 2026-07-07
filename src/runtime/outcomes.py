@@ -206,24 +206,28 @@ def file_line_hashes(repo_path: str, tip_sha: str, path: str,
       * a populated/empty set = git POSITIVELY answered. A genuinely-absent object (deleted/renamed at
         tip, CONFIRMED via a successful ls-tree) -> the EMPTY set, so every finding in it closes (the
         design-accepted whole-file-delete/rename case §6).
-      * None = presence could NOT be determined (a `git show` failure that is NOT a confirmed delete:
-        timeout, OSError, a momentary index.lock / mid-gc, or the object exists but was unreadable). The
+      * None = presence could NOT be determined (a blob-read failure that is NOT a confirmed delete:
+        timeout, OSError, a momentary index.lock / mid-gc, or the blob exists but was unreadable). The
         caller MUST then leave the finding OPEN — collapsing a transient failure into 'absent' would
         insert a false applied_fixed and permanently poison the outcomes ground-truth that gates autonomy.
     `run_git` is the injected callable(argv) -> stdout|None so this stays pure + unit-testable."""
     if run_git is None:
         return None                                 # no git injected -> can't determine -> don't close
-    out = run_git(["-C", repo_path, "show", f"{tip_sha}:{path}"])
+    # `cat-file blob` (NOT `git show`): show SUCCEEDS on a non-blob — for a file replaced by a DIRECTORY
+    # it prints the tree's child NAMES, which we'd then hash as "lines" and could false-keep a finding
+    # open if a child name collides (kilabz). cat-file blob fails on any non-blob, so the content path
+    # below only runs for a REAL file blob; every non-blob falls to the ls-tree type probe.
+    out = run_git(["-C", repo_path, "cat-file", "blob", f"{tip_sha}:{path}"])
     if out is not None:
         hashes: set[str] = set()
         for content in out.split("\n"):
             if normalize_line(content):             # skip empty/ws-only (never a keyed finding line)
                 hashes.add(line_hash(content))
         return hashes
-    # `git show` failed. Distinguish a GENUINE delete/replacement (close) from a TRANSIENT error (leave
-    # open) by POSITIVELY probing the tree. NOT --name-only: we need the object TYPE (a `git show` on a
-    # blob-that-timed-out and a `git show` on a file-replaced-by-a-submodule/dir BOTH fail, but only the
-    # first is transient — the second means the file's lines are genuinely gone). ls-tree line =
+    # blob read failed. Distinguish a GENUINE delete/replacement (close) from a TRANSIENT error (leave
+    # open) by POSITIVELY probing the tree. NOT --name-only: we need the object TYPE (cat-file blob on a
+    # blob-that-timed-out and on a file-replaced-by-a-submodule/dir BOTH fail, but only the first is
+    # transient — the second means the file's lines are genuinely gone). ls-tree line =
     # "<mode> <type> <sha>\t<path>".
     listed = run_git(["-C", repo_path, "ls-tree", tip_sha, "--", path])
     if listed is None:

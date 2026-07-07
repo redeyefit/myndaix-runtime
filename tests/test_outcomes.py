@@ -129,13 +129,13 @@ def test_parse_empty_text():
 
 # ---- resolve_and_hash: hunk validation + git-object read (injected run_git) --------------
 def _fake_git(files):
-    """A run_git stub: files = {path: full_file_text}. `show` returns None for a missing object (like a
-    non-zero exit), else the file text. `ls-tree` lists the path iff it exists (mirrors real git), so
-    file_line_hashes can positively confirm a delete vs a transient show failure."""
+    """A run_git stub: files = {path: full_file_text}. `cat-file blob` returns None for a missing/non-blob
+    object (like a non-zero exit), else the file text. `ls-tree` lists the path iff it exists (mirrors
+    real git), so file_line_hashes can positively confirm a delete vs a transient blob-read failure."""
     def run(argv):
         cmd = argv[2]                                   # ["-C", repo, <cmd>, ...]
-        if cmd == "show":                               # argv[-1] = "<tip>:<path>"
-            return files.get(argv[-1].split(":", 1)[1])
+        if cmd in ("cat-file", "show"):                 # resolve_and_hash uses `show`; file_line_hashes
+            return files.get(argv[-1].split(":", 1)[1]) # uses `cat-file blob`; both read a blob by <tip>:<path>
         if cmd == "ls-tree":                            # "<mode> <type> <sha>\t<path>" iff it's in the tree
             path = argv[-1]
             return (f"100644 blob deadbeef\t{path}\n") if path in files else ""
@@ -220,13 +220,13 @@ def test_file_line_hashes_transient_show_failure_does_not_close():
     # object was UNREADABLE (transient/mid-gc/lock), NOT deleted -> None, so the caller leaves the
     # finding OPEN rather than fabricating an applied_fixed.
     def stub(argv):
-        if argv[2] == "show":
-            return None                                 # transient read failure
+        if argv[2] == "cat-file":
+            return None                                 # transient blob-read failure
         if argv[2] == "ls-tree":
             return "100644 blob abc123\tsrc/a.py\n"     # but the path IS present as a BLOB
         return None
     ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=stub) is None,
-       "show fails on an EXISTING blob -> None (transient, do NOT close)")
+       "blob read fails on an EXISTING blob -> None (transient, do NOT close)")
 
 
 def test_file_line_hashes_git_unavailable_does_not_close():
@@ -239,13 +239,26 @@ def test_file_line_hashes_file_replaced_by_submodule_closes():
     # kilabz: a file replaced by a submodule/gitlink -> `git show` fails (not a blob) but ls-tree lists
     # it as type 'commit'. The file's LINES are genuinely gone -> close (empty set), not hang open forever.
     def stub(argv):
-        if argv[2] == "show":
-            return None                                 # can't show a gitlink as a blob
+        if argv[2] == "cat-file":
+            return None                                 # cat-file blob fails on a gitlink (not a blob)
         if argv[2] == "ls-tree":
             return "160000 commit abc123\tsrc/a.py\n"   # now a submodule (non-blob) at the path
         return None
     ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=stub) == set(),
        "a file replaced by a submodule (non-blob) -> empty set (close, lines gone)")
+
+
+def test_file_line_hashes_file_replaced_by_directory_closes():
+    # kilabz r2: `git show <tip>:<dir>` SUCCEEDS on a tree (prints child names) — the old code would
+    # hash those as lines. cat-file blob FAILS on a tree, and ls-tree reports type 'tree' -> close.
+    def stub(argv):
+        if argv[2] == "cat-file":
+            return None                                 # cat-file blob fails on a tree (not a blob)
+        if argv[2] == "ls-tree":
+            return "040000 tree abc123\tsrc/a.py\n"     # a directory now lives at the old file path
+        return None
+    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=stub) == set(),
+       "a file replaced by a directory (tree) -> empty set (close, lines gone — not the dir listing)")
 
 
 def test_file_line_hashes_reads_objects_not_worktree():
