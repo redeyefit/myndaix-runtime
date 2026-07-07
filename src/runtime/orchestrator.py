@@ -361,16 +361,19 @@ class OrchestratorDriver:
         # runner's Higgsfield fetch hardening. A legit redirecting URL must be passed pre-resolved or via
         # --ref-image. mkstemp (not mktemp): no predictable-name TOCTOU; always removed in finally.
         fd, tmp = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
         try:
             r = httpx.get(image_url, headers={"User-Agent": "Mozilla/5.0"},
                           follow_redirects=False, timeout=60)
             if r.status_code != 200:
                 raise RuntimeError(f"persona ref download {r.status_code} "
                                    f"(redirects refused as an SSRF guard — pass a direct https URL or --ref-image)")
-            Path(tmp).write_bytes(r.content)
+            with os.fdopen(fd, "wb") as fh:      # write via the mkstemp fd — NOT close-then-reopen-by-name
+                fh.write(r.content)              # (that reopen would be a TOCTOU window — oracle r1)
+            fd = None                            # fdopen took ownership + closed it
             emb, _ = critic.embed_face(tmp)
         finally:
+            if fd is not None:
+                os.close(fd)                     # httpx raised / non-200 before fdopen -> close the raw fd
             try:
                 os.remove(tmp)
             except OSError:
