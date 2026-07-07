@@ -368,12 +368,12 @@ class OrchestratorDriver:
                 raise RuntimeError(f"persona ref download {r.status_code} "
                                    f"(redirects refused as an SSRF guard — pass a direct https URL or --ref-image)")
             with os.fdopen(fd, "wb") as fh:      # write via the mkstemp fd — NOT close-then-reopen-by-name
-                fh.write(r.content)              # (that reopen would be a TOCTOU window — oracle r1)
-            fd = None                            # fdopen took ownership + closed it
+                fd = None                        # fdopen OWNS it now; the `with` closes it even if write()
+                fh.write(r.content)              # raises — so finally must NOT also close it (double-close/OSError)
             emb, _ = critic.embed_face(tmp)
         finally:
             if fd is not None:
-                os.close(fd)                     # httpx raised / non-200 before fdopen -> close the raw fd
+                os.close(fd)                     # httpx raised / non-200 BEFORE fdopen -> close the raw fd
             try:
                 os.remove(tmp)
             except OSError:
