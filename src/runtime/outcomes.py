@@ -237,6 +237,10 @@ def file_line_hashes(repo_path: str, tip_sha: str, path: str,
     # parsed as magic and match NOTHING (empirically: `ls-tree HEAD -- ':weird.py'` returns empty for
     # an EXISTING file), which reads as "absent" below and would FABRICATE an applied_fixed close on
     # a transiently-unreadable blob. literal magic probes the exact name.
+    # Do NOT add `-d` here (a reviewer proposed it to "stop recursion into a dir at the path" —
+    # REFUTED 2026-07-06: bare ls-tree on a dir path returns the tree ENTRY, not its children, so
+    # there is no recursion to stop; and `-d` SUPPRESSES blob entries entirely, so an EXISTING file
+    # would probe as absent -> set() -> fabricated close on every transient blob-read failure).
     listed = run_git(["-C", repo_path, "ls-tree", tip_sha, "--", f":(literal){path}"])
     if listed is None:
         return None                                 # ls-tree also failed -> transient/unknown -> don't close
