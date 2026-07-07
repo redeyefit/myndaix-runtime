@@ -136,9 +136,9 @@ def _fake_git(files):
         cmd = argv[2]                                   # ["-C", repo, <cmd>, ...]
         if cmd == "show":                               # argv[-1] = "<tip>:<path>"
             return files.get(argv[-1].split(":", 1)[1])
-        if cmd == "ls-tree":                            # argv[-1] = path; git lists it iff it's in the tree
+        if cmd == "ls-tree":                            # "<mode> <type> <sha>\t<path>" iff it's in the tree
             path = argv[-1]
-            return (path + "\n") if path in files else ""
+            return (f"100644 blob deadbeef\t{path}\n") if path in files else ""
         return None
     return run
 
@@ -223,16 +223,29 @@ def test_file_line_hashes_transient_show_failure_does_not_close():
         if argv[2] == "show":
             return None                                 # transient read failure
         if argv[2] == "ls-tree":
-            return "src/a.py\n"                          # but the path IS present in the tree
+            return "100644 blob abc123\tsrc/a.py\n"     # but the path IS present as a BLOB
         return None
     ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=stub) is None,
-       "show fails on an EXISTING path -> None (transient, do NOT close)")
+       "show fails on an EXISTING blob -> None (transient, do NOT close)")
 
 
 def test_file_line_hashes_git_unavailable_does_not_close():
     # both show and ls-tree fail (git wedged / timeout / OSError -> None) -> can't determine -> None.
     ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=lambda _a: None) is None,
        "show+ls-tree both fail -> None (fail-closed on a transient error)")
+
+
+def test_file_line_hashes_file_replaced_by_submodule_closes():
+    # kilabz: a file replaced by a submodule/gitlink -> `git show` fails (not a blob) but ls-tree lists
+    # it as type 'commit'. The file's LINES are genuinely gone -> close (empty set), not hang open forever.
+    def stub(argv):
+        if argv[2] == "show":
+            return None                                 # can't show a gitlink as a blob
+        if argv[2] == "ls-tree":
+            return "160000 commit abc123\tsrc/a.py\n"   # now a submodule (non-blob) at the path
+        return None
+    ok(O.file_line_hashes("/repo", "tip", "src/a.py", run_git=stub) == set(),
+       "a file replaced by a submodule (non-blob) -> empty set (close, lines gone)")
 
 
 def test_file_line_hashes_reads_objects_not_worktree():

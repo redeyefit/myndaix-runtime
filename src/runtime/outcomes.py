@@ -220,11 +220,20 @@ def file_line_hashes(repo_path: str, tip_sha: str, path: str,
             if normalize_line(content):             # skip empty/ws-only (never a keyed finding line)
                 hashes.add(line_hash(content))
         return hashes
-    # `git show` failed. Distinguish a GENUINE delete (close) from a TRANSIENT error (leave open) by
-    # POSITIVELY probing the tree: `git ls-tree` lists the path iff the object exists at tip.
-    listed = run_git(["-C", repo_path, "ls-tree", "--name-only", tip_sha, "--", path])
+    # `git show` failed. Distinguish a GENUINE delete/replacement (close) from a TRANSIENT error (leave
+    # open) by POSITIVELY probing the tree. NOT --name-only: we need the object TYPE (a `git show` on a
+    # blob-that-timed-out and a `git show` on a file-replaced-by-a-submodule/dir BOTH fail, but only the
+    # first is transient — the second means the file's lines are genuinely gone). ls-tree line =
+    # "<mode> <type> <sha>\t<path>".
+    listed = run_git(["-C", repo_path, "ls-tree", tip_sha, "--", path])
     if listed is None:
         return None                                 # ls-tree also failed -> transient/unknown -> don't close
-    if listed.strip() == "":
+    listed = listed.strip()
+    if listed == "":
         return set()                                # tree read OK + path absent -> genuinely deleted -> close (§6)
-    return None                                     # path IS in the tree but show failed -> unreadable/transient
+    fields = listed.split()
+    obj_type = fields[1] if len(fields) >= 2 else ""
+    if obj_type == "blob":
+        return None                                 # exists as a FILE but show failed -> unreadable/transient -> don't close
+    return set()                                    # non-blob at the path (commit=submodule/gitlink, tree=dir):
+                                                    # the file's lines are genuinely gone -> close (kilabz r1)
