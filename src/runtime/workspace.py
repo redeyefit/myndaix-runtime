@@ -37,16 +37,20 @@ def _git_timeout() -> int:
     be reclaimed and DOUBLE-run. worker/pool now also run these off the loop (asyncio.to_thread), so
     this timeout is what actually frees the thread. Default 120s; $MYNDAIX_WORKTREE_GIT_TIMEOUT overrides."""
     v = os.environ.get("MYNDAIX_WORKTREE_GIT_TIMEOUT", "")
-    if v.isdigit():
-        n = int(v)                                    # parse FIRST, then require > 0: "0"/"000"/"00"
-        if n > 0:                                     # all -> 0 -> would make every op instant-timeout
-            return n
-    return 120
+    try:
+        n = int(v)                                    # int() (not v.isdigit(): that is True for Unicode
+    except ValueError:                                # digits like '²' that int() REJECTS -> would escape)
+        return 120
+    return n if n > 0 else 120                         # "0"/"00"/negative -> 120: never disable the guard
 
 
 def _git(args: list[str], cwd: str) -> str:
+    # stdin=DEVNULL + GIT_TERMINAL_PROMPT=0: a credential/auth prompt is one of the wedge causes above;
+    # this makes it fail INSTANTLY instead of blocking the full timeout (the timeout becomes a backstop,
+    # not the primary defense), and stops git inheriting the parent's stdin (fresh-eyes review).
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
-                          check=True, timeout=_git_timeout()).stdout
+                          check=True, timeout=_git_timeout(), stdin=subprocess.DEVNULL, env=env).stdout
 
 
 class WorkspaceManager:

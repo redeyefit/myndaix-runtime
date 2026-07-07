@@ -136,6 +136,10 @@ def test_git_timeout_parsing():
         assert W._git_timeout() == 120, "'0' never disables the guard -> default"
         os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = "garbage"
         assert W._git_timeout() == 120, "garbage -> default"
+        os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = "²"   # '²': isdigit() True but int() raises
+        assert W._git_timeout() == 120, "Unicode digit that int() rejects -> default (not a crash)"
+        os.environ["MYNDAIX_WORKTREE_GIT_TIMEOUT"] = "-5"
+        assert W._git_timeout() == 120, "negative -> default"
     finally:
         if saved is None:
             os.environ.pop("MYNDAIX_WORKTREE_GIT_TIMEOUT", None)
