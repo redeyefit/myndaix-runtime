@@ -37,7 +37,11 @@ def _git_timeout() -> int:
     be reclaimed and DOUBLE-run. worker/pool now also run these off the loop (asyncio.to_thread), so
     this timeout is what actually frees the thread. Default 120s; $MYNDAIX_WORKTREE_GIT_TIMEOUT overrides."""
     v = os.environ.get("MYNDAIX_WORKTREE_GIT_TIMEOUT", "")
-    return int(v) if v.isdigit() and v != "0" else 120
+    if v.isdigit():
+        n = int(v)                                    # parse FIRST, then require > 0: "0"/"000"/"00"
+        if n > 0:                                     # all -> 0 -> would make every op instant-timeout
+            return n
+    return 120
 
 
 def _git(args: list[str], cwd: str) -> str:

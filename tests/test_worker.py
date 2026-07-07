@@ -202,6 +202,40 @@ async def test_workspace_ops_do_not_block_the_event_loop():
     assert ticks_during >= 10, f"event loop was blocked during the worktree op (ticks={ticks_during})"
 
 
+async def test_create_failure_still_cleans_up():
+    # kilabz: create is now INSIDE the try/finally, so a git failure/timeout during `worktree add`
+    # still reaches cleanup — and cleanup gets the DETERMINISTIC path even though create never returned.
+    _register_fixer()
+    repo = _init_repo()
+    ledger = Ledger()
+    await ledger.submit_job("test-fixer", "x", repo_id=repo)
+    attempt_id = await ledger.lease_job("w1", [])
+    real = worker.WorkspaceManager()
+    cleaned = []
+
+    class FailingCreateWM:
+        def worktree_path(self, aid):
+            return real.worktree_path(aid)
+
+        def create(self, *a):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=1)   # wedged git
+
+        def capture_diff(self, *a):
+            return None
+
+        def cleanup(self, repo_path, wt):
+            cleaned.append(wt)
+
+    raised = False
+    try:
+        await worker.process_attempt(ledger, attempt_id, wm=FailingCreateWM())
+    except subprocess.TimeoutExpired:
+        raised = True
+    assert raised, "a create TimeoutExpired propagates out of process_attempt"
+    assert cleaned == [real.worktree_path(str(attempt_id))], \
+        "cleanup ran with the deterministic worktree path despite create failing"
+
+
 async def _main():
     passed = 0
     for _name, _fn in sorted(globals().items()):
