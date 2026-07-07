@@ -64,9 +64,20 @@ V1_ROSTER: list[AgentSpec] = [
               # model on both hosts, and sonnet-tier is sufficient for it (optimal-team brief);
               # auth is flat-rate (Max plan), so this is about determinism + preserving premium
               # model quota for hard work, not dollars.
+              # TOOL CONFINEMENT (core-audit 2026-07-06): lobster is CONTROLLER-authority and runs on
+              # the review/triage path, whose inputs are UNTRUSTED (PR diffs + review findings). A bare
+              # `claude -p` inherits the operator's real $HOME + ~22 MCP servers (filesystem/firecrawl/
+              # github) + full Bash/Write — the identical read-only-sandbox bypass the curator was
+              # hardened against, but on a MORE dangerous agent (untrusted input -> injection -> RCE/
+              # exfil). lobster is read-only judgment (text verdict from the prompt), so it takes the
+              # SAME proven confinement as curator (minus staging_cwd): --tools Read Glob Grep (hard
+              # built-in whitelist; no Write/Bash/net), --strict-mcp-config (ignore the inherited MCP
+              # fleet), --safe-mode (no project/local hooks/plugins), scratch_home (empty throwaway HOME).
               adapter={"kind": "cli", "argv": ["claude", "-p", "--model", "sonnet",
-                       "--output-format", "text"],
-                       "prompt_channel": "stdin", "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # long-lived subscription token
+                       "--output-format", "text", "--tools", "Read", "Glob", "Grep",
+                       "--strict-mcp-config", "--safe-mode"],
+                       "prompt_channel": "stdin", "scratch_home": True,
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # long-lived subscription token
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
