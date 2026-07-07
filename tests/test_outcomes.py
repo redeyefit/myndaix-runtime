@@ -301,10 +301,12 @@ def test_file_line_hashes_pathspec_magic_filename_probes_literal():
        "a ':'-named file that exists but is transiently unreadable stays OPEN (no fabricated close)")
 
 
-def test_file_line_hashes_whitespace_filename_does_not_fabricate_close():
-    # oracle (core-audit follow-up): a file literally NAMED whitespace yields an ls-tree entry line
-    # ENDING in that whitespace; `.strip()` collapsed it to "" == the absent case -> false close on a
-    # transient blob failure. Newline-only rstrip keeps the entry and lands on type 'blob' -> None.
+def test_file_line_hashes_whitespace_filename_stays_open():
+    # Plain regression pin for a whitespace-NAMED file. (An oracle claim that `.strip()` could
+    # collapse this entry to "" and fabricate a close was REFUTED — the line always carries
+    # "<mode> <type> <sha>" so it parses to type 'blob' under strip OR rstrip; kilabz's re-review
+    # caught the original test asserting a fix for a non-bug. Kept as a behavior pin: an existing
+    # whitespace-named blob with a transient read failure must stay OPEN.)
     def stub(argv):
         if argv[2] == "cat-file":
             return None                                 # transient blob-read failure
@@ -312,7 +314,7 @@ def test_file_line_hashes_whitespace_filename_does_not_fabricate_close():
             return "100644 blob abc123\t  \n"           # the file's NAME is two spaces
         return None
     ok(O.file_line_hashes("/repo", "tip", "  ", run_git=stub) is None,
-       "a whitespace-named existing blob with a transient read failure stays OPEN (was: false close)")
+       "a whitespace-named existing blob with a transient read failure stays OPEN")
 
 
 def main():

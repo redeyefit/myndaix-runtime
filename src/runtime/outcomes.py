@@ -240,8 +240,11 @@ def file_line_hashes(repo_path: str, tip_sha: str, path: str,
     listed = run_git(["-C", repo_path, "ls-tree", tip_sha, "--", f":(literal){path}"])
     if listed is None:
         return None                                 # ls-tree also failed -> transient/unknown -> don't close
-    # rstrip newlines ONLY (not .strip()): a file whose NAME is whitespace produces an entry line
-    # ending in that whitespace — .strip() would collapse it to "" and fabricate a close (oracle).
+    # rstrip newlines ONLY (not .strip()): the only trailing bytes we ever mean to trim are the line
+    # terminator. (A reviewer claimed .strip() could collapse a whitespace-NAMED file's entry to ""
+    # and fabricate a close — REFUTED 2026-07-06: the entry line always carries "<mode> <type> <sha>"
+    # so it survives strip() non-empty and lands on the blob branch either way. rstrip kept as the
+    # precise idiom; it also preserves the path field verbatim for any future parsing.)
     listed = listed.rstrip("\r\n")
     if listed == "":
         return set()                                # tree read OK + path absent -> genuinely deleted -> close (§6)
