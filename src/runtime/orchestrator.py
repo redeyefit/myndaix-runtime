@@ -355,12 +355,29 @@ class OrchestratorDriver:
         import tempfile
 
         import httpx
-        tmp = tempfile.mktemp(suffix=".png")
-        r = httpx.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True, timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"persona ref download {r.status_code}")
-        Path(tmp).write_bytes(r.content)
-        emb, _ = critic.embed_face(tmp)
+        # follow_redirects=False: _reject_unsafe_url only classifies the ORIGINAL host (it does not
+        # pin the resolved IP or re-check redirect targets), so following a 30x would let the untrusted
+        # host bounce us to 169.254.169.254 / localhost / RFC1918 — SSRF. Refuse redirects, matching the
+        # runner's Higgsfield fetch hardening. A legit redirecting URL must be passed pre-resolved or via
+        # --ref-image. mkstemp (not mktemp): no predictable-name TOCTOU; always removed in finally.
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        try:
+            r = httpx.get(image_url, headers={"User-Agent": "Mozilla/5.0"},
+                          follow_redirects=False, timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"persona ref download {r.status_code} "
+                                   f"(redirects refused as an SSRF guard — pass a direct https URL or --ref-image)")
+            with os.fdopen(fd, "wb") as fh:      # write via the mkstemp fd — NOT close-then-reopen-by-name
+                fd = None                        # fdopen OWNS it now; the `with` closes it even if write()
+                fh.write(r.content)              # raises — so finally must NOT also close it (double-close/OSError)
+            emb, _ = critic.embed_face(tmp)
+        finally:
+            if fd is not None:
+                os.close(fd)                     # httpx raised / non-200 BEFORE fdopen -> close the raw fd
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         if emb is None:
             raise RuntimeError("no face found in the seed image (persona ref)")
         return emb
@@ -369,9 +386,16 @@ class OrchestratorDriver:
         """Stage-4 Soul-ID gate: extract a plate frame, embed the largest face, gate identity vs the
         reference. A FAIL carries a one-variable retry hint (LOWER motion_strength reduces warping)."""
         import tempfile
-        png = tempfile.mktemp(suffix=".png")
-        await self._grab_frame_png(plate_ref, png)
-        frame_emb, face_frac = critic.embed_face(png)
+        fd, png = tempfile.mkstemp(suffix=".png")   # mkstemp (not mktemp): no TOCTOU; removed in finally
+        os.close(fd)
+        try:
+            await self._grab_frame_png(plate_ref, png)
+            frame_emb, face_frac = critic.embed_face(png)
+        finally:
+            try:
+                os.remove(png)
+            except OSError:
+                pass
         v = critic.critic_persona(frame_emb, ref_emb, face_frac)
         v["retry_hint"] = {"motion_strength_delta": -0.1} if v["status"] == "fail" else None
         return v

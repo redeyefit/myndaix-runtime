@@ -334,6 +334,21 @@ def test_scratch_home_noop_without_flag():
     assert scratch is None and env == {"HOME": "/real/home"}
 
 
+def test_lobster_is_confined():
+    """core-audit HIGH: lobster is CONTROLLER-authority on the review/triage path (UNTRUSTED PR
+    diffs + findings). A bare `claude -p` would inherit the operator's HOME + ~22 MCP servers +
+    Bash/Write = injection->RCE. It must carry the same read-only confinement as curator."""
+    from runtime.registry import get as get_spec
+    ad = get_spec("lobster").adapter
+    argv = ad["argv"]
+    assert ad.get("scratch_home") is True, "lobster must run under an empty scratch HOME"
+    assert "--strict-mcp-config" in argv, "lobster must ignore the inherited MCP fleet"
+    assert "--safe-mode" in argv, "lobster must disable inherited hooks/plugins"
+    assert "--tools" in argv and {"Read", "Glob", "Grep"}.issubset(set(argv)), \
+        f"lobster must hard-whitelist read-only tools; got {argv}"
+    assert not ({"Write", "Edit", "Bash"} & set(argv)), "lobster is read-only triage — no write/bash tools"
+
+
 def test_scratch_home_empty_for_curator(tmpdir=None):
     """A scratch_home agent with NO seed entry (curator: claude auths via the env token) runs
     under an EMPTY throwaway HOME — so it can't inherit the operator's ~/.claude MCP servers /

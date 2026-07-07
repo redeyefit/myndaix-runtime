@@ -372,6 +372,40 @@ def test_requeue_safe_paid_agent_never_requeues():
     ok(L._requeue_safe("mack") is False, "a workspace-actor still never requeues")
 
 
+def test_embed_ref_refuses_redirects_and_cleans_temp():
+    # core-audit HIGH (SSRF): _embed_ref must fetch the seed with follow_redirects=False (a 30x from
+    # the untrusted host would bounce to IMDS/localhost past the guard) AND always remove the temp file.
+    import httpx
+    from runtime import runner
+    captured, created = {}, []
+    orig_get, orig_guard, orig_mkstemp = httpx.get, runner._reject_unsafe_url, tempfile.mkstemp
+
+    async def _noop(_u):
+        return None
+
+    def _spy_get(url, **kw):
+        captured["fr"] = kw.get("follow_redirects")
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+
+    def _track(**kw):
+        fd, p = orig_mkstemp(**kw)
+        created.append(p)
+        return fd, p
+
+    httpx.get, runner._reject_unsafe_url, tempfile.mkstemp = _spy_get, _noop, _track
+    try:
+        raised = False
+        try:
+            asyncio.run(O.OrchestratorDriver()._embed_ref(None, "https://evil.example/seed.png"))
+        except RuntimeError:
+            raised = True                                    # 302 -> non-200 -> RuntimeError (not followed)
+        ok(captured.get("fr") is False, "seed fetched with follow_redirects=False (SSRF guard)")
+        ok(raised, "a 302 redirect is rejected, not followed to the internal host")
+        ok(bool(created) and not any(os.path.exists(p) for p in created), "persona temp file is cleaned up")
+    finally:
+        httpx.get, runner._reject_unsafe_url, tempfile.mkstemp = orig_get, orig_guard, orig_mkstemp
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
