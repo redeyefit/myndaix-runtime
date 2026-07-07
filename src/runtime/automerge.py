@@ -72,6 +72,12 @@ GH_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_GH_TIMEOUT", 30)
 REVIEW_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", 600)
 REVIEW_MAX_DIFF = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF", 262144)  # match play-review PLAY_MAX_DIFF
 REVIEW_MAX_DIFF_LINES = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", 2000)  # match play-review PLAY_MAX_DIFF_LINES
+# ceiling on transient (infra/abort) re-reviews per PR HEAD. A transient verdict records NOTHING
+# (returns None) so the paid 3-agent gate re-runs EVERY tick — unlike the controller, which has a
+# blocked ceiling for exactly this. Without a bound, a persistently-transient docs PR (e.g. oracle
+# down, which the gate REQUIRES) burns a full paid panel hourly, forever. After N transients on the
+# same head, record a terminal human skip (deduped, stops re-spending); a new push resets the count.
+MAX_REVIEW_ATTEMPTS = _int_env("MYNDAIX_AUTOMERGE_MAX_REVIEW_ATTEMPTS", 3)
 RATE_FLOOR = _int_env("MYNDAIX_AUTOMERGE_RATE_FLOOR", 100)
 
 DRY_RUN = os.environ.get("MYNDAIX_AUTOMERGE_DRY_RUN") == "1"
@@ -302,6 +308,25 @@ def _charge(author: str) -> None:
         pass
 
 
+# -- transient-review ceiling: bound the paid re-review of a persistently-transient head ----------
+def _attempt_file(rid: str, n: int, head: str) -> Path:
+    # per-(repo, pr, head) transient-review counter. Keyed on HEAD (a new push = new head = fresh
+    # ceiling). Slug the repo id like the day counters. Shares $STATE with play-review, so the same
+    # PRUNE_DAYS reaper cleans stale counters (a head that merged/was-recorded is never re-read).
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", rid)
+    return STATE / f"automerge-rev-attempt-{slug}-{n}-{head}"
+
+
+def _bump_attempt(p: Path) -> int:
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        c = _count(p) + 1                            # _count fail-closes to 1<<30 on a corrupt file:
+        p.write_text(str(c))                         # unreadable -> treated as OVER the ceiling below
+        return c
+    except OSError:
+        return 1 << 30                               # can't persist the count -> stop re-spending (fail-closed)
+
+
 # -- the per-PR gate -----------------------------------------------------------
 def _ci_green(repo: dict, head: str) -> Optional[bool]:
     """The required `test` check(s) for THIS commit. Returns True (all COMPLETED+SUCCESS),
@@ -472,8 +497,12 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
     content = _git(repo["path"], "diff", "--no-ext-diff", f"{B}..{H}")
     if content.returncode != 0:
         log(f"PR#{n}: content diff failed — defer"); return None
-    if len(content.stdout) > REVIEW_MAX_DIFF:
-        return ("skipped", f"docs diff {len(content.stdout)}B over the {REVIEW_MAX_DIFF}B review cap — human")
+    # count the diff bytes the way the worker's PLAY_MAX_DIFF check does: bash `$(git diff)` strips
+    # trailing newlines, so rstrip here (mirrors controller._diff_bytes) — else raw>=stripped disagrees
+    # by exactly the trailing-newline byte at the cap boundary and a within-budget PR is skipped.
+    cbytes = len(content.stdout.rstrip(b"\n"))
+    if cbytes > REVIEW_MAX_DIFF:
+        return ("skipped", f"docs diff {cbytes}B over the {REVIEW_MAX_DIFF}B review cap — human")
     # same mirror-wedge for the worker's CHANGED-LINES cap (PLAY_MAX_DIFF_LINES): a >2000-line
     # docs PR under 256KB would gate-abort exit-2 "transient" EVERY tick forever (workflow #2)
     # — pre-cap on the identical numstat metric and record the same terminal human skip.
@@ -511,9 +540,16 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
     if not DRY_RUN and _count(_day(f"-author-{author}")) >= MAX_PER_AUTHOR_DAY:
         log(f"PR#{n}: author {author} daily cap — defer"); return None
 
-    # gate 5: synchronous review — pass / needs_fix(terminal) / transient(defer)
+    # gate 5: synchronous review — pass / needs_fix(terminal) / transient(defer, but ceiling-bounded)
     rev = _review_pass(repo, B, H)
     if rev == "transient":
+        # a transient verdict runs the FULL paid panel then aborts. Bound the re-runs per head so a
+        # persistent-transient PR (oracle down / always-aborting diff) can't burn paid reviews hourly
+        # forever: after MAX_REVIEW_ATTEMPTS, record a terminal human skip (deduped). A new push resets.
+        attempts = _bump_attempt(_attempt_file(rid, n, H))
+        if attempts >= MAX_REVIEW_ATTEMPTS:
+            return ("skipped", f"review transient x{attempts} (infra/persistent abort) — human")
+        log(f"PR#{n}: review transient (attempt {attempts}/{MAX_REVIEW_ATTEMPTS}) — defer")
         return None
     if rev == "needs_fix":
         return ("needs_fix", "review did not PASS — human")

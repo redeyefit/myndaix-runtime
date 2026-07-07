@@ -226,6 +226,101 @@ def test_line_precap_is_terminal_before_the_paid_review():
     ok(calls == [], "the paid review is NOT called for an over-line-cap PR")
 
 
+def test_transient_review_is_ceiling_bounded():
+    # spine-audit HIGH: a transient verdict returns None (records nothing) so the paid 3-agent panel
+    # re-runs EVERY tick forever. After MAX_REVIEW_ATTEMPTS on the SAME head it must record a terminal
+    # human skip (deduped, stops re-spending). Uses the REAL _count/_bump_attempt against a temp STATE.
+    import tempfile, pathlib
+    H, M, B = "a" * 40, "b" * 40, "c" * 40
+    calls = []
+
+    def fake_git(path, *args, **kw):
+        a = args[0] if args else ""
+        if a == "rev-parse":
+            return _R(0, (H if "pr/" in args[1] else M).encode())
+        if a == "merge-base":
+            return _R(0, B.encode())
+        return _R(0, b"stub")
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    monkey = {"_git": fake_git, "_merge_queue": lambda repo: False,
+              "parse_raw_z": lambda out: [], "classify_diff": lambda e: (True, ""),
+              "_ci_green": lambda repo, head: True, "STATE": tmpdir,   # real _count + _bump_attempt
+              "_review_pass": lambda repo, b, h: calls.append((b, h)) or "transient"}
+    saved = {k: getattr(A, k) for k in monkey}
+    for k, v in monkey.items():
+        setattr(A, k, v)
+    try:
+        pr = {"number": 45, "headRefOid": H, "baseRefOid": M,
+              "author": {"login": "redeyefit"}, "isDraft": False,
+              "isCrossRepository": False, "mergeStateStatus": "CLEAN"}
+        repo = {"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}
+        results = [A.evaluate_pr(repo, pr, [0]) for _ in range(A.MAX_REVIEW_ATTEMPTS)]
+    finally:
+        for k, v in saved.items():
+            setattr(A, k, v)
+    ok(all(r is None for r in results[:-1]),
+       f"transient defers (None) for the first {A.MAX_REVIEW_ATTEMPTS - 1} attempts")
+    ok(isinstance(results[-1], tuple) and results[-1][0] == "skipped" and "transient" in results[-1][1],
+       "at the ceiling a terminal human skip is recorded (bounds the paid re-runs)")
+    ok(len(calls) == A.MAX_REVIEW_ATTEMPTS,
+       "the paid review runs at most MAX_REVIEW_ATTEMPTS times for one head, then never again")
+
+
+def test_byte_precap_matches_worker_metric_at_the_boundary():
+    # spine-audit LOW: the byte pre-cap must count like the worker — bash `$(git diff)` strips the
+    # trailing newline, so a diff whose STRIPPED size == cap (raw == cap+1) must be REVIEWED, not
+    # skipped (mirrors controller._diff_bytes rstrip). A genuinely-over diff is still a terminal skip.
+    H, M, B = "a" * 40, "b" * 40, "c" * 40
+    cap = 10
+
+    def run(content):
+        calls = []
+
+        def fake_git(path, *args, **kw):
+            a = args[0] if args else ""
+            if a == "rev-parse":
+                return _R(0, (H if "pr/" in args[1] else M).encode())
+            if a == "merge-base":
+                return _R(0, B.encode())
+            if a == "diff" and "--numstat" in args:
+                return _R(0, b"1\t0\tdocs/x.md\n")       # 1 line, well under the line cap
+            if a == "diff" and "--raw" in args:
+                return _R(0, b"")
+            if a == "diff":
+                return _R(0, content)                    # the content byte-cap diff
+            return _R(0, b"stub")
+
+        monkey = {"_git": fake_git, "_merge_queue": lambda repo: False,
+                  "parse_raw_z": lambda out: [], "classify_diff": lambda e: (True, ""),
+                  "_ci_green": lambda repo, head: True, "_count": lambda p: 0,
+                  # needs_fix (terminal, reached) proves the review RAN without entering the merge
+                  # subprocess path (which would need a real cwd) — we only assert it was reached.
+                  "_review_pass": lambda repo, b, h: calls.append(1) or "needs_fix"}
+        saved = {k: getattr(A, k) for k in monkey}
+        saved_cap = A.REVIEW_MAX_DIFF
+        A.REVIEW_MAX_DIFF = cap
+        for k, v in monkey.items():
+            setattr(A, k, v)
+        try:
+            pr = {"number": 45, "headRefOid": H, "baseRefOid": M,
+                  "author": {"login": "redeyefit"}, "isDraft": False,
+                  "isCrossRepository": False, "mergeStateStatus": "CLEAN"}
+            res = A.evaluate_pr({"path": "/tmp/x", "nwo": "redeyefit/myndaix-runtime"}, pr, [0])
+        finally:
+            for k, v in saved.items():
+                setattr(A, k, v)
+            A.REVIEW_MAX_DIFF = saved_cap
+        return res, calls
+
+    res, calls = run(b"x" * cap + b"\n")                 # stripped == cap (raw == cap+1)
+    ok(calls == [1] and not (isinstance(res, tuple) and res[0] == "skipped"),
+       "a diff whose STRIPPED size == cap is reviewed, not skipped (boundary matches the worker)")
+    res, calls = run(b"x" * (cap + 1))                   # genuinely over
+    ok(isinstance(res, tuple) and res[0] == "skipped" and "review cap" in res[1] and calls == [],
+       "a diff genuinely over the byte cap is a terminal skip before the paid review")
+
+
 def test_gate_env_forwards_diff_caps():
     # §3's pre-check enforces REVIEW_MAX_DIFF_LINES/REVIEW_MAX_DIFF; the gate worker env MUST carry
     # the SAME values as PLAY_MAX_DIFF_LINES/PLAY_MAX_DIFF — else a raised automerge cap passes the
