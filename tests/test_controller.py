@@ -168,7 +168,7 @@ async def test_done_marker_advances_cursor(led: PostgresLedger) -> None:
     await C.process_repo(led, repo, [0])
     head2 = advance(repo, "c1")
     await C.process_repo(led, repo, [0])                 # pending = head2
-    (C.STATE / f"done-{head2}").write_text("")           # play-review "delivered" (marker)
+    C._done_marker(repo, repo.watch_ref, head2).write_text("")   # play-review "delivered" (scoped marker)
     await C.process_repo(led, repo, [0])                 # advance pass picks it up
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["reviewed_sha"] == head2 and cur["pending_sha"] is None
@@ -316,7 +316,7 @@ async def test_transient_streak_alerts_once_and_delivery_resets(led: PostgresLed
             await C.process_repo(led, repo, [0])         # forgive + re-dispatch each tick
         assert len(alerts) == 1, f"alert fires ONLY at streak=={C.TRANSIENT_ALERT_STREAK}, got {len(alerts)}"
         assert C._transient_streak_file(repo.repo_id).exists(), "streak persists while the outage lasts"
-        (C.STATE / f"done-{head2}").write_text("")       # the review finally delivers
+        C._done_marker(repo, repo.watch_ref, head2).write_text("")       # the review finally delivers
         await C.process_repo(led, repo, [0])             # advance pass consumes the marker
         cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
         assert cur["reviewed_sha"] == head2 and cur["state"] == "delivered"
@@ -411,6 +411,41 @@ async def test_transient_marker_bash_python_contract(led: PostgresLedger) -> Non
     assert r.stdout == expected, f"bash and python marker names must agree: {r.stdout!r}"
 
 
+# -- the DONE marker (drives cursor ADVANCE) must be repo/ref-scoped like the transient one -------
+async def test_done_marker_scoped_by_repo_and_ref(led: PostgresLedger) -> None:
+    await _truncate(led)
+    seam = fresh_seam("donescope"); repo = make_repo("donescope")
+    await C.process_repo(led, repo, [0])                 # baseline
+    head2 = advance(repo, "c1")
+    await C.process_repo(led, repo, [0])                 # dispatch (pending=head2)
+    # a FOREIGN-scope done marker for the same sha (another repo / another ref) must NOT advance us
+    fork = C.Repo("donefork", _TMP / "donefork", repo.watch_ref)     # same sha, DIFFERENT repo
+    C._done_marker(fork, repo.watch_ref, head2).write_text("")
+    C._done_marker(repo, "refs/heads/dev", head2).write_text("")     # same repo, DIFFERENT ref
+    await C.process_repo(led, repo, [0])
+    cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
+    assert cur["pending_sha"] == head2 and cur["reviewed_sha"] != head2, \
+        "a done marker from a foreign (repo, ref) scope must NOT advance this cursor past unreviewed code"
+    assert len(records(seam)) == 1, "still deduped in-flight (no re-dispatch)"
+
+
+# -- the bash mark_done and python _done_marker derivations MUST agree ------------
+def test_done_marker_bash_python_contract() -> None:
+    tip = "b" * 40
+    repo = C.Repo("my.repo", _TMP / "somewhere" / "my.repo", "refs/heads/feat/x")
+    expected = f"done-my.repo-refs-heads-feat-x-{tip}"
+    assert C._done_marker(repo, repo.watch_ref, tip).name == expected
+    r = subprocess.run(
+        ["bash", "-c",
+         'repo_id="$(basename "$1")"; ref="$2"; tip="$3"; '
+         'marker_slug="${repo_id//[^A-Za-z0-9._-]/-}-${ref//[^A-Za-z0-9._-]/-}"; '
+         'printf "done-%s-%s" "$marker_slug" "$tip"',
+         "bash", str(repo.path), repo.watch_ref, tip],
+        capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == expected, f"bash and python done-marker names must agree: {r.stdout!r}"
+
+
 # -- config: duplicate basenames rejected; junk entries skipped ----------------
 async def test_load_config_dedup_and_validation(led: PostgresLedger) -> None:
     a = make_repo("dup")                                  # basename 'dup'
@@ -480,15 +515,15 @@ async def test_over_budget_range_chunks_and_walks(led: PostgresLedger) -> None:
         "must dispatch the LARGEST prefix under budget (base..c1), not the full range"
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["pending_sha"] == c1, "the ledger claim must be keyed on the chunk target"
-    (C.STATE / f"done-{c1}").write_text("")              # chunk 1 delivered
+    C._done_marker(repo, repo.watch_ref, c1).write_text("")              # chunk 1 delivered
     await C.process_repo(led, repo, [0])                 # advance to c1, dispatch next chunk
     recs = records(seam)
     assert len(recs) == 2 and recs[1]["base"] == c1 and recs[1]["head"] == c2
-    (C.STATE / f"done-{c2}").write_text("")              # chunk 2 delivered
+    C._done_marker(repo, repo.watch_ref, c2).write_text("")              # chunk 2 delivered
     await C.process_repo(led, repo, [0])                 # tail now fits -> full head
     recs = records(seam)
     assert len(recs) == 3 and recs[2]["base"] == c2 and recs[2]["head"] == c3
-    (C.STATE / f"done-{c3}").write_text("")
+    C._done_marker(repo, repo.watch_ref, c3).write_text("")
     await C.process_repo(led, repo, [0])
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["reviewed_sha"] == c3, "the walk must converge on the true head"
@@ -705,7 +740,7 @@ async def test_byte_fat_middle_commit_walks_past(led: PostgresLedger) -> None:
     await C.process_repo(led, repo, [0])                 # chunk 1: base..c1
     recs = records(seam)
     assert len(recs) == 1 and recs[0]["head"] == c1
-    (C.STATE / f"done-{c1}").write_text("")
+    C._done_marker(repo, repo.watch_ref, c1).write_text("")
     before = {f.name for f in C.JEFE_INBOX.glob("*.md")} if C.JEFE_INBOX.exists() else set()
     await C.process_repo(led, repo, [0])                 # advance to c1; c2 is byte-fat -> flag+advance
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
@@ -726,7 +761,7 @@ async def test_backward_force_push_advances_and_flags(led: PostgresLedger) -> No
     await C.process_repo(led, repo, [0])                 # seed baseline at c0
     c1 = advance_lines(repo, "w.txt", 25)
     await C.process_repo(led, repo, [0])                 # dispatch c0..c1 (fits default budget)
-    (C.STATE / f"done-{c1}").write_text("")
+    C._done_marker(repo, repo.watch_ref, c1).write_text("")
     await C.process_repo(led, repo, [0])                 # advance: reviewed = c1
     cur = await led.get_cursor(repo.repo_id, repo.watch_ref)
     assert cur["reviewed_sha"] == c1
@@ -759,7 +794,7 @@ async def test_daily_budget_blocks_dispatch_not_advance(led: PostgresLedger) -> 
     head2 = advance(repo, "c1")
     await C.process_repo(led, repo, [0])                 # dispatch head2 (pending)
     assert len(records(seam)) == 1
-    (C.STATE / f"done-{head2}").write_text("")           # head2 delivered
+    C._done_marker(repo, repo.watch_ref, head2).write_text("")           # head2 delivered
     C.MAX_DISPATCH_PER_DAY = 0                            # exhaust the daily dispatch budget
     head3 = advance(repo, "c2")                           # a new head arrives
     await C.process_repo(led, repo, [0])                 # advance MUST run; dispatch MUST NOT
@@ -779,7 +814,9 @@ async def test_end_to_end_stub_play_review(led: PostgresLedger) -> None:
     stub.write_text(
         "#!/bin/bash\nread -r lr ls rr rs\n"
         f'printf "%s|%s|%s|%s" "$lr" "$ls" "$rr" "$rs" > "{record}"\n'
-        f'mkdir -p "{state}"; printf x > "{state}/done-$ls"\nexit 0\n')
+        # scoped done marker: done-<repo>-<ref>-<sha>, mirroring play-review.sh's marker_slug
+        'slug="$(basename "$PWD")"; slug="${slug//[^A-Za-z0-9._-]/-}-${lr//[^A-Za-z0-9._-]/-}"\n'
+        f'mkdir -p "{state}"; printf x > "{state}/done-$slug-$ls"\nexit 0\n')
     stub.chmod(0o755)
     C.PLAY_REVIEW = stub
     C.TEST_MODE = False; C.DISPATCH_OVERRIDE = ""         # exercise the REAL subprocess trigger path
@@ -787,7 +824,8 @@ async def test_end_to_end_stub_play_review(led: PostgresLedger) -> None:
         await C.process_repo(led, repo, [0])             # baseline
         base = head_of(repo); head2 = advance(repo, "c1")
         await C.process_repo(led, repo, [0])             # real dispatch -> stub writes done-<head2>
-        assert (state / f"done-{head2}").exists(), "controller must invoke play-review which writes the marker"
+        assert C._done_marker(repo, repo.watch_ref, head2).exists(), \
+            "controller must invoke play-review which writes the (scoped) marker"
         got = record.read_text().split("|")
         assert got == ["refs/heads/main", head2, "refs/heads/main", base], f"synthetic-stdin contract: {got}"
         await C.process_repo(led, repo, [0])             # advance pass consumes the marker
