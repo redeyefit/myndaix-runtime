@@ -32,12 +32,17 @@ case "$agent" in
     exit 0 ;;
   review-stage)
     # PR-2 staging primitive: STUB_STAGE_FAIL simulates an infra failure (empty stdout + a
-    # control-charged reason on stderr, to exercise the degradation/fail-closed + clean() paths);
-    # otherwise mkdir a fake review-* dir under the staging root and echo it (the ONLY stdout).
+    # control-charged reason on stderr, to exercise the degradation/fail-closed + clean() paths).
+    # STUB_STAGE_FAIL_WITH_PATH prints a REAL dir to stdout but exits NON-ZERO — the "partial path
+    # before a late failure" case (kilabz HIGH): play-review must key on the EXIT STATUS, not the
+    # stdout shape, so this must still take the fail-closed/degrade branch. Otherwise: mkdir a fake
+    # review-* dir and echo it (the ONLY stdout) with exit 0.
     if [[ -n "${STUB_STAGE_FAIL:-}" ]]; then printf 'staging failed: %b\n' "stub \033[31mreason\033[0m" >&2; exit 1; fi
     d="$HOME/.myndaix/orchestrator/staging/review-stub-$$-$RANDOM"
     mkdir -p "$d" 2>/dev/null || { echo "mkdir failed" >&2; exit 1; }
-    printf '%s\n' "$d"; exit 0 ;;
+    printf '%s\n' "$d"
+    [[ -n "${STUB_STAGE_FAIL_WITH_PATH:-}" ]] && exit 1   # path printed, but FAILED -> must not read as success
+    exit 0 ;;
   review-teardown)
     printf 'review-teardown\t%s\n' "$*" >> "$HOME/.myndaix/teardown-argv.log" 2>/dev/null || true
     [[ -n "${2:-}" ]] && rm -rf "$2" 2>/dev/null || true; exit 0 ;;
@@ -363,6 +368,14 @@ echo "46b. PR-2: degradation reason is control-stripped (ESC from the stub reaso
 echo "47. PR-2: staging FAILURE fails the GATE CLOSED (ABORTED, exit 2 -> retry)"; reset; rm -f "$ROOT/verdict.json"
   STUB_STAGE_FAIL=1 STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "gate staging-fail exits 2 (transient)"
   ck "gate verdict ABORTED on staging failure" '"verdict":"ABORTED"' "$ROOT/verdict.json"
+
+echo "47b. PR-2 (kilabz HIGH): review-stage that PRINTS a path but EXITS NON-ZERO still fails closed"; reset; rm -f "$ROOT/verdict.json"
+  STUB_STAGE_FAIL_WITH_PATH=1 STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "gate keys on exit status, not stdout shape (exit 2)"
+  ck "verdict ABORTED despite a printed staging path" '"verdict":"ABORTED"' "$ROOT/verdict.json"
+  reset; STUB_STAGE_FAIL_WITH_PATH=1 STUB_TRIAGE="PLAY_PASS" run
+  L="$(mlog)"
+  if grep -q $'^kilabz\t.*--staged-workdir' "$L" 2>/dev/null; then echo "  FAIL: staged-workdir passed after a nonzero-exit stage"; FAIL=$((FAIL+1)); else echo "  ok: push review degrades (no staged-workdir) on nonzero-exit stage"; PASS=$((PASS+1)); fi
+  ck "push verdict marks the degradation" "reviewed WITHOUT snapshot"
 
 echo "48. PR-2: scope-flag count is still 3 (staged-workdir is additive, not a new scoped call)"; reset; STUB_TRIAGE="PLAY_PASS" run
   rid="$(basename "$REPO")"; L="$(mlog)"
