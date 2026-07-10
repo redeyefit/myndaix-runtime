@@ -102,8 +102,14 @@ def test_export_basic_verbatim_and_locked_down():
         assert not (snap / ".git").exists()
         mode = (snap / "run.sh").stat().st_mode
         assert not (mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)), oct(mode)
+        # OWNER-ONLY + non-writable (kilabz r2 HIGH — no group/other read on a snapshot
+        # of possibly-private repo content): files 0400, dirs 0500, incl. the run dir.
+        for p in snap.rglob("*"):
+            perm = p.stat().st_mode & 0o777
+            assert perm == (0o500 if p.is_dir() else 0o400), f"{p}: {oct(perm)}"
+        assert snap.stat().st_mode & 0o777 == 0o500, oct(snap.stat().st_mode)
         for p in [snap, *snap.rglob("*")]:
-            assert not (p.stat().st_mode & 0o222), f"writable: {p}"
+            assert not (p.stat().st_mode & 0o277), f"group/other or writable: {p}"
         # teardown removes it (chmod-before-remove — a-w would wedge a naive rmtree)
         assert staging.teardown_snapshot(snap, root=root) is True
         assert not snap.exists()
@@ -260,6 +266,34 @@ def test_case_colliding_names():
             shutil.rmtree(d, ignore_errors=True)
 
 
+def test_case_colliding_DIRECTORY_prefixes():
+    # kilabz r2 HIGH: O_EXCL catches file collisions, but makedirs(exist_ok=True) would
+    # SILENTLY MERGE FOO/a and foo/b into one dir on a case-insensitive fs (count check
+    # still passes → snapshot diverges from the tree). The dir_owner realpath guard must
+    # fail closed on case-insensitive; on case-sensitive the two dirs legitimately coexist.
+    repo, root = _mkrepo(), _tmproot()
+    try:
+        ba = _hash_blob(repo, b"a\n")
+        bb = _hash_blob(repo, b"b\n")
+        foo_up = _raw_tree(repo, [("100644", b"a", ba)])       # FOO/a
+        foo_lo = _raw_tree(repo, [("100644", b"b", bb)])       # foo/b
+        tip = _commit_tree(repo, _raw_tree(
+            repo, [("40000", b"FOO", foo_up), ("40000", b"foo", foo_lo)]))
+        if _fs_case_insensitive(root):
+            try:
+                staging.stage_snapshot(repo, tip, root=root)
+                raise AssertionError("dir-prefix case collision must fail closed")
+            except StagingError:
+                pass
+            assert not list(root.iterdir())                    # nothing left behind
+        else:
+            snap = staging.stage_snapshot(repo, tip, root=root)
+            assert (snap / "FOO" / "a").exists() and (snap / "foo" / "b").exists()
+    finally:
+        for d in (repo, root):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def test_tip_validation_and_caps():
     repo, root = _mkrepo(), _tmproot()
     try:
@@ -331,7 +365,7 @@ def test_reaper_ttl_derived_and_scoped():
         past = time.time() - ttl - 60
         os.utime(old, (past, past))          # LAST — writing into the dir bumps its mtime
         os.utime(foreign, (past, past))
-        assert staging.reap_old_review_staging() == 1
+        assert staging.reap_old_review_staging(set()) == 1   # empty set = reap freely
         assert not old.exists() and fresh.exists() and foreign.exists()
     finally:
         os.environ.pop("MYNDAIX_STAGING_ROOT", None)
@@ -353,8 +387,24 @@ def test_reaper_never_reaps_in_use_dir():
         os.utime(live, (past, past))
         os.utime(dead, (past, past))
         # in_use compares by realpath, so a symlinked/relative spelling still protects
-        n = staging.reap_old_review_staging(in_use={str(live)})
+        n = staging.reap_old_review_staging({str(live)})
         assert n == 1 and dead.exists() is False and live.exists()
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_reaper_none_liveness_reaps_nothing():
+    # kilabz r2 MED: in_use=None means "liveness UNKNOWN" (e.g. ledger down) → reap
+    # NOTHING, never blind mtime-reap (the round-1 bug class).
+    root = _tmproot()
+    os.environ["MYNDAIX_STAGING_ROOT"] = str(root)
+    try:
+        d = root / "review-old"
+        d.mkdir()
+        past = time.time() - staging._review_ttl_s() - 60
+        os.utime(d, (past, past))
+        assert staging.reap_old_review_staging(None) == 0 and d.exists()
     finally:
         os.environ.pop("MYNDAIX_STAGING_ROOT", None)
         shutil.rmtree(root, ignore_errors=True)

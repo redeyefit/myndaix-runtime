@@ -191,6 +191,16 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
     total_bytes = 0
     rd = str(rundir)
     rd_real = os.path.realpath(rd)                  # rundir is fresh + not a symlink (mkdir)
+    # dir-prefix case-collision guard (kilabz r2 HIGH): O_EXCL catches FILE collisions,
+    # but `makedirs(exist_ok=True)` SILENTLY MERGES case-colliding DIRECTORY prefixes on
+    # a case-insensitive fs (APFS): tree entries `FOO/a` then `foo/b` land in ONE physical
+    # dir, the count check still passes, and the snapshot diverges from the tree instead of
+    # failing closed. Keyed on the parent's (st_dev, st_ino) INODE — NOT realpath, which on
+    # macOS preserves the requested case spelling rather than the on-disk one: on a
+    # case-insensitive fs the two rel-parents share ONE inode; on a case-sensitive fs they
+    # are distinct dirs with distinct inodes. So it rejects the collision only where it
+    # actually collides.
+    dir_owner: dict[tuple, str] = {}
     for mode, otype, sha, path in entries:
         if otype == "commit" and mode == "160000":
             continue                                   # gitlink (submodule) — skip
@@ -225,6 +235,17 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
             raise StagingError(f"realpath failed for {path!r}: {e}") from e
         if real_parent != rd_real and os.path.commonpath([real_parent, rd_real]) != rd_real:
             raise StagingError(f"entry parent resolves outside run dir: {path!r}")
+        # a parent INODE already OWNED by a different intended rel-parent == a merged
+        # case-collision on this fs → fail closed (see dir_owner note above).
+        try:
+            pst = os.stat(parent)
+        except OSError as e:
+            raise StagingError(f"stat failed for {path!r}: {e}") from e
+        rel_parent = os.path.dirname(path)
+        owner = dir_owner.setdefault((pst.st_dev, pst.st_ino), rel_parent)
+        if owner != rel_parent:
+            raise StagingError(f"case-colliding directory prefix for {path!r} "
+                               f"(collides with {owner!r} on this filesystem)")
 
         if not _TIP_RE.fullmatch(sha):                 # blob sha feeds git argv — validate
             raise StagingError(f"non-hex blob sha for {path!r}: {sha!r}")
@@ -236,10 +257,12 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
         if total_bytes > max_bytes:
             raise StagingError(f"snapshot exceeds byte cap {max_bytes}")
         try:
-            # O_EXCL: duplicates / case-colliding names fail LOUDLY (never a silent
-            # overwrite on case-insensitive APFS). O_NOFOLLOW: belt — no symlinks exist
-            # by construction.
-            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            # O_EXCL: duplicate / case-colliding FILE names fail LOUDLY (never a silent
+            # overwrite on case-insensitive APFS; dir-prefix collisions are caught above).
+            # O_NOFOLLOW: belt — no symlinks exist by construction. mode 0600: owner-only
+            # from birth (kilabz r2 HIGH — a review snapshot of possibly-private repo
+            # content must not be group/other-readable).
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         except OSError as e:
             raise StagingError(f"create failed (duplicate/collision?) for {path!r}: {e}") from e
         try:
@@ -252,15 +275,18 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
     if written != expected:
         raise StagingError(f"count check failed: wrote {written}, ls-tree lists {expected}")
 
-    # make the snapshot GENUINELY non-writable ("read-only" is otherwise only an
-    # agent-sandbox property). Bottom-up so parents stay traversable while chmod-ing
-    # children; never follows symlinks (none exist — belt).
+    # make the snapshot GENUINELY non-writable AND owner-only ("read-only" is otherwise
+    # only an agent-sandbox property; kilabz r2 HIGH — do NOT widen to group/other read).
+    # Files → 0400 (owner read, no write), dirs → 0500 (owner read+traverse, no write),
+    # INCLUDING the rundir itself (it was 0700 — 0500 removes owner write without adding
+    # any group/other bit). Bottom-up so parents stay traversable while chmod-ing children;
+    # never follows symlinks (none exist — belt).
     for dirpath, dirnames, filenames in os.walk(rundir, topdown=False):
         for fn in filenames:
             p = os.path.join(dirpath, fn)
             if not os.path.islink(p):
-                os.chmod(p, 0o444)
-        os.chmod(dirpath, 0o555)
+                os.chmod(p, 0o400)
+        os.chmod(dirpath, 0o500)
 
 
 def _force_remove(rundir: Path) -> None:
@@ -316,25 +342,27 @@ def _review_ttl_s() -> int:
     return max(timeouts or [900]) * attempts + 3600
 
 
-def reap_old_review_staging(in_use: Optional[set[str]] = None) -> int:
+def reap_old_review_staging(in_use: Optional[set[str]]) -> int:
     """Remove leaked review-* staging dirs older than the derived TTL (crash-leak
     backstop, same shape as curate.reap_old_staging). Restores write permission first —
     the a-w snapshot would otherwise wedge the reaper. Returns the count removed.
 
-    `in_use` is a fail-safe denylist of workdir paths a live (non-terminal) job still
-    references — NEVER reaped whatever their age (the caller supplies it from
-    PostgresLedger.active_workdirs). Liveness is decided by JOB STATE, not mtime: a
-    reviewer reading the chmod'd-a-w snapshot never refreshes its mtime, so age alone
-    would let a concurrent reap yank a still-running reviewer's cwd — defeating the
-    terminal-state teardown gate (adversarial-review MED, 2026-07-09). The mtime cutoff
-    stays as the backstop for a dir NO live job references (a crash before submit, or a
-    stranded-then-terminal job). Paths are compared by realpath so a symlink/relative
-    spelling can't dodge the guard."""
+    `in_use` is the REQUIRED fail-safe denylist of workdir paths a live (non-terminal)
+    job still references — NEVER reaped whatever their age. Liveness is decided by JOB
+    STATE, not mtime: a reviewer reading the chmod'd-a-w snapshot never refreshes its
+    mtime, so age alone would let a concurrent reap yank a still-running reviewer's cwd
+    (adversarial-review MED, 2026-07-09). Pass an (empty) set to reap freely; pass
+    **None** ONLY when liveness is UNKNOWN (e.g. the ledger is unreachable) — then this
+    reaps NOTHING and returns 0, because blind mtime-reaping is the exact bug class
+    (kilabz r2 MED). The mtime cutoff still gates the reap of a dir no live job
+    references. Paths compared by realpath so a symlink/relative spelling can't dodge it."""
+    if in_use is None:
+        return 0                                           # liveness unknown → never blind-reap
     sroot = staging_root()
     if not sroot.is_dir():
         return 0
     protected = set()
-    for p in (in_use or ()):
+    for p in in_use:
         try:
             protected.add(os.path.realpath(p))
         except OSError:
@@ -354,6 +382,18 @@ def reap_old_review_staging(in_use: Optional[set[str]] = None) -> int:
     return reaped
 
 
+async def ledger_active_workdirs() -> set[str]:
+    """Live-job cwds from the ledger, for the reaper's in-use denylist. Raises on any
+    ledger error (the caller decides whether to skip the reap — NEVER reap blind)."""
+    from runtime.ledger.postgres_store import PostgresLedger
+    dsn = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
+    led = await PostgresLedger.connect(dsn)
+    try:
+        return await led.active_workdirs()
+    finally:
+        await led.close()
+
+
 def main(argv: list[str]) -> int:
     """The PR-2 seam for play-review.sh: stage/teardown/reap without a bash
     reimplementation of the exporter. Prints the staged dir on stdout; all diagnostics
@@ -369,7 +409,15 @@ def main(argv: list[str]) -> int:
     if len(args) == 2 and args[0] == "teardown":
         return 0 if teardown_snapshot(args[1]) else 1
     if len(args) == 1 and args[0] == "reap":
-        print(reap_old_review_staging())
+        # query live cwds from the ledger and FAIL CLOSED if it's unreachable — a
+        # standalone reap must never fall back to blind mtime-reaping (kilabz r2 MED).
+        import asyncio
+        try:
+            in_use = asyncio.run(ledger_active_workdirs())
+        except Exception as e:                             # noqa: BLE001
+            print(f"reap: cannot load live workdirs, refusing to reap: {e}", file=sys.stderr)
+            return 1
+        print(reap_old_review_staging(in_use))
         return 0
     print("usage: python3 -m runtime.staging stage <repo> <tip40> | teardown <dir> | reap",
           file=sys.stderr)

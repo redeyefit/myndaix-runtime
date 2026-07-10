@@ -226,6 +226,20 @@ def test_cli_staged_workdir_threads_to_context():
         restore()
 
 
+def test_cli_staged_workdir_empty_string_still_propagates():
+    # kilabz r2 MED: an EXPLICIT empty --staged-workdir "" must reach context.workdir
+    # (→ runner rejects it TERMINAL), never be dropped by a truthy check to a silent
+    # scratch downgrade. Omitting the flag entirely leaves workdir unset.
+    captured, restore = _capture_submit()
+    try:
+        rc = cli.main(["kilabz", "t", "--repo", "x", "--staged-workdir", ""])
+        assert rc == 0 and captured["context"] == {"workdir": ""}
+        rc = cli.main(["kilabz", "t", "--repo", "x"])
+        assert rc == 0 and "workdir" not in captured["context"]
+    finally:
+        restore()
+
+
 def test_cli_review_routes_to_review_main():
     from runtime import review as review_mod
     captured = {}

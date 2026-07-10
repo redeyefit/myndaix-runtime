@@ -136,9 +136,12 @@ def _build_context(args: argparse.Namespace) -> dict:
             raise SystemExit("--end-card must be an http(s) URL (local paths are not accepted; "
                              "host the image or upload it first)")
         ctx["end_card_url"] = ec
-    if getattr(args, "staged_workdir", None):
+    if getattr(args, "staged_workdir", None) is not None:
         # pass-through only: the RUNNER is the trust boundary (realpath strictly inside
         # $MYNDAIX_STAGING_ROOT, staging-cwd adapters only — fail-closed TERMINAL there).
+        # `is not None` (not truthy): an EXPLICIT empty --staged-workdir "" must propagate
+        # so the runner rejects it TERMINAL, never silently drop to a scratch downgrade
+        # (kilabz r2 MED — a wrapper passing an unset var must not quietly de-contextualize).
         ctx["workdir"] = args.staged_workdir
     return ctx
 

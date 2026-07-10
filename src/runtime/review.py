@@ -69,19 +69,6 @@ def _clean(s: str) -> str:
     return _C0_DEL.sub("", s)
 
 
-async def _active_workdirs() -> Optional[set]:
-    """Workdirs of non-terminal jobs, for the reaper's fail-safe in-use guard. A short
-    dedicated connection (the reaper runs before dispatch, ahead of run_job's own
-    connection); returns None on any ledger error so the reaper degrades to mtime-only."""
-    from runtime.ledger.postgres_store import PostgresLedger
-    dsn = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
-    led = await PostgresLedger.connect(dsn)
-    try:
-        return await led.active_workdirs()
-    finally:
-        await led.close()
-
-
 def _warn(msg: str) -> None:
     print(f"mxr review: {_clean(msg)}", file=sys.stderr, flush=True)
 
@@ -228,13 +215,16 @@ async def _review(args: argparse.Namespace) -> int:
         _warn(f"agent '{args.agent}' is not staging-eligible (v1: confined reviewers "
               f"only) — dispatching inline-only")
     else:
-        # crash-leak backstop — but NEVER reap a dir a live review still references
-        # (the reaper decides liveness by job state, not mtime; adversarial-review MED).
+        # crash-leak backstop — but NEVER reap a dir a live review still references (the
+        # reaper decides liveness by job state, not mtime). On a ledger error SKIP the
+        # reap entirely rather than reap blind (kilabz r2 MED: mtime-only reaping is the
+        # bug class); a leaked dir just persists until a later reap with live data.
         try:
-            in_use = await _active_workdirs()
-        except Exception:                         # noqa: BLE001 — reap is best-effort
-            in_use = None
-        staging.reap_old_review_staging(in_use=in_use)
+            in_use = await staging.ledger_active_workdirs()
+        except Exception as e:                    # noqa: BLE001 — reap is best-effort
+            _warn(f"skipping staging reap (cannot load live workdirs: {e})")
+        else:
+            staging.reap_old_review_staging(in_use)
         try:
             staged = staging.stage_snapshot(repo, tip)
         except staging.StagingError as e:
