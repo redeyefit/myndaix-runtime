@@ -1,6 +1,6 @@
 # Self-labeling system — safe automation of the outcomes-ledger labeling flywheel (design v0.4)
 
-**Status:** DESIGN v0.4 — oracle r3 APPROVE (airtight); folded kilabz r3's spec-completeness (label-vs-lifecycle axis, complete source×outcome algebra, current-not-rows aggregation) + oracle's drop-the-diagnostic-view refinement. Awaiting r4 confirmation. NOT built.
+**Status:** DESIGN v0.4 — ✅ CONVERGED, DUAL-FAMILY APPROVE (kilabz r4 + oracle r3/r4: "airtight, cleared to build"). 4 cross-family rounds folded 2 CRITICAL + 10 BLOCKER + several HIGH. AWAITING JEFE'S BUILD-GO on PR-1 (the fence). One kilabz r4 build note folded (§5 pairwise matrix).
 **Author:** Mack (Fable 5), 2026-07-10. **Scope:** `src/runtime/{ledger,command_api}` + labeler module + `orchestrator/` sweep + migration `0009`. NO edits to shipped 0008.
 
 ## 0. Change log
@@ -68,7 +68,7 @@ Three Command-API verbs, each server-minting `created_by`/`outcome_source`/`sour
 | `record_exec_prior` | **exec-oracle service identity ONLY** | `exec_verified` | `exec_real_prior` |
 | `propose_outcome` | **labeler service identity ONLY** | `panel_proposed` | `panel_real`, `panel_fp` |
 
-Un-bypassable server assertion: `assert (caller_class, source, outcome) ∈ MATRIX` before insert. The exec-oracle and labeler identities have NO path to `confirm_outcome` and NO generic ledger-append (kilabz/oracle BLOCKER — a machine cannot mint human-looking truth). `created_by` is not trusted verbatim; airtightness is the matrix + server-mint, mirroring the `api:<principal>` guard.
+Un-bypassable server assertion: `assert (caller_class, source, outcome) ∈ MATRIX` before insert. **The matrix is a set of exact PAIRS, not a Cartesian product of a verb's allowed sources × allowed outcomes (kilabz r4 build note):** `human_confirm`↔`confirmed_real` only; `human_dismiss`↔`{dismissed_false_positive, dismissed_wontfix}` only; `exec_verified`↔`exec_real_prior`; `panel_proposed`↔`{panel_real, panel_fp}` — matching the §3 legal-pair table exactly, so a verb can never mint an off-pair combination. The exec-oracle and labeler identities have NO path to `confirm_outcome` and NO generic ledger-append (kilabz/oracle BLOCKER — a machine cannot mint human-looking truth). `created_by` is not trusted verbatim; airtightness is the matrix + server-mint, mirroring the `api:<principal>` guard.
 
 ## 6. Data flow
 
