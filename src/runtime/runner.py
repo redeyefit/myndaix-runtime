@@ -172,30 +172,41 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     cwd = job.worktree_path or None
     scratch_cwd = None
     started = time.monotonic()
-    # staging-cwd agents (curator): the curate guard passes context.workdir = a staging dir IT
-    # created. Honored ONLY when the adapter declares staging_cwd AND the path is a real dir
-    # strictly inside the staging namespace — FAIL-CLOSED to a TERMINAL Result, never a scratch
-    # fallback (a curator without its staged corpus would answer from nothing) and never an
-    # arbitrary live dir (the PR #39 scratch-cwd invariant stays closed for every other agent:
-    # without the adapter flag, context.workdir is ignored entirely).
-    # UNCONDITIONAL over any worktree (oracle code-review BLOCKER): the curator is a
-    # WORKSPACE_ACTOR, so a dispatch carrying a repo_id would make the worker set job.worktree_path
-    # and (under a `cwd is None` guard) SKIP staging → the agent runs in the live worktree, past
-    # the guard boundary. A staging_cwd agent must NEVER run anywhere but its validated staging
-    # dir; a stray worktree_path is ignored (and would be a misconfiguration to pass one).
-    if adapter.get("staging_cwd"):
+    # staging-cwd agents: the caller (curate guard / mxr review verb / play-review) passes
+    # context.workdir = a staging dir IT created; the runner is the trust boundary. TWO MODES
+    # of the one flag (design mxr-review-context D3 — one validator, two modes):
+    #   True ("required", curator): workdir absent → TERMINAL (a curator without its staged
+    #     corpus must not answer from nothing).
+    #   "optional" (kilabz/lobster reviewers): workdir ABSENT → scratch cwd (exactly today's
+    #     empty-cwd review; staging is additive). The absence check is EXPLICIT — not the bare
+    #     truthy adapter gate — or optional+absent would fail CLOSED through the validator
+    #     (oracle r1 MED).
+    # PRESENT-but-invalid → TERMINAL in BOTH modes (a bad staged path is a bug or an attack —
+    # never silently downgrade to scratch), and the path must be a real dir strictly inside the
+    # staging namespace — never an arbitrary live dir (the PR #39 scratch-cwd invariant stays
+    # closed for every other agent: without the adapter flag, context.workdir is ignored
+    # entirely).
+    # UNCONDITIONAL over any worktree, in EITHER mode (oracle curator BLOCKER + kilabz r1 HIGH):
+    # a dispatch carrying a repo_id makes the worker set job.worktree_path — a staging_cwd agent
+    # must NEVER run anywhere but its validated staging dir (or, in optional mode, a scratch
+    # cwd); a stray worktree_path is ignored.
+    staging_mode = adapter.get("staging_cwd")
+    if staging_mode:
         wd = (job.context or {}).get("workdir")
-        real = os.path.realpath(wd) if isinstance(wd, str) and wd else ""
-        sroot = os.path.realpath(_staging_root())
-        try:
-            inside = bool(real) and os.path.commonpath([real, sroot]) == sroot and real != sroot
-        except ValueError:                     # different drives / malformed
-            inside = False
-        if not (inside and os.path.isdir(real)):
-            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                          text=f"staging_cwd agent requires context.workdir inside "
-                               f"{sroot} (got {wd!r})", ms=_ms(started))
-        cwd = real
+        if staging_mode == "optional" and wd is None:
+            cwd = None                         # → fresh scratch cwd below (never the worktree)
+        else:
+            real = os.path.realpath(wd) if isinstance(wd, str) and wd else ""
+            sroot = os.path.realpath(_staging_root())
+            try:
+                inside = bool(real) and os.path.commonpath([real, sroot]) == sroot and real != sroot
+            except ValueError:                 # different drives / malformed
+                inside = False
+            if not (inside and os.path.isdir(real)):
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                              text=f"staging_cwd agent requires context.workdir inside "
+                                   f"{sroot} (got {wd!r})", ms=_ms(started))
+            cwd = real
     try:
         try:
             # allocate the scratch cwd INSIDE the try so an mkdtemp OSError (e.g. ENOSPC) becomes a

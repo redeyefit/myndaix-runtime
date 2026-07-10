@@ -871,6 +871,22 @@ class PostgresLedger:
             out["created_at"] = out["created_at"].isoformat()
         return out
 
+    async def active_workdirs(self) -> set[str]:
+        """Every context.workdir currently claimed by a NON-terminal job (queued/leased/
+        running) — the fail-safe denylist the review-staging reaper consults so it can
+        never remove a dir a live reviewer is still reading. Mirrors workspace.sweep
+        deciding liveness by JOB STATE, never directory mtime: a reviewer reading a
+        chmod'd-a-w snapshot never refreshes its mtime, so an mtime-only reaper would
+        yank a long-running review's cwd (the terminal-state-gate defeat the adversarial
+        review found). A dir is safe to reap only when NO live job points at it AND it is
+        old."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT context->>'workdir' AS wd FROM job
+                    WHERE status NOT IN ('done','failed','dead')
+                      AND context ? 'workdir'""")
+        return {r["wd"] for r in rows if r["wd"]}
+
     async def resolve_job_prefix(self, prefix: str) -> list[str]:
         """Full job ids (uuid text) whose hyphen-stripped id starts with `prefix` —
         the `mxr get <short-id>` resolver (cli.get_job validates lowercase hex,

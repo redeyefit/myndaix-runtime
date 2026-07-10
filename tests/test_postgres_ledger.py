@@ -715,6 +715,29 @@ async def test_resolve_job_prefix(led: PostgresLedger) -> None:
     assert await led.resolve_job_prefix("ffffffff") == []
 
 
+async def test_active_workdirs(led: PostgresLedger) -> None:
+    # the review-staging reaper's fail-safe in-use denylist: only NON-terminal jobs with
+    # a context.workdir appear; a done/failed/dead job's workdir drops out (safe to reap).
+    await _truncate(led)
+    j_live = await led.submit_job(to_agent="kilabz", prompt="review",
+                                  context={"workdir": "/stage/review-live"})
+    await led.submit_job(to_agent="kilabz", prompt="no-wd")            # no workdir key
+    j_done = await led.submit_job(to_agent="kilabz", prompt="finished",
+                                  context={"workdir": "/stage/review-done"})
+    # drive every leasable job terminal, then re-queue the live one so it is non-terminal
+    att = await led.lease_job("w1", [])
+    while att is not None:
+        await led.complete_attempt(att, _ok())
+        att = await led.lease_job("w1", [])
+    # all three are now done; flip j_live back to queued to model an in-flight review
+    async with led._pool.acquire() as con:
+        await con.execute("UPDATE job SET status='queued' WHERE id=$1", j_live)
+    wds = await led.active_workdirs()
+    assert "/stage/review-live" in wds, wds
+    assert "/stage/review-done" not in wds, "a terminal job's workdir must not be protected"
+    assert all(w for w in wds), "no null/empty workdirs"
+
+
 async def main() -> None:
     led = await PostgresLedger.connect(DSN)
     # fresh schema for the run (schema.sql is plain CREATE, not IF NOT EXISTS)

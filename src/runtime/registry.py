@@ -73,10 +73,17 @@ V1_ROSTER: list[AgentSpec] = [
               # SAME proven confinement as curator (minus staging_cwd): --tools Read Glob Grep (hard
               # built-in whitelist; no Write/Bash/net), --strict-mcp-config (ignore the inherited MCP
               # fleet), --safe-mode (no project/local hooks/plugins), scratch_home (empty throwaway HOME).
+              # staging_cwd "optional" (mxr-review-context D3/D5): a caller MAY stage a
+              # de-linked, non-writable snapshot of the reviewed tip as the cwd (runner-
+              # validated; workdir ABSENT → scratch cwd, exactly the pre-staging review).
+              # lobster-with-snapshot at triage is the fabrication-killer: the CONFINED
+              # synthesis agent verifies both reviews' claims against real code. The tool
+              # whitelist above is unchanged — a cwd is not a permission.
               adapter={"kind": "cli", "argv": ["claude", "-p", "--model", "sonnet",
                        "--output-format", "text", "--tools", "Read", "Glob", "Grep",
                        "--strict-mcp-config", "--safe-mode"],
                        "prompt_channel": "stdin", "scratch_home": True,
+                       "staging_cwd": "optional",
                        "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # long-lived subscription token
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
@@ -101,9 +108,17 @@ V1_ROSTER: list[AgentSpec] = [
               # profile timeout when job.timeout_s is unset (== the 300s field default); an
               # explicitly-set job.timeout_s wins in EITHER direction — see runner exec_timeout.
               profile=Profile(timeout_s=900),
+              # staging_cwd "optional" (mxr-review-context D3/D5): a caller MAY stage a
+              # de-linked, non-writable snapshot of the reviewed tip as the cwd so kilabz
+              # verifies the fenced diff against real code instead of an empty scratch dir
+              # (runner-validated; absent → scratch = pre-staging behavior). codex's
+              # --sandbox read-only seatbelt is unchanged (writes+net OS-denied); the
+              # accepted §5 residual — read-only exec of snapshot entry points — is
+              # capability-identical to its existing un-path-scoped Read.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
                        "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
+                       "staging_cwd": "optional",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="gpt-5.5", role="builder/debugger",

@@ -211,6 +211,53 @@ def test_cli_get_full_uuid_skips_resolver():
         restore()
 
 
+# ---- --staged-workdir + `mxr review` routing (mxr-review-context PR-1) ------
+
+def test_cli_staged_workdir_threads_to_context():
+    # pass-through ONLY — the runner is the trust boundary (staging-cwd adapters,
+    # strictly inside $MYNDAIX_STAGING_ROOT, fail-closed TERMINAL there)
+    captured, restore = _capture_submit()
+    try:
+        rc = cli.main(["kilabz", "review this", "--repo", "myndaix-runtime",
+                       "--staged-workdir", "/tmp/staging/review-x"])
+        assert rc == 0
+        assert captured["context"] == {"workdir": "/tmp/staging/review-x"}
+    finally:
+        restore()
+
+
+def test_cli_staged_workdir_empty_string_still_propagates():
+    # kilabz r2 MED: an EXPLICIT empty --staged-workdir "" must reach context.workdir
+    # (→ runner rejects it TERMINAL), never be dropped by a truthy check to a silent
+    # scratch downgrade. Omitting the flag entirely leaves workdir unset.
+    captured, restore = _capture_submit()
+    try:
+        rc = cli.main(["kilabz", "t", "--repo", "x", "--staged-workdir", ""])
+        assert rc == 0 and captured["context"] == {"workdir": ""}
+        rc = cli.main(["kilabz", "t", "--repo", "x"])
+        assert rc == 0 and "workdir" not in captured["context"]
+    finally:
+        restore()
+
+
+def test_cli_review_routes_to_review_main():
+    from runtime import review as review_mod
+    captured = {}
+
+    def fake_main(argv):
+        captured["argv"] = argv
+        return 0
+
+    orig = review_mod.main
+    review_mod.main = fake_main
+    try:
+        rc = cli.main(["review", "kilabz", "--repo", "x", "--tip", "a" * 40])
+        assert rc == 0
+        assert captured["argv"][0] == "review" and captured["argv"][1] == "kilabz"
+    finally:
+        review_mod.main = orig
+
+
 # ---- sync-wait derivation (PR-3 quick win 2) --------------------------------
 
 def _with_env(key, value, fn):
