@@ -351,25 +351,56 @@ def test_tip_validation_and_caps():
 
 # ---- teardown + reaper --------------------------------------------------------------
 
-def test_bounded_ls_tree_ceiling_fails_closed():
-    # kilabz r4 HIGH (softer half): ls-tree output is read with a byte ceiling so a huge
-    # tree can't OOM before the caps. A tiny ceiling must fail closed, not buffer it all.
+def test_ls_tree_stream_parse_and_caps():
+    # kilabz r4+r5 HIGH: ls-tree is stream-parsed into a bounded entry list with
+    # file-count + metadata caps enforced DURING the read (no full-buffer split/decode).
     repo = _mkrepo()
     try:
         for i in range(5):
             (repo / f"f{i}.txt").write_text("x\n")
         tip = _commit_all(repo)
-        # full read succeeds under a generous ceiling
-        out = staging._git_capture_bounded(repo, ["ls-tree", "-r", "-z", tip], 1 << 20)
-        assert b"f0.txt" in out
-        # a 2-byte ceiling is exceeded → StagingError (not a truncated silent result)
+        # full read returns parsed (mode,type,sha,path) tuples
+        entries = staging._read_ls_tree_entries(repo, tip, 100, 1 << 20)
+        paths = {e[3] for e in entries}
+        assert paths == {f"f{i}.txt" for i in range(5)}
+        assert all(e[1] == "blob" for e in entries)
+        # a tiny METADATA cap is exceeded → StagingError (not a truncated silent result)
         try:
-            staging._git_capture_bounded(repo, ["ls-tree", "-r", "-z", tip], 2)
-            raise AssertionError("ceiling not enforced")
+            staging._read_ls_tree_entries(repo, tip, 100, 4)
+            raise AssertionError("metadata cap not enforced")
+        except StagingError:
+            pass
+        # a file-count cap of 2 aborts before the 6th record
+        try:
+            staging._read_ls_tree_entries(repo, tip, 2, 1 << 20)
+            raise AssertionError("file cap not enforced")
         except StagingError:
             pass
     finally:
         shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_ls_tree_metadata_cap_independent_of_byte_cap():
+    # the metadata cap must NOT scale with MYNDAIX_STAGING_MAX_BYTES (kilabz r5): raising
+    # the blob budget for a big-blob repo must not enlarge the ls-tree buffer.
+    repo, root = _mkrepo(), _tmproot()
+    os.environ["MYNDAIX_STAGING_MAX_BYTES"] = str(1 << 30)     # 1 GiB blob budget
+    os.environ["MYNDAIX_STAGING_MAX_META_BYTES"] = "8"         # 8-byte metadata budget
+    try:
+        for i in range(4):
+            (repo / f"f{i}.txt").write_text("x\n")
+        tip = _commit_all(repo)
+        try:
+            staging.stage_snapshot(repo, tip, root=root)
+            raise AssertionError("metadata cap should fail closed regardless of byte cap")
+        except StagingError:
+            pass
+        assert not list(root.iterdir())
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_MAX_BYTES", None)
+        os.environ.pop("MYNDAIX_STAGING_MAX_META_BYTES", None)
+        for d in (repo, root):
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def test_blob_over_cap_rejected_before_read():

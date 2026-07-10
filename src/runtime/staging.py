@@ -62,6 +62,11 @@ _HFS_IGNORABLE = {
 # legitimately bigger repo, never silently exceeded.
 _MAX_FILES_DEFAULT = 20_000
 _MAX_BYTES_DEFAULT = 512 * 1024 * 1024
+# ls-tree METADATA cap — the in-memory budget for the entry list, INDEPENDENT of the blob
+# byte budget (kilabz r5: raising MAX_BYTES for a big-blob repo must not enlarge the
+# ls-tree buffer a hostile deep-path tree can amplify). One tree path is capped too.
+_MAX_META_BYTES_DEFAULT = 64 * 1024 * 1024
+_MAX_PATH_LEN = 8192
 
 
 class StagingError(RuntimeError):
@@ -99,38 +104,78 @@ def _git(repo: Path, argv: list[str]) -> bytes:
     return p.stdout
 
 
-def _git_capture_bounded(repo: Path, argv: list[str], max_bytes: int) -> bytes:
-    """Like _git but reads stdout INCREMENTALLY with a hard byte ceiling — so a hostile
-    tree with millions of entries can't OOM the orchestrator by materializing unbounded
-    `ls-tree` output before the count/size caps run (kilabz r4 HIGH, the softer half).
-    select() gives the per-read timeout (hang safety = the old subprocess timeout)."""
+def _parse_record(rec: bytes) -> tuple[str, str, str, str]:
+    """Parse ONE `ls-tree -z` record (`mode SP type SP sha TAB path`) → (mode, type, sha,
+    path). Path decoded strictly as UTF-8 (a non-UTF-8 path can't be safely validated
+    against the dot-git/traversal rules → fail closed) and length-capped so one absurd
+    path can't bloat the entry list."""
+    try:
+        meta_part, path_b = rec.split(b"\t", 1)
+        mode, otype, sha = meta_part.split(b" ", 2)
+        path = path_b.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as e:
+        raise StagingError(f"unparseable ls-tree entry: {rec[:100]!r} ({e})") from e
+    if len(path.encode("utf-8")) > _MAX_PATH_LEN:
+        raise StagingError(f"tree path too long for {path[:60]!r} ({len(path)} chars)")
+    return mode.decode(), otype.decode(), sha.decode(), path
+
+
+def _read_ls_tree_entries(repo: Path, tip: str, max_files: int,
+                          max_meta: int) -> list[tuple[str, str, str, str]]:
+    """Stream `git ls-tree -r -z <tip>` and parse it INCREMENTALLY into a bounded entry
+    list, enforcing the file-count, metadata-byte, and per-path-length caps DURING the
+    read — so a hostile tree can't OOM by amplifying metadata (many tiny blobs under very
+    long/deep paths) via a full-output buffer + split()/decode copies (kilabz r5 HIGH).
+    The metadata cap is INDEPENDENT of the blob byte budget (raising MAX_BYTES for a
+    big-blob repo must not enlarge the in-memory ls-tree buffer). The WHOLE stream is read
+    and git closed BEFORE any blob is written, so slow blob writes can't trip this read's
+    timeout. select() = hang safety; git's nonzero exit fails closed."""
     try:
         proc = subprocess.Popen(
-            ["git", "-C", str(repo), *argv],
+            ["git", "-C", str(repo), "ls-tree", "-r", "-z", tip],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except OSError as e:
-        raise StagingError(f"git {argv[0]}: {e}") from e
-    out = bytearray()
+        raise StagingError(f"git ls-tree: {e}") from e
+    entries: list[tuple[str, str, str, str]] = []
+    buf = bytearray()
+    meta = 0
     deadline = time.monotonic() + _GIT_TIMEOUT_S
     try:
-        while True:
+        eof = False
+        while not eof:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 proc.kill()
-                raise StagingError(f"git {argv[0]} timed out")
+                raise StagingError("git ls-tree timed out")
             ready, _, _ = select.select([proc.stdout], [], [], remaining)
             if not ready:
                 proc.kill()
-                raise StagingError(f"git {argv[0]} timed out")
+                raise StagingError("git ls-tree timed out")
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:
-                break
-            out += chunk
-            if len(out) > max_bytes:
+                eof = True
+            else:
+                meta += len(chunk)
+                if meta > max_meta:
+                    proc.kill()
+                    raise StagingError(f"ls-tree metadata exceeds cap {max_meta}")
+                buf += chunk
+            nul = buf.find(b"\0")                       # drain complete records
+            while nul != -1:
+                rec = bytes(buf[:nul])
+                del buf[:nul + 1]
+                entries.append(_parse_record(rec))
+                if len(entries) > max_files:
+                    proc.kill()
+                    raise StagingError(f"tree exceeds file cap {max_files}")
+                nul = buf.find(b"\0")
+            if len(buf) > _MAX_PATH_LEN + 512:          # one unterminated record too long
                 proc.kill()
-                raise StagingError(f"git {argv[0]} output exceeds cap {max_bytes}")
+                raise StagingError("ls-tree record too long")
+        if buf:
+            raise StagingError("ls-tree ended mid-record (no trailing NUL)")
     finally:
         try:
             proc.stdout.close()
@@ -140,8 +185,8 @@ def _git_capture_bounded(repo: Path, argv: list[str], max_bytes: int) -> bytes:
         err = proc.stderr.read().decode(errors="replace").strip()[:300]
         proc.stderr.close()
     if rc != 0:
-        raise StagingError(f"git {argv[0]} exited {rc}: {err}")
-    return bytes(out)
+        raise StagingError(f"git ls-tree exited {rc}: {err}")
+    return entries
 
 
 def _cat_file_size(repo: Path, sha: str) -> int:
@@ -200,24 +245,6 @@ def _verify_entry_path(path: str) -> None:
             raise StagingError(f"tree entry with .git component: {path!r}")
 
 
-def _parse_ls_tree(out: bytes) -> list[tuple[str, str, str, str]]:
-    """Parse `ls-tree -r -z` output into (mode, type, sha, path) tuples. Paths are bytes
-    decoded strictly as UTF-8 — a non-UTF-8 path can't be safely validated against the
-    dot-git/traversal rules, so it fails staging closed rather than round-tripping."""
-    entries = []
-    for rec in out.split(b"\0"):
-        if not rec:
-            continue
-        try:
-            meta, path_b = rec.split(b"\t", 1)
-            mode, otype, sha = meta.split(b" ", 2)
-            path = path_b.decode("utf-8")
-        except (ValueError, UnicodeDecodeError) as e:
-            raise StagingError(f"unparseable ls-tree entry: {rec[:100]!r} ({e})") from e
-        entries.append((mode.decode(), otype.decode(), sha.decode(), path))
-    return entries
-
-
 def stage_snapshot(repo_path: str | os.PathLike, tip: str, *,
                    root: Optional[Path] = None) -> Path:
     """Export <repo>@<tip> into a fresh run dir under the staging root and return it.
@@ -254,16 +281,12 @@ def stage_snapshot(repo_path: str | os.PathLike, tip: str, *,
 def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
     max_files = _int_env("MYNDAIX_STAGING_MAX_FILES", _MAX_FILES_DEFAULT)
     max_bytes = _int_env("MYNDAIX_STAGING_MAX_BYTES", _MAX_BYTES_DEFAULT)
-    # ls-tree output is read with a byte ceiling so a huge tree can't OOM before the
-    # count/size caps run. The ceiling scales with the file cap (a path is bounded well
-    # under 4 KiB) and never below the byte cap — generous vs any real repo, loud past it.
-    entries = _parse_ls_tree(
-        _git_capture_bounded(repo, ["ls-tree", "-r", "-z", tip],
-                             max(max_files * 4096, max_bytes)))
+    max_meta = _int_env("MYNDAIX_STAGING_MAX_META_BYTES", _MAX_META_BYTES_DEFAULT)
+    # ls-tree is stream-parsed into a bounded entry list (file-count + metadata + per-path
+    # caps enforced DURING the read), fully read + git closed BEFORE any blob is written.
+    entries = _read_ls_tree_entries(repo, tip, max_files, max_meta)
 
     expected = sum(1 for _, otype, _, _ in entries if otype == "blob")
-    if expected > max_files:
-        raise StagingError(f"tree has {expected} blobs > cap {max_files}")
 
     written = 0
     total_bytes = 0
