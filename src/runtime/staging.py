@@ -177,43 +177,142 @@ def _read_ls_tree_entries(repo: Path, tip: str, max_files: int,
         if buf:
             raise StagingError("ls-tree ended mid-record (no trailing NUL)")
     finally:
+        # kill BEFORE wait (oracle r6 MED): if _parse_record raised, the cap kills were
+        # skipped — a git blocked on a full stderr pipe would never see SIGPIPE on stdout,
+        # so proc.wait() could deadlock forever. Kill an un-exited child first.
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
         try:
             proc.stdout.close()
         except OSError:
             pass
+        try:
+            err = proc.stderr.read().decode(errors="replace").strip()[:300]
+        except OSError:
+            err = ""
+        finally:
+            proc.stderr.close()
         rc = proc.wait()
-        err = proc.stderr.read().decode(errors="replace").strip()[:300]
-        proc.stderr.close()
     if rc != 0:
         raise StagingError(f"git ls-tree exited {rc}: {err}")
     return entries
 
 
-def _cat_file_size(repo: Path, sha: str) -> int:
-    """Object byte size via `git cat-file -s` — cheap (reads the header, never the
-    content), so an over-cap blob is rejected BEFORE it is ever read into memory."""
-    out = _git(repo, ["cat-file", "-s", sha]).decode(errors="replace").strip()
-    if not out.isdigit():
-        raise StagingError(f"cat-file -s returned non-numeric size for {sha}: {out!r}")
-    return int(out)
+class _CatFileBatch:
+    """One long-running `git cat-file --batch` for the WHOLE tree — feed a blob sha on
+    stdin, read a `<sha> <type> <size>\\n` header, then <size> content bytes + a trailing
+    `\\n`. This replaces a per-blob `cat-file -s` + `cat-file blob` fork pair (oracle r6
+    HIGH: 2 forks × 20k files = 40k fork/exec ≈ 200s of blocking wall-clock — an
+    asymmetric DoS on the single-threaded orchestrator). The header carries the size, so
+    an over-budget blob is rejected BEFORE its content is read, and content streams
+    straight to the dest fd (never buffered in Python — the r4 OOM property is kept).
+    stderr → DEVNULL so a chatty git can't fill an unread pipe and deadlock; per-object
+    status ('missing') comes on stdout and process failure via a short/closed stream."""
 
+    def __init__(self, repo: Path):
+        try:
+            self._p = subprocess.Popen(
+                ["git", "-C", str(repo), "cat-file", "--batch"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        except OSError as e:
+            raise StagingError(f"git cat-file --batch: {e}") from e
+        self._fd = self._p.stdout.fileno()
 
-def _cat_file_blob_to(repo: Path, sha: str, fileobj) -> None:
-    """Stream `git cat-file blob <sha>` STRAIGHT into fileobj's fd — git writes to the
-    file directly, so a multi-GB blob is never buffered in Python (the OOM vector). The
-    caller pre-checks the size against the remaining budget so this only ever streams an
-    in-budget blob."""
-    try:
-        p = subprocess.run(
-            ["git", "-C", str(repo), "cat-file", "blob", sha],
-            stdout=fileobj, stderr=subprocess.PIPE, timeout=_GIT_TIMEOUT_S,
-            stdin=subprocess.DEVNULL,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise StagingError(f"git cat-file blob: {e}") from e
-    if p.returncode != 0:
-        err = p.stderr.decode(errors="replace").strip()[:300]
-        raise StagingError(f"git cat-file blob exited {p.returncode}: {err}")
+    def _read(self, n: int, deadline: float) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StagingError("git cat-file --batch timed out")
+            ready, _, _ = select.select([self._fd], [], [], remaining)
+            if not ready:
+                raise StagingError("git cat-file --batch timed out")
+            chunk = os.read(self._fd, min(65536, n - len(buf)))
+            if not chunk:
+                raise StagingError("git cat-file --batch closed early")
+            buf += chunk
+        return bytes(buf)
+
+    def _read_header(self, deadline: float) -> bytes:
+        buf = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StagingError("git cat-file --batch timed out")
+            ready, _, _ = select.select([self._fd], [], [], remaining)
+            if not ready:
+                raise StagingError("git cat-file --batch timed out")
+            ch = os.read(self._fd, 1)
+            if not ch:
+                raise StagingError("git cat-file --batch closed early")
+            if ch == b"\n":
+                return bytes(buf)
+            buf += ch
+            if len(buf) > 4096:
+                raise StagingError("git cat-file --batch header too long")
+
+    def write_blob(self, sha: str, fileobj, budget: int) -> int:
+        """Stream blob <sha> into fileobj, rejecting closed if its size exceeds `budget`
+        (the remaining byte cap). Returns the blob size. A once-per-blob deadline keeps
+        the read hang-safe without coupling to the whole export's duration."""
+        deadline = time.monotonic() + _GIT_TIMEOUT_S
+        try:
+            self._p.stdin.write(sha.encode() + b"\n")
+            self._p.stdin.flush()
+        except OSError as e:
+            raise StagingError(f"git cat-file --batch write: {e}") from e
+        header = self._read_header(deadline).decode("utf-8", "replace")
+        parts = header.split(" ")
+        if len(parts) == 2 and parts[1] in ("missing", "ambiguous"):
+            raise StagingError(f"blob {parts[1]} in batch: {sha}")
+        if len(parts) != 3 or parts[1] != "blob":
+            raise StagingError(f"unexpected cat-file --batch header: {header!r}")
+        try:
+            size = int(parts[2])
+        except ValueError:
+            raise StagingError(f"bad size in cat-file --batch header: {header!r}")
+        if size > budget:                              # reject BEFORE reading content
+            raise StagingError(f"snapshot exceeds byte cap (blob {size} > remaining {budget})")
+        remaining = size
+        while remaining > 0:
+            dl = deadline - time.monotonic()
+            if dl <= 0:
+                raise StagingError("git cat-file --batch timed out")
+            ready, _, _ = select.select([self._fd], [], [], dl)
+            if not ready:
+                raise StagingError("git cat-file --batch timed out")
+            chunk = os.read(self._fd, min(65536, remaining))
+            if not chunk:
+                raise StagingError("git cat-file --batch closed early")
+            try:
+                fileobj.write(chunk)
+            except OSError as e:
+                raise StagingError(f"blob write failed for {sha}: {e}") from e
+            remaining -= len(chunk)
+        self._read(1, deadline)                        # consume the trailing newline
+        return size
+
+    def close(self) -> None:
+        try:
+            if self._p.stdin:
+                self._p.stdin.close()
+        except OSError:
+            pass
+        if self._p.poll() is None:                     # kill BEFORE wait — never deadlock
+            try:
+                self._p.kill()
+            except OSError:
+                pass
+        self._p.wait()
+        try:
+            self._p.stdout.close()
+        except OSError:
+            pass
 
 
 def _is_dotgit(component: str) -> bool:
@@ -299,94 +398,91 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
     # failing closed. Keyed on the parent's (st_dev, st_ino) INODE — NOT realpath, which on
     # macOS preserves the requested case spelling rather than the on-disk one: on a
     # case-insensitive fs the two rel-parents share ONE inode; on a case-sensitive fs they
-    # are distinct dirs with distinct inodes. So it rejects the collision only where it
-    # actually collides.
+    # are distinct dirs with distinct inodes.
     dir_owner: dict[tuple, str] = {}
-    for mode, otype, sha, path in entries:
-        if otype == "commit" and mode == "160000":
-            continue                                   # gitlink (submodule) — skip
-        if otype != "blob":
-            raise StagingError(f"unexpected ls-tree entry type {otype!r} for {path!r}")
-        if mode not in ("100644", "100755", "120000"):
-            raise StagingError(f"unexpected blob mode {mode!r} for {path!r}")
-        _verify_entry_path(path)
+    checked_dirs: set[str] = set()                  # dirs whose full ancestor chain is validated
+    batch = _CatFileBatch(repo)                     # ONE git process for ALL blobs (oracle r6 HIGH)
+    try:
+        for mode, otype, sha, path in entries:
+            if otype == "commit" and mode == "160000":
+                continue                               # gitlink (submodule) — skip
+            if otype != "blob":
+                raise StagingError(f"unexpected ls-tree entry type {otype!r} for {path!r}")
+            if mode not in ("100644", "100755", "120000"):
+                raise StagingError(f"unexpected blob mode {mode!r} for {path!r}")
+            _verify_entry_path(path)
 
-        dst = os.path.normpath(os.path.join(rd, path))
-        # lexical belt: components are already validated (no ..,/.git), so normpath can't
-        # escape — but assert anyway.
-        if os.path.commonpath([dst, rd]) != rd or dst == rd:
-            raise StagingError(f"entry escapes run dir: {path!r}")
+            dst = os.path.normpath(os.path.join(rd, path))
+            # lexical belt: components are already validated (no ..,/.git), so normpath
+            # can't escape — but assert anyway.
+            if os.path.commonpath([dst, rd]) != rd or dst == rd:
+                raise StagingError(f"entry escapes run dir: {path!r}")
 
-        parent = os.path.dirname(dst)
-        if parent != rd:
+            parent = os.path.dirname(dst)
+            if parent != rd:
+                try:
+                    os.makedirs(parent, exist_ok=True)  # a file/dir name collision raises
+                except OSError as e:
+                    raise StagingError(f"mkdir failed for {path!r}: {e}") from e
+            # CANONICAL check (kilabz MED): the lexical commonpath above does not PROVE the
+            # design's "final canonical path strictly under the run dir" — a symlinked
+            # intermediate dir would satisfy it while resolving outside. Components are
+            # validated and dirs are created fresh so no symlink can exist here, but the
+            # trust boundary must actually verify what it claims. (O_NOFOLLOW below covers
+            # the final component.)
             try:
-                os.makedirs(parent, exist_ok=True)     # a file/dir name collision raises
+                real_parent = os.path.realpath(parent)
             except OSError as e:
-                raise StagingError(f"mkdir failed for {path!r}: {e}") from e
-        # CANONICAL check (kilabz MED): the lexical commonpath above does not PROVE the
-        # design's "final canonical path strictly under the run dir" — a symlinked
-        # intermediate dir would satisfy it while resolving outside. Components are
-        # validated and dirs are created fresh so no symlink can exist here, but the
-        # trust boundary must actually verify what it claims: resolve the parent and
-        # require it strictly under the resolved run dir. (O_NOFOLLOW on the open below
-        # covers the final component.)
-        try:
-            real_parent = os.path.realpath(parent)
-        except OSError as e:
-            raise StagingError(f"realpath failed for {path!r}: {e}") from e
-        if real_parent != rd_real and os.path.commonpath([real_parent, rd_real]) != rd_real:
-            raise StagingError(f"entry parent resolves outside run dir: {path!r}")
-        # a directory INODE already OWNED by a different intended rel-path == a merged
-        # case-collision on this fs → fail closed. Walk EVERY intermediate dir from the
-        # leaf parent up to the run dir, not just the immediate parent (oracle r3 HIGH:
-        # `FOO/a/b` + `foo/c/d` have distinct leaf parents FOO/a and foo/c, so an
-        # immediate-parent-only check never stats the FOO/foo merge one level up).
-        cur, cur_rel = dst, path
-        while True:
-            cur = os.path.dirname(cur)
-            cur_rel = os.path.dirname(cur_rel)
-            if cur == rd or not cur_rel:
-                break
-            try:
-                pst = os.stat(cur)
-            except OSError as e:
-                raise StagingError(f"stat failed for {path!r}: {e}") from e
-            owner = dir_owner.setdefault((pst.st_dev, pst.st_ino), cur_rel)
-            if owner != cur_rel:
-                raise StagingError(f"case-colliding directory prefix for {path!r} "
-                                   f"(collides with {owner!r} on this filesystem)")
+                raise StagingError(f"realpath failed for {path!r}: {e}") from e
+            if real_parent != rd_real and os.path.commonpath([real_parent, rd_real]) != rd_real:
+                raise StagingError(f"entry parent resolves outside run dir: {path!r}")
+            # Walk EVERY intermediate dir from the leaf parent up to the run dir, not just
+            # the immediate parent (oracle r3 HIGH: `FOO/a/b` + `foo/c/d` have distinct leaf
+            # parents so an immediate-parent-only check never stats the FOO/foo merge one
+            # level up). MEMOIZED on rel-path (oracle r6 HIGH): a dir whose chain is already
+            # validated is skipped, so this is O(distinct dirs), not O(files × depth) — a
+            # deep hostile tree can't storm the orchestrator with tens of millions of stats.
+            cur, cur_rel = dst, path
+            while True:
+                cur = os.path.dirname(cur)
+                cur_rel = os.path.dirname(cur_rel)
+                if cur == rd or not cur_rel or cur_rel in checked_dirs:
+                    break
+                try:
+                    pst = os.stat(cur)
+                except OSError as e:
+                    raise StagingError(f"stat failed for {path!r}: {e}") from e
+                owner = dir_owner.setdefault((pst.st_dev, pst.st_ino), cur_rel)
+                if owner != cur_rel:
+                    raise StagingError(f"case-colliding directory prefix for {path!r} "
+                                       f"(collides with {owner!r} on this filesystem)")
+                checked_dirs.add(cur_rel)
 
-        if not _TIP_RE.fullmatch(sha):                 # blob sha feeds git argv — validate
-            raise StagingError(f"non-hex blob sha for {path!r}: {sha!r}")
-        # SIZE CHECK BEFORE READING (kilabz r4 HIGH): cat-file -s reads only the object
-        # header, so a hostile multi-GB blob is rejected against the byte budget BEFORE
-        # any content is read — never buffered into memory. 120000 (symlink): the blob
-        # bytes ARE the target string, written as inert regular-file content. 100755:
-        # exec bit deliberately NOT reproduced (reviewers read; nothing needs to run).
-        blob_size = _cat_file_size(repo, sha)
-        total_bytes += blob_size
-        if total_bytes > max_bytes:
-            raise StagingError(f"snapshot exceeds byte cap {max_bytes}")
-        try:
-            # O_EXCL: duplicate / case-colliding FILE names fail LOUDLY (never a silent
-            # overwrite on case-insensitive APFS; dir-prefix collisions are caught above).
-            # O_NOFOLLOW: belt — no symlinks exist by construction. mode 0600: owner-only
-            # from birth (kilabz r2 HIGH — a review snapshot of possibly-private repo
-            # content must not be group/other-readable).
-            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        except OSError as e:
-            raise StagingError(f"create failed (duplicate/collision?) for {path!r}: {e}") from e
-        try:
-            with os.fdopen(fd, "wb") as f:
-                _cat_file_blob_to(repo, sha, f)        # stream git→fd, no Python buffer
-                f.flush()
-                actual = os.fstat(f.fileno()).st_size
-        except OSError as e:
-            raise StagingError(f"write failed for {path!r}: {e}") from e
-        if actual != blob_size:                        # truncation/mismatch → fail closed
-            raise StagingError(f"blob size mismatch for {path!r}: "
-                               f"wrote {actual}, expected {blob_size}")
-        written += 1
+            if not _TIP_RE.fullmatch(sha):             # blob sha feeds git argv — validate
+                raise StagingError(f"non-hex blob sha for {path!r}: {sha!r}")
+            try:
+                # O_EXCL: duplicate / case-colliding FILE names fail LOUDLY (never a silent
+                # overwrite on case-insensitive APFS; dir-prefix collisions caught above).
+                # O_NOFOLLOW: belt — no symlinks exist by construction. mode 0600: owner-
+                # only from birth (kilabz r2 HIGH — a snapshot of possibly-private repo
+                # content must not be group/other-readable).
+                fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            except OSError as e:
+                raise StagingError(f"create failed (duplicate/collision?) for {path!r}: {e}") from e
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    # the batch header carries the size, so an over-budget blob is rejected
+                    # BEFORE its content is read (r4 OOM property); content streams straight
+                    # to the fd (no Python buffer). 120000 (symlink): the blob bytes ARE the
+                    # target string, written as inert regular-file content. 100755: exec bit
+                    # deliberately NOT reproduced (reviewers read; nothing runs).
+                    blob_size = batch.write_blob(sha, f, max_bytes - total_bytes)
+            except OSError as e:
+                raise StagingError(f"write failed for {path!r}: {e}") from e
+            total_bytes += blob_size
+            written += 1
+    finally:
+        batch.close()
 
     if written != expected:
         raise StagingError(f"count check failed: wrote {written}, ls-tree lists {expected}")

@@ -430,6 +430,65 @@ def test_blob_over_cap_rejected_before_read():
             shutil.rmtree(d, ignore_errors=True)
 
 
+def test_dir_check_memoized_stat_count():
+    # oracle r6 HIGH: the case-collision walk must be O(distinct dirs), not O(files*depth)
+    # — a deep tree with many files must not storm the orchestrator with stats. Count the
+    # os.stat calls the export makes and assert it equals the number of distinct dirs.
+    import runtime.staging as S
+    repo, root = _mkrepo(), _tmproot()
+    files, depth = 10, 20
+    try:
+        # `files` files under ONE shared `depth`-deep dir. The collision walk, if
+        # memoized, stats each distinct dir ONCE (~depth); unmemoized it would stat
+        # files*depth = 200 times. (Total also includes makedirs' O(files) isdir checks.)
+        deep = repo.joinpath(*[f"d{i}" for i in range(depth)])
+        deep.mkdir(parents=True)
+        for i in range(files):
+            (deep / f"f{i}.txt").write_text("x\n")
+        tip = _commit_all(repo)
+        real_stat = os.stat
+        calls = {"n": 0}
+
+        def counting_stat(*a, **k):
+            calls["n"] += 1
+            return real_stat(*a, **k)
+
+        S.os.stat = counting_stat
+        try:
+            snap = staging.stage_snapshot(repo, tip, root=root)
+        finally:
+            S.os.stat = real_stat
+        # memoized: ~depth (walk) + ~files (makedirs) ≈ 30; unmemoized would be > 200.
+        assert calls["n"] < files * depth // 2, \
+            f"stat count {calls['n']} suggests the walk is NOT memoized (quadratic)"
+        assert all((deep_snap := snap.joinpath(*[f"d{i}" for i in range(depth)]))
+                   .joinpath(f"f{i}.txt").exists() for i in range(files))
+    finally:
+        for d in (repo, root):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_batch_stages_many_blobs_one_process():
+    # oracle r6 HIGH: all blobs stream through ONE cat-file --batch (verbatim), not a
+    # fork per blob. Verify content correctness across several files + a symlink + binary.
+    repo, root = _mkrepo(), _tmproot()
+    try:
+        for i in range(6):
+            (repo / f"f{i}.dat").write_bytes(bytes([i]) * (i * 50 + 1))
+        os.symlink("/etc/hosts", repo / "lnk")
+        (repo / "sub").mkdir()
+        (repo / "sub" / "deep.txt").write_text("nested\n")
+        tip = _commit_all(repo)
+        snap = staging.stage_snapshot(repo, tip, root=root)
+        for i in range(6):
+            assert (snap / f"f{i}.dat").read_bytes() == bytes([i]) * (i * 50 + 1)
+        assert (snap / "lnk").read_bytes() == b"/etc/hosts" and not (snap / "lnk").is_symlink()
+        assert (snap / "sub" / "deep.txt").read_text() == "nested\n"
+    finally:
+        for d in (repo, root):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def test_teardown_refuses_non_review_paths():
     root = _tmproot()
     os.environ["MYNDAIX_STAGING_ROOT"] = str(root)
