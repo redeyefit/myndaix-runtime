@@ -16,6 +16,7 @@ import asyncio
 import datetime as _dt
 import inspect
 import os
+import uuid as _uuid
 
 import asyncpg
 
@@ -691,6 +692,27 @@ async def test_get_attempt_job_gate_rejects_cancelled(led: PostgresLedger) -> No
     await led.cancel(jid)
     assert await led.get_attempt_job(att) is None, \
         "after cancel the ownership gate returns None -> worker skips the paid invoke"
+
+
+async def test_resolve_job_prefix(led: PostgresLedger) -> None:
+    # `mxr get <short-id>` resolver: unique prefix -> one full id, shared prefix -> all
+    # matches newest-first, no match -> []. Ids are crafted via UPDATE so the prefixes
+    # are deterministic (submit_job mints random uuids).
+    await _truncate(led)
+    j1 = await led.submit_job(to_agent="mack", prompt="older")
+    j2 = await led.submit_job(to_agent="mack", prompt="newer")
+    a = _uuid.UUID("deadbeef-0000-4000-8000-000000000001")
+    b = _uuid.UUID("deadbeef-1111-4111-8111-000000000002")
+    async with led._pool.acquire() as con:
+        await con.execute("UPDATE job SET id = $2 WHERE id = $1", j1, a)
+        await con.execute("UPDATE job SET id = $2 WHERE id = $1", j2, b)
+
+    # unique 12-hex prefix (hyphen-stripped by the caller) -> exactly the one full id
+    assert await led.resolve_job_prefix("deadbeef0000") == [str(a)]
+    # shared 8-hex prefix -> both, newest first (j2 was submitted after j1)
+    assert await led.resolve_job_prefix("deadbeef") == [str(b), str(a)]
+    # no match -> empty (cli maps this to the same rc as an unknown full id)
+    assert await led.resolve_job_prefix("ffffffff") == []
 
 
 async def main() -> None:

@@ -25,25 +25,34 @@ from runtime.registry import REGISTRY
 DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 
+def _resolve_sync_wait(agent: str) -> float:
+    """The SYNC wait for a submitted job to finish: MXR_TIMEOUT_S when set (env ALWAYS
+    wins — play-review exports it for slow reviews), else the agent's profile-derived
+    wait (Profile.sync_wait(): exec timeout + margin, so the wait scales with the
+    agent instead of a flat 180s that expired under kilabz's 900s exec cap), else 180.
+    Parsed HERE, not in an import-time default arg — an empty or malformed exported
+    MXR_TIMEOUT_S would otherwise crash float() at import and take down the WHOLE cli,
+    including `mxr get`/`mxr skillselect` that never submit a job (kilabz+oracle)."""
+    raw = os.environ.get("MXR_TIMEOUT_S") or ""
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            print(f"warning: invalid MXR_TIMEOUT_S={raw!r}, using the agent default",
+                  file=sys.stderr)
+    prof = getattr(REGISTRY.get(agent), "profile", None)
+    return prof.sync_wait() if prof is not None else 180.0
+
+
 async def submit(agent: str, task: str, *, context: Optional[dict] = None,
                  repo_id: Optional[str] = None, base_ref: Optional[str] = None,
                  timeout_s: Optional[float] = None) -> int:
-    # the SYNC wait for the job to finish. Default 180s for interactive ops; the review path
-    # (play-review) sets MXR_TIMEOUT_S higher so mxr doesn't abandon a slow review BEFORE the
-    # agent's own ~300s exec cap. Parsed HERE, not in the import-time default arg — an empty or
-    # malformed exported MXR_TIMEOUT_S would otherwise crash float() at import and take down the
-    # WHOLE cli, including `mxr get`/`mxr skillselect` that never submit a job (kilabz+oracle).
-    if timeout_s is None:
-        raw = os.environ.get("MXR_TIMEOUT_S") or ""
-        try:
-            timeout_s = float(raw) if raw else 180.0
-        except ValueError:
-            print(f"warning: invalid MXR_TIMEOUT_S={raw!r}, using 180", file=sys.stderr)
-            timeout_s = 180.0
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
         print(f"unknown agent '{agent}'. roster: {roster}", file=sys.stderr)
         return 2
+    if timeout_s is None:
+        timeout_s = _resolve_sync_wait(agent)
 
     led = await PostgresLedger.connect(DSN)
     try:
@@ -122,14 +131,36 @@ async def get_job(job_id: str) -> int:
     """`mxr get <job_id>` -> structured JSON of the job's status, including
     artifact_ref + base_sha. The fix stage (orchestrator/play-fix.sh) reads the
     diff artifact from HERE - via the ledger, parsed as JSON - NEVER by grepping a
-    reply body an agent controls (a spoofable path is a security hole, not a bug)."""
+    reply body an agent controls (a spoofable path is a security hole, not a bug).
+
+    Accepts a FULL uuid or an id PREFIX of >=8 hex chars (hyphens ignored on both
+    sides, so both the 8-char short id `submit` prints and a hyphen-spanning slice
+    of the full JOB_ID work). Ambiguous prefix -> fail closed listing candidates —
+    same shape as the finding_key resolver (postgres_store.human_dismiss)."""
+    raw_id = (job_id or "").strip()
+    prefix: Optional[str] = None
     try:
-        jid = uuid.UUID(job_id)
+        jid: Optional[uuid.UUID] = uuid.UUID(raw_id)
     except (ValueError, AttributeError):
-        print(f"not a job id: {job_id!r}", file=sys.stderr)
-        return 2
+        jid = None
+        prefix = raw_id.replace("-", "").lower()
+        if len(prefix) < 8 or any(c not in "0123456789abcdef" for c in prefix):
+            print(f"not a job id: {job_id!r} (need a full uuid, or an id prefix of "
+                  f">=8 hex chars)", file=sys.stderr)
+            return 2
     led = await PostgresLedger.connect(DSN)
     try:
+        if jid is None:
+            matches = await led.resolve_job_prefix(prefix)
+            if not matches:
+                print(f"no such job: {job_id}", file=sys.stderr)
+                return 1
+            if len(matches) > 1:
+                print(f"ambiguous job id prefix {job_id!r} — candidates:", file=sys.stderr)
+                for m in matches:
+                    print(f"  {m}", file=sys.stderr)
+                return 2
+            jid = uuid.UUID(matches[0])
         st = await led.get_status(jid)
         if not st:
             print(f"no such job: {job_id}", file=sys.stderr)
@@ -159,7 +190,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if raw and raw[0] == "get":
         gp = argparse.ArgumentParser(prog="mxr get",
                                      description="print a job's status as JSON")
-        gp.add_argument("job_id", help="the job uuid (from a prior `mxr` submit)")
+        gp.add_argument("job_id", help="the job uuid, or an id prefix of >=8 hex chars "
+                                       "(from a prior `mxr` submit; hyphens optional)")
         gargs = gp.parse_args(raw[1:])
         return asyncio.run(get_job(gargs.job_id))
 
