@@ -871,6 +871,20 @@ class PostgresLedger:
             out["created_at"] = out["created_at"].isoformat()
         return out
 
+    async def resolve_job_prefix(self, prefix: str) -> list[str]:
+        """Full job ids (uuid text) whose hyphen-stripped id starts with `prefix` —
+        the `mxr get <short-id>` resolver (cli.get_job validates lowercase hex,
+        >=8 chars, BEFORE calling, so the LIKE pattern can carry no wildcards).
+        Newest first, capped at 10: the cap only shapes the ambiguity error listing
+        (>1 already fails closed); an 8-hex prefix colliding 10+ times isn't a real
+        operator case."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT id::text AS id FROM job
+                    WHERE replace(id::text, '-', '') LIKE $1 || '%'
+                    ORDER BY created_at DESC LIMIT 10""", prefix)
+        return [r["id"] for r in rows]
+
     async def count_queued(self) -> int:
         """Cheap queue-depth probe for a pool's idle detection."""
         async with self._pool.acquire() as con:

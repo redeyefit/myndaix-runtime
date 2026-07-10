@@ -99,6 +99,166 @@ def test_cli_get_rejects_non_uuid_before_db():
     assert asyncio.run(cli.get_job("not-a-uuid")) == 2
 
 
+# ---- `mxr get` short-id prefix resolver (PR-3 quick win 1) -----------------
+
+class _FakeLedger:
+    """Stands in for PostgresLedger past the parse gate: resolve_job_prefix over a
+    fixed id list (same hyphen-stripped LIKE semantics as the SQL), get_status a
+    canned dict."""
+    def __init__(self, ids):
+        self.ids = ids
+        self.prefix_seen = None
+        self.status_asked = None
+
+    async def resolve_job_prefix(self, prefix):
+        self.prefix_seen = prefix
+        return [i for i in self.ids if i.replace("-", "").startswith(prefix)]
+
+    async def get_status(self, jid):
+        self.status_asked = str(jid)
+        return {"id": str(jid), "status": "done", "to_agent": "recon"}
+
+    async def close(self):
+        pass
+
+
+def _patch_ledger(fake):
+    class _FakePL:
+        @staticmethod
+        async def connect(dsn):
+            return fake
+    orig = cli.PostgresLedger
+    cli.PostgresLedger = _FakePL
+    return lambda: setattr(cli, "PostgresLedger", orig)
+
+
+def test_cli_get_short_prefix_too_short_rejected_before_db():
+    # <8 hex chars fails closed at parse time — the ledger is never dialed
+    import asyncio
+
+    class _Boom:
+        @staticmethod
+        async def connect(dsn):
+            raise AssertionError("must not touch the ledger for a too-short prefix")
+    orig = cli.PostgresLedger
+    cli.PostgresLedger = _Boom
+    try:
+        assert asyncio.run(cli.get_job("abc123")) == 2       # 6 hex chars
+        assert asyncio.run(cli.get_job("abcd-12")) == 2      # 6 after hyphen strip
+    finally:
+        cli.PostgresLedger = orig
+
+
+def test_cli_get_unique_prefix_resolves():
+    import asyncio
+    full = "deadbeef-0000-4000-8000-000000000001"
+    fake = _FakeLedger([full, "11111111-2222-3333-4444-555555555555"])
+    restore = _patch_ledger(fake)
+    try:
+        assert asyncio.run(cli.get_job("deadbeef")) == 0
+        assert fake.prefix_seen == "deadbeef"
+        assert fake.status_asked == full                     # resolved to the FULL id
+    finally:
+        restore()
+
+
+def test_cli_get_prefix_hyphens_and_case_stripped():
+    # a hyphen-spanning, mixed-case slice of the full JOB_ID works (12 hex after strip)
+    import asyncio
+    full = "deadbeef-0000-4000-8000-000000000001"
+    fake = _FakeLedger([full])
+    restore = _patch_ledger(fake)
+    try:
+        assert asyncio.run(cli.get_job("DEAD-beef-0000")) == 0
+        assert fake.prefix_seen == "deadbeef0000"
+        assert fake.status_asked == full
+    finally:
+        restore()
+
+
+def test_cli_get_ambiguous_prefix_fails_closed():
+    import asyncio
+    fake = _FakeLedger(["deadbeef-0000-4000-8000-000000000001",
+                        "deadbeef-1111-4111-8111-000000000002"])
+    restore = _patch_ledger(fake)
+    try:
+        assert asyncio.run(cli.get_job("deadbeef")) == 2     # refuse, don't guess
+        assert fake.status_asked is None                     # no status read happened
+    finally:
+        restore()
+
+
+def test_cli_get_prefix_no_match():
+    import asyncio
+    fake = _FakeLedger(["deadbeef-0000-4000-8000-000000000001"])
+    restore = _patch_ledger(fake)
+    try:
+        assert asyncio.run(cli.get_job("abcd1234")) == 1     # same rc as unknown full id
+    finally:
+        restore()
+
+
+def test_cli_get_full_uuid_skips_resolver():
+    import asyncio
+    full = "11111111-2222-3333-4444-555555555555"
+    fake = _FakeLedger([full])
+    restore = _patch_ledger(fake)
+    try:
+        assert asyncio.run(cli.get_job(full)) == 0
+        assert fake.prefix_seen is None                      # resolver never consulted
+        assert fake.status_asked == full
+    finally:
+        restore()
+
+
+# ---- sync-wait derivation (PR-3 quick win 2) --------------------------------
+
+def _with_env(key, value, fn):
+    import os
+    had, orig = key in os.environ, os.environ.get(key)
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+    try:
+        return fn()
+    finally:
+        if had:
+            os.environ[key] = orig
+        else:
+            os.environ.pop(key, None)
+
+
+def test_profile_sync_wait_derived_from_timeout():
+    from runtime.contracts import Profile
+    assert Profile().sync_wait() == 360.0                    # 300 default + 60 margin
+    assert Profile(timeout_s=900).sync_wait() == 960.0       # kilabz: scales, not flat 180
+    assert Profile(timeout_s=900, sync_wait_s=42).sync_wait() == 42.0   # explicit pin wins
+
+
+def test_resolve_sync_wait_env_always_wins():
+    assert _with_env("MXR_TIMEOUT_S", "77", lambda: cli._resolve_sync_wait("kilabz")) == 77.0
+
+
+def test_resolve_sync_wait_unset_env_uses_profile():
+    # kilabz profile timeout_s=900 -> 960; the 180s flat default that stranded a DONE
+    # reply behind a 900s exec cap is gone for registry agents
+    assert _with_env("MXR_TIMEOUT_S", None, lambda: cli._resolve_sync_wait("kilabz")) == 960.0
+    assert _with_env("MXR_TIMEOUT_S", None, lambda: cli._resolve_sync_wait("recon")) >= 180.0
+
+
+def test_resolve_sync_wait_no_profile_falls_back_180():
+    # defensive: an agent missing from the registry (submit rejects it earlier anyway)
+    assert _with_env("MXR_TIMEOUT_S", None,
+                     lambda: cli._resolve_sync_wait("no-such-agent")) == 180.0
+
+
+def test_resolve_sync_wait_malformed_env_falls_to_profile():
+    # a broken export must not crash NOR silently pin 180 under a 900s exec cap
+    assert _with_env("MXR_TIMEOUT_S", "not-a-number",
+                     lambda: cli._resolve_sync_wait("kilabz")) == 960.0
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):

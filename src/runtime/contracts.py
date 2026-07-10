@@ -33,11 +33,29 @@ class Authority(str, enum.Enum):
     COMPOSITE = "composite"               # multiple internal calls; declares net authority
 
 
+# margin the CLI's sync wait adds over the agent's exec timeout: covers queue/lease/
+# outbound latency around the attempt itself, so the wait can't expire while a
+# still-in-budget attempt is finishing.
+_SYNC_WAIT_MARGIN_S = 60
+
+
 class Profile(BaseModel):
     """Cost/concurrency/timeout characteristics - consumed by C4."""
     timeout_s: int = 300
     concurrency_weight: int = 1
     cost_budget: Optional[float] = None   # api agents; None = no $ budget
+    sync_wait_s: Optional[int] = None     # cli sync-wait override; None -> derived (sync_wait())
+
+    def sync_wait(self) -> float:
+        """How long `mxr` waits synchronously for this agent's reply, when the operator
+        set nothing (MXR_TIMEOUT_S always wins — cli.submit). DERIVED from the exec
+        timeout + margin unless sync_wait_s pins it, so the two budgets can never be
+        hand-tuned apart: kilabz's exec cap is 900s while the CLI default wait was a
+        flat 180s, so a slow-but-successful review stranded its DONE reply in the
+        ledger looking like a timeout (2026-07-03/06)."""
+        if self.sync_wait_s is not None:
+            return float(self.sync_wait_s)
+        return float(self.timeout_s + _SYNC_WAIT_MARGIN_S)
 
 
 # -- ledger state-machine enums (C2 / C4) --------------------------------
