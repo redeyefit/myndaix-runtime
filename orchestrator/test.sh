@@ -30,6 +30,24 @@ case "$agent" in
     printf 'outcome-record\t%s\n' "$*" >> "$HOME/.myndaix/outcome-argv.log" 2>/dev/null || true
     [[ -n "${STUB_OUTCOME_KEYS:-}" ]] && printf '%s\n' "$STUB_OUTCOME_KEYS"
     exit 0 ;;
+  review-stage)
+    # PR-2 staging primitive: STUB_STAGE_FAIL simulates an infra failure (empty stdout + a
+    # control-charged reason on stderr, to exercise the degradation/fail-closed + clean() paths).
+    # STUB_STAGE_FAIL_WITH_PATH prints a REAL dir to stdout but exits NON-ZERO — the "partial path
+    # before a late failure" case (kilabz HIGH): play-review must key on the EXIT STATUS, not the
+    # stdout shape, so this must still take the fail-closed/degrade branch. Otherwise: mkdir a fake
+    # review-* dir and echo it (the ONLY stdout) with exit 0.
+    if [[ -n "${STUB_STAGE_FAIL:-}" ]]; then printf 'staging failed: %b\n' "stub \033[31mreason\033[0m" >&2; exit 1; fi
+    d="$HOME/.myndaix/orchestrator/staging/review-stub-$$-$RANDOM"
+    mkdir -p "$d" 2>/dev/null || { echo "mkdir failed" >&2; exit 1; }
+    printf '%s\n' "$d"
+    [[ -n "${STUB_STAGE_FAIL_WITH_PATH:-}" ]] && exit 1   # path printed, but FAILED -> must not read as success
+    exit 0 ;;
+  review-teardown)
+    printf 'review-teardown\t%s\n' "$*" >> "$HOME/.myndaix/teardown-argv.log" 2>/dev/null || true
+    [[ -n "${2:-}" ]] && rm -rf "$2" 2>/dev/null || true; exit 0 ;;
+  review-reap)
+    printf 'review-reap\n' >> "$HOME/.myndaix/reap-calls" 2>/dev/null || true; exit 0 ;;
 esac
 case "$prompt" in
   *READY*) [[ "${STUB_CANARY_FAIL:-}" == "$agent" ]] && exit 1; echo READY; exit 0 ;;
@@ -305,6 +323,64 @@ echo "41. keys file does NOT touch the verdict file (verdict untouched)"; reset;
   STUB_OUTCOME_KEYS="$(printf 'cafebabe4567\toracle\ttoctou-race\tf.py')" STUB_TRIAGE="1. fix it" run
   vf="$(ls -t "$INBOX"/*.md 2>/dev/null | grep -v -- '-outcomes.md' | head -1)"
   if [[ -n "$vf" ]] && ! grep -q "cafebabe4567" "$vf"; then echo "  ok: verdict file has no injected keys (separate file)"; PASS=$((PASS+1)); else echo "  FAIL: keys leaked into the verdict file"; FAIL=$((FAIL+1)); fi
+
+# ====================== PR-2: review-context snapshot staging ======================
+# play-review stages a de-linked read-only snapshot of the reviewed tip as the CONFINED
+# reviewers' cwd (kilabz + lobster; oracle inline-only, D5). Push mode degrades LOUDLY on a
+# staging failure; gate mode fails CLOSED. Teardown on the terminal path; reaper on leaks.
+mlog(){ echo "$FAKE/.myndaix/mxr-argv.log"; }
+
+echo "42. PR-2: --staged-workdir reaches kilabz + lobster (2), NOT oracle"; reset; STUB_TRIAGE="PLAY_PASS" run
+  # the argv (with its multi-line prompt) logs as one multi-line entry; the trailing flags land
+  # on the SAME physical line as --repo/--base-ref (like test 16). So count the flag-tail lines:
+  # kilabz + lobster carry `--base-ref $TIP --staged-workdir`; oracle carries --base-ref WITHOUT it.
+  L="$(mlog)"
+  ntotal="$(grep -c -- "--base-ref $TIP" "$L" 2>/dev/null || true)"; [[ "$ntotal" =~ ^[0-9]+$ ]] || ntotal=0
+  nstaged="$(grep -c -- "--base-ref $TIP --staged-workdir" "$L" 2>/dev/null || true)"; [[ "$nstaged" =~ ^[0-9]+$ ]] || nstaged=0
+  [[ "$nstaged" -eq 2 ]] && { echo "  ok: exactly kilabz + lobster carry --staged-workdir"; PASS=$((PASS+1)); } || { echo "  FAIL: staged review calls = $nstaged (want 2)"; FAIL=$((FAIL+1)); }
+  [[ "$ntotal" -eq 3 && $((ntotal - nstaged)) -eq 1 ]] && { echo "  ok: oracle stays inline-only (1 review call has no staged-workdir, D5)"; PASS=$((PASS+1)); } || { echo "  FAIL: inline (oracle) review calls = $((ntotal - nstaged)) (want 1)"; FAIL=$((FAIL+1)); }
+
+echo "43. PR-2: snapshot_intro (trusted sentence) reaches the staged prompts, references the tip"; reset; STUB_TRIAGE="PLAY_PASS" run
+  L="$(mlog)"
+  if grep -q "de-linked, non-writable snapshot of this repo at the reviewed tip $TIP" "$L" 2>/dev/null; then echo "  ok: snapshot intro references the reviewed tip"; PASS=$((PASS+1)); else echo "  FAIL: snapshot intro absent/wrong"; FAIL=$((FAIL+1)); fi
+
+echo "44. PR-2: review-stage called once; review-teardown fires on the terminal success path"; reset; STUB_TRIAGE="PLAY_PASS" run
+  L="$(mlog)"
+  nstage="$(grep -c $'^review-stage\t' "$L" 2>/dev/null || true)"; [[ "$nstage" =~ ^[0-9]+$ ]] || nstage=0
+  [[ "$nstage" -eq 1 ]] && { echo "  ok: review-stage called exactly once"; PASS=$((PASS+1)); } || { echo "  FAIL: review-stage called $nstage times"; FAIL=$((FAIL+1)); }
+  ckfile "$FAKE/.myndaix/teardown-argv.log" "review-teardown fired on the terminal (post-triage) path"
+
+echo "45. PR-2: leaked-snapshot reaper runs at worker startup"; reset; STUB_TRIAGE="PLAY_PASS" run
+  ckfile "$FAKE/.myndaix/reap-calls" "review-reap invoked at startup"
+
+echo "46. PR-2: staging FAILURE degrades a PUSH review LOUDLY (still delivers, header marks it)"; reset
+  STUB_STAGE_FAIL=1 STUB_TRIAGE="1. fix it" run
+  ck "push review still delivers despite staging failure" "review NEEDS-FIX"
+  ck "verdict header carries the degradation marker" "reviewed WITHOUT snapshot"
+  L="$(mlog)"
+  if grep -q $'^kilabz\t.*--staged-workdir' "$L" 2>/dev/null; then echo "  FAIL: staged-workdir passed after a staging failure"; FAIL=$((FAIL+1)); else echo "  ok: no staged-workdir after a staging failure (inline-only)"; PASS=$((PASS+1)); fi
+
+echo "46b. PR-2: degradation reason is control-stripped (ESC from the stub reason never lands)"; reset
+  STUB_STAGE_FAIL=1 STUB_TRIAGE="PLAY_PASS" run
+  df="$(latest)"
+  if [[ -n "$df" ]] && LC_ALL=C grep -q $'\033' "$df" 2>/dev/null; then echo "  FAIL: ESC from the staging reason survived into the verdict"; FAIL=$((FAIL+1)); else echo "  ok: ESC stripped from the degradation reason"; PASS=$((PASS+1)); fi
+
+echo "47. PR-2: staging FAILURE fails the GATE CLOSED (ABORTED, exit 2 -> retry)"; reset; rm -f "$ROOT/verdict.json"
+  STUB_STAGE_FAIL=1 STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "gate staging-fail exits 2 (transient)"
+  ck "gate verdict ABORTED on staging failure" '"verdict":"ABORTED"' "$ROOT/verdict.json"
+
+echo "47b. PR-2 (kilabz HIGH): review-stage that PRINTS a path but EXITS NON-ZERO still fails closed"; reset; rm -f "$ROOT/verdict.json"
+  STUB_STAGE_FAIL_WITH_PATH=1 STUB_TRIAGE="PLAY_PASS" gate_run; ckexit $? 2 "gate keys on exit status, not stdout shape (exit 2)"
+  ck "verdict ABORTED despite a printed staging path" '"verdict":"ABORTED"' "$ROOT/verdict.json"
+  reset; STUB_STAGE_FAIL_WITH_PATH=1 STUB_TRIAGE="PLAY_PASS" run
+  L="$(mlog)"
+  if grep -q $'^kilabz\t.*--staged-workdir' "$L" 2>/dev/null; then echo "  FAIL: staged-workdir passed after a nonzero-exit stage"; FAIL=$((FAIL+1)); else echo "  ok: push review degrades (no staged-workdir) on nonzero-exit stage"; PASS=$((PASS+1)); fi
+  ck "push verdict marks the degradation" "reviewed WITHOUT snapshot"
+
+echo "48. PR-2: scope-flag count is still 3 (staged-workdir is additive, not a new scoped call)"; reset; STUB_TRIAGE="PLAY_PASS" run
+  rid="$(basename "$REPO")"; L="$(mlog)"
+  nscoped="$(grep -c -- "--repo $rid --base-ref $TIP" "$L" 2>/dev/null || true)"; [[ "$nscoped" =~ ^[0-9]+$ ]] || nscoped=0
+  [[ "$nscoped" -eq 3 ]] && { echo "  ok: still exactly 3 scoped review calls"; PASS=$((PASS+1)); } || { echo "  FAIL: scoped calls = $nscoped (want 3)"; FAIL=$((FAIL+1)); }
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

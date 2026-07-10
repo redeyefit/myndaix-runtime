@@ -258,6 +258,29 @@ def test_cli_review_routes_to_review_main():
         review_mod.main = orig
 
 
+def test_cli_review_staging_verbs_route_to_staging_main():
+    # PR-2: the staging primitives play-review.sh calls each map to staging.main's
+    # subcommand (stage/teardown/reap), inheriting the runtime venv via mxr.
+    from runtime import staging as staging_mod
+    captured = {}
+
+    def fake_main(argv):
+        captured["argv"] = argv
+        return 0
+
+    orig = staging_mod.main
+    staging_mod.main = fake_main
+    try:
+        assert cli.main(["review-stage", "/some/repo", "a" * 40]) == 0
+        assert captured["argv"] == ["staging", "stage", "/some/repo", "a" * 40]
+        assert cli.main(["review-teardown", "/stage/review-x"]) == 0
+        assert captured["argv"] == ["staging", "teardown", "/stage/review-x"]
+        assert cli.main(["review-reap"]) == 0
+        assert captured["argv"] == ["staging", "reap"]
+    finally:
+        staging_mod.main = orig
+
+
 # ---- sync-wait derivation (PR-3 quick win 2) --------------------------------
 
 def _with_env(key, value, fn):

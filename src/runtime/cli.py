@@ -279,6 +279,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         from runtime import review
         return review.main(["review", *raw[1:]])
 
+    # `mxr review-stage <repo> <tip> | review-teardown <dir> | review-reap` — the STAGING
+    # primitives for play-review.sh (PR-2). play-review runs its OWN review pipeline (fences,
+    # skillselect, oracle-inline, triage), so it wants only the exporter, not the full `review`
+    # verb. Routed through mxr so the hook env inherits the runtime venv + PYTHONPATH + DSN
+    # (bare `python3 -m runtime.staging` would not resolve). stage prints the snapshot dir;
+    # teardown refuses anything not a review-* dir under the staging root; reap fails CLOSED
+    # if the ledger is unreachable (never blind mtime-reap).
+    if raw and raw[0] in ("review-stage", "review-teardown", "review-reap"):
+        from runtime import staging
+        sub = {"review-stage": "stage", "review-teardown": "teardown",
+               "review-reap": "reap"}[raw[0]]
+        return staging.main(["staging", sub, *raw[1:]])
+
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')
