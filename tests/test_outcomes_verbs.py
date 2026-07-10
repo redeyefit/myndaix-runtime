@@ -219,7 +219,7 @@ async def test_human_dismiss_correct_mislabel(led):
     ok(r1["dismissed"] == 1, "first dismissal (fp) wrote a row")
     ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_false_positive", "labelled fp")
     prec_fp = await led._pool.fetchval(
-        "SELECT dismissed_false_positive FROM finding_precision WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
+        "SELECT dismissed_false_positive FROM finding_precision_raw WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
     ok(prec_fp == 1, "precision view shows 1 fp before the correction")
     # correct it to wontfix
     r2 = await led.human_dismiss(fk[:12], "kilabz", "wontfix")
@@ -227,7 +227,7 @@ async def test_human_dismiss_correct_mislabel(led):
     ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_wontfix",
        "current state is the CORRECTED label (higher-seq human row wins)")
     prec_fp2 = await led._pool.fetchval(
-        "SELECT dismissed_false_positive FROM finding_precision WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
+        "SELECT dismissed_false_positive FROM finding_precision_raw WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
     ok((prec_fp2 or 0) == 0, "the correction drops the fp count in finding_precision (current-state read)")
     # re-issuing the SAME kind is an idempotent no-op
     r3 = await led.human_dismiss(fk[:12], "kilabz", "wontfix")

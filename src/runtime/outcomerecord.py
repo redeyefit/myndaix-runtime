@@ -19,7 +19,7 @@ Three verbs (routed via `mxr`, so each inherits the runtime venv + PYTHONPATH + 
   - `mxr outcome <finding_key_prefix> fp|wontfix`
         the human dismissal (fail-CLOSED on an ambiguous / <12-hex prefix — prints colliding keys).
   - `mxr outcome-stats`
-        print the finding_precision rows + open count (human-readable) for the morning brain-check.
+        print the finding_precision_raw rows + open count (human-readable) for the morning brain-check.
 
 CONTRACT (mirrors capturerecord): default OFF ($ORCH/OUTCOMES_ENABLED gate is enforced in the
 play-review WIRING, not here — this verb records whatever it's handed); HARD no-op in gate mode
