@@ -1,12 +1,13 @@
-# Self-labeling system — safe automation of the outcomes-ledger labeling flywheel (design v0.3)
+# Self-labeling system — safe automation of the outcomes-ledger labeling flywheel (design v0.4)
 
-**Status:** DESIGN v0.3 — folded dual-family r2 (both: axis is right, close the remaining leaks → then PR-1 is buildable). Precise schema/view/authority contracts below. NOT built.
+**Status:** DESIGN v0.4 — oracle r3 APPROVE (airtight); folded kilabz r3's spec-completeness (label-vs-lifecycle axis, complete source×outcome algebra, current-not-rows aggregation) + oracle's drop-the-diagnostic-view refinement. Awaiting r4 confirmation. NOT built.
 **Author:** Mack (Fable 5), 2026-07-10. **Scope:** `src/runtime/{ledger,command_api}` + labeler module + `orchestrator/` sweep + migration `0009`. NO edits to shipped 0008.
 
 ## 0. Change log
 
 - **v0.1 → v0.2:** firewall axis moved from "objective vs model" to **"human-confirmed vs proposed."** The gate is human confirmation; the fix-probe and panel are pure labor.
-- **v0.2 → v0.3 (this rev):** fold r2. (a) **Split the write verbs** — no single verb can mint both human and machine truth (confused-deputy BLOCKER). (b) Canonical label-queue is **machine-blind** — panel_proposed, exec_verified AND auto_fix_landed all leave a finding in the human queue until a human row lands (kilabz BLOCKER). (c) **Killed the sampled-audit auto-promote path** — every gating row is human-authored/confirmed; the audit only informs a cheap *bulk* human-confirm (kilabz CRITICAL / oracle Q2). (d) **Precise schema** — exact `outcome_source`/`outcome` values + which rows are gating inputs (kilabz HIGH). (e) **One idempotency rule** — `outcome_source` added to the unique tuple (kilabz HIGH). (f) Renamed the all-source current view `_resolved` (not `_promoted`) and made it private/diagnostic (oracle MODERATE / kilabz BLOCKER).
+- **v0.2 → v0.3:** fold r2. Split write verbs (no confused deputy); machine-blind queue; killed sampled-audit auto-promote (bulk human-confirm instead); precise schema; one idempotency rule; renamed the all-source view.
+- **v0.3 → v0.4 (this rev):** oracle r3 = APPROVE (airtight). Folded kilabz r3: (a) **label vs lifecycle axes** — `ttl_sweep/expired` is a lifecycle tombstone, NOT a label; the queue is human-LABEL-terminal only, TTL is a separate documented+tested axis (kilabz BLOCKER). (b) **complete source×outcome algebra** — all 10 legal pairs enumerated; `0009` widens the two independent value-CHECKs (non-breaking), pairing is verb-enforced (kilabz BLOCKER). (c) **current-not-rows aggregation** — precision reads `finding_current_human` (DISTINCT-ON latest human label), no double-count on repeat/correction (kilabz HIGH). (d) **dropped `finding_current_resolved` from the DB** — attractive nuisance; the UI joins dynamically (oracle r3).
 
 ## 1. Problem (unchanged, brief)
 
@@ -16,37 +17,46 @@ Self-learning is stalled on **labeling throughput**: Mini accrued 37 findings si
 
 **A label gates autonomy — and removes a finding from the human queue — iff a human authored or confirmed it.** Every machine output (panel proposal, exec-probe prior, line-vanish) is fenced from BOTH the gating metric AND the canonical label-queue until a human row lands. This preserves v1's original "no LLM in the gating path" invariant intact.
 
-The fence is a closed algebra over three columns, checkable by `grep`:
+The fence is a closed algebra over three columns, checkable by `grep`. Two ORTHOGONAL axes — a finding carries at most one LABEL (a real/fp verdict) and, separately, a LIFECYCLE state (active / aged-out); no machine touches the label axis:
 - **Gating inputs** = rows where `outcome_source ∈ {human_confirm, human_dismiss}` (both HUMAN). Nothing else counts.
-- **Queue-terminal** = the same two human sources (+ `expired` TTL). No machine source is queue-terminal.
+- **Label-terminal (removes-as-labeled from the queue)** = the same two human sources ONLY. **No machine source is label-terminal.** `panel_proposed`, `exec_verified`, `auto_fix_landed` are all invisible to the queue.
+- **Lifecycle tombstone (a SEPARATE axis, not a label)** = `ttl_sweep/expired` ages out a finding the human left unlabeled past the TTL. It asserts NO verdict, gates NO precision (counts toward neither side — the existing v1 "keeps denominators honest" rule), and is the ONLY non-human way a finding leaves the *active* queue. It is not a machine *label*; it is fail-closed + deterministic (`expire_open`, `sweep:<utcday>`) and merely stops tracking a stale finding — a documented, tested exception distinct from labeling authority (kilabz r3).
 - **Write authority** = server-minted `outcome_source` + a principal→source matrix (§5); a machine identity can NEVER mint a human source.
 
 ## 3. Schema contract (migration `0009`, guarded ALTER of 0008's CHECKs — never edit 0008)
 
 **`outcome_source`** (WHO produced the row) — existing `{review_raised, auto_fix_landed, auto_git_revert, human_dismiss, ttl_sweep}` + **new** `{panel_proposed, exec_verified, human_confirm}`.
 
-**`outcome`** (WHAT the row asserts) — existing `{open, applied_fixed, dismissed_false_positive, dismissed_wontfix, reverted, expired}` + **new** `{confirmed_real, exec_real_prior, panel_real, panel_fp}`. Mapping (source × outcome, the only legal pairs):
+**`outcome`** (WHAT the row asserts) — existing `{open, applied_fixed, dismissed_false_positive, dismissed_wontfix, reverted, expired}` + **new** `{confirmed_real, exec_real_prior, panel_real, panel_fp}`.
 
-| verdict | `outcome_source` | `outcome` | gating? | queue-terminal? |
-|---|---|---|---|---|
-| human says REAL | `human_confirm` | `confirmed_real` | **YES (numerator)** | YES |
-| human says FP | `human_dismiss` | `dismissed_false_positive` | **YES (denominator)** | YES |
-| human says wontfix | `human_dismiss` | `dismissed_wontfix` | no (n/a) | YES |
-| exec-probe REAL prior | `exec_verified` | `exec_real_prior` | **no (prior only)** | **no** |
-| panel proposes REAL | `panel_proposed` | `panel_real` | no | no |
-| panel proposes FP | `panel_proposed` | `panel_fp` | no | no |
-| line vanished (v1) | `auto_fix_landed` | `applied_fixed` | **no** | **no** (was queue-terminal in v1 finding_current; the new queue view ignores it) |
+**`0009` adds the new values to the two INDEPENDENT value-set CHECKs** (one on `outcome_source`, one on `outcome`), matching 0008's pattern — a guarded `ALTER … DROP/ADD CONSTRAINT` that only WIDENS each enum, so it can never break an existing row (kilabz r3 — a pair-CHECK enumerated from the verdict table alone would reject existing `review_raised/open` etc.). The (source × outcome) PAIRING is enforced at the WRITE point by the §5 verb matrix, not a DB pair-CHECK (a full pair-CHECK is optional later hardening and MUST enumerate every existing pair too).
 
-**Gating precision** (`finding_precision_promoted`) = `count(confirmed_real) / (count(confirmed_real) + count(dismissed_false_positive))` per `(rule_tag × reviewer_family)`, both from `human_*` sources only — the CUT lever (`applied_fixed`) and all machine outcomes are structurally absent from the fraction. There is no path for a machine outcome to enter it.
+Complete legal (`outcome_source`, `outcome`) pairs — **existing (unchanged)** + **new**:
+
+| # | `outcome_source` | `outcome` | axis | gating? | label-terminal? |
+|---|---|---|---|---|---|
+| e1 | `review_raised` | `open` | label (none yet) | no | no (it IS the open state) |
+| e2 | `auto_fix_landed` | `applied_fixed` | label (v1 diag) | **no** | **no** (queue ignores it) |
+| e3 | `auto_git_revert` | `reverted` | label (v1, no writer) | no | no |
+| e4 | `human_dismiss` | `dismissed_false_positive` | label | **YES (denom)** | **YES** |
+| e5 | `human_dismiss` | `dismissed_wontfix` | label | no (n/a) | **YES** |
+| e6 | `ttl_sweep` | `expired` | **lifecycle** | no | no (tombstone — active-queue only) |
+| n1 | `human_confirm` | `confirmed_real` | label | **YES (numer)** | **YES** |
+| n2 | `exec_verified` | `exec_real_prior` | label | **no (prior)** | **no** |
+| n3 | `panel_proposed` | `panel_real` | label | no | no |
+| n4 | `panel_proposed` | `panel_fp` | label | no | no |
+
+**Gating precision** (`finding_precision_promoted`) aggregates the ONE CURRENT human label per `(finding_key, reviewer_family)` — read from `finding_current_human` (§4), a DISTINCT-ON-latest-human-terminal view — NOT raw rows (kilabz r3 HIGH: a repeat confirm or an fp→real correction inserts a second row under a different `source_event`; counting raw rows would double-count). Then per `(rule_tag × reviewer_family)`: `count(current confirmed_real) / (count(current confirmed_real) + count(current dismissed_false_positive))`. Only the two human label-pairs (e4, n1) can enter; every machine outcome and the CUT lever (`applied_fixed`) is structurally absent.
 
 **Idempotency (one rule):** `0009` DROPs 0008's `UNIQUE(finding_key, reviewer_family, outcome, source_event)` and CREATEs `UNIQUE(finding_key, reviewer_family, outcome, outcome_source, source_event)` (adds `outcome_source`). Each verb owns a reserved server-minted `source_event` prefix (`human:`, `probe:`, `panel:`); same tuple = idempotent no-op; a differing payload uses a different event = inserts; cross-source reuse cannot collide (source is in the key) and thus can never silently shadow a human promotion.
 
 ## 4. View architecture (the three-layer fence, precise)
 
-- **`finding_labelqueue` (new)** — the human queue + the sweep input. A finding is present iff NO `human_*` terminal row exists for it AND it is not `expired`. **All machine sources (`panel_proposed`, `exec_verified`, `auto_fix_landed`) are invisible to terminal resolution** — a machine can never remove a finding from this queue. (v1's `finding_current` is left unchanged for its existing consumers — record_findings' sticky-dismiss + the current sweep; the self-labeling pipeline reads `finding_labelqueue`, not `finding_current`.)
-- **`finding_precision_promoted` (new)** — the ONLY autonomy-facing metric; reads gating inputs only (§3).
-- **`finding_current_resolved` (new, private/diagnostic)** — the all-source precedence-ordered view (`human > exec_verified > auto_fix_landed > panel_proposed > open`), for the human-batch UI (JOIN the queue against priors/proposals to see what's ripe for bulk-confirm) and the accuracy audit. Explicitly NOT `_promoted`; a PR-1 test asserts no backlog/queue/acting-rung/sweep reads it.
+- **`finding_current_human` (new)** — DISTINCT ON `(finding_key, reviewer_family)` of `human_*` rows only, latest human-terminal by `seq`; ONE current human label per finding/family. The gating metric reads THIS (no double-count; kilabz r3 HIGH).
+- **`finding_labelqueue` (new)** — the human queue + the sweep input. A finding is present iff it has NO row in `finding_current_human` (i.e. no human label) AND it is not lifecycle-tombstoned (`ttl_sweep/expired`). **Every non-human LABEL source (`panel_proposed`, `exec_verified`, `auto_fix_landed`, `review_raised`, `auto_git_revert`) is invisible to label-terminal resolution** — no machine can remove a finding from this queue as *labeled*; only a human label or the TTL tombstone (a separate lifecycle axis, §2) affects presence. (v1's `finding_current` is unchanged for its existing consumers; the self-labeling pipeline reads `finding_labelqueue`.)
+- **`finding_precision_promoted` (new)** — the ONLY autonomy-facing metric; reads `finding_current_human` gating inputs only (§3).
 - **`finding_precision_raw` (renamed from `finding_precision`)** — v1 all-source diagnostic, kept only as the accuracy-audit baseline; a PR-1 consumer-proof test asserts no acting rung reads it.
+- **NO all-source `finding_current_resolved` view in the DB (oracle r3).** It was an attractive nuisance (future code would query it for gating). The human-batch UI's "priors/proposals ripe for confirm" is a DYNAMIC JOIN at request time in the labeler service (queue ⋈ `panel_proposed`/`exec_verified` rows), never a materialized core view — or, if performance ever demands it, a table in a separate `ui_views` schema the core engine can't see.
 
 ## 5. Write-authority (split verbs + principal→source matrix)
 
@@ -115,14 +125,13 @@ No acting (no dial flips / auto-suppress / auto-fix-landing); no automerge coupl
 
 ## 12. Build + rollout (staged; each PR cross-family reviewed)
 
-- **PR-1 (the fence — buildable per both families):** migration `0009` (§3 sources/outcomes + the `outcome_source`-in-tuple unique index; §4 views: `finding_labelqueue`, `finding_precision_promoted`, `finding_current_resolved`, rename→`finding_precision_raw`) + the three Command-API verbs (§5) with server-mint + the principal→source matrix. Tests: no machine row enters `finding_precision_promoted`; no machine row removes a finding from `finding_labelqueue`; exec/labeler identities are DENIED `confirm_outcome`; the idempotency matrix (same=noop, diff-payload=insert, cross-source no-shadow); no consumer reads `_raw`/`_resolved`. **No labeler.**
+- **PR-1 (the fence — buildable per both families):** migration `0009` (§3: widen the two independent value-CHECKs + the `outcome_source`-in-tuple unique index; §4 views: `finding_current_human`, `finding_labelqueue`, `finding_precision_promoted`, rename→`finding_precision_raw` — NO `finding_current_resolved`) + the three Command-API verbs (§5) with server-mint + the principal→source matrix. Tests: no machine row enters `finding_precision_promoted`; **EVERY non-human LABEL source (`panel_proposed`, `exec_verified`, `auto_fix_landed`, `review_raised`, `auto_git_revert`) fails to remove a finding from `finding_labelqueue`** (only a human label or TTL-tombstone does); a repeat/correction human confirm resolves to ONE current label (no double-count); exec/labeler identities are DENIED `confirm_outcome`; the idempotency matrix (same=noop, diff-payload=insert, cross-source no-shadow); `0009` widens (never breaks) existing rows; no consumer reads `_raw`. **No labeler.**
 - **PR-2 (exec prior):** play-fix full-fix OBSERVE mode → `record_exec_prior`. Passive default.
 - **PR-3 (panel + human batch):** scheduled decorrelated sweep → `propose_outcome` + cluster/rank + phone-first bulk-confirm UI + `labeler_accuracy` audit.
 - **PR-4 (active knob):** `$ORCH/LABELER_ACTIVE` + per-day budget — Jefe's compute opt-in.
 - **Deploy:** Mini `git pull` + kickstart (0009 auto-applies) + `$ORCH` cp of the sweep script.
 
-## 13. Open questions (v0.3 — minimal)
+## 13. Open questions (v0.4 — minimal)
 
-1. Confirm the fence is now airtight: can any machine row reach `finding_precision_promoted` OR remove a finding from `finding_labelqueue`, through any path (views, idempotency, principal matrix, source/outcome algebra)?
-2. `finding_current_resolved` is private/diagnostic — is a consumer-proof test enough, or should the human-batch UI read the queue + a proposals view directly and drop `_resolved` entirely?
-3. **D4 (Jefe's, not derivable):** active vs passive default probe.
+1. Final airtightness confirm: with the label-vs-lifecycle split, the complete source×outcome algebra, current-not-rows aggregation, and no `_resolved` view — can any machine LABEL still reach `finding_precision_promoted` or remove a finding from `finding_labelqueue`?
+2. **D4 (Jefe's, not derivable):** active vs passive default probe.
