@@ -189,7 +189,14 @@ async def _review(args: argparse.Namespace) -> int:
     diff = None
     if args.range:
         # endpoints resolved to 40-hex above — only resolved shas reach git argv
-        diff = _git(repo, ["diff", "--no-ext-diff", base_sha, head_sha, "--"])
+        # --no-ext-diff AND --no-textconv: a hostile in-tree `.gitattributes` selecting a
+        # diff driver (`*.bin diff=lfs`) whose textconv/command is configured HOST-side
+        # would otherwise run that command on the orchestrator during `git diff` — the
+        # exact host-code-execution class the raw exporter avoids, reintroduced on the
+        # diff path (kilabz r3 HIGH). --no-ext-diff kills external-diff drivers,
+        # --no-textconv kills textconv; git falls back to its built-in binary/text diff.
+        diff = _git(repo, ["diff", "--no-ext-diff", "--no-textconv",
+                           base_sha, head_sha, "--"])
         if diff is None:
             print(f"mxr review: git diff failed for {args.range!r}", file=sys.stderr)
             return 1

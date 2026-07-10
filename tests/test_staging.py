@@ -294,6 +294,35 @@ def test_case_colliding_DIRECTORY_prefixes():
             shutil.rmtree(d, ignore_errors=True)
 
 
+def test_case_colliding_INTERMEDIATE_prefixes():
+    # oracle r3 HIGH: the collision is at an INTERMEDIATE level (FOO vs foo) while the
+    # leaf files sit in DIFFERENT subdirs (FOO/a/x, foo/c/y) — an immediate-parent-only
+    # check misses it (FOO/a and foo/c are distinct inodes). The walk-up must catch it.
+    repo, root = _mkrepo(), _tmproot()
+    try:
+        bx = _hash_blob(repo, b"x\n")
+        by = _hash_blob(repo, b"y\n")
+        a_tree = _raw_tree(repo, [("100644", b"x", bx)])          # a/x
+        c_tree = _raw_tree(repo, [("100644", b"y", by)])          # c/y
+        foo_up = _raw_tree(repo, [("40000", b"a", a_tree)])        # FOO/a/x
+        foo_lo = _raw_tree(repo, [("40000", b"c", c_tree)])        # foo/c/y
+        tip = _commit_tree(repo, _raw_tree(
+            repo, [("40000", b"FOO", foo_up), ("40000", b"foo", foo_lo)]))
+        if _fs_case_insensitive(root):
+            try:
+                staging.stage_snapshot(repo, tip, root=root)
+                raise AssertionError("intermediate case collision must fail closed")
+            except StagingError:
+                pass
+            assert not list(root.iterdir())
+        else:
+            snap = staging.stage_snapshot(repo, tip, root=root)
+            assert (snap / "FOO" / "a" / "x").exists() and (snap / "foo" / "c" / "y").exists()
+    finally:
+        for d in (repo, root):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def test_tip_validation_and_caps():
     repo, root = _mkrepo(), _tmproot()
     try:
@@ -464,6 +493,30 @@ def test_verb_tip_range_coherence():
                 pass
         # tip not local → inline-only signal (None), not an error
         assert review._resolve_tip(repo, "d" * 40, None) == (None, None, None)
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_verb_diff_no_textconv_no_driver_exec():
+    # kilabz r3 HIGH: a hostile in-tree .gitattributes selecting a host-configured diff
+    # driver must NOT run that driver during `mxr review --range`'s git diff. Configure a
+    # LOCAL textconv+command driver whose command drops a sentinel, then confirm the diff
+    # (built with --no-ext-diff --no-textconv) never fires it.
+    repo = _mkrepo()
+    sentinel = repo / "DRIVER_RAN"
+    try:
+        # a driver that would leave a trace if git ever invoked it
+        _git(repo, "config", "diff.danger.textconv", f"touch {sentinel};cat")
+        _git(repo, "config", "diff.danger.command", f"touch {sentinel};true")
+        (repo / ".gitattributes").write_text("*.bin diff=danger\n")
+        (repo / "payload.bin").write_bytes(b"before\n")
+        c1 = _commit_all(repo, "c1")
+        (repo / "payload.bin").write_bytes(b"after\n")
+        c2 = _commit_all(repo, "c2")
+        # drive the exact diff the verb builds
+        out = review._git(repo, ["diff", "--no-ext-diff", "--no-textconv", c1, c2, "--"])
+        assert out is not None
+        assert not sentinel.exists(), "a hostile diff driver EXECUTED on the host"
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 

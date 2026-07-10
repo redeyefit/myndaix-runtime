@@ -235,17 +235,25 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
             raise StagingError(f"realpath failed for {path!r}: {e}") from e
         if real_parent != rd_real and os.path.commonpath([real_parent, rd_real]) != rd_real:
             raise StagingError(f"entry parent resolves outside run dir: {path!r}")
-        # a parent INODE already OWNED by a different intended rel-parent == a merged
-        # case-collision on this fs → fail closed (see dir_owner note above).
-        try:
-            pst = os.stat(parent)
-        except OSError as e:
-            raise StagingError(f"stat failed for {path!r}: {e}") from e
-        rel_parent = os.path.dirname(path)
-        owner = dir_owner.setdefault((pst.st_dev, pst.st_ino), rel_parent)
-        if owner != rel_parent:
-            raise StagingError(f"case-colliding directory prefix for {path!r} "
-                               f"(collides with {owner!r} on this filesystem)")
+        # a directory INODE already OWNED by a different intended rel-path == a merged
+        # case-collision on this fs → fail closed. Walk EVERY intermediate dir from the
+        # leaf parent up to the run dir, not just the immediate parent (oracle r3 HIGH:
+        # `FOO/a/b` + `foo/c/d` have distinct leaf parents FOO/a and foo/c, so an
+        # immediate-parent-only check never stats the FOO/foo merge one level up).
+        cur, cur_rel = dst, path
+        while True:
+            cur = os.path.dirname(cur)
+            cur_rel = os.path.dirname(cur_rel)
+            if cur == rd or not cur_rel:
+                break
+            try:
+                pst = os.stat(cur)
+            except OSError as e:
+                raise StagingError(f"stat failed for {path!r}: {e}") from e
+            owner = dir_owner.setdefault((pst.st_dev, pst.st_ino), cur_rel)
+            if owner != cur_rel:
+                raise StagingError(f"case-colliding directory prefix for {path!r} "
+                                   f"(collides with {owner!r} on this filesystem)")
 
         if not _TIP_RE.fullmatch(sha):                 # blob sha feeds git argv — validate
             raise StagingError(f"non-hex blob sha for {path!r}: {sha!r}")
