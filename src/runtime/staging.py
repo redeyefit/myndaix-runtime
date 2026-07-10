@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import select
 import shutil
 import stat
 import subprocess
@@ -96,6 +97,78 @@ def _git(repo: Path, argv: list[str]) -> bytes:
         err = p.stderr.decode(errors="replace").strip()[:300]
         raise StagingError(f"git {argv[0]} exited {p.returncode}: {err}")
     return p.stdout
+
+
+def _git_capture_bounded(repo: Path, argv: list[str], max_bytes: int) -> bytes:
+    """Like _git but reads stdout INCREMENTALLY with a hard byte ceiling — so a hostile
+    tree with millions of entries can't OOM the orchestrator by materializing unbounded
+    `ls-tree` output before the count/size caps run (kilabz r4 HIGH, the softer half).
+    select() gives the per-read timeout (hang safety = the old subprocess timeout)."""
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", str(repo), *argv],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except OSError as e:
+        raise StagingError(f"git {argv[0]}: {e}") from e
+    out = bytearray()
+    deadline = time.monotonic() + _GIT_TIMEOUT_S
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                raise StagingError(f"git {argv[0]} timed out")
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                proc.kill()
+                raise StagingError(f"git {argv[0]} timed out")
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > max_bytes:
+                proc.kill()
+                raise StagingError(f"git {argv[0]} output exceeds cap {max_bytes}")
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        rc = proc.wait()
+        err = proc.stderr.read().decode(errors="replace").strip()[:300]
+        proc.stderr.close()
+    if rc != 0:
+        raise StagingError(f"git {argv[0]} exited {rc}: {err}")
+    return bytes(out)
+
+
+def _cat_file_size(repo: Path, sha: str) -> int:
+    """Object byte size via `git cat-file -s` — cheap (reads the header, never the
+    content), so an over-cap blob is rejected BEFORE it is ever read into memory."""
+    out = _git(repo, ["cat-file", "-s", sha]).decode(errors="replace").strip()
+    if not out.isdigit():
+        raise StagingError(f"cat-file -s returned non-numeric size for {sha}: {out!r}")
+    return int(out)
+
+
+def _cat_file_blob_to(repo: Path, sha: str, fileobj) -> None:
+    """Stream `git cat-file blob <sha>` STRAIGHT into fileobj's fd — git writes to the
+    file directly, so a multi-GB blob is never buffered in Python (the OOM vector). The
+    caller pre-checks the size against the remaining budget so this only ever streams an
+    in-budget blob."""
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "blob", sha],
+            stdout=fileobj, stderr=subprocess.PIPE, timeout=_GIT_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise StagingError(f"git cat-file blob: {e}") from e
+    if p.returncode != 0:
+        err = p.stderr.decode(errors="replace").strip()[:300]
+        raise StagingError(f"git cat-file blob exited {p.returncode}: {err}")
 
 
 def _is_dotgit(component: str) -> bool:
@@ -179,9 +252,14 @@ def stage_snapshot(repo_path: str | os.PathLike, tip: str, *,
 
 
 def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
-    entries = _parse_ls_tree(_git(repo, ["ls-tree", "-r", "-z", tip]))
     max_files = _int_env("MYNDAIX_STAGING_MAX_FILES", _MAX_FILES_DEFAULT)
     max_bytes = _int_env("MYNDAIX_STAGING_MAX_BYTES", _MAX_BYTES_DEFAULT)
+    # ls-tree output is read with a byte ceiling so a huge tree can't OOM before the
+    # count/size caps run. The ceiling scales with the file cap (a path is bounded well
+    # under 4 KiB) and never below the byte cap — generous vs any real repo, loud past it.
+    entries = _parse_ls_tree(
+        _git_capture_bounded(repo, ["ls-tree", "-r", "-z", tip],
+                             max(max_files * 4096, max_bytes)))
 
     expected = sum(1 for _, otype, _, _ in entries if otype == "blob")
     if expected > max_files:
@@ -257,11 +335,13 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
 
         if not _TIP_RE.fullmatch(sha):                 # blob sha feeds git argv — validate
             raise StagingError(f"non-hex blob sha for {path!r}: {sha!r}")
-        blob = _git(repo, ["cat-file", "blob", sha])   # VERBATIM bytes — no attr processing
-        # 120000 (symlink): the TARGET STRING becomes the regular file's content — inert,
-        # nothing to traverse. 100755: exec bit deliberately NOT reproduced (reviewers
-        # read; nothing needs to run).
-        total_bytes += len(blob)
+        # SIZE CHECK BEFORE READING (kilabz r4 HIGH): cat-file -s reads only the object
+        # header, so a hostile multi-GB blob is rejected against the byte budget BEFORE
+        # any content is read — never buffered into memory. 120000 (symlink): the blob
+        # bytes ARE the target string, written as inert regular-file content. 100755:
+        # exec bit deliberately NOT reproduced (reviewers read; nothing needs to run).
+        blob_size = _cat_file_size(repo, sha)
+        total_bytes += blob_size
         if total_bytes > max_bytes:
             raise StagingError(f"snapshot exceeds byte cap {max_bytes}")
         try:
@@ -275,9 +355,14 @@ def _export_tree(repo: Path, tip: str, rundir: Path) -> None:
             raise StagingError(f"create failed (duplicate/collision?) for {path!r}: {e}") from e
         try:
             with os.fdopen(fd, "wb") as f:
-                f.write(blob)
+                _cat_file_blob_to(repo, sha, f)        # stream git→fd, no Python buffer
+                f.flush()
+                actual = os.fstat(f.fileno()).st_size
         except OSError as e:
             raise StagingError(f"write failed for {path!r}: {e}") from e
+        if actual != blob_size:                        # truncation/mismatch → fail closed
+            raise StagingError(f"blob size mismatch for {path!r}: "
+                               f"wrote {actual}, expected {blob_size}")
         written += 1
 
     if written != expected:

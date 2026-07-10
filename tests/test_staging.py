@@ -351,6 +351,54 @@ def test_tip_validation_and_caps():
 
 # ---- teardown + reaper --------------------------------------------------------------
 
+def test_bounded_ls_tree_ceiling_fails_closed():
+    # kilabz r4 HIGH (softer half): ls-tree output is read with a byte ceiling so a huge
+    # tree can't OOM before the caps. A tiny ceiling must fail closed, not buffer it all.
+    repo = _mkrepo()
+    try:
+        for i in range(5):
+            (repo / f"f{i}.txt").write_text("x\n")
+        tip = _commit_all(repo)
+        # full read succeeds under a generous ceiling
+        out = staging._git_capture_bounded(repo, ["ls-tree", "-r", "-z", tip], 1 << 20)
+        assert b"f0.txt" in out
+        # a 2-byte ceiling is exceeded → StagingError (not a truncated silent result)
+        try:
+            staging._git_capture_bounded(repo, ["ls-tree", "-r", "-z", tip], 2)
+            raise AssertionError("ceiling not enforced")
+        except StagingError:
+            pass
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_blob_over_cap_rejected_before_read():
+    # the DoS fix: a blob whose SIZE exceeds the remaining budget is rejected by the
+    # cheap cat-file -s probe BEFORE its content is read, and nothing is staged.
+    repo, root = _mkrepo(), _tmproot()
+    os.environ["MYNDAIX_STAGING_MAX_BYTES"] = "16"
+    try:
+        (repo / "big.txt").write_bytes(b"y" * 4096)      # 4 KiB > 16 B cap
+        tip = _commit_all(repo)
+        try:
+            staging.stage_snapshot(repo, tip, root=root)
+            raise AssertionError("over-cap blob not rejected")
+        except StagingError:
+            pass
+        assert not list(root.iterdir())                  # partial export removed
+        # a normal blob under the cap still streams correctly (verbatim)
+        os.environ["MYNDAIX_STAGING_MAX_BYTES"] = "1048576"
+        (repo / "ok.txt").write_bytes(b"z" * 100)
+        tip2 = _commit_all(repo, "c2")
+        snap = staging.stage_snapshot(repo, tip2, root=root)
+        assert (snap / "ok.txt").read_bytes() == b"z" * 100
+        assert (snap / "big.txt").read_bytes() == b"y" * 4096
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_MAX_BYTES", None)
+        for d in (repo, root):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def test_teardown_refuses_non_review_paths():
     root = _tmproot()
     os.environ["MYNDAIX_STAGING_ROOT"] = str(root)
