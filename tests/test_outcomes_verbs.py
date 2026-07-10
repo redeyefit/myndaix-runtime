@@ -44,7 +44,7 @@ def _present(**path_to_lines):
     lines directly: _present(**{"src/a.py": ["return None", "x = 1"]}) -> {path: {hash,hash}}. Given []
     -> an empty set = CONFIRMED-absent file -> its findings close (§6). A path OMITTED entirely, or
     passed as None, is UNDETERMINED (transient git error) -> its findings are NOT closed (fail-closed)."""
-    return {path: {outcomes.line_hash(line) for line in lines}
+    return {path: (None if lines is None else {outcomes.line_hash(line) for line in lines})
             for path, lines in path_to_lines.items()}
 
 
@@ -113,9 +113,11 @@ async def test_close_undetermined_presence_does_not_close(led):
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
                               [f], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
-    # transient: present[src/a.py] = None -> the open finding must STAY open (not fabricated fixed)
+    # transient: present[src/a.py] = None -> the open finding must STAY open (not fabricated fixed).
+    # Routed through _present (kilabz: injecting the raw dict bypassed the helper's documented
+    # None-pass-through, leaving that contract unexercised).
     res = await led.record_findings("repoA", "main", "tip2", "play2", ["src/a.py"],
-                                    [], {"src/a.py": None})
+                                    [], _present(**{"src/a.py": None}))
     ok(res["closed"] == 0, "undetermined presence (None) does NOT close (no fabricated applied_fixed)")
     row = await _current(led, fk, "kilabz")
     ok(row["outcome"] == "open", "the finding is still OPEN after a transient git error")

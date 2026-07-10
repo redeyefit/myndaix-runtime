@@ -134,10 +134,12 @@ def _fake_git(files):
     real git), so file_line_hashes can positively confirm a delete vs a transient blob-read failure."""
     def run(argv):
         cmd = argv[2]                                   # ["-C", repo, <cmd>, ...]
-        if cmd in ("cat-file", "show"):                 # resolve_and_hash uses `show`; file_line_hashes
-            return files.get(argv[-1].split(":", 1)[1]) # uses `cat-file blob`; both read a blob by <tip>:<path>
+        if cmd == "cat-file":                           # BOTH primitives read a blob by <tip>:<path>
+            return files.get(argv[-1].split(":", 1)[1]) # via `cat-file blob` (never `show`)
         if cmd == "ls-tree":                            # "<mode> <type> <sha>\t<path>" iff it's in the tree
             path = argv[-1]
+            assert path.startswith(":(literal)"), "probe must use literal pathspec magic"
+            path = path[len(":(literal)"):]
             return (f"100644 blob deadbeef\t{path}\n") if path in files else ""
         return None
     return run
@@ -215,8 +217,8 @@ def test_file_line_hashes_no_run_git_is_none():
        "no run_git injected -> None (can't determine -> fail-closed, don't close)")
 
 
-def test_file_line_hashes_transient_show_failure_does_not_close():
-    # core-audit HIGH: `git show` fails (None) but the path EXISTS at tip (ls-tree lists it) -> the
+def test_file_line_hashes_transient_read_failure_does_not_close():
+    # core-audit HIGH: the blob read fails (None) but the path EXISTS at tip (ls-tree lists it) -> the
     # object was UNREADABLE (transient/mid-gc/lock), NOT deleted -> None, so the caller leaves the
     # finding OPEN rather than fabricating an applied_fixed.
     def stub(argv):
@@ -266,6 +268,53 @@ def test_file_line_hashes_reads_objects_not_worktree():
     files = {"tests/test_outcomes.py": "FAKE OBJECT LINE\n"}
     got = O.file_line_hashes("/repo", "tip", "tests/test_outcomes.py", run_git=_fake_git(files))
     ok(got == {O.line_hash("FAKE OBJECT LINE")}, "content comes from the git-object stub, not disk")
+
+
+def test_both_primitives_read_blobs_via_cat_file_never_show():
+    # `git show <tip>:<path>` SUCCEEDS on a non-blob (prints a tree listing) — hashing that output
+    # is the core-audit-B bug class. Pin the exact read argv for BOTH primitives.
+    seen = []
+    def spy(argv):
+        seen.append(list(argv))
+        return None
+    O.resolve_and_hash("/repo", "tip", "src/a.py", 1, [(1, 1)], run_git=spy)
+    O.file_line_hashes("/repo", "tip", "src/a.py", run_git=spy)
+    reads = [a for a in seen if a[2] not in ("ls-tree",)]
+    ok(len(reads) == 2 and all(a[2:4] == ["cat-file", "blob"] for a in reads),
+       "both primitives read git objects via `cat-file blob`, never `show`")
+
+
+def test_file_line_hashes_pathspec_magic_filename_probes_literal():
+    # A filename starting with ':' is parsed as PATHSPEC MAGIC by a bare `ls-tree -- <path>` probe and
+    # matches NOTHING (verified against real git 2026-07-06) — the probe would then read an EXISTING
+    # file as "absent" and FABRICATE an applied_fixed close whenever the blob read blips. The probe
+    # must wrap the path in `:(literal)`; with it, git returns the real entry.
+    def stub(argv):
+        if argv[2] == "cat-file":
+            return None                                 # transient blob-read failure
+        if argv[2] == "ls-tree":
+            p = argv[-1]
+            ok(p == ":(literal):weird.py", "probe wraps the exact filename in :(literal)")
+            return "100644 blob abc123\t:weird.py\n"    # real git WITH literal magic: entry found
+        return None
+    ok(O.file_line_hashes("/repo", "tip", ":weird.py", run_git=stub) is None,
+       "a ':'-named file that exists but is transiently unreadable stays OPEN (no fabricated close)")
+
+
+def test_file_line_hashes_whitespace_filename_stays_open():
+    # Plain regression pin for a whitespace-NAMED file. (An oracle claim that `.strip()` could
+    # collapse this entry to "" and fabricate a close was REFUTED — the line always carries
+    # "<mode> <type> <sha>" so it parses to type 'blob' under strip OR rstrip; kilabz's re-review
+    # caught the original test asserting a fix for a non-bug. Kept as a behavior pin: an existing
+    # whitespace-named blob with a transient read failure must stay OPEN.)
+    def stub(argv):
+        if argv[2] == "cat-file":
+            return None                                 # transient blob-read failure
+        if argv[2] == "ls-tree":
+            return "100644 blob abc123\t  \n"           # the file's NAME is two spaces
+        return None
+    ok(O.file_line_hashes("/repo", "tip", "  ", run_git=stub) is None,
+       "a whitespace-named existing blob with a transient read failure stays OPEN")
 
 
 def main():
