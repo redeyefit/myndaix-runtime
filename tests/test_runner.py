@@ -205,6 +205,117 @@ def test_staging_cwd_ignores_stray_worktree(monkeypatch=None):
         shutil.rmtree(stray_wt, ignore_errors=True)
 
 
+# -- staging_cwd "optional" (kilabz/lobster reviewers, mxr-review-context D3): workdir
+#    ABSENT → scratch cwd (exactly the pre-staging review — NOT terminal: the oracle r1
+#    truthy-gate trap); PRESENT-but-invalid → TERMINAL in both modes; the worktree is
+#    NEVER used once staging_cwd is declared (kilabz r1 HIGH pin).
+
+def _optional_spec():
+    return AgentSpec(agent_id="reviewer", reach=Reach.CLI, authority=Authority.RESPONDER,
+                     model="none", role="test",
+                     adapter={"kind": "cli", "argv": ["/bin/pwd"], "prompt_channel": "stdin",
+                              "staging_cwd": "optional"})
+
+
+def test_staging_optional_absent_gets_scratch_not_terminal():
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        for ctx in (None, {}, {"workdir": None}):
+            job = _job()
+            job.context = ctx
+            r = asyncio.run(runner.invoke_cli(_optional_spec(), job))
+            assert r.status is ResultStatus.OK, f"ctx={ctx!r}: {r.text}"
+            ran_in = os.path.realpath(r.text.strip())
+            assert os.path.basename(ran_in).startswith("mdx-cli-cwd."), \
+                f"optional+absent must run in a scratch cwd, ran in {ran_in}"
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+
+
+def test_staging_optional_absent_never_uses_stray_worktree():
+    # kilabz r1 HIGH: once staging_cwd is declared (either mode), the cwd is
+    # staged-or-scratch — a stray repo_id dispatch (worker sets worktree_path) must not
+    # put a reviewer in a live worktree.
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    stray_wt = tempfile.mkdtemp(prefix="mdx-test-straywt.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        job = _job()
+        job.worktree_path = stray_wt
+        job.context = {}
+        r = asyncio.run(runner.invoke_cli(_optional_spec(), job))
+        assert r.status is ResultStatus.OK, r.text
+        ran_in = os.path.realpath(r.text.strip())
+        assert ran_in != os.path.realpath(stray_wt), "reviewer ran in the live worktree"
+        assert os.path.basename(ran_in).startswith("mdx-cli-cwd.")
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+        shutil.rmtree(stray_wt, ignore_errors=True)
+
+
+def test_staging_optional_valid_workdir_runs_there():
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        wd = os.path.join(sroot, "review-20260101000000-abcd")
+        os.mkdir(wd)
+        job = _job()
+        job.context = {"workdir": wd}
+        r = asyncio.run(runner.invoke_cli(_optional_spec(), job))
+        assert r.status is ResultStatus.OK, r.text
+        assert os.path.realpath(r.text.strip()) == os.path.realpath(wd)
+        assert os.path.isdir(wd)                     # runner must NOT remove the staged dir
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+
+
+def test_staging_optional_present_but_invalid_is_terminal():
+    # present-but-invalid → TERMINAL in BOTH modes: a bad staged path is a bug or an
+    # attack — never a silent downgrade to scratch. Matrix: outside-root, == root,
+    # non-dir, symlink-escape, non-string, empty string.
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    outside = tempfile.mkdtemp(prefix="mdx-test-outside.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        nondir = os.path.join(sroot, "review-afile")
+        with open(nondir, "w") as f:
+            f.write("x")
+        link = os.path.join(sroot, "review-link")     # inside by name, outside by target
+        os.symlink(outside, link)
+        for bad in (outside, sroot, os.path.join(sroot, "..", "esc"), nondir, link,
+                    "", 123, {"nested": "dict"}):
+            job = _job()
+            job.context = {"workdir": bad}
+            r = asyncio.run(runner.invoke_cli(_optional_spec(), job))
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, \
+                f"workdir {bad!r} must be TERMINAL, got {r.status}"
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_staging_required_absent_still_terminal():
+    # curator regression pin: required mode (True) keeps failing CLOSED on an absent
+    # workdir — the optional mode must not have loosened it.
+    sroot = tempfile.mkdtemp(prefix="mdx-test-staging.")
+    os.environ["MYNDAIX_STAGING_ROOT"] = sroot
+    try:
+        for ctx in (None, {}, {"workdir": None}):
+            job = _job()
+            job.context = ctx
+            r = asyncio.run(runner.invoke_cli(_staging_spec(), job))
+            assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL, \
+                f"required+absent ctx={ctx!r} must stay TERMINAL"
+    finally:
+        os.environ.pop("MYNDAIX_STAGING_ROOT", None)
+        shutil.rmtree(sroot, ignore_errors=True)
+
+
 def test_staging_cwd_flag_absent_ignores_workdir():
     # the invariant: an agent WITHOUT staging_cwd never honors context.workdir — it still gets a
     # fresh scratch cwd (PR #39). Prevents a future roster row from opting into an arbitrary cwd.

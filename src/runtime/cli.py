@@ -47,10 +47,22 @@ def _resolve_sync_wait(agent: str) -> float:
 async def submit(agent: str, task: str, *, context: Optional[dict] = None,
                  repo_id: Optional[str] = None, base_ref: Optional[str] = None,
                  timeout_s: Optional[float] = None) -> int:
+    rc, _terminal = await run_job(agent, task, context=context, repo_id=repo_id,
+                                  base_ref=base_ref, timeout_s=timeout_s)
+    return rc
+
+
+async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
+                  repo_id: Optional[str] = None, base_ref: Optional[str] = None,
+                  timeout_s: Optional[float] = None) -> tuple[int, bool]:
+    """Submit + sync-wait + print the reply. Returns (rc, job_terminal): job_terminal is
+    False ONLY when the sync wait expired with the job still in flight — the review verb
+    gates staging teardown on it (a job can outlive the wait; deleting the staged cwd on
+    sync-timeout would yank a RUNNING reviewer's cwd — the age-reaper owns that case)."""
     if agent not in REGISTRY:
         roster = ", ".join(sorted(REGISTRY))
         print(f"unknown agent '{agent}'. roster: {roster}", file=sys.stderr)
-        return 2
+        return 2, True
     if timeout_s is None:
         timeout_s = _resolve_sync_wait(agent)
 
@@ -78,7 +90,7 @@ async def submit(agent: str, task: str, *, context: Optional[dict] = None,
             await asyncio.sleep(0.3)
         else:
             print("timed out (is the pool running? `python3 -m runtime.serve`)", file=sys.stderr)
-            return 1
+            return 1, False
 
         if st["status"] == "done":
             reply = next((o["body"] for o in (st.get("outbound") or [])), None)
@@ -87,7 +99,7 @@ async def submit(agent: str, task: str, *, context: Optional[dict] = None,
             for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
                 if o["status"] == "pending":
                     await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
-            return 0
+            return 0, True
 
         # failed/dead: surface WHY (the agent's error output, from the attempt)
         err = next((a.get("text") for a in (st.get("attempts") or [])
@@ -95,7 +107,7 @@ async def submit(agent: str, task: str, *, context: Optional[dict] = None,
         if err:
             print(err.strip(), file=sys.stderr)
         print(f"(job {st['status']})", file=sys.stderr)
-        return 1
+        return 1, True
     finally:
         await led.close()
 
@@ -124,6 +136,10 @@ def _build_context(args: argparse.Namespace) -> dict:
             raise SystemExit("--end-card must be an http(s) URL (local paths are not accepted; "
                              "host the image or upload it first)")
         ctx["end_card_url"] = ec
+    if getattr(args, "staged_workdir", None):
+        # pass-through only: the RUNNER is the trust boundary (realpath strictly inside
+        # $MYNDAIX_STAGING_ROOT, staging-cwd adapters only — fail-closed TERMINAL there).
+        ctx["workdir"] = args.staged_workdir
     return ctx
 
 
@@ -251,6 +267,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         from runtime import curate
         return curate.main(["curate", *raw[1:]])
 
+    # `mxr review <agent> --repo <path|basename> ...` — the review-context verb
+    # (docs/mxr-review-context-design.md D6): stage a de-linked read-only snapshot of the
+    # reviewed tip as the CONFINED reviewer's cwd, build the objective-above-fence prompt
+    # with the nonce-fenced range diff, dispatch, tear down. Replaces the hand-embed
+    # `mxr kilabz "$(cat prompt+diff)"` workflow end-to-end.
+    if raw and raw[0] == "review":
+        from runtime import review
+        return review.main(["review", *raw[1:]])
+
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')
@@ -272,6 +297,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="repo bucket id for per-repo concurrency (omitted -> cap-exempt)")
     p.add_argument("--base-ref", metavar="REF", dest="base_ref",
                    help="base git ref/SHA the work is anchored to (e.g. the reviewed tip)")
+    p.add_argument("--staged-workdir", metavar="DIR", dest="staged_workdir",
+                   help="a staging dir the CALLER created for this job's cwd — honored ONLY "
+                        "by staging-cwd adapters (kilabz/lobster/curator), MUST resolve "
+                        "strictly inside $MYNDAIX_STAGING_ROOT, and fails the job TERMINAL "
+                        "otherwise (it cannot select an arbitrary cwd)")
     args = p.parse_args(raw)
     return asyncio.run(submit(args.agent, args.task, context=_build_context(args),
                               repo_id=args.repo_id, base_ref=args.base_ref))
