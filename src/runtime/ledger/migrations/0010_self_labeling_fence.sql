@@ -25,6 +25,24 @@ ALTER TABLE finding_outcome ADD  CONSTRAINT finding_outcome_outcome_source_check
     ('review_raised','auto_fix_landed','auto_git_revert','human_dismiss','ttl_sweep',
      'panel_proposed','exec_verified','human_confirm'));
 
+-- (1b) PAIR check: the views TRUST outcome_source (finding_current_human filters human sources;
+--      finding_labelqueue treats any 'expired' as a tombstone; finding_precision_promoted counts
+--      confirmed_real). Independent value-CHECKs alone would let a RAW/buggy INSERT forge an illegal
+--      pair — e.g. ('panel_proposed','expired') to tombstone a finding via a MACHINE, or
+--      ('review_raised','confirmed_real') to gate — breaking the fence outside the verbs. This closed
+--      pair algebra makes the DB back up the §5 verb matrix (kilabz code-review HIGH). Non-breaking:
+--      every existing + verb-minted row matches exactly one pair.
+ALTER TABLE finding_outcome DROP CONSTRAINT IF EXISTS finding_outcome_source_outcome_pair;
+ALTER TABLE finding_outcome ADD  CONSTRAINT finding_outcome_source_outcome_pair CHECK (
+       (outcome_source = 'review_raised'   AND outcome = 'open')
+    OR (outcome_source = 'auto_fix_landed' AND outcome = 'applied_fixed')
+    OR (outcome_source = 'auto_git_revert' AND outcome = 'reverted')
+    OR (outcome_source = 'human_dismiss'   AND outcome IN ('dismissed_false_positive','dismissed_wontfix'))
+    OR (outcome_source = 'ttl_sweep'       AND outcome = 'expired')
+    OR (outcome_source = 'human_confirm'   AND outcome = 'confirmed_real')
+    OR (outcome_source = 'exec_verified'   AND outcome = 'exec_real_prior')
+    OR (outcome_source = 'panel_proposed'  AND outcome IN ('panel_real','panel_fp')));
+
 -- (2) Source-aware idempotency: add outcome_source to the unique tuple so cross-source events can
 --     never collide or silently shadow a human promotion. New index name; drop the 4-col one.
 --     (The four existing ON CONFLICT writers are updated to the 5-col target in postgres_store.py.)

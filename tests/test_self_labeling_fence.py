@@ -18,6 +18,8 @@ import inspect
 import os
 import uuid
 
+import asyncpg
+
 from runtime.ledger.postgres_store import PostgresLedger
 
 DSN = os.environ.get("LEDGER_TEST_DSN", "postgresql://localhost/runtime_test")
@@ -209,6 +211,58 @@ async def test_verbs_require_an_existing_finding(led):
     assert r.get("error") == "no such finding"
     r = await led.confirm_outcome(FK2[:16], "kilabz", "real", principal_role="human")
     assert r.get("error") == "no finding matches that prefix"
+
+
+async def test_human_dismiss_is_also_gated(led):
+    # kilabz code-review BLOCKER: the pre-existing human_dismiss writes a human-terminal (gating +
+    # queue-terminal) row, so it takes the SAME principal gate as confirm_outcome — not a fourth
+    # unguarded human-label writer.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+    for role in ("labeler", "exec_oracle", "reviewer", ""):
+        try:
+            await led.human_dismiss(FK[:16], "kilabz", "fp", principal_role=role)
+            raise AssertionError(f"human_dismiss allowed non-human role {role!r}")
+        except PermissionError:
+            pass
+    r = await led.human_dismiss(FK[:16], "kilabz", "fp", principal_role="human")
+    assert r["dismissed"] == 1 and not await _in_queue(led)
+
+
+async def test_pair_check_rejects_illegal_source_outcome(led):
+    # kilabz code-review HIGH: the DB pair-CHECK backs up the verb matrix so even a RAW insert can't
+    # forge an illegal (source, outcome) that the trusting views would mishandle — e.g. a MACHINE
+    # source with a lifecycle (expired) or gating (confirmed_real/dismissed_*) outcome.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        for src, outc in (("panel_proposed", "expired"),          # machine -> tombstone (queue)
+                          ("review_raised", "confirmed_real"),    # machine -> gating
+                          ("exec_verified", "dismissed_false_positive"),
+                          ("panel_proposed", "open"),
+                          ("human_confirm", "panel_real")):
+            raised = False
+            try:
+                await _seed(con, source=src, outcome=outc, source_event=f"bad:{src}:{outc}")
+            except asyncpg.CheckViolationError:
+                raised = True
+            assert raised, f"pair CHECK let illegal ({src!r},{outc!r}) through"
+
+
+async def test_ttl_expires_a_machine_current_unlabeled_finding(led):
+    # kilabz code-review MEDIUM: a machine label becomes latest-by-seq in finding_current, so an
+    # 'open'-only sweep would MISS an unlabeled finding and strand it in the queue forever. The queue
+    # sweep (age = raise-time) still tombstones it.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+        await con.execute(
+            "UPDATE finding_outcome SET created_at = now() - interval '99 days' WHERE finding_key=$1", FK)
+    await led.propose_outcome(FK, "kilabz", "real", principal_role="labeler", play="p1")
+    assert await _in_queue(led), "an unlabeled finding stays in the queue after a machine label"
+    n = await led.expire_open(30)
+    assert n == 1, "TTL must tombstone a machine-CURRENT unlabeled finding (not just an 'open' one)"
+    assert not await _in_queue(led)
 
 
 async def test_consumer_proof_no_code_reads_the_bare_gating_name(led):

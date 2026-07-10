@@ -208,7 +208,7 @@ async def dismiss(prefix: str, kind: str) -> int:
         log(f"ledger connect failed ({e})")
         return 0
     try:
-        res = await led.human_dismiss(prefix, "all", kind)
+        res = await led.human_dismiss(prefix, "all", kind, principal_role="admin")
     except ValueError as e:                      # bad kind (guarded before this call) / bad family
         log(f"dismiss error: {e}"); return 0
     except Exception as e:

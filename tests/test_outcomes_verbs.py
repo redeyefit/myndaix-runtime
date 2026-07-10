@@ -195,7 +195,7 @@ async def test_human_dismiss_and_sticky_reopen(led):
     pres = _present(**{"src/a.py": ["return None"]})
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f], pres)
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
-    res = await led.human_dismiss(fk[:12], "kilabz", "fp")
+    res = await led.human_dismiss(fk[:12], "kilabz", "fp", principal_role="human")
     ok(res.get("dismissed") == 1 and res["finding_key"] == fk, "human_dismiss wrote one fp row")
     row = await _current(led, fk, "kilabz")
     ok(row["outcome"] == "dismissed_false_positive", "current state is the human dismissal")
@@ -215,14 +215,14 @@ async def test_human_dismiss_correct_mislabel(led):
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
                               [f], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
-    r1 = await led.human_dismiss(fk[:12], "kilabz", "fp")
+    r1 = await led.human_dismiss(fk[:12], "kilabz", "fp", principal_role="human")
     ok(r1["dismissed"] == 1, "first dismissal (fp) wrote a row")
     ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_false_positive", "labelled fp")
     prec_fp = await led._pool.fetchval(
         "SELECT dismissed_false_positive FROM finding_precision_raw WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
     ok(prec_fp == 1, "precision view shows 1 fp before the correction")
     # correct it to wontfix
-    r2 = await led.human_dismiss(fk[:12], "kilabz", "wontfix")
+    r2 = await led.human_dismiss(fk[:12], "kilabz", "wontfix", principal_role="human")
     ok(r2["dismissed"] == 1, "the correction (wontfix) wrote a NEW row (distinct kind source_event)")
     ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_wontfix",
        "current state is the CORRECTED label (higher-seq human row wins)")
@@ -230,7 +230,7 @@ async def test_human_dismiss_correct_mislabel(led):
         "SELECT dismissed_false_positive FROM finding_precision_raw WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
     ok((prec_fp2 or 0) == 0, "the correction drops the fp count in finding_precision (current-state read)")
     # re-issuing the SAME kind is an idempotent no-op
-    r3 = await led.human_dismiss(fk[:12], "kilabz", "wontfix")
+    r3 = await led.human_dismiss(fk[:12], "kilabz", "wontfix", principal_role="human")
     ok(r3["dismissed"] == 0, "re-issuing the same kind is an idempotent no-op (0 written)")
 
 
@@ -240,7 +240,7 @@ async def test_human_terminal_precedence_over_later_machine_row(led):
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
                               [f], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
-    await led.human_dismiss(fk[:12], "kilabz", "wontfix")
+    await led.human_dismiss(fk[:12], "kilabz", "wontfix", principal_role="human")
     # force a LATER machine row (higher seq) for the same key directly — a close event that races in.
     await led._pool.execute(
         """INSERT INTO finding_outcome (id, finding_key, repo_id, ref, rule_tag, reviewer_family,
@@ -258,7 +258,7 @@ async def test_human_dismiss_fail_closed_on_short_prefix(led):
     f = _finding("fail-open", "src/a.py", "return None", "kilabz")
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"], [f])
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", f["line_hash"])
-    res = await led.human_dismiss(fk[:8], "kilabz", "fp")   # < 12 hex chars
+    res = await led.human_dismiss(fk[:8], "kilabz", "fp", principal_role="human")   # < 12 hex chars
     ok("error" in res, "a <12-hex prefix is refused (fail-closed)")
     row = await _current(led, fk, "kilabz")
     ok(row["outcome"] == "open", "nothing was dismissed on the short-prefix refusal")
@@ -276,7 +276,7 @@ async def test_human_dismiss_fail_closed_on_ambiguous_prefix(led):
                    path, line_hash, source_event, tip_sha, outcome, outcome_source)
                VALUES (gen_random_uuid(), $1, 'repoA', 'main', 'fail-open', 'kilabz', 'src/a.py',
                        'h', 'review:x', 'tip', 'open', 'review_raised')""", fk)
-    res = await led.human_dismiss(shared, "kilabz", "fp")
+    res = await led.human_dismiss(shared, "kilabz", "fp", principal_role="human")
     ok("error" in res and len(res.get("candidates", [])) == 2,
        "an ambiguous prefix is refused and BOTH colliding full keys are returned (fail-closed)")
 
@@ -292,7 +292,7 @@ async def test_cross_file_collision_does_not_merge(led):
     kb = outcomes.finding_key("repoA", "fail-open", "src/b.py", fb["line_hash"])
     ok(ka != kb, "path-in-key gives them DISTINCT finding_keys")
     # dismiss a.py's finding; b.py's must stay open (histories not merged).
-    await led.human_dismiss(ka[:12], "kilabz", "fp")
+    await led.human_dismiss(ka[:12], "kilabz", "fp", principal_role="human")
     ok((await _current(led, ka, "kilabz"))["outcome"] == "dismissed_false_positive", "a.py finding dismissed")
     ok((await _current(led, kb, "kilabz"))["outcome"] == "open", "b.py finding UNAFFECTED (separate history)")
 
@@ -320,7 +320,7 @@ async def test_per_family_dismissal_independent(led):
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
                               [fk_kila, fk_orac], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", fk_kila["line_hash"])
-    await led.human_dismiss(fk[:12], "kilabz", "fp")   # dismiss ONLY kilabz's
+    await led.human_dismiss(fk[:12], "kilabz", "fp", principal_role="human")   # dismiss ONLY kilabz's
     ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_false_positive", "kilabz dismissed")
     ok((await _current(led, fk, "oracle"))["outcome"] == "open", "oracle's finding is UNAFFECTED (open)")
 
@@ -333,7 +333,7 @@ async def test_dismiss_all_families(led):
     await led.record_findings("repoA", "main", "tip1", "play1", ["src/a.py"],
                               [fk_kila, fk_orac], _present(**{"src/a.py": ["return None"]}))
     fk = outcomes.finding_key("repoA", "fail-open", "src/a.py", fk_kila["line_hash"])
-    res = await led.human_dismiss(fk[:12], "all", "wontfix")
+    res = await led.human_dismiss(fk[:12], "all", "wontfix", principal_role="human")
     ok(res["dismissed"] == 2, "'all' dismisses both families currently open on the key")
     ok((await _current(led, fk, "kilabz"))["outcome"] == "dismissed_wontfix", "kilabz dismissed")
     ok((await _current(led, fk, "oracle"))["outcome"] == "dismissed_wontfix", "oracle dismissed")
@@ -379,7 +379,7 @@ async def test_outcome_stats(led):
     f2 = _finding("fail-open", "src/b.py", "line two", "kilabz")
     await led.record_findings("repoA", "main", "t1", "p1", ["src/a.py", "src/b.py"], [f1, f2])
     k2 = outcomes.finding_key("repoA", "fail-open", "src/b.py", f2["line_hash"])
-    await led.human_dismiss(k2[:12], "kilabz", "fp")                 # f2 -> fp
+    await led.human_dismiss(k2[:12], "kilabz", "fp", principal_role="human")                 # f2 -> fp
     # f1's line ("line one") is GONE from src/a.py at t2 (present_hashes omits it) -> applied_fixed.
     await led.record_findings("repoA", "main", "t2", "p2", ["src/a.py"], [], {"src/a.py": set()})
     stats = await led.outcome_stats()
