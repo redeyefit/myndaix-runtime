@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # test-xreview.sh — smoke test for xreview.sh (phase-routed manual cross-family review) with a STUBBED
-# mxr. Proves the routing AND the security invariants folded from two rounds of dogfooding:
-#   CODE mode gates on kilabz via `mxr review` (staged snapshot); a kilabz failure is a HARD stop;
-#   oracle is a degradable weak backup that gets the REAL fenced diff; a staging DEGRADATION is
-#   surfaced (not swallowed); raw reviews print before synthesis; the upstream-input fence nonce and
-#   the downstream-synthesis fence nonce DIFFER (no fence escape into lobster); reviewer output is
-#   control-char sanitized; a missing objective-file does not abort the gate.
+# mxr. Proves the routing AND the security/robustness invariants folded from THREE rounds of dogfooding:
+#   CODE mode gates on kilabz via `mxr review` (staged snapshot) with a SHA-PINNED range (immune to ref
+#   movement); a kilabz failure is a HARD stop that surfaces the gate's stderr root-cause; oracle is a
+#   degradable weak backup that gets the REAL fenced diff on the IDENTICAL SHAs, and is SKIPPED LOUDLY
+#   (never silently) when the diff would blow ARG_MAX; a staging DEGRADATION is surfaced; raw reviews
+#   print before synthesis; the upstream-input fence nonce and the downstream-synthesis nonce DIFFER (no
+#   fence escape into lobster); reviewer output is control-char (ESC + CR) sanitized.
 #   DESIGN mode leads with oracle, degrades if one is down, but FAILS CLOSED if BOTH are down.
 # Run: bash orchestrator/test-xreview.sh
 set -uo pipefail
@@ -19,7 +20,7 @@ cat > "$FAKE/.local/bin/mxr" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$HOME/mxr-argv.log" 2>/dev/null || true
 if [[ "${1:-}" == "review" ]]; then            # `mxr review <agent> --repo .. --range ..` = code gate
-  [[ -n "${STUB_KILABZ_FAIL:-}" ]] && exit 1
+  [[ -n "${STUB_KILABZ_FAIL:-}" ]] && { printf 'GATE-ROOT-CAUSE-XYZ\n' >&2; exit 1; }   # emit a root cause on stderr
   [[ -n "${STUB_DEGRADE:-}" ]] && printf 'kilabz review ran WITHOUT snapshot (staging failed, inline-only)\n' >&2
   printf '%s\n' "${STUB_KILABZ:-KILABZ code review: real bug at line 1}"; exit 0
 fi
@@ -48,8 +49,8 @@ c="$HOME/.oc"; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" 
 OSTUB
 chmod +x "$FAKE/.local/bin/openssl"
 
-# a REAL throwaway git repo so code mode's _repo_path resolves (abs path -> has .git) and the
-# oracle-backup `git diff <base> <head>` produces a real, non-empty diff to fence.
+# a REAL throwaway git repo so code mode's _repo_path resolves (abs path -> has .git), rev-parse pins
+# the range to SHAs, and the oracle-backup `git diff <base> <head>` produces a real, non-empty diff.
 REPO="$ROOT/repo"; mkdir -p "$REPO"
 git -C "$REPO" init -q
 printf 'base-line\n' > "$REPO/f.txt"; git -C "$REPO" add f.txt
@@ -62,62 +63,71 @@ DOC="$ROOT/design.md"; printf '# a design\n\nthesis: X\n' > "$DOC"
 run(){ env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" bash "$SCRIPT" "$@" 2>"$ROOT/err"; }
 log(){ echo "$FAKE/mxr-argv.log"; }
 ck(){ if grep -q "$2" "$1" 2>/dev/null; then echo "  ok: $3"; PASS=$((PASS+1)); else echo "  FAIL: $3"; FAIL=$((FAIL+1)); fi; }
+cke(){ if grep -Eq "$2" "$1" 2>/dev/null; then echo "  ok: $3"; PASS=$((PASS+1)); else echo "  FAIL: $3"; FAIL=$((FAIL+1)); fi; }
 ckx(){ if [[ "$1" == "$2" ]]; then echo "  ok: $3"; PASS=$((PASS+1)); else echo "  FAIL: $3 (rc $1 != $2)"; FAIL=$((FAIL+1)); fi; }
-okv(){ if eval "$1"; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2"; FAIL=$((FAIL+1)); fi; }
+cko(){ if echo "$1" | grep -q "$2"; then echo "  ok: $3"; PASS=$((PASS+1)); else echo "  FAIL: $3"; FAIL=$((FAIL+1)); fi; }
 
-echo "1. code mode: kilabz GATE runs via 'mxr review' (staged snapshot), oracle gets the REAL fenced diff, verdict printed"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "1. code mode: kilabz GATE via 'mxr review' (SHA-PINNED range), oracle gets the REAL fenced diff, verdict printed"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(run code "$REPO" "$RANGE")"; ckx $? 0 "code review exits 0"
-  ck "$(log)" "review kilabz --repo $REPO --range $RANGE" "kilabz gate dispatched via mxr review (snapshot)"
-  ck "$(log)" "BEGIN UNTRUSTED pushed-diff" "oracle backup gets a nonce-fenced diff (finding #3, r1)"
+  ck "$(log)" "review kilabz --repo $REPO --range" "kilabz gate dispatched via mxr review (snapshot)"
+  cke "$(log)" "review kilabz --repo .* --range [0-9a-f]{7,}\.\.[0-9a-f]{7,}" "gate --range is SHA-pinned (r3 #2 — immune to ref movement)"
+  ck "$(log)" "BEGIN UNTRUSTED pushed-diff" "oracle backup gets a nonce-fenced diff"
   ck "$(log)" "head-line" "the fenced diff carries the real change (base->head)"
-  echo "$out" | grep -q "XREVIEW VERDICT (code)" && { echo "  ok: prints a synthesized code verdict"; PASS=$((PASS+1)); } || { echo "  FAIL: no code verdict"; FAIL=$((FAIL+1)); }
-  # raw reviews printed to stdout BEFORE the synthesized verdict (finding #4, r1) — survive a lobster failure
-  echo "$out" | grep -q "kilabz-review (authoritative" && { echo "  ok: raw kilabz review printed to stdout"; PASS=$((PASS+1)); } || { echo "  FAIL: raw review not printed"; FAIL=$((FAIL+1)); }
+  cko "$out" "XREVIEW VERDICT (code)" "prints a synthesized code verdict"
+  cko "$out" "kilabz-review (authoritative" "raw kilabz review printed to stdout (survives a lobster failure)"
 
-echo "2. code mode: the UPSTREAM-input nonce and the SYNTHESIS nonce DIFFER (finding #1, r2 — no fence escape into lobster)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "2. code mode: the UPSTREAM-input nonce and the SYNTHESIS nonce DIFFER (r2 HIGH — no fence escape into lobster)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   run code "$REPO" "$RANGE" >/dev/null
   distinct="$(grep -o 'nonce=nonce[0-9]*' "$(log)" | sort -u | wc -l | tr -d ' ')"
-  okv '[[ "$distinct" -ge 2 ]]' "at least 2 distinct fence nonces in play (got $distinct)"
+  ckx "$([[ "$distinct" -ge 2 ]] && echo ok)" "ok" "at least 2 distinct fence nonces in play (got $distinct)"
 
-echo "3. code mode: reviewer output is control-char sanitized on print (finding #3, r2)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
-  esc="$(printf '\033')"
-  out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_KILABZ="$(printf '\033[31mANSI-HACK\033[0m real bug')" bash "$SCRIPT" code "$REPO" "$RANGE" 2>/dev/null)"
-  echo "$out" | grep -q "ANSI-HACK" && { echo "  ok: review text content survives"; PASS=$((PASS+1)); } || { echo "  FAIL: review content lost"; FAIL=$((FAIL+1)); }
-  if printf '%s' "$out" | LC_ALL=C grep -q "$esc"; then echo "  FAIL: raw ESC/ANSI reached stdout"; FAIL=$((FAIL+1)); else echo "  ok: ESC/ANSI stripped from printed output"; PASS=$((PASS+1)); fi
+echo "3. code mode: reviewer output is control-char (ESC + CR) sanitized on print (r2/r3 #4)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+  esc="$(printf '\033')"; cr="$(printf '\r')"
+  out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_KILABZ="$(printf '\033[31mANSI-HACK\033[0m real\rREWRITE bug')" bash "$SCRIPT" code "$REPO" "$RANGE" 2>/dev/null)"
+  cko "$out" "ANSI-HACK" "review text content survives sanitization"
+  if printf '%s' "$out" | LC_ALL=C grep -q "$esc"; then echo "  FAIL: raw ESC reached stdout"; FAIL=$((FAIL+1)); else echo "  ok: ESC stripped from printed output"; PASS=$((PASS+1)); fi
+  if printf '%s' "$out" | LC_ALL=C grep -q "$cr"; then echo "  FAIL: raw CR reached stdout"; FAIL=$((FAIL+1)); else echo "  ok: CR stripped from printed output"; PASS=$((PASS+1)); fi
 
-echo "4. code mode: a kilabz failure is a HARD stop (the gate)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "4. code mode: an OVERSIZED diff SKIPS the oracle backup LOUDLY, never a silent ARG_MAX drop (r3 #1 HIGH)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+  out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" XREVIEW_DIFF_CAP=10 bash "$SCRIPT" code "$REPO" "$RANGE" 2>"$ROOT/err")"; ckx $? 0 "oversized-diff review still exits 0"
+  ck "$ROOT/err" "SKIPPING the oracle backup" "oversize skip warned LOUDLY on stderr"
+  cko "$out" "oracle backup SKIPPED" "verdict records the oracle skip (not silent)"
+  cko "$out" "XREVIEW VERDICT" "gate-only verdict still produced"
+
+echo "5. code mode: a kilabz failure is a HARD stop AND surfaces the gate's stderr root-cause (r3 #5)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_KILABZ_FAIL=1 bash "$SCRIPT" code "$REPO" "$RANGE" >/dev/null 2>"$ROOT/err"; ckx $? 2 "kilabz gate failure -> exit 2"
   ck "$ROOT/err" "code gate" "error names the code gate"
+  ck "$ROOT/err" "GATE-ROOT-CAUSE-XYZ" "gate stderr root-cause surfaced before the temp is deleted"
 
-echo "5. code mode: oracle down still produces a verdict (weak backup, review proceeds)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "6. code mode: oracle down still produces a verdict (weak backup, review proceeds)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_ORACLE_FAIL=1 bash "$SCRIPT" code "$REPO" "$RANGE" 2>/dev/null)"; ckx $? 0 "oracle-down code review still exits 0"
-  echo "$out" | grep -q "XREVIEW VERDICT" && { echo "  ok: verdict produced on the kilabz gate alone"; PASS=$((PASS+1)); } || { echo "  FAIL: no verdict when oracle down"; FAIL=$((FAIL+1)); }
+  cko "$out" "XREVIEW VERDICT" "verdict produced on the kilabz gate alone"
 
-echo "6. code mode: a staging DEGRADATION is surfaced LOUDLY, not swallowed (finding #1, r1)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "7. code mode: a staging DEGRADATION is surfaced LOUDLY, not swallowed (r1 #1)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_DEGRADE=1 bash "$SCRIPT" code "$REPO" "$RANGE" >/dev/null 2>"$ROOT/err"; ckx $? 0 "degraded gate still exits 0"
   ck "$ROOT/err" "DEGRADED" "staging degradation warned on stderr"
 
-echo "7. code mode: a MISSING objective-file does NOT abort the gate (finding #4, r2)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "8. code mode: a MISSING objective-file does NOT abort the gate (r2 #4)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(run code "$REPO" "$RANGE" /no/such/obj.txt)"; ckx $? 0 "missing objf still exits 0"
   if grep -q -- "--prompt-file" "$(log)"; then echo "  FAIL: passed --prompt-file for a missing objf"; FAIL=$((FAIL+1)); else echo "  ok: no --prompt-file for a missing objf"; PASS=$((PASS+1)); fi
 
-echo "8. code mode: an unresolvable repo is a usage error (exit 2)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "9. code mode: an unresolvable repo is a usage error (exit 2)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   run code /no/such/repo "$RANGE" >/dev/null 2>&1; ckx $? 2 "unresolvable repo -> exit 2"
 
-echo "9. design mode: oracle LEADS (dispatched), verdict printed, no snapshot verb"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "10. design mode: oracle LEADS (dispatched), verdict printed, no snapshot verb"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(run design "$DOC")"; ckx $? 0 "design review exits 0"
   if grep -q "oracle" "$(log)" && grep -q "kilabz" "$(log)"; then echo "  ok: both oracle (lead) + kilabz dispatched"; PASS=$((PASS+1)); else echo "  FAIL: design routing missing a family"; FAIL=$((FAIL+1)); fi
   if grep -q "^review " "$(log)"; then echo "  FAIL: design mode used the code snapshot verb"; FAIL=$((FAIL+1)); else echo "  ok: design mode embeds the doc (no snapshot verb)"; PASS=$((PASS+1)); fi
 
-echo "10. design mode: ONE reviewer down degrades (not a hard stop) — still exits 0 with a verdict"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "11. design mode: ONE reviewer down degrades (not a hard stop) — still exits 0 with a verdict"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_ORACLE_FAIL=1 bash "$SCRIPT" design "$DOC" 2>"$ROOT/err")"; ckx $? 0 "oracle-down design review degrades, exits 0"
   ck "$ROOT/err" "DEGRADED" "degradation warned loudly"
 
-echo "11. design mode: BOTH reviewers down -> FAIL CLOSED (finding #2, r2), no verdict"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+echo "12. design mode: BOTH reviewers down -> FAIL CLOSED (r2 #2), no verdict"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_ORACLE_FAIL=1 STUB_KILABZ_FAIL=1 bash "$SCRIPT" design "$DOC" >/dev/null 2>"$ROOT/err"; ckx $? 2 "both design reviewers down -> exit 2"
   ck "$ROOT/err" "both design reviewers" "error names the both-reviewer failure"
 
-echo "12. usage errors exit 2"; run bogus >/dev/null 2>&1; ckx $? 2 "bad mode -> exit 2"
+echo "13. usage errors exit 2"; run bogus >/dev/null 2>&1; ckx $? 2 "bad mode -> exit 2"
   run code "$REPO" not-a-range >/dev/null 2>&1; ckx $? 2 "code without a range -> exit 2"
   run design /no/such/doc >/dev/null 2>&1; ckx $? 2 "design without a real doc -> exit 2"
 

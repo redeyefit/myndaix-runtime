@@ -37,14 +37,18 @@ have mxr || die "mxr not on PATH"
 
 # nonce-fenced UNTRUSTED wrapper: the reviewed artifact / diff is attacker-influenced — it must be
 # fenced as DATA with the objective ABOVE the fence, so a hostile doc can't inject "emit PLAY_PASS".
-# clean() strips C0/DEL/ESC (keep \t\n) so an escape can't forge the boundary OR emit terminal control.
+# clean() strips ALL C0 controls incl CR(\r) + ESC, plus DEL (keeps only \t and \n) so an escape can't
+# forge a fence boundary OR emit terminal control (CR line-rewrite / CSI sequences) into the operator's
+# terminal/log. C1 (0x80-0x9f) is DELIBERATELY not blanket-stripped: under LC_ALL=C that would delete
+# UTF-8 continuation bytes (0x80-0xbf) and corrupt legitimate non-ASCII review text — a worse failure
+# than the rarely-honored 8-bit control risk.
 # TWO nonces (round-2 dogfood HIGH): nonce_in fences content shown to the UPSTREAM reviewers; nonce_syn
 # fences those reviews for the DOWNSTREAM synthesis agent (lobster). An upstream reviewer never sees
 # nonce_syn, so even if a hostile diff makes it echo a closing boundary, it can't escape lobster's fence
 # (lobster is the agent that emits the trusted PLAY_PASS token — the one that must not be steerable).
 nonce_in="$(openssl rand -hex 16 2>/dev/null || printf 'i%s%s' "$$" "${RANDOM:-0}")"
 nonce_syn="$(openssl rand -hex 16 2>/dev/null || printf 's%s%s' "$$" "${RANDOM:-1}")"
-clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }
+clean(){ LC_ALL=C tr -d '\000-\010\013-\037\177'; }   # 0-8, 11-31 (incl CR/ESC), 127 — keep \t(9) \n(10)
 fence(){ printf '===BEGIN UNTRUSTED %s nonce=%s===\n' "$1" "$3"; printf '%s' "$2" | clean; printf '\n===END UNTRUSTED nonce=%s===\n' "$3"; }
 
 # resolve a repo_id|path to an on-disk repo path (needed to compute the diff for oracle's backup)
@@ -62,22 +66,36 @@ if [[ "$mode" == code ]]; then
   [[ -n "$repo" && "$range" == *..* ]] || die "code mode: xreview.sh code <repo_id|path> <base>..<head> [obj-file]"
   base="${range%%..*}"; head="${range##*..}"
   rp="$(_repo_path "$repo")"; [[ -d "$rp/.git" ]] || die "cannot resolve a repo path for '$repo' (need an abs path or a repos.json entry)"
+  # r3 finding #2: resolve BOTH endpoints to immutable commit SHAs up front. A symbolic ref (HEAD, a
+  # branch) can MOVE during the long kilabz call, so the gate and the oracle backup would otherwise
+  # review DIFFERENT changes. Pin the gate's --range AND the oracle diff to the SAME SHAs -> a genuinely
+  # decorrelated backup on the IDENTICAL change.
+  base_sha="$(git -C "$rp" rev-parse --verify "${base}^{commit}" 2>/dev/null || true)"
+  head_sha="$(git -C "$rp" rev-parse --verify "${head}^{commit}" 2>/dev/null || true)"
+  [[ -n "$base_sha" && -n "$head_sha" ]] || die "cannot resolve '$range' to commits in $rp"
+  sha_range="${base_sha}..${head_sha}"
+  # compute the oracle-backup diff ONCE from the immutable SHAs. --no-ext-diff --no-textconv: a hostile
+  # in-tree .gitattributes driver can't run host-side.
+  diff="$(git -C "$rp" diff --no-ext-diff --no-textconv "$base_sha" "$head_sha" 2>/dev/null || true)"
+  diff_bytes="$(printf '%s' "$diff" | wc -c | tr -d ' ' || true)"; diff_bytes=$((10#${diff_bytes:-0}))
   obj="$(_read_obj "$objf")"
   obj="${obj:-review this change for correctness bugs and risks; report SEVERITY + file + issue + why, or APPROVE. Verify each finding against the real code in your snapshot cwd; if a claim needs code you cannot see, say so.}"
 
   # kilabz = the GATE, via mxr review (staged snapshot cwd + the --range diff). Capture stderr so a
-  # staging DEGRADATION (mxr review falls back inline-only + warns on stderr) is DETECTED, not
-  # swallowed (finding #1) — the verdict must never falsely claim it was snapshot-backed.
+  # staging DEGRADATION (mxr review falls back inline-only + warns on stderr) is DETECTED, not swallowed —
+  # the verdict must never falsely claim it was snapshot-backed.
   printf '== [code] kilabz (GATE, staged snapshot) ==\n' >&2
-  # only pass --prompt-file when it actually exists+readable (finding #4): a missing objf must not
-  # abort the GATE while oracle silently falls back to the default objective (asymmetric failure).
+  # only pass --prompt-file when it actually exists+readable: a missing objf must not abort the GATE while
+  # oracle silently falls back to the default objective (asymmetric failure).
   pf=(); [[ -n "$objf" && -r "$objf" ]] || objf=""
   [[ -n "$objf" ]] && pf=(--prompt-file "$objf")
-  kerr="$(mktemp)"; trap 'rm -f "$kerr"' EXIT   # finding #6: no orphan temp on SIGINT
-  kilabz="$(MXR_TIMEOUT_S="$WAIT" mxr review kilabz --repo "$repo" --range "$range" \
-             ${pf[@]+"${pf[@]}"} 2>"$kerr")" \
-    || die "kilabz (the code gate) failed/timeout — recover from the ledger (mxr get <id>)"
-  [[ -n "${kilabz//[[:space:]]/}" ]] || die "kilabz returned empty — the gate did not run"
+  kerr="$(mktemp)"; trap 'rm -f "$kerr"' EXIT   # no orphan temp on SIGINT
+  if ! kilabz="$(MXR_TIMEOUT_S="$WAIT" mxr review kilabz --repo "$repo" --range "$sha_range" ${pf[@]+"${pf[@]}"} 2>"$kerr")"; then
+    # r3 finding #5: surface the gate's actual stderr (the root cause) BEFORE the EXIT trap deletes it.
+    if [[ -s "$kerr" ]]; then printf '%s\n' '--- kilabz (gate) stderr ---' >&2; cat "$kerr" >&2 || true; fi
+    die "kilabz (the code gate) failed/timeout — recover from the ledger (mxr get <id>)"
+  fi
+  [[ -n "${kilabz//[[:space:]]/}" ]] || { { [[ -s "$kerr" ]] && cat "$kerr" >&2; } || true; die "kilabz returned empty — the gate did not run"; }
   snap_note="reviewed WITH a de-linked read-only code snapshot"
   if grep -qi "WITHOUT snapshot" "$kerr" 2>/dev/null; then
     snap_note="reviewed WITHOUT a snapshot (staging DEGRADED to inline-only)"
@@ -85,15 +103,22 @@ if [[ "$mode" == code ]]; then
   fi
   rm -f "$kerr"
 
-  # oracle = WEAK inline backup. Give it the SAME fenced diff kilabz reviewed (finding #3), not just
-  # kilabz's review, so it is a genuine decorrelated second opinion (blind, but on the real change).
-  # --no-ext-diff --no-textconv: a hostile in-tree .gitattributes driver can't run host-side.
+  # oracle = WEAK inline backup on the SAME immutable diff kilabz reviewed — a genuine decorrelated second
+  # opinion (blind, but on the real change). The diff rides in as a CLI arg, so a very large change would
+  # blow ARG_MAX; rather than let `2>/dev/null || true` SWALLOW the E2BIG (a SILENT backup drop on exactly
+  # the big PRs that most need review — r3 HIGH), measure it and SKIP LOUDLY over the cap. The GATE is
+  # unaffected (mxr review passes --range, not the inline diff).
   printf '== [code] oracle (weak inline backup) ==\n' >&2
-  diff="$(git -C "$rp" diff --no-ext-diff --no-textconv "$base" "$head" 2>/dev/null || true)"
-  oracle="$(MXR_TIMEOUT_S="$WAIT" mxr --repo "$repo" oracle "OBJECTIVE (decorrelated second opinion, DIFFERENT family): ${obj}
+  DIFF_CAP="${XREVIEW_DIFF_CAP:-524288}"; [[ "$DIFF_CAP" =~ ^[0-9]+$ ]] || DIFF_CAP=524288; DIFF_CAP=$((10#$DIFF_CAP))
+  if [[ "$diff_bytes" -gt "$DIFF_CAP" ]]; then
+    printf 'xreview: WARNING — diff is %sB (> cap %sB); SKIPPING the oracle backup to avoid a SILENT ARG_MAX drop\n' "$diff_bytes" "$DIFF_CAP" >&2
+    oracle="(oracle backup SKIPPED — diff ${diff_bytes}B exceeds the ${DIFF_CAP}B arg cap; the kilabz GATE (staged, not arg-limited) still ran. Raise XREVIEW_DIFF_CAP or add a runtime --prompt-file path.)"
+  else
+    oracle="$(MXR_TIMEOUT_S="$WAIT" mxr --repo "$repo" oracle "OBJECTIVE (decorrelated second opinion, DIFFERENT family): ${obj}
 You have NO repo access — review ONLY the fenced diff below; if a claim needs unseen code, say so rather than assert.
 $(fence pushed-diff "$diff" "$nonce_in")" 2>/dev/null || true)"
-  [[ -n "${oracle//[[:space:]]/}" ]] || oracle="(oracle unavailable — proceeding on the kilabz gate alone)"
+    [[ -n "${oracle//[[:space:]]/}" ]] || oracle="(oracle unavailable — proceeding on the kilabz gate alone)"
+  fi
 
   synth_intro="These are two reviews of a CODE change. kilabz ${snap_note} and is the AUTHORITATIVE gate; oracle reviewed the diff BLIND and is a weak decorrelated backup. Merge into ONE ordered fix-list, ranked by severity. SYNTHESIS RULE: when they DISAGREE about whether an issue is real or already closed, keep it OPEN unless kilabz explicitly retracts it — never close on oracle's say-so. If NEITHER has a real actionable issue, reply with EXACTLY the token PLAY_PASS."
   a_label="kilabz-review (authoritative, ${snap_note})"; a_content="$kilabz"
@@ -108,11 +133,11 @@ else
   # oracle LEADS on design (whole-artifact reasoning); the doc is nonce-fenced as untrusted.
   printf '== [design] oracle (LEAD) ==\n' >&2
   oracle_ok=1; kilabz_ok=1
-  oracle="$(MXR_TIMEOUT_S="$WAIT" mxr --repo "$(basename "$doc")" oracle "OBJECTIVE: ${obj}
+  oracle="$(MXR_TIMEOUT_S="$WAIT" mxr --repo "$(basename -- "$doc")" oracle "OBJECTIVE: ${obj}
 $(fence design-doc "$body" "$nonce_in")" 2>/dev/null || true)"
   [[ -n "${oracle//[[:space:]]/}" ]] || { oracle_ok=0; printf 'xreview: WARNING — oracle (design lead) unavailable; proceeding on kilabz alone (DEGRADED)\n' >&2; oracle="(oracle/design-lead unavailable — DEGRADED review on kilabz completeness alone)"; }
   printf '== [design] kilabz (completeness + trust boundaries) ==\n' >&2
-  kilabz="$(MXR_TIMEOUT_S="$WAIT" mxr --repo "$(basename "$doc")" kilabz "OBJECTIVE: ${obj} Focus on mechanical completeness, missing legal-pair/edge enumeration, and trust boundaries.
+  kilabz="$(MXR_TIMEOUT_S="$WAIT" mxr --repo "$(basename -- "$doc")" kilabz "OBJECTIVE: ${obj} Focus on mechanical completeness, missing legal-pair/edge enumeration, and trust boundaries.
 $(fence design-doc "$body" "$nonce_in")" 2>/dev/null || true)"
   [[ -n "${kilabz//[[:space:]]/}" ]] || { kilabz_ok=0; kilabz="(kilabz unavailable — proceeding on the oracle lead)"; }
   # fail-closed if BOTH design reviewers were down (finding #2): never emit a verdict with no substance.
