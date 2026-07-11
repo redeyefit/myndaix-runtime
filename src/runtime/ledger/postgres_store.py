@@ -1358,8 +1358,10 @@ class PostgresLedger:
     # ---- outcomes ledger (the per-finding OUTCOME LABEL) — v0.3 append-only state machine --------
     # Append-only: NEVER UPDATE/DELETE a finding_outcome row. Current state is the finding_current
     # view (human-terminal precedence, else latest-by-seq). Idempotency is the unique index
-    # (finding_key, reviewer_family, outcome, source_event) + ON CONFLICT DO NOTHING, so re-running a
-    # review / sweep / dismissal is a no-op, not a duplicate event. NO LLM decides identity or outcome:
+    # (finding_key, reviewer_family, outcome, outcome_source, source_event) + ON CONFLICT DO NOTHING
+    # (outcome_source added in migration 0010 — self-labeling fence — so cross-source events never
+    # collide/shadow), so re-running a review / sweep / dismissal is a no-op, not a duplicate event.
+    # NO LLM decides identity or outcome:
     # the finding_key is a path-scoped line-hash (runtime.outcomes), the CLOSE phase compares STORED
     # hashes to what git shows at tip, and human labels are terminal (design §2 precedence).
     async def record_findings(self, repo_id: str, ref: str, tip_sha: str, play: str,
@@ -1456,7 +1458,7 @@ class PostgresLedger:
                                (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
                                 line_hash, source_event, tip_sha, outcome, outcome_source)
                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'applied_fixed','auto_fix_landed')
-                           ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
+                           ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source, source_event)
                                DO NOTHING
                            RETURNING id""",
                         _new_id(), r["finding_key"], repo_id, ref, r["rule_tag"],
@@ -1480,7 +1482,7 @@ class PostgresLedger:
                                (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
                                 line_hash, source_event, tip_sha, outcome, outcome_source)
                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open','review_raised')
-                           ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
+                           ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source, source_event)
                                DO NOTHING
                            RETURNING id""",
                         _new_id(), fk, repo_id, ref, f["tag"], fam,
@@ -1492,8 +1494,12 @@ class PostgresLedger:
         return {"closed": closed, "opened": opened, "skipped_dismissed": skipped,
                 "opened_rows": opened_rows}
 
-    async def human_dismiss(self, finding_key_prefix: str, family_or_all: str, kind: str) -> dict:
-        """The human's per-finding dismissal (the fp-vs-wontfix label). FAIL-CLOSED on an ambiguous or
+    async def human_dismiss(self, finding_key_prefix: str, family_or_all: str, kind: str,
+                            *, principal_role: str) -> dict:
+        """The human's per-finding dismissal (the fp-vs-wontfix label). GATED to human/admin — it
+        writes a human-terminal row that finding_current_human + finding_labelqueue treat as gating +
+        queue-terminal, so it takes the SAME principal binding as confirm_outcome (kilabz code-review
+        BLOCKER — this must not be an unguarded fourth human-label writer). FAIL-CLOSED on an ambiguous or
         too-short prefix: a <12-hex or non-unique prefix dismisses NOTHING and returns the colliding
         full keys, so grinding a short-prefix collision is an error message, not a mislabel (design §2).
 
@@ -1502,9 +1508,11 @@ class PostgresLedger:
         already-dismissed on that key (a human overrules whichever family raised it, and can CORRECT a
         prior mislabel: fp<->wontfix). DETERMINISTIC source_event 'human:<finding_key12>:<kind>' — the
         kind is IN the event so a correcting DIFFERENT-kind row is a distinct unique-index tuple
-        (finding_key, reviewer_family, outcome, source_event) and INSERTS; the human row with the
+        (finding_key, reviewer_family, outcome, outcome_source, source_event) and INSERTS; the human row with the
         higher seq wins in finding_current, so the corrected label takes. Re-issuing the SAME kind is
-        an idempotent ON CONFLICT DO NOTHING no-op.
+        an idempotent ON CONFLICT DO NOTHING no-op. (The unique tuple gained outcome_source in
+        migration 0010 — the self-labeling fence — but human_dismiss's behavior is unchanged: it
+        always mints outcome_source='human_dismiss', so the 5-col conflict is identical to the 4-col.)
 
         Residual v1 limitation (rare, accepted): re-affirming the ORIGINAL kind after having corrected
         AWAY from it (a flip-flop back, e.g. fp -> wontfix -> fp) won't re-win — the original fp row
@@ -1514,6 +1522,8 @@ class PostgresLedger:
 
         Returns {"dismissed": n, "finding_key": <full>} on success (n = rows WRITTEN this call; a
         same-kind re-issue is 0), or {"error": ..., "candidates": [...]}."""
+        if principal_role not in self._HUMAN_ROLES:
+            raise PermissionError(f"human_dismiss is human/admin only, not {principal_role!r}")
         prefix = (finding_key_prefix or "").strip().lower()
         if len(prefix) < 12 or any(c not in "0123456789abcdef" for c in prefix):
             return {"error": "prefix must be >= 12 hex chars", "candidates": []}
@@ -1560,7 +1570,7 @@ class PostgresLedger:
                                (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
                                 line_hash, source_event, tip_sha, outcome, outcome_source)
                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'human_dismiss')
-                           ON CONFLICT (finding_key, reviewer_family, outcome, source_event)
+                           ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source, source_event)
                                DO NOTHING
                            RETURNING id""",
                         _new_id(), fk, cur["repo_id"], cur["ref"], cur["rule_tag"], fam,
@@ -1570,11 +1580,15 @@ class PostgresLedger:
         return {"dismissed": dismissed, "finding_key": fk}
 
     async def expire_open(self, ttl_days: int) -> int:
-        """The TTL sweep (piggybacks the same outcome-record invocation, cheap SQL): INSERT an
-        'expired' row for every finding whose CURRENT state is 'open' and whose latest open event is
-        older than `ttl_days` (design §2 — keeps denominators honest; expired counts toward neither
-        precision side). DETERMINISTIC source_event 'sweep:<utcday>' so re-running the sweep on the
-        same UTC day is an index-conflict no-op. Returns the count expired."""
+        """The TTL sweep (piggybacks the same outcome-record invocation, cheap SQL): tombstone every
+        finding STILL AWAITING A HUMAN LABEL past `ttl_days`. Reads finding_labelqueue (no human label
+        AND not already expired) — NOT finding_current.outcome='open', because a machine-proposed row
+        (panel_*/exec_real_prior) can become the latest finding_current state and hide an unlabeled
+        finding from an 'open'-only sweep, stranding it in the queue forever (kilabz code-review
+        MEDIUM). Age = when the finding was RAISED (min(created_at)), so a late machine row can't reset
+        the clock. `expired` is a LIFECYCLE tombstone, not a label — counts toward neither precision
+        side (design §2). DETERMINISTIC source_event 'sweep:<utcday>' so a same-day re-run is an
+        index-conflict no-op. Returns the count expired."""
         utcday = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
         source_event = f"sweep:{utcday}"
         async with self._pool.acquire() as con:
@@ -1582,32 +1596,173 @@ class PostgresLedger:
                 """INSERT INTO finding_outcome
                        (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
                         line_hash, source_event, tip_sha, outcome, outcome_source)
-                   SELECT gen_random_uuid(), fc.finding_key, fc.repo_id, fc.ref, fc.rule_tag,
-                          fc.reviewer_family, fc.path, fc.line_hash, $1, fc.tip_sha,
+                   SELECT gen_random_uuid(), lq.finding_key, lq.repo_id, lq.ref, lq.rule_tag,
+                          lq.reviewer_family, lq.path, lq.line_hash, $1, lq.tip_sha,
                           'expired', 'ttl_sweep'
-                     FROM finding_current fc
-                    WHERE fc.outcome = 'open'
-                      AND fc.created_at < now() - make_interval(days => $2)
-                   ON CONFLICT (finding_key, reviewer_family, outcome, source_event) DO NOTHING
+                     FROM finding_labelqueue lq
+                     JOIN (SELECT finding_key, reviewer_family, min(created_at) AS raised_at
+                             FROM finding_outcome GROUP BY finding_key, reviewer_family) r
+                       ON r.finding_key = lq.finding_key AND r.reviewer_family = lq.reviewer_family
+                    WHERE r.raised_at < now() - make_interval(days => $2)
+                   ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source, source_event) DO NOTHING
                    RETURNING id""",
                 source_event, ttl_days)
         return len(rows)
 
     async def outcome_stats(self) -> dict:
         """The read surface for `mxr outcome-stats` (PR-B) + the morning brain-check: the
-        finding_precision view rows (per rule_tag × reviewer_family) + the current open-finding count
-        (parser-drift starvation is VISIBLE when this stays 0). Reads the computed views only."""
+        finding_precision_raw view rows (per rule_tag × reviewer_family) + the current open-finding
+        count (parser-drift starvation is VISIBLE when this stays 0). Reads the computed views only.
+        NB: reads finding_precision_raw (the all-source DIAGNOSTIC, renamed in migration 0010) — this
+        is a display surface, NOT an autonomy gate; the gating metric is finding_precision_promoted."""
         async with self._pool.acquire() as con:
             prec = await con.fetch(
                 """SELECT rule_tag, reviewer_family, applied_fixed, dismissed_false_positive,
                           volume, precision
-                     FROM finding_precision ORDER BY rule_tag, reviewer_family""")
+                     FROM finding_precision_raw ORDER BY rule_tag, reviewer_family""")
             open_n = await con.fetchval(
                 "SELECT count(*) FROM finding_current WHERE outcome = 'open'")
         return {
             "precision": [dict(r) for r in prec],
             "open_count": open_n,
         }
+
+    # ---- self-labeling FENCE: the write verbs (docs/self-labeling-design.md v0.4) -----------------
+    # Each labeled-write verb SERVER-MINTS outcome_source + source_event (never caller-supplied),
+    # hard-codes its exact (source, outcome) PAIRS (§3 legal-pair table + the DB pair-CHECK backs it),
+    # and asserts the caller's principal-role against the §5 matrix. Consequence: a MACHINE identity can
+    # never mint a human label, no verb can mint an off-pair combination, and (with the promoted/queue
+    # views) nothing a machine writes gates precision OR removes a finding from finding_labelqueue.
+    #
+    # AUTH-BINDING CONTRACT (kilabz code-review HIGH): `principal_role` is a TRUSTED-CALLER binding,
+    # NOT untrusted request input. It is set by the AUTHENTICATED caller layer — api.py's
+    # Principal.role (client|admin) for an HTTP client, or the local operator for a direct `mxr` op —
+    # and MUST be required (no permissive default). PR-1 wires NO machine caller to a human verb; when
+    # the labeler/exec-oracle SERVICES land (PR-2/3) their pool-internal code calls ONLY their own verb
+    # (record_exec_prior / propose_outcome), and any API exposure derives the role from the
+    # authenticated api-key, never the body. The role check here is the belt over that architecture.
+    # confirm_outcome + human_dismiss are BOTH gated human writers (the two human-label paths); the
+    # #74/#77-hardened human_dismiss stays otherwise byte-identical.
+    _HUMAN_ROLES = ("human", "admin")
+
+    async def _finding_fields(self, con, finding_key: str, reviewer_family: str):
+        """The repo_id/ref/rule_tag/path/line_hash/tip_sha to stamp a new row for an EXISTING finding,
+        read from finding_current (any state). None if the finding was never raised — a verb must not
+        conjure a row for a finding that does not exist."""
+        return await con.fetchrow(
+            """SELECT repo_id, ref, rule_tag, path, line_hash, tip_sha
+                 FROM finding_current WHERE finding_key = $1 AND reviewer_family = $2""",
+            finding_key, reviewer_family)
+
+    async def confirm_outcome(self, finding_key_prefix: str, family_or_all: str, kind: str,
+                              *, principal_role: str) -> dict:
+        """HUMAN/admin ONLY — the ONLY writer of a GATING + label-terminal row. kind ∈
+        real|fp|wontfix -> (human_confirm/confirmed_real) | (human_dismiss/dismissed_false_positive) |
+        (human_dismiss/dismissed_wontfix). Server-mints source_event 'human:<key12>:<kind>'. Same
+        fail-closed prefix resolution as human_dismiss (>=12 hex, unique). Returns
+        {"written": n, "finding_key": <full>} or {"error": ..., "candidates": [...]}."""
+        if principal_role not in self._HUMAN_ROLES:
+            raise PermissionError(f"confirm_outcome is human/admin only, not {principal_role!r}")
+        pairs = {"real": ("human_confirm", "confirmed_real"),
+                 "fp": ("human_dismiss", "dismissed_false_positive"),
+                 "wontfix": ("human_dismiss", "dismissed_wontfix")}
+        if kind not in pairs:
+            raise ValueError(f"confirm_outcome: bad kind {kind!r} (expected real|fp|wontfix)")
+        source, outcome = pairs[kind]
+        prefix = (finding_key_prefix or "").strip().lower()
+        if len(prefix) < 12 or any(c not in "0123456789abcdef" for c in prefix):
+            return {"error": "prefix must be >= 12 hex chars", "candidates": []}
+        families = (["kilabz", "oracle"] if family_or_all == "all" else [family_or_all])
+        if any(fam not in ("kilabz", "oracle") for fam in families):
+            raise ValueError(f"confirm_outcome: bad family {family_or_all!r}")
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                keys = await con.fetch(
+                    "SELECT DISTINCT finding_key FROM finding_outcome WHERE finding_key LIKE $1 || '%'",
+                    prefix)
+                if len(keys) == 0:
+                    return {"error": "no finding matches that prefix", "candidates": []}
+                if len(keys) > 1:
+                    return {"error": "ambiguous prefix — refine it",
+                            "candidates": [k["finding_key"] for k in keys]}
+                fk = keys[0]["finding_key"]
+                source_event = f"human:{fk[:12]}:{kind}"
+                written = 0
+                for fam in families:
+                    f = await self._finding_fields(con, fk, fam)
+                    if f is None:
+                        continue                        # that family never raised this finding
+                    ins = await con.fetchval(
+                        """INSERT INTO finding_outcome
+                               (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                                line_hash, source_event, tip_sha, outcome, outcome_source)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                           ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source,
+                                        source_event) DO NOTHING
+                           RETURNING id""",
+                        _new_id(), fk, f["repo_id"], f["ref"], f["rule_tag"], fam,
+                        f["path"], f["line_hash"], source_event, f["tip_sha"], outcome, source)
+                    if ins is not None:
+                        written += 1
+        return {"written": written, "finding_key": fk}
+
+    async def record_exec_prior(self, finding_key: str, reviewer_family: str,
+                                *, principal_role: str, tip_sha: str) -> dict:
+        """EXEC-ORACLE service identity ONLY (PR-2 play-fix observe bridge). Mints
+        exec_verified/exec_real_prior — a positive red->green REAL PRIOR: never an FP, never gates,
+        never removes from the queue. Server-mints source_event 'probe:<utcday>:<tip12>'. Returns
+        {"written": 0|1, "finding_key": ...} or {"error": ...}."""
+        if principal_role != "exec_oracle":
+            raise PermissionError(f"record_exec_prior is exec-oracle only, not {principal_role!r}")
+        if not (isinstance(tip_sha, str) and len(tip_sha) >= 12):
+            raise ValueError("record_exec_prior: tip_sha must be a full sha")
+        utcday = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+        source_event = f"probe:{utcday}:{tip_sha[:12]}"
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                f = await self._finding_fields(con, finding_key, reviewer_family)
+                if f is None:
+                    return {"error": "no such finding", "finding_key": finding_key}
+                ins = await con.fetchval(
+                    """INSERT INTO finding_outcome
+                           (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                            line_hash, source_event, tip_sha, outcome, outcome_source)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'exec_real_prior','exec_verified')
+                       ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source,
+                                    source_event) DO NOTHING
+                       RETURNING id""",
+                    _new_id(), finding_key, f["repo_id"], f["ref"], f["rule_tag"], reviewer_family,
+                    f["path"], f["line_hash"], source_event, tip_sha)
+        return {"written": 1 if ins is not None else 0, "finding_key": finding_key}
+
+    async def propose_outcome(self, finding_key: str, reviewer_family: str, verdict: str,
+                              *, principal_role: str, play: str) -> dict:
+        """LABELER service identity ONLY (PR-3 panel sweep). verdict ∈ real|fp ->
+        panel_proposed/(panel_real|panel_fp) — a PROPOSAL: never gates, never removes from the queue.
+        Server-mints source_event 'panel:<play>'. Returns {"written": 0|1, "finding_key": ...}."""
+        if principal_role != "labeler":
+            raise PermissionError(f"propose_outcome is labeler only, not {principal_role!r}")
+        outcomes = {"real": "panel_real", "fp": "panel_fp"}
+        if verdict not in outcomes:
+            raise ValueError(f"propose_outcome: bad verdict {verdict!r} (expected real|fp)")
+        outcome = outcomes[verdict]
+        source_event = f"panel:{play}"
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                f = await self._finding_fields(con, finding_key, reviewer_family)
+                if f is None:
+                    return {"error": "no such finding", "finding_key": finding_key}
+                ins = await con.fetchval(
+                    """INSERT INTO finding_outcome
+                           (id, finding_key, repo_id, ref, rule_tag, reviewer_family, path,
+                            line_hash, source_event, tip_sha, outcome, outcome_source)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'panel_proposed')
+                       ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source,
+                                    source_event) DO NOTHING
+                       RETURNING id""",
+                    _new_id(), finding_key, f["repo_id"], f["ref"], f["rule_tag"], reviewer_family,
+                    f["path"], f["line_hash"], source_event, f["tip_sha"], outcome)
+        return {"written": 1 if ins is not None else 0, "finding_key": finding_key}
 
     # ---- knowledge (the curator rung's derived FTS index) — docs/curator-design.md v0.4 ---------
     # Append-only + computed views (finding_outcome's discipline). Files are the source of truth;
