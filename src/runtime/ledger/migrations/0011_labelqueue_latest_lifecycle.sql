@@ -8,9 +8,14 @@
 -- again. The all-history NOT EXISTS check kept it hidden from the human label queue FOREVER — silently
 -- dropping a real, re-raised finding from the very queue the fence exists to feed.
 --
--- FIX: tombstone iff the LATEST machine-lifecycle row (newest by seq, excluding the human sources that
--- the first NOT EXISTS already removes) is 'expired'. A re-raise inserts a higher-seq review_raised row,
--- so the latest is no longer 'expired' -> the finding correctly reappears in the queue.
+-- FIX: tombstone iff the LATEST open/expire LIFECYCLE-TOGGLE row (newest by seq among ONLY
+-- review_raised [open] and ttl_sweep [expired]) is 'expired'. A genuine re-raise inserts a higher-seq
+-- review_raised row -> latest toggle is no longer 'expired' -> the finding reappears. LABEL sources
+-- (panel_proposed, exec_verified, auto_fix_landed, auto_git_revert) are DELIBERATELY excluded from the
+-- toggle: a machine write must NEVER change queue membership (adding OR removing) — only a human label
+-- (handled by the first NOT EXISTS) or a real detect/expire lifecycle transition may (fence invariant).
+-- (An earlier form checked the latest NON-human row, which let a stale post-TTL panel_proposed/
+-- exec_verified write RESURRECT an expired finding without a fresh re-detection — kilabz, r1.)
 --
 -- Idempotent (CREATE OR REPLACE VIEW); re-run on every serve boot. Data-safe: only redefines a view.
 
@@ -23,14 +28,15 @@ SELECT DISTINCT ON (fo.finding_key, fo.reviewer_family)
                     WHERE h.finding_key = fo.finding_key
                       AND h.reviewer_family = fo.reviewer_family
                       AND h.outcome_source IN ('human_confirm','human_dismiss'))
-   -- latest-lifecycle-aware tombstone: exclude ONLY if the newest machine row is 'expired'
-   -- (a re-raise adds a higher-seq review_raised row, so an expired-then-reopened finding returns).
+   -- latest-lifecycle-aware tombstone: exclude ONLY if the newest open/expire TOGGLE row is 'expired'.
+   -- The toggle is JUST review_raised (open) + ttl_sweep (expired); label sources can't move it, so a
+   -- machine write can never resurrect an expired finding — only a real re-detection (review_raised).
    AND 'expired' IS DISTINCT FROM (
          SELECT x.outcome
            FROM finding_outcome x
           WHERE x.finding_key = fo.finding_key
             AND x.reviewer_family = fo.reviewer_family
-            AND x.outcome_source NOT IN ('human_confirm','human_dismiss')
+            AND x.outcome_source IN ('review_raised','ttl_sweep')
           ORDER BY x.seq DESC
           LIMIT 1)
  ORDER BY fo.finding_key, fo.reviewer_family, fo.seq DESC;

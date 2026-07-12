@@ -138,6 +138,22 @@ async def test_reraise_after_expired_returns_to_queue(led):
     assert await _in_queue(led), "a finding re-raised after expiry must RETURN to the label queue"
 
 
+async def test_machine_label_after_expiry_does_not_resurrect(led):
+    # regression (0011 r1, kilabz): a LABEL source (panel_proposed / exec_verified) written AFTER a
+    # finding expired must NOT lift the tombstone — only the open/expire lifecycle toggle
+    # (review_raised / ttl_sweep) may. A machine can never change queue membership; only a genuine
+    # re-detection or a human label does. (The first cut checked "latest non-human row", which let a
+    # stale post-TTL machine write resurrect an expired finding without a fresh detection.)
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)                                                             # open (seq 1)
+        await _seed(con, outcome="expired", source="ttl_sweep",
+                    source_event="sweep:2026-07-10")                                 # expired (seq 2)
+        await _seed(con, outcome="panel_real", source="panel_proposed",
+                    source_event="panel:x")                                          # machine label (seq 3)
+    assert not await _in_queue(led), "a machine label after expiry must NOT resurrect an expired finding"
+
+
 async def test_no_double_count_on_repeat_and_correction(led):
     await _truncate(led)
     async with led._pool.acquire() as con:

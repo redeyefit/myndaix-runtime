@@ -342,8 +342,10 @@ teardown_staged(){ [[ -n "${staged:-}" && "${staged_terminal:-0}" == "1" ]] \
 # Cleanup runs on the EXIT trap ONLY. INT/TERM must EXIT (a bash trap that merely runs cleanup and
 # RETURNS lets the script RESUME past the just-released lock — a second worker could then take the lock
 # and run concurrently). Separate signal traps -> exit -> the EXIT trap does cleanup exactly once, and
-# the process actually terminates (130/143 = the conventional 128+signal codes).
-trap 'teardown_staged; release_lock' EXIT
+# the process actually terminates (130/143 = the conventional 128+signal codes). The EXIT trap first
+# IGNORES further INT/TERM so a second signal arriving mid-cleanup can't abort it and strand the lock
+# (oracle, r1).
+trap 'trap "" INT TERM; teardown_staged; release_lock' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
