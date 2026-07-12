@@ -201,6 +201,25 @@ def test_recency_order_is_seq_not_input_order():
     ok(c["precision_recent"] == 1.0, "recency sorts by seq (input order must not matter)")
 
 
+def test_recency_literal_s7_shape_alltime_below_recent_above():
+    # the LITERAL §7 bullet: old fp's + recent confirms with all-time hi BELOW the floor while
+    # recent hi is ABOVE it — the exact would-suppress-but-recovering shape §4.2 must refuse.
+    # (snap/weekly/cohort helpers are defined in the eval section below; tests run at __main__.)
+    p = D.ShadowParams(recency_n=5)
+    rows = spread([fp(i) for i in range(1, 38)] + [real(i) for i in range(38, 41)])  # 3/40 real
+    c = one_cell(rows, p)
+    ok(c["wilson_hi"] < p.floor, f"all-time hi {c['wilson_hi']:.3f} < floor (suppress territory)")
+    ok(c["wilson_recent_hi"] > p.floor,
+       f"recent hi {c['wilson_recent_hi']:.3f} > floor — the recovery is visible, not hidden (M3)")
+    ok(c["would_say"] == "would-suppress" and c["dismissed_fp"] >= p.min_fp,
+       "the CLASSIFIER may still say would-suppress on all-time…")
+    ev = D.eval_arming(
+        [snap(t, hi=c["wilson_hi"], hi_r=c["wilson_recent_hi"]) for t in weekly(4)],
+        cohort(14, 0))
+    ok(ev["gates"]["both_windows"] is False and not ev["eligible"],
+       "…but §4.2 both-windows refuses arming while the recent window is above the floor")
+
+
 # ---- aggregation / display -----------------------------------------------------------------------
 def test_cells_keyed_by_tag_and_family():
     rows = (spread([fp(i, tag="fail-open", family="kilabz") for i in range(1, 4)])
