@@ -123,6 +123,21 @@ async def test_ttl_tombstone_removes_but_is_not_a_label(led):
     assert (await _promoted_real(led)) in (None, 0)
 
 
+async def test_reraise_after_expired_returns_to_queue(led):
+    # regression (migration 0011, found by the loop on its own 0010 merge): the expired tombstone must be
+    # LATEST-lifecycle-aware. A finding that expired then legitimately re-detects (the documented
+    # re-raise-after-expired regression rule) gets a fresh review_raised row and MUST reappear in the
+    # queue — the old all-history NOT EXISTS check hid it forever.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)                                                             # open (seq 1)
+        await _seed(con, outcome="expired", source="ttl_sweep",
+                    source_event="sweep:2026-07-10")                                 # expired (seq 2)
+        assert not await _in_queue(led), "still tombstoned while expired is the latest state"
+        await _seed(con, source_event="review:reraise")                             # re-raised open (seq 3)
+    assert await _in_queue(led), "a finding re-raised after expiry must RETURN to the label queue"
+
+
 async def test_no_double_count_on_repeat_and_correction(led):
     await _truncate(led)
     async with led._pool.acquire() as con:
