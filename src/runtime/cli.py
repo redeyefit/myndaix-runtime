@@ -338,8 +338,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     task = args.task
     if args.prompt_file:
         try:
-            task = Path(args.prompt_file).read_text()
-        except OSError as e:
+            task = Path(args.prompt_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:   # UnicodeDecodeError is a ValueError, not OSError
             p.error(f"--prompt-file: {e}")
         if not task.strip():
             p.error("--prompt-file: file is empty")

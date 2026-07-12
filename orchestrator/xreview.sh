@@ -6,9 +6,9 @@
 #
 #   xreview.sh code   <repo_id|abs-path> <base>..<head> [objective-file]
 #       CODE review: kilabz is the GATE, run via `mxr review` (stages a de-linked read-only snapshot
-#       of <head> as the confined reviewer's cwd + inlines the range diff); oracle is a WEAK
-#       decorrelated backup that gets the SAME fenced diff via --prompt-file (issue #83: the prompt
-#       rides the ledger, not argv — no E2BIG ceiling; it still reviews code blind); lobster
+#       of <head> as the confined reviewer's cwd via stdin — no argv ceiling); oracle is a WEAK
+#       decorrelated backup on the SAME fenced diff, but agy is arg-channel so its prompt still hits
+#       ARG_MAX at the worker — it keeps a conservative cap + loud-skip (it reviews code blind); lobster
 #       synthesizes WITH its own staged snapshot of the tip (issue #83: the fabrication guard —
 #       synthesis verifies disputed claims against real code; degrades to reconcile-only if staging
 #       fails), under the standing rule that the primary (kilabz) re-derives adversarially and the
@@ -123,15 +123,17 @@ if [[ "$mode" == code ]]; then
   rm -f "$kerr"
 
   # oracle = WEAK inline backup on the SAME immutable diff kilabz reviewed — a genuine decorrelated
-  # second opinion (blind, but on the real change). The prompt now rides in via --prompt-file
-  # (issue #83 item 1), so the OS argv ceiling (E2BIG) is out of the picture entirely; the cap
-  # below is a MODEL-practicality belt (a multi-MB diff exceeds any useful review context), still
-  # skipped LOUDLY, never silently (r3 HIGH lineage).
+  # second opinion (blind, but on the real change). IMPORTANT: oracle (agy) is the ONE arg-channel
+  # reviewer (registry prompt_channel:"arg"), so even via --prompt-file the WORKER re-appends the
+  # prompt to agy's argv — the OS argv ceiling (E2BIG) still applies at the agy spawn, just relocated
+  # off the mxr call. So oracle keeps a CONSERVATIVE cap safely below ARG_MAX (kilabz+lobster are
+  # stdin-channel and ARE fully relieved by --prompt-file — no cap needed there). Over-cap = SKIP
+  # LOUDLY, never a silent E2BIG->"oracle unavailable" (r3 HIGH lineage + this PR's gate HIGH).
   printf '== [code] oracle (weak inline backup) ==\n' >&2
-  DIFF_CAP="${XREVIEW_DIFF_CAP:-4194304}"; [[ "$DIFF_CAP" =~ ^[0-9]+$ ]] || DIFF_CAP=4194304; DIFF_CAP=$((10#$DIFF_CAP))
+  DIFF_CAP="${XREVIEW_DIFF_CAP:-262144}"; [[ "$DIFF_CAP" =~ ^[0-9]+$ ]] || DIFF_CAP=262144; DIFF_CAP=$((10#$DIFF_CAP))
   if [[ "$diff_bytes" -gt "$DIFF_CAP" ]]; then
-    printf 'xreview: WARNING — diff is %sB (> cap %sB); SKIPPING the oracle backup (model-practicality belt)\n' "$diff_bytes" "$DIFF_CAP" >&2
-    oracle="(oracle backup SKIPPED — diff ${diff_bytes}B exceeds the ${DIFF_CAP}B practicality cap; the kilabz GATE (staged, not size-limited) still ran. Raise XREVIEW_DIFF_CAP to force it.)"
+    printf 'xreview: WARNING — diff is %sB (> cap %sB); SKIPPING the oracle backup (agy is arg-channel; stays below ARG_MAX)\n' "$diff_bytes" "$DIFF_CAP" >&2
+    oracle="(oracle backup SKIPPED — diff ${diff_bytes}B exceeds the ${DIFF_CAP}B cap; agy is arg-channel so its argv still hits ARG_MAX. The kilabz GATE (stdin-channel, staged, not size-limited) still ran. Raise XREVIEW_DIFF_CAP to force it.)"
   else
     oprompt="OBJECTIVE (decorrelated second opinion, DIFFERENT family): ${obj}
 You have NO repo access — review ONLY the fenced diff below; if a claim needs unseen code, say so rather than assert.
