@@ -251,6 +251,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     if raw and raw[0] == "labelqueue":
         from runtime import outcomerecord
         return outcomerecord.labelqueue_main(["labelqueue", *raw[1:]])
+    # `mxr dial-shadow [--snapshot|--eval]` — the shadow dial's MEASURE-ONLY read surface
+    # (docs/shadow-dial-design.md v0.6 PR-A): per-(tag × family) Wilson-bounded precision over
+    # human labels + a would-suppress/would-trust classification that ACTS ON NOTHING. OPERATOR
+    # tier: fail-CLOSED (exit 2) on an unreachable ledger. Rides the morning brain-check.
+    if raw and raw[0] == "dial-shadow":
+        from runtime import dialshadowrecord
+        return dialshadowrecord.main(["dial-shadow", *raw[1:]])
     # `mxr outcome <key12> real|fp|wontfix` (single) or `mxr outcome <kind> <key12>...` (batch) —
     # the human's per-finding label, ALL kinds routed through the fence's confirm_outcome
     # (label-throughput PR-A D-1: `real` is the gating numerator and finally has a caller).
