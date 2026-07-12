@@ -331,6 +331,140 @@ async def test_consumer_proof_no_code_reads_the_bare_gating_name(led):
     assert not offenders, "code reads the bare gating-suggestive name finding_precision:\n" + "\n".join(offenders)
 
 
+# ---- label-throughput PR-A (docs/label-throughput-design.md §8) --------------------------------
+
+async def test_confirm_real_lands_in_promoted_and_drains_queue(led):
+    # the whole point of PR-A: `real` finally has a caller, the gating numerator can move.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+    res = await led.confirm_outcome(FK[:12], "all", "real", principal_role="admin")
+    assert res["written"] == 1
+    assert (await _promoted_real(led)) == 1, "confirmed_real must land in the PROMOTED numerator"
+    assert not await _in_queue(led), "a human label is queue-terminal"
+
+
+async def test_real_after_applied_fixed_writes(led):
+    # §2a any-state: post-hoc human truth on an auto-closed finding is exactly what promoted wants.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+        await _seed(con, outcome="applied_fixed", source="auto_fix_landed",
+                    source_event="review:close1")
+    res = await led.confirm_outcome(FK[:12], "all", "real", principal_role="admin")
+    assert res["written"] == 1, "confirm-real must write on an auto-closed (applied_fixed) finding"
+    assert (await _promoted_real(led)) == 1
+
+
+async def test_fp_after_expired_writes_without_resurrect(led):
+    # §2a any-state: truth recorded on an expired finding; queue membership UNCHANGED.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+        await _seed(con, outcome="expired", source="ttl_sweep", source_event="sweep:x")
+    assert not await _in_queue(led)
+    res = await led.confirm_outcome(FK[:12], "all", "fp", principal_role="admin")
+    assert res["written"] == 1, "fp must write on an expired finding (truth is truth)"
+    assert not await _in_queue(led), "labeling an expired finding must not resurrect it"
+    n = await _val(led, "SELECT dismissed_false_positive FROM finding_precision_promoted "
+                        "WHERE rule_tag='fail-open' AND reviewer_family='kilabz'")
+    assert n == 1, "the fp lands in promoted"
+
+
+async def test_all_scope_writes_only_raising_family(led):
+    # §2a "all" semantics: a key raised by ONE family writes exactly 1 row — never labels unseen.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)                                     # kilabz only
+    res = await led.confirm_outcome(FK[:12], "all", "real", principal_role="admin")
+    assert res["written"] == 1, "'all' must skip the family that never raised the finding"
+
+
+async def test_cli_kind_maps_to_exact_pair(led):
+    # §2a table: each kind mints EXACTLY its pair (the no-schema-change proof, asserted).
+    table = {"real": ("human_confirm", "confirmed_real"),
+             "fp": ("human_dismiss", "dismissed_false_positive"),
+             "wontfix": ("human_dismiss", "dismissed_wontfix")}
+    for kind, (src, outc) in table.items():
+        await _truncate(led)
+        async with led._pool.acquire() as con:
+            await _seed(con)
+        await led.confirm_outcome(FK[:12], "all", kind, principal_role="admin")
+        n = await _val(led, "SELECT count(*) FROM finding_outcome WHERE finding_key=$1 "
+                            "AND outcome=$2 AND outcome_source=$3", FK, outc, src)
+        assert n == 1, f"kind {kind!r} must mint exactly ({src},{outc})"
+
+
+async def test_label_batch_mixed_dedup_and_idempotent(led):
+    # §2b: per-key fail-closed, batch fail-open, duplicates deduped, four-count summary exact.
+    from runtime import outcomerecord as orec
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+        await _seed(con, finding_key=FK2, path="src/y.py", source_event="review:second")
+    s = await orec.label_batch(led, "real", [FK[:12], "zz-not-hex!!", FK2[:12], FK[:12], "abc"])
+    assert s == {"labeled": 2, "rows": 2, "refused": 2, "duplicates": 1}, s
+    s2 = await orec.label_batch(led, "real", [FK[:12], FK2[:12]])       # re-run: idempotent
+    assert s2["labeled"] == 2 and s2["rows"] == 0, s2
+
+
+async def test_label_batch_cap_refuses_whole_invocation(led):
+    from runtime import outcomerecord as orec
+    s = await orec.label_batch(led, "real", [f"{i:012x}" for i in range(201)])
+    assert s["labeled"] == 0 and s["rows"] == 0 and s["refused"] == 201, s
+
+
+async def test_label_queue_shows_auto_closed_and_keys_roundtrip(led):
+    # §2c: the browser includes applied_fixed findings (latest-RAISE join, not latest-open),
+    # emits 12-hex keys, and those keys round-trip VERBATIM into the batch verb.
+    from runtime import outcomerecord as orec
+    await _truncate(led)
+    fk3 = "c" * 64
+    async with led._pool.acquire() as con:
+        await _seed(con)                                                 # open
+        await _seed(con, finding_key=fk3, path="src/z.py", source_event="review:r2")
+        await _seed(con, finding_key=fk3, path="src/z.py", outcome="applied_fixed",
+                    source="auto_fix_landed", source_event="review:close2")
+    rows = await led.label_queue()
+    keys = {r["key12"] for r in rows}
+    assert FK[:12] in keys and fk3[:12] in keys, "auto-closed finding must stay visible"
+    assert all(len(k) == 12 and all(c in "0123456789abcdef" for c in k) for k in keys)
+    txt = orec.format_label_queue(rows)
+    assert FK[:12] in txt and "fail-open" in txt, "formatter surfaces keys + cluster tag"
+    s = await orec.label_batch(led, "wontfix", sorted(keys))            # verbatim round-trip
+    assert s["labeled"] == 2 and s["refused"] == 0, s
+    assert await led.label_queue() == [], "human labels drain the queue"
+
+
+async def test_fp_to_real_correction_consistent_in_raw_current(led):
+    # code-gate MED (migration 0012): after an fp -> real correction the RAW finding_current must
+    # show the latest human word, not the stale fp (finding_current_human already did).
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+    await led.confirm_outcome(FK[:12], "all", "fp", principal_role="admin")
+    await led.confirm_outcome(FK[:12], "all", "real", principal_role="admin")
+    cur = await _val(led, "SELECT outcome FROM finding_current WHERE finding_key=$1", FK)
+    assert cur == "confirmed_real", "finding_current must show the LATEST human word after a correction"
+
+
+async def test_confirmed_real_sticky_no_reraise_and_outranks_machine(led):
+    # code-gate MED: a human-confirmed finding must (a) outrank any LATER machine row in
+    # finding_current, and (b) never be re-raised by a re-detection (no keys-file re-ask).
+    await _truncate(led)
+    of = [{"tag": "fail-open", "path": "src/x.py", "line_hash": "lh-1", "reviewer_family": "kilabz"}]
+    r1 = await led.record_findings("r", "refs/heads/main", "d" * 40, "p1", ["src/x.py"], of, None)
+    assert r1["opened"] == 1
+    fk = await _val(led, "SELECT finding_key FROM finding_current WHERE reviewer_family='kilabz'")
+    await led.confirm_outcome(fk[:12], "all", "real", principal_role="admin")
+    cur = await _val(led, "SELECT outcome FROM finding_current WHERE finding_key=$1", fk)
+    assert cur == "confirmed_real", "the human row outranks machine rows in the raw current view"
+    r2 = await led.record_findings("r", "refs/heads/main", "e" * 40, "p2", ["src/x.py"], of, None)
+    assert r2["opened"] == 0 and r2["opened_rows"] == [], \
+        "a re-detection of a human-confirmed finding must not re-open or resurface it"
+    assert r2["skipped_dismissed"] == 1, "the skip is counted"
+
+
 async def main():
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

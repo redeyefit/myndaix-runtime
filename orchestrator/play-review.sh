@@ -464,13 +464,16 @@ outcomes_record(){
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
   local kf="$INBOX/$(date +%Y%m%d%H%M%S)-$play-outcomes.md"
-  { printf '# outcome keys — %s\n\nplay: %s\nref: %s\n\nEach recorded finding below. Label it if the reviewer was wrong (fp) or you decline the fix (wontfix):\n\n' \
+  # all12 = the key12 column, space-joined — feeds the paste-ready batch hint (PR-A §2d)
+  local all12; all12="$(printf '%s\n' "$out_keys" | cut -f1 | tr '\n' ' ' || true)"
+  { printf '# outcome keys — %s\n\nplay: %s\nref: %s\n\nEach recorded finding below. Label it: real (reviewer was RIGHT — ground truth), fp (reviewer was WRONG), or wontfix (right, but declining):\n\n' \
       "$play" "$play" "$ref"
     printf '%s\n' "$out_keys" | while IFS=$'\t' read -r k12 fam tag path; do
       [[ -n "$k12" ]] || continue
-      printf -- '- finding:%s @ %s  [%s]\n    mxr outcome %s fp        # reviewer was WRONG\n    mxr outcome %s wontfix   # right, but declining\n' \
-        "$tag" "$path" "$fam" "$k12" "$k12"
+      printf -- '- finding:%s @ %s  [%s]\n    mxr outcome %s real      # reviewer was RIGHT — confirmed ground truth\n    mxr outcome %s fp        # reviewer was WRONG\n    mxr outcome %s wontfix   # right, but declining\n' \
+        "$tag" "$path" "$fam" "$k12" "$k12" "$k12"
     done
+    printf -- '\nBatch — ONE kind per command (a command applies its kind to EVERY listed key; for mixed labels move keys onto separate real/fp/wontfix commands):\n    mxr outcome real %s\n' "${all12% }"
   } > "$kf" 2>/dev/null || true
   return 0
 }

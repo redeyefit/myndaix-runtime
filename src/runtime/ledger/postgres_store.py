@@ -1396,9 +1396,10 @@ class PostgresLedger:
         feature branch whose fix never merged (design §2, v1 scope).
 
         OPEN — for each finding in `open_findings` INSERT an 'open' row, SKIPPING any (finding_key,
-        family) whose LATEST state is dismissed_* (sticky dismissals — a human 'this reviewer was
-        wrong' suppresses re-detection, which is what the stable key exists FOR). Re-raise after
-        'expired' or 'applied_fixed' is allowed (a regression).
+        family) whose current state carries a HUMAN label: dismissed_* (sticky dismissals — a human
+        'this reviewer was wrong' suppresses re-detection, which is what the stable key exists FOR)
+        and confirmed_real (0012: the human already ruled REAL — a re-detection must not re-ask via
+        keys-files). Re-raise after 'expired' or 'applied_fixed' is allowed (a regression).
 
         `open_findings` is a list of resolved dicts from runtime.outcomes (the wiring layer already ran
         parse_finding_lines + resolve_and_hash, per family), each:
@@ -1466,15 +1467,18 @@ class PostgresLedger:
                     if ins is not None:
                         closed += 1
                 # OPEN: insert 'open' rows per (finding_key, family), skipping any (key, family) whose
-                # latest state is dismissed_* (sticky). One state read per (key, family) via
-                # finding_current — both families' rows are independent (per-family dedup above).
+                # current state carries a HUMAN label (sticky): dismissed_* suppresses re-detection
+                # (the reviewer was wrong / declined), and confirmed_real (migration 0012 makes it the
+                # current winner) suppresses the re-ask — the human already ruled, so a re-detection
+                # must not resurface the finding in keys-files or the label queue. One state read per
+                # (key, family) via finding_current — both families' rows are independent.
                 for (fk, fam), f in by_key.items():
                     cur = await con.fetchrow(
                         """SELECT outcome FROM finding_current
                             WHERE finding_key = $1 AND reviewer_family = $2""",
                         fk, fam)
                     if cur is not None and cur["outcome"] in (
-                            "dismissed_false_positive", "dismissed_wontfix"):
+                            "dismissed_false_positive", "dismissed_wontfix", "confirmed_real"):
                         skipped += 1
                         continue
                     ins = await con.fetchval(
@@ -1631,6 +1635,26 @@ class PostgresLedger:
             "precision": [dict(r) for r in prec],
             "open_count": open_n,
         }
+
+    async def label_queue(self) -> list:
+        """Read surface for `mxr labelqueue` (label-throughput PR-A §2c): every finding awaiting a
+        human label, joined to its latest RAISE row. The join is on review_raised — NOT the latest
+        row's state — because the queue deliberately contains auto-closed (applied_fixed) findings
+        awaiting post-hoc human truth, and the browser must not hide them. Request-time join over
+        the fence views, never a materialized core view (self-labeling design §4). Read-only."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT lq.rule_tag, lq.reviewer_family, left(lq.finding_key, 12) AS key12,
+                          lq.path, r.ref, r.source_event, r.seq AS raise_seq
+                     FROM finding_labelqueue lq
+                     JOIN LATERAL (SELECT x.ref, x.source_event, x.seq
+                                     FROM finding_outcome x
+                                    WHERE x.finding_key = lq.finding_key
+                                      AND x.reviewer_family = lq.reviewer_family
+                                      AND x.outcome_source = 'review_raised'
+                                    ORDER BY x.seq DESC LIMIT 1) r ON true
+                    ORDER BY lq.rule_tag, lq.reviewer_family, lq.path""")
+        return [dict(r) for r in rows]
 
     # ---- self-labeling FENCE: the write verbs (docs/self-labeling-design.md v0.4) -----------------
     # Each labeled-write verb SERVER-MINTS outcome_source + source_event (never caller-supplied),

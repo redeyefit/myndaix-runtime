@@ -223,15 +223,16 @@ CREATE UNIQUE INDEX finding_outcome_event_once
 CREATE INDEX finding_outcome_key_idx  ON finding_outcome (finding_key, created_at DESC);
 CREATE INDEX finding_outcome_open_idx ON finding_outcome (repo_id, path) WHERE outcome = 'open';
 
--- current state per (finding_key, reviewer_family): a human dismissed_* row is TERMINAL (outranks any
--- later machine row), else latest-by-seq.
+-- current state per (finding_key, reviewer_family): ANY human row (human_dismiss OR human_confirm)
+-- is TERMINAL (outranks any later machine row); among human rows the latest wins (a correction);
+-- else latest-by-seq. (Both-source precedence = migration 0012.)
 CREATE OR REPLACE VIEW finding_current AS
 SELECT DISTINCT ON (finding_key, reviewer_family)
        finding_key, reviewer_family, repo_id, ref, rule_tag, path, line_hash,
        outcome, outcome_source, tip_sha, source_event, created_at, seq
   FROM finding_outcome
  ORDER BY finding_key, reviewer_family,
-          (outcome_source = 'human_dismiss') DESC,   -- human-terminal precedence FIRST
+          (outcome_source IN ('human_dismiss', 'human_confirm')) DESC,  -- human-terminal FIRST
           seq DESC;
 
 -- precision per (rule_tag × reviewer_family), over ALL history (no time window in v1). Reads current
