@@ -1,4 +1,9 @@
-# Shadow Dial — DESIGN (v0.3, post-fence measurement surface)
+# Shadow Dial — DESIGN (v0.4, post-fence measurement surface)
+
+_v0.4 folds the cross-family gauntlet on v0.3 (2 BLOCKER + 5 MAJOR + 1 MINOR): the Wilson gate
+direction was inverted (B1), the eval/arming gate is now fully specified (B2/M2), the label
+include/exclude set is enumerated (M4), the snapshot schema is made reproducible (M5), and the
+small-n example is corrected (M1). The MEASURE-ONLY thesis was not challenged._
 
 **Builds directly on `docs/outcomes-dials-design.md` v0.2** (branch `feat/outcomes-precision-dials`;
 dual-family + 42-agent adversarial review, mechanism ENDORSED, 2 BLOCKERs + 5 MAJORs folded). This
@@ -13,9 +18,11 @@ is that design's **PR-A SHADOW**, re-scoped for two things that changed since 20
 
 The v2.0-era autonomy ladder's first rung, in its safest form: a read surface that says what a
 suppress dial *would* do, and changes nothing. No prompt weighting, no note injection, no
-suppression, no arm state, no writes. The entire deliverable is **visibility + an honest
-evaluation loop**. Acting (the v0.2 doc's PR-B) stays deferred, now gated on this rung showing a
-*stable* signal Jefe agrees with AND the unresolved benign-taxonomy question (below).
+suppression, no arm state. The ONLY write is the opt-in `--snapshot` append to the rung's own
+`dial_shadow_snapshot` table, which no review/prompt/gate code ever reads (m1). The entire
+deliverable is **visibility + an honest evaluation loop**. Acting (the v0.2 doc's PR-B) stays
+deferred, now gated on this rung showing a *stable* signal Jefe agrees with (§4) AND the unresolved
+benign-taxonomy question (below).
 
 Why measure-only is the right first rung (the v0.2 reframe, still true): the live taxonomy is
 **entirely correctness/security classes**, and under fail-closed policy essentially none is safe to
@@ -38,26 +45,45 @@ recency window, so a recovering class is visible, not hidden.
 
 ## 2. The computation (per rule_tag × reviewer_family, over human labels only)
 
-Read `finding_current_human` (the fenced human-label state) → per (tag, family):
+**The admitted label set (M4 — the M1-closure requirement, enumerated).** The surface reads
+`finding_current_human` (0010): `SELECT DISTINCT ON (finding_key, reviewer_family) … WHERE
+outcome_source IN ('human_confirm','human_dismiss') ORDER BY seq DESC` — so per (finding, family)
+exactly ONE current human row, latest-by-seq (a correction supersedes). Then:
+- **INCLUDE** `(human_confirm, confirmed_real)` → the numerator, and `(human_dismiss,
+  dismissed_false_positive)` → the fp denominator term.
+- **EXCLUDE** `applied_fixed` / `auto_fix_landed` (machine, not in `finding_current_human` at all —
+  this is the structural reason v0.2's M1 is moot), `dismissed_wontfix` (real-but-declined, not a
+  precision signal), superseded rows (the DISTINCT ON keeps only the latest human row), and ANY
+  future non-human source (they never enter `finding_current_human`). A builder must NOT widen the
+  admitted set without a design change.
+
+Per (tag, family) over that set:
 - `n` = confirmed_real + dismissed_false_positive (the labeled denominator; `dismissed_wontfix`
   is excluded — "real but declining" is not a precision signal, matching the promoted view).
 - `precision` = confirmed_real / n (point estimate; NULL if n = 0).
-- **Wilson score interval** (z = 1.96, 95%) lower & upper bound on `precision` — the statistical-
-  stability fold: never classify on the point estimate over ~8 labels; the LOWER bound gates
-  would-suppress, the UPPER bound gates would-trust, so both require the interval to actually clear
-  the threshold, not just the noisy midpoint.
-- `n_recent` / `precision_recent` = the same over the last `SHADOW_RECENCY_N` (default 30) labeled
-  events by `seq` (M3: a recovering class shows a rising recent precision even while all-time lags).
-- `provenance` = distinct source refs among the labeled findings (`finding_outcome.ref`) — the
-  author/PR-diversity proxy (anti-poisoning fold: one misunderstood PR's bulk-dismissals is one
-  ref, not N independent signals). Surfaced so a human never reads 8 labels from 1 ref as 8.
+- **Wilson score interval** (z = 1.96, 95%) `[lo, hi]` on `precision` — the statistical-stability
+  fold. B1 direction (corrected): to be *confident precision is BELOW the floor* the whole interval
+  must sit below it → **`hi < FLOOR`** gates would-suppress (the LOWER bound is wrong: it fires on a
+  middling 50% sample). Symmetrically, to be *confident precision is ABOVE the ceiling* → **`lo ≥
+  CEILING`** gates would-trust. Both require the interval to actually clear the threshold, never the
+  noisy midpoint.
+- `n_recent` / `wilson_recent` = the same interval over the last `SHADOW_RECENCY_N` (default 30)
+  labeled events by `seq` (M3: a recovering class shows a rising recent precision even while all-time
+  lags — and the eval/arming gate in §4 requires BOTH windows to clear, not just all-time).
+- `provenance` = distinct source refs (`finding_outcome.ref`) AND distinct source plays
+  (`source_event` `review:<play>`) among the labeled findings. NOTE (M3, post-fence): every human
+  label is authored by the single trusted operator (`principal_role='admin'`), so author-diversity
+  is N/A here — a REDUCTION in attack surface vs v0.2's all-source metric (an attacker cannot forge
+  the operator's labels at all). The meaningful anti-poisoning signal is that the labels span
+  independent reviews/branches, not one bulk-dismissal of one decoy PR's findings — hence distinct
+  refs AND distinct plays, so 8 labels from 1 review read as thin, not as 8 independent signals.
 
 Classification (INFORMATIONAL — no action attached):
 | would-say | condition |
 |---|---|
-| `insufficient` | n < `SHADOW_MIN_N` (default 10) OR provenance < `SHADOW_MIN_REFS` (default 2) |
-| `would-suppress` | Wilson **lower** bound < `SHADOW_FLOOR` (0.30) AND dismissed_fp ≥ `SHADOW_MIN_FP` (3) AND enough n/refs |
-| `would-trust` | Wilson **lower** bound ≥ `SHADOW_CEILING` (0.90) AND enough n/refs |
+| `insufficient` | n < `SHADOW_MIN_N` (default 10) OR distinct-refs < `SHADOW_MIN_REFS` (2) OR distinct-plays < `SHADOW_MIN_PLAYS` (2) |
+| `would-suppress` | Wilson **upper** bound `hi` < `SHADOW_FLOOR` (0.30) AND dismissed_fp ≥ `SHADOW_MIN_FP` (3) AND not `insufficient` |
+| `would-trust` | Wilson **lower** bound `lo` ≥ `SHADOW_CEILING` (0.90) AND not `insufficient` |
 | `hold` | otherwise |
 
 **Fail-closed suppressibility is retained and code-owned** (the v0.2 B1 fold): a `would-suppress`
@@ -75,32 +101,53 @@ distinct-refs, the would-say, and the suppressible flag. Rides the morning brain
 can't read must not print an empty "nothing to suppress"). Thresholds are read from env in the
 VERB (per v0.2 D1); the SQL is a pure projection.
 
-Example:
+Example (n=8 is BELOW MIN_N=10 → `insufficient`, not `hold` — M1):
 ```
 rule_tag                  family  n   prec  wilson[lo,hi]  recent  refs  would-say     suppressible
 missing-scoping           oracle  3   0.00  [0.00,0.56]    0.00    2     insufficient  no (n<10)
-unsanitized-injection     oracle  8   0.50  [0.22,0.78]    0.55    3     hold          —
+unsanitized-injection     oracle  8   0.50  [0.22,0.78]    0.55    3     insufficient  no (n<10)
 silent-error-suppression  kilabz  5   1.00  [0.57,1.00]    1.00    2     insufficient  no (n<10)
 ```
+**Expected today: `insufficient` for essentially EVERY cell.** At current volumes (~3–8 human
+labels/cell) nothing clears MIN_N=10 — the surface correctly refuses to classify, and that refusal
+IS the honest v1 output. It becomes informative only as labels accrue over weeks.
 
 ## 4. The EVALUATE loop (the point of shadowing)
 
 A shadow prediction is only worth arming if it's STABLE and the human AGREES. Two mechanisms:
 - **Snapshot** (`mxr dial-shadow --snapshot`): append the current classification to
-  `dial_shadow_snapshot` (a NEW additive table — tag, family, n, precision, wilson_lo, would_say,
-  captured_at). Weekly cron or manual. This is the ONLY write in the rung and it touches no
-  outcome/fence table.
+  `dial_shadow_snapshot` (a NEW additive table — schema below). Weekly cron or manual. This is the
+  rung's ONLY write, to its OWN table, which no review/prompt/gate code ever reads.
 - **Agreement report** (`mxr dial-shadow --eval`): for each past snapshot's `would-suppress`
-  classes, compute the human labels that landed on that (tag, family) SINCE the snapshot, and
-  report agreement = did the new labels confirm low precision (mostly fp) or contradict it (mostly
-  real)? A `would-suppress` that new human labels keep dismissing is a stable, real signal; one
-  that new labels start confirming was small-n noise. This is a single honest number over time —
-  the exact evidence the acting rung must clear before any arm conversation.
+  classes, compute the human labels that landed on that (tag, family) SINCE the snapshot's
+  `data_cutoff_seq`, and report whether the new labels confirm low precision (fp) or contradict it
+  (real).
 
-Pre-committed gate (written here so it can't be rationalized away later): **≥ 4 weekly snapshots
-showing a stable would-say for a class, with ≥ 70% subsequent-label agreement, before PR-B (acting)
-is even designed for that class.** Shadow is the instrument that earns its own arming — or refuses
-it cheaply.
+**The arming gate — every sub-gate numeric (B2 fold), NONE of which the eval may skip.** A
+(tag × family) `would-suppress` is "arming-eligible" ONLY if ALL hold:
+1. **Stability:** the SAME `would-suppress` appears in ≥ `SHADOW_STABLE_SNAPS` (4) snapshots spanning
+   ≥ 4 distinct ISO weeks (not 4 same-day snaps).
+2. **Both windows:** in the LATEST snapshot, BOTH all-time `hi < FLOOR` AND recent-window `hi <
+   FLOOR` (M2 — a class recovering in its recent window is NOT eligible even if all-time still lags).
+3. **Subsequent cohort size:** the post-cutoff human labels number ≥ `SHADOW_EVAL_MIN_N` (10), from
+   ≥ `SHADOW_MIN_REFS` distinct refs AND ≥ `SHADOW_MIN_PLAYS` distinct plays (the §2 provenance/
+   min-FP guards apply to the eval cohort, not just the classifier).
+4. **Agreement with a CI, not a point rate:** over that cohort, the Wilson **upper** bound of the
+   AGREEMENT rate (fraction of subsequent labels that are fp) must clear ≥ `SHADOW_EVAL_AGREE`
+   (0.70) — i.e. confidently-high agreement, not a bare 7/10.
+5. **Empty-denominator = not eligible:** zero subsequent labels → `insufficient`, never a pass.
+
+Pre-committed (written here so it can't be rationalized away later): **PR-B (acting) is not even
+DESIGNED for a class until that class is arming-eligible by ALL of 1–5.** Shadow is the instrument
+that earns its own arming — or refuses it cheaply.
+
+`dial_shadow_snapshot` schema (M5 — self-contained so any future eval reproduces from the snapshot
+alone): `captured_at`, `data_cutoff_seq` (max seq of finding_outcome at capture — the "labels
+since" boundary), `rule_tag`, `reviewer_family`, `confirmed_real`, `dismissed_fp`, `n`, `precision`,
+`wilson_lo`, `wilson_hi`, `n_recent`, `wilson_recent_lo`, `wilson_recent_hi`, `distinct_refs`,
+`distinct_plays`, `would_say`, `suppressible`, and the policy context `floor`, `ceiling`, `min_n`,
+`min_refs`, `min_plays`, `min_fp`, `recency_n`, `z`, `suppressible_set_version`,
+`taxonomy_version`.
 
 ## 5. What this rung deliberately does NOT do (each with its un-gating condition)
 
@@ -113,10 +160,11 @@ it cheaply.
 | A dashboard / web UI | terminal read verb is the point | never (anti-over-engineering) |
 
 ## 6. Security & failure modes
-- **Read-only** (except the opt-in `--snapshot` append to its own table): no fence table is
-  touched, no acting path exists, so the suppress-lever attack surface from v0.2 §6 is absent by
-  construction. There is nothing to weaponize — the worst an attacker who could forge labels
-  achieves is a wrong number in a report a human reads.
+- **Read-only except the opt-in `--snapshot` append to `dial_shadow_snapshot`** (never read by
+  review/prompt/gate code): no fence table is written, no acting path exists, so the suppress-lever
+  attack surface from v0.2 §6 is absent by construction. There is nothing to weaponize — the worst
+  an attacker who could forge labels achieves is a wrong number in a report a human reads (and they
+  cannot forge the operator's human labels in the first place).
 - `rule_tag`/`reviewer_family` are validated against the taxonomy allowlist before display (no
   path component, no prompt — they only ever reach stdout here).
 - Wilson math + all thresholds are pure/deterministic; env knobs parsed fail-safe (default on
@@ -125,13 +173,22 @@ it cheaply.
 
 ## 7. Test plan (test-first, deterministic)
 - Wilson bound math: known (k, n) → known [lo, hi] within tolerance; n=0 → NULL, no divide.
-- classification edges: lower-bound-below-floor+enough-fp+refs → would-suppress; lower-bound-above-
-  ceiling → would-trust; n<MIN_N → insufficient; refs<MIN_REFS → insufficient (even at high n);
-  suppressible flag always "no" while SUPPRESSIBLE is empty.
-- recency: a class with old fp's + recent confirms shows all-time low, recent high.
-- provenance: 8 labels from 1 ref → insufficient (diversity gate), from 3 refs → eligible.
-- snapshot: append-only, correct columns; --eval computes subsequent-label agreement against a
-  seeded snapshot+later-labels fixture.
+- **B1 direction (the load-bearing test):** a middling sample (k=5, n=10, p=0.5, interval
+  ≈[0.24,0.76]) must be `hold`, NOT would-suppress (proves the gate reads `hi<FLOOR`, not `lo`); a
+  genuinely-low sample (k=0, n=12, hi≈0.24<0.30) → would-suppress; k=n high → `lo≥CEILING` →
+  would-trust.
+- classification edges: n<MIN_N → insufficient; distinct-refs<MIN_REFS → insufficient (even at high
+  n); distinct-plays<MIN_PLAYS → insufficient; dismissed_fp<MIN_FP → not would-suppress; suppressible
+  flag always "no" while SUPPRESSIBLE is empty; `dismissed_wontfix` + `applied_fixed` rows never
+  enter n (the admitted-set enumeration).
+- recency: old fp's + recent confirms → all-time hi below vs recent hi above (arming-ineligible by §4.2).
+- provenance: 8 labels from 1 ref/1 play → insufficient; from ≥2 refs AND ≥2 plays → eligible.
+- snapshot: append-only, ALL schema columns populated (incl. data_cutoff_seq + policy context);
+  reproducible (recomputing from the snapshot's own columns yields its would_say).
+- **eval gate (B2, each sub-gate):** stability needs 4 snaps across 4 distinct weeks (4 same-day →
+  fail); both-windows required; subsequent cohort < EVAL_MIN_N → insufficient; agreement uses the
+  Wilson upper bound (7/10 point-rate that fails the CI → NOT eligible); zero subsequent labels →
+  insufficient, never a pass.
 - verb: fail-closed exit 2 on unreachable ledger; empty ledger → honest "insufficient everywhere".
 
 ## 8. Build plan
