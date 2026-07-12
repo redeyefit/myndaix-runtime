@@ -1,6 +1,7 @@
 # Label-throughput — human bulk-confirm, terminal-first (PR-A of the self-labeling rollout)
 
-**DESIGN v0.1 — 2026-07-12.** Child of `docs/self-labeling-design.md` v0.4 (branch
+**DESIGN v0.2 — 2026-07-12** (v0.1 + the 8-finding cross-family fold; reorder/D-1/D-2 verified
+sound by both families). Child of `docs/self-labeling-design.md` v0.4 (branch
 `design/self-labeling-system`, dual-family APPROVED): this is the buildable spec for the HUMAN
 side of its §6 confirmation stage, re-scoped against the shipped code (fence = migration 0010,
 PR #81; lifecycle fixes = 0011, PR #84) and the measured live state.
@@ -32,22 +33,54 @@ Throughput target (inherited): **~3–5 batch commands/week, not 42 taps.**
 ### 2a. `real` — wire the confirm path
 `mxr outcome <key12> real` joins `fp|wontfix`. Routes to the EXISTING
 `confirm_outcome(prefix, "all", kind, principal_role="admin")`.
+
+**The exact kind→row table** (all three pairs already legal under the 0010 pair-CHECK; NO new
+pair, hence no schema change — this table IS the verification):
+
+| CLI kind | outcome_source | outcome | source_event (server-minted) |
+|---|---|---|---|
+| `real` | `human_confirm` | `confirmed_real` | `human:<key12>:real` |
+| `fp` | `human_dismiss` | `dismissed_false_positive` | `human:<key12>:fp` |
+| `wontfix` | `human_dismiss` | `dismissed_wontfix` | `human:<key12>:wontfix` |
+
+`confirm_outcome` inserts these rows DIRECTLY (the shipped verb at postgres_store.py:1662 does
+its own INSERT with the mapped pair — it does NOT call the legacy `human_dismiss` API, so no
+legacy open-state guard is inherited; a builder must keep it that way).
+
+**`"all"` family semantics (unchanged from today's `mxr outcome`):** `"all"` expands to
+[kilabz, oracle] and writes one row PER family that has a `finding_current` row for the key —
+i.e. only families that actually raised the finding (0, 1, or 2 rows). This does not label
+unseen rows: the key identifies one code-level claim; if both families raised it, the human's
+verdict on the claim applies to both (precision is per-family, and both were right/wrong
+together). A family that never raised it is skipped by `_finding_fields` returning None.
+
 - **All three kinds route through `confirm_outcome`** (D-1 below): one verb, one semantics.
-  `human_dismiss` stays for API/back-compat, but the CLI stops calling it. Behavioral delta
-  (deliberate): `confirm_outcome` writes for a finding in ANY `finding_current` state — so a
-  human can confirm-real a finding that already auto-closed (`applied_fixed`) or expired.
-  That is CORRECT: post-hoc human ground truth on a closed finding is exactly what the
-  promoted metric wants. `fp` on an expired finding likewise records truth (was-wrong) without
-  resurrecting anything (labelqueue membership is human-label-terminal; 0011 toggle unaffected).
+  `human_dismiss` stays for API/back-compat, but the CLI stops calling it.
+- **Any-state semantics, enumerated.** The outcome vocabulary is CLOSED (10 values; there are
+  no in-flight/pending states — nothing is "mid-action" in this ledger, every row is a
+  completed fact). What a human label means per possible `finding_current` state:
+  `open` → the normal case; `applied_fixed`/`reverted` → post-hoc truth on an auto-closed
+  finding (exactly what the promoted metric wants); `expired` → truth recorded, queue
+  membership UNCHANGED (human rows are terminal for membership; the 0011 toggle is untouched —
+  no resurrection); `dismissed_*`/`confirmed_real` → a correction (higher seq wins in
+  `finding_current_human`); `exec_real_prior`/`panel_*` (future) → the human verdict lands on
+  top of the machine prior, which never gated anyway. No state cancels or waits on anything.
 - Prefix resolution, ambiguity refusal, idempotent re-issue: inherited unchanged from the verb.
 
 ### 2b. Multi-key batch — same verb, N keys
 `mxr outcome <kind> <key12> [<key12>...]` (kind-first when multiple keys; the existing
 `<key12> <kind>` single form stays). Loops the single-key verb per key — no new ledger verb, no
 new transaction shape.
-- **Per-key fail-closed, batch fail-open:** an ambiguous/unknown key refuses THAT key (prints
-  candidates) and continues; the summary line reports `labeled N, refused M`. Exit 0 always
-  (operator-retry, per the outcome verb's tier-3 discipline).
+- **Validation is PER-KEY, at that key's turn** (not whole-argv prevalidation): each token is
+  checked ≥12-hex immediately before ITS resolve+write; a junk/ambiguous token refuses THAT
+  key (prints candidates) and the loop continues — earlier valid keys are already written,
+  later ones still proceed. §6's "validated before any DB touch" means before THAT KEY's DB
+  touch.
+- **Duplicates within one invocation are deduped** (first occurrence kept, order preserved)
+  before the loop. Summary line reports all four counts:
+  `labeled <unique keys> (<rows> rows), refused <n>, duplicates <n>` — "rows" is ledger rows
+  actually inserted this call (0–2 per key via family expansion; idempotent re-issues insert 0).
+  Exit 0 always (operator-retry, per the outcome verb's tier-3 discipline).
 - **Explicit keys ONLY** (D-2): every labeled key was enumerated by the human (typed/pasted).
   NO `--tag`/`--play`/`--all` selector bulk in PR-A — a selector labels rows the human never
   saw, which is exactly the authority-laundering D3 forbids without shown evidence. When the
@@ -56,14 +89,22 @@ new transaction shape.
 
 ### 2c. `mxr labelqueue` — the evidence surface (read-only)
 The terminal edition of v0.4's "cluster/rank + audit sample shown". Reads
-`finding_labelqueue` ⋈ latest open row, clustered by (`rule_tag`, `reviewer_family`), ordered
-by cluster size desc:
+`finding_labelqueue` joined to each finding's **latest RAISE row** (`review_raised`, any
+current state — NOT "latest open": the queue deliberately contains auto-closed
+`applied_fixed` findings awaiting human truth, and the join must not hide them), clustered by
+(`rule_tag`, `reviewer_family`), ordered by cluster size desc:
 
 ```
-unsanitized-injection  oracle   6   4822…  src/runtime/curate.py  …
-                                key12s: 383c0f  5d1adc  386fa1  37b10c  ab24c6  8ccd99
+unsanitized-injection  oracle   6   src/runtime/curate.py +4 more paths
+  keys: 383c0f3f5ab1  5d1adc49f850  386fa1de6433  37b10cfd99ae  ab24c61b7223  8ccd998f3ba4
 ```
 
+- **Emitted keys are exactly 12-hex** — the minimum the CLI contract accepts — and a test
+  asserts `labelqueue` output keys are accepted VERBATIM by the 2b batch verb (copy-paste
+  round-trip is the whole point).
+- Scope note: the browser shows the ACTIVE queue (`finding_labelqueue` membership — so not
+  expired-tombstoned findings). An expired finding can still be labeled by explicit key from
+  an old keys-file (2a any-state semantics); the browser just doesn't advertise it.
 - Per cluster: count, the key12s (paste-ready for 2b), paths, and `ref`/`play` of the latest
   raise (so the human can pull the verdict file's claim text if wanted).
 - Read-only SQL over existing views — no new view, no materialization (v0.4 §4: UI joins are
@@ -133,7 +174,16 @@ human reads (Mack relays / labelqueue browser) ──▶ mxr outcome <kind> <key
 
 ## 8. Test plan (test-first, deterministic)
 Extend `tests/test_self_labeling_fence.py` + a new CLI-level check set:
-confirm-real lands in promoted numerator; real-after-applied_fixed writes; fp-after-expired
-writes without resurrecting queue membership; batch = mixed valid/ambiguous/junk keys → per-key
-refusals + correct count; batch re-run idempotent; labelqueue clustering matches a seeded queue;
-keys-file carries all three commands (orchestrator/test.sh).
+- confirm-real lands in the promoted numerator; real-after-`applied_fixed` writes;
+  fp-after-expired writes WITHOUT resurrecting queue membership.
+- **each CLI kind maps to exactly its §2a table pair** (assert outcome_source+outcome per
+  kind); an illegal pair attempted raw still fails at the DB pair-CHECK (fence holds beneath
+  the CLI).
+- **`"all"` scope:** a key raised by ONE family writes exactly 1 row (the other family is
+  skipped, never labeled unseen).
+- batch: mixed valid/ambiguous/junk keys → per-key refusals, earlier+later valid keys all
+  written, four-count summary correct; duplicate keys in one argv → deduped, counted;
+  batch re-run → 0 rows, idempotent.
+- `labelqueue`: clustering matches a seeded queue; includes an `applied_fixed` (auto-closed)
+  finding; **emitted keys are 12-hex and round-trip verbatim into the batch verb**.
+- keys-file carries all three paste-ready commands + the batch hint (orchestrator/test.sh).
