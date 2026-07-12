@@ -49,7 +49,9 @@ have mxr || die "mxr not on PATH"
 # (we hold the synthesis result = proof the job finished); every other exit leaves it to the
 # LIVENESS-AWARE age-reaper (`mxr review-reap` skips workdirs any live job references). cleanup() thus
 # removes ONLY scratch.
-xtmp="$(mktemp -d)"; staged=""
+xtmp="$(mktemp -d)" || die "cannot create a scratch dir"   # set -e is exempt on an assignment RHS
+[[ -n "$xtmp" && -d "$xtmp" ]] || die "scratch dir not created"
+staged=""
 cleanup(){ rm -rf "$xtmp" 2>/dev/null; return 0; }   # NEVER teardown here — the reaper owns live snapshots
 trap 'trap "" INT TERM; cleanup' EXIT
 # reap prior orphaned review snapshots (liveness-aware, age-based) so manual xreview runs don't
