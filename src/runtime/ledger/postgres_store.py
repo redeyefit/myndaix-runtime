@@ -1585,9 +1585,12 @@ class PostgresLedger:
         AND not already expired) — NOT finding_current.outcome='open', because a machine-proposed row
         (panel_*/exec_real_prior) can become the latest finding_current state and hide an unlabeled
         finding from an 'open'-only sweep, stranding it in the queue forever (kilabz code-review
-        MEDIUM). Age = when the finding was RAISED (min(created_at)), so a late machine row can't reset
-        the clock. `expired` is a LIFECYCLE tombstone, not a label — counts toward neither precision
-        side (design §2). DETERMINISTIC source_event 'sweep:<utcday>' so a same-day re-run is an
+        MEDIUM). Age = the LATEST review_raised detection (max(created_at) over review_raised rows): a
+        genuine re-raise after expiry RESETS the clock — else the queue view correctly un-hides the
+        re-detected finding and the very next sweep, anchored on the OLD first-raise, instantly
+        re-expires it (kilabz r2 HIGH). A machine LABEL row still can't reset it (only review_raised
+        counts). `expired` is a LIFECYCLE tombstone, not a label — counts toward neither precision side
+        (design §2). DETERMINISTIC source_event 'sweep:<utcday>' so a same-day re-run is an
         index-conflict no-op. Returns the count expired."""
         utcday = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
         source_event = f"sweep:{utcday}"
@@ -1600,8 +1603,10 @@ class PostgresLedger:
                           lq.reviewer_family, lq.path, lq.line_hash, $1, lq.tip_sha,
                           'expired', 'ttl_sweep'
                      FROM finding_labelqueue lq
-                     JOIN (SELECT finding_key, reviewer_family, min(created_at) AS raised_at
-                             FROM finding_outcome GROUP BY finding_key, reviewer_family) r
+                     JOIN (SELECT finding_key, reviewer_family, max(created_at) AS raised_at
+                             FROM finding_outcome
+                            WHERE outcome_source = 'review_raised'
+                            GROUP BY finding_key, reviewer_family) r
                        ON r.finding_key = lq.finding_key AND r.reviewer_family = lq.reviewer_family
                     WHERE r.raised_at < now() - make_interval(days => $2)
                    ON CONFLICT (finding_key, reviewer_family, outcome, outcome_source, source_event) DO NOTHING
