@@ -334,11 +334,19 @@ def test_eval_empty_cohort_never_passes():
     ok(ev["cohort_n"] == 0 and not ev["eligible"], "pre-cutoff labels are NOT cohort")
 
 
-def test_eval_cohort_counts_from_earliest_ws_snapshot():
+def test_eval_cohort_counts_from_latest_ws_snapshot_only():
+    # xreview r1 MED: fresh-evidence-only. Snapshot cutoffs 100/110/120/130 — labels landing
+    # BETWEEN snapshots (seq 101..130) already fed later snapshots' classifications (stability
+    # evidence) and must NOT be re-admitted as agreement evidence; only seq > 130 counts.
     snaps = [snap(t, cutoff=100 + 10 * i) for i, t in enumerate(weekly(4))]
-    rows = cohort(14, 0, start_seq=101)                                # all > earliest cutoff 100
-    ev = D.eval_arming(snaps, rows)
-    ok(ev["cohort_n"] == 14, "cohort counts from the EARLIEST would-suppress cutoff")
+    between = cohort(14, 0, start_seq=101)                             # seqs 101..114 ≤ 130
+    ev = D.eval_arming(snaps, between)
+    ok(ev["cohort_n"] == 0 and not ev["eligible"],
+       "labels between snapshots are NOT cohort (no evidence reuse across sub-gates)")
+    fresh = cohort(14, 0, start_seq=131)                               # all > latest cutoff 130
+    ev = D.eval_arming(snaps, between + fresh)
+    ok(ev["cohort_n"] == 14, "cohort = labels after the LATEST would-suppress cutoff only")
+    ok(ev["eligible"] is True, "a fully-fresh 14-fp cohort still arms")
 
 
 def test_eval_wontfix_and_invalid_not_cohort():

@@ -134,6 +134,15 @@ A shadow prediction is only worth arming if it's STABLE and the human AGREES. Tw
   `data_cutoff_seq`, and report whether the new labels confirm low precision (fp) or contradict it
   (real).
 
+_Two build-time resolutions (PR-A code gate, r1 — kilabz):_ (1) **snapshot consistency** — the
+verb reads `data_cutoff_seq` FIRST and then reads labels **bounded to `seq <= cutoff`**, so a
+snapshot's cells are exactly its cutoff's labels; a label racing in mid-snapshot is cleanly
+post-cutoff (a future eval cohort), never lost from both sides of the boundary. (2) **the eval
+cohort anchors at the LATEST would-suppress snapshot's cutoff** (fresh-evidence-only, `max` not
+`min`): a label that landed between snapshots already fed later snapshots' classifications (the
+stability sub-gate), so re-admitting it as agreement evidence would count one label at two
+sub-gates — the strict fail-closed reading of "post-cutoff" in sub-gate 3.
+
 **The arming gate — every sub-gate numeric (B2 fold), NONE of which the eval may skip.** A
 (tag × family) `would-suppress` is "arming-eligible" ONLY if ALL hold:
 1. **Stability:** the SAME `would-suppress` appears in ≥ `SHADOW_STABLE_SNAPS` (4) snapshots spanning

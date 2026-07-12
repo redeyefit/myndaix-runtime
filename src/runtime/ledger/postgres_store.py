@@ -1661,12 +1661,22 @@ class PostgresLedger:
     # lives in the verb (v0.2 D1), and dial_shadow_snapshot is NEVER read by review/prompt/gate
     # code (design m1; its only reader is `mxr dial-shadow --eval`). --------------------------------
 
-    async def dial_shadow_labels(self) -> list:
+    async def dial_shadow_labels(self, cutoff: int | None = None) -> list:
         """One CURRENT human row per (finding, family) from finding_current_human (the admitted-set
         view — machine sources structurally absent), joined to the finding's latest RAISE row for
         provenance (ref + play: the design §2 anti-poisoning signal is that labels span independent
         reviews, not one bulk dismissal). LEFT JOIN + ref fallback: a missing raise row degrades to
-        NO play provenance (fail-safe — fewer distinct, never more)."""
+        NO play provenance (fail-safe — fewer distinct, never more).
+
+        `cutoff` (the --snapshot path, xreview r1 HIGH): with a cutoff the read is BOUNDED to
+        seq <= cutoff (rows AND the provenance join) so a snapshot's cells are exactly consistent
+        with its data_cutoff_seq — the verb reads max_finding_seq() FIRST, then labels. A label
+        racing in during the snapshot lands seq > cutoff: absent from these cells, present in a
+        future eval cohort (seq > cutoff) — never lost, never double-counted. Edge (documented,
+        accepted): a CORRECTION racing into that window supersedes its finding's current row in
+        the view, so the finding drops from this snapshot's cells entirely and re-enters as
+        post-cutoff evidence — consistent, just not an as-of-cutoff reconstruction (which would
+        require duplicating the 0010 view SQL here; not worth the drift risk at one-label scale)."""
         async with self._pool.acquire() as con:
             rows = await con.fetch(
                 """SELECT h.rule_tag, h.reviewer_family, h.outcome, h.outcome_source, h.seq,
@@ -1677,8 +1687,10 @@ class PostgresLedger:
                                          WHERE x.finding_key = h.finding_key
                                            AND x.reviewer_family = h.reviewer_family
                                            AND x.outcome_source = 'review_raised'
+                                           AND ($1::bigint IS NULL OR x.seq <= $1)
                                          ORDER BY x.seq DESC LIMIT 1) r ON true
-                    ORDER BY h.rule_tag, h.reviewer_family, h.seq""")
+                    WHERE ($1::bigint IS NULL OR h.seq <= $1)
+                    ORDER BY h.rule_tag, h.reviewer_family, h.seq""", cutoff)
         out = []
         for r in rows:
             d = dict(r)

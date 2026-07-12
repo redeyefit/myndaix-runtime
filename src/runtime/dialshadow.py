@@ -246,8 +246,12 @@ def eval_arming(snaps: list, all_cell_rows: list) -> dict:
     (M5/M5-r2: an eval verdict is reproducible from the snapshots alone, not live config — so the
     gate reads thresholds from the LATEST snapshot, never from env).
     all_cell_rows = ALL current human rows for the cell (aggregate_cells input shape); the cohort
-    is the included-pair rows with seq > the EARLIEST would-suppress snapshot's data_cutoff_seq —
-    the full out-of-sample record since the prediction first appeared.
+    is the included-pair rows with seq > the LATEST would-suppress snapshot's data_cutoff_seq —
+    FRESH evidence only (xreview r1 MED): a label that landed between snapshots already fed the
+    later snapshots' classifications (the stability signal), so re-admitting it as agreement
+    evidence would count the same label at two sub-gates. Anchoring at the latest cutoff is the
+    strict fail-closed reading of §4.3 "post-cutoff" — arming needs eval_min_n labels that arrived
+    after the MOST RECENT prediction, evidence no snapshot has seen.
 
     Returns {"eligible": bool, "gates": {...}, ...} — informational; NOTHING reads this to act."""
     snaps = sorted(snaps, key=lambda s: s["captured_at"])
@@ -286,8 +290,10 @@ def eval_arming(snaps: list, all_cell_rows: list) -> dict:
     g_windows = hi is not None and hi_r is not None and float(hi) < floor and float(hi_r) < floor
     out["gates"]["both_windows"] = g_windows
 
-    # §4.3+§4.5 cohort: included-pair labels landed AFTER the prediction first appeared.
-    cutoff = min(int(s["data_cutoff_seq"]) for s in ws_snaps)
+    # §4.3+§4.5 cohort: included-pair labels landed AFTER the latest would-suppress prediction —
+    # fresh, unseen-by-any-snapshot evidence only (max, never min: no evidence reuse across the
+    # stability and agreement sub-gates).
+    cutoff = max(int(s["data_cutoff_seq"]) for s in ws_snaps)
     cohort = []
     for r in all_cell_rows:
         if int(r["seq"]) <= cutoff:

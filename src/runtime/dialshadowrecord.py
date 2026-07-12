@@ -65,18 +65,22 @@ async def _run(mode: str) -> int:
         return 2
     try:
         params = ds.ShadowParams.from_env()
-        rows = await led.dial_shadow_labels()
-        cells = ds.aggregate_cells(rows, params)
 
         if mode == "table":
-            print(ds.format_table(cells, params))
+            rows = await led.dial_shadow_labels()
+            print(ds.format_table(ds.aggregate_cells(rows, params), params))
             return 0
 
         if mode == "snapshot":
+            # cutoff FIRST, then a cutoff-BOUNDED labels read (xreview r1 HIGH): the snapshot's
+            # cells are exactly the labels with seq <= data_cutoff_seq, so a label racing in
+            # mid-snapshot is cleanly post-cutoff (a future eval cohort) instead of silently
+            # lost from both sides of the boundary.
+            cutoff = await led.max_finding_seq()
+            cells = ds.aggregate_cells(await led.dial_shadow_labels(cutoff), params)
             if not cells:
                 print("no human-labeled findings yet — nothing to snapshot")
                 return 0
-            cutoff = await led.max_finding_seq()
             n = await led.dial_shadow_snapshot_append(
                 [_snapshot_row(c, cutoff, params) for c in cells])
             print(ds.format_table(cells, params))
@@ -84,6 +88,7 @@ async def _run(mode: str) -> int:
             return 0
 
         # --eval: group snapshots by cell; report every cell with ≥1 would-suppress snapshot.
+        rows = await led.dial_shadow_labels()
         snaps = await led.dial_shadow_snapshots()
         by_cell: dict = {}
         for s in snaps:

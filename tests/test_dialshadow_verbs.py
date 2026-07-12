@@ -125,6 +125,24 @@ async def test_max_finding_seq(led):
     ok(await led.max_finding_seq() >= 2, "cutoff = max seq after raise + label")
 
 
+async def test_labels_read_cutoff_bounded(led):
+    """xreview r1 HIGH: the --snapshot path reads cutoff FIRST then labels bounded to seq<=cutoff,
+    so a label racing in mid-snapshot is cleanly post-cutoff instead of silently lost from both
+    the cells and the future eval cohort."""
+    await _truncate(led)
+    await _seed_labeled(led, n_fp=2)
+    cutoff = await led.max_finding_seq()
+    await _seed_labeled(led, n_fp=0, n_real=1, tag="missing-scoping")   # the "racing" label
+    bounded = await led.dial_shadow_labels(cutoff)
+    ok(len(bounded) == 2 and all(r["seq"] <= cutoff for r in bounded),
+       "bounded read = exactly the labels at seq<=cutoff (the race label excluded)")
+    ok(all(r["rule_tag"] == "fail-open" for r in bounded), "the post-cutoff cell is absent")
+    unbounded = await led.dial_shadow_labels()
+    ok(len(unbounded) == 3, "unbounded read (table/eval) still sees the racing label")
+    racer = next(r for r in unbounded if r["rule_tag"] == "missing-scoping")
+    ok(racer["seq"] > cutoff, "the race label is post-cutoff -> a FUTURE eval cohort, never lost")
+
+
 # ---- snapshot append (M5) ------------------------------------------------------------------------
 async def test_snapshot_append_all_columns_and_reproducible(led):
     await _truncate(led)
