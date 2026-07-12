@@ -379,3 +379,45 @@ charged-after-cancel job to `dead` (NOT requeued), so it is at most ONE extra su
 deadlock-ordering-sensitive — do NOT rush into the orchestrator PR):** make `get_attempt_job` a
 locking ownership gate + a `begin_attempt` CAS immediately before `_invoke`, to shrink the window to
 [CAS commit → HTTP submit]. Benefits every paid agent, not just the orchestrator.
+
+---
+
+## 12. SUPPLIER GATEWAY AS-BUILT (2026-07-12 — Jefe-approved addition)
+
+**What changed.** Stage 3 now defaults to a thin PRICED gateway — `src/runtime/supplier.py` —
+with ONE interface, three ops (**t2i / multi-ref edit / i2v**), backed by **fal.ai (primary)**
+and **Replicate (secondary)** per-call APIs. The Higgsfield path (`--backend higgsfield`, plus
+the mcp.higgsfield.ai connector) stays as the ALTERNATE, unchanged. NOT a platform: one flow,
+brief → gated plate/clip → the §8 manifest that mx-engine's reelgen consumes; a supplier never
+renders a brand pixel.
+
+**Shape (mirrors the proven runtime seams — nothing new in the spine):**
+- New `AgentSpec` row `supplier` (RESPONDER, `adapter.kind="supplier"`, `non_idempotent: true`,
+  `Profile.timeout_s=600`); `runner.invoke` routes the kind to `supplier.invoke_supplier`.
+  **Every call is a ledger job**; `Result.cost` (persisted in `attempt.result`) logs the spend.
+- **Cost = a LIST-PRICE ESTIMATE** from the pinned catalog (`supplier.DEFAULT_CATALOG`, data —
+  override via `adapter["catalog"]`): neither fal nor Replicate returns the charged amount
+  in-band. UNPRICED (backend, op) **fails closed pre-spend**. `get_status` now surfaces
+  attempt `cost`, and the driver's manifest reads the LOGGED cost back (closes Open Q5's
+  "estimate-only" caveat at the manifest level; dashboard reconciliation still v2).
+- **Charge contract = `_hf_generate`'s, verbatim:** pre-send connect failure RETRYABLE;
+  ambiguous submit TERMINAL fail-closed; ANY post-submit failure TERMINAL inside a no-escape
+  backstop; deadline → best-effort cancel + TIMEOUT. status/response/cancel URLs pinned to the
+  provider origin; every forwarded image URL SSRF-guarded; model ids path-validated;
+  request bodies built from an explicit whitelist (never a context splat).
+- **Pinned catalog (verified 2026-07-12 vs fal docs/model pages):** fal queue API
+  (`queue.fal.run`, `Key` auth, `IN_QUEUE/IN_PROGRESS/COMPLETED`, failures = COMPLETED+`error`);
+  i2v `bytedance/seedance-2.0/image-to-video` (~$0.19/s est), edit `fal-ai/nano-banana-2/edit`
+  ($0.08/img), t2i `fal-ai/nano-banana-2` ($0.08 est). Replicate: predictions API confirmed;
+  **input param names for edit/i2v pinned from memory, UNVERIFIED live** — verify with one
+  bounded call before relying on that backend.
+- **Orchestrator:** `--backend fal|replicate|higgsfield` (default fal), `--duration`. Gateway
+  i2v has no `motion_id` param — the router's CLOSED motion enum rides as a deterministic
+  `CAMERA_MOTION:` prompt line whose intensity is the same ONE retry variable; the gate now
+  shows `backend` + real `cost_units` (USD vs credits) with the worst-case disclosure intact.
+- **Tests:** `tests/test_supplier.py` (39 checks, httpx.MockTransport, no spend) + repo
+  `test.sh` (all suites + a CLI dry-run proving the gate renders and aborts on EOF).
+
+**Live-run checklist (pre first spend):** put `FAL_KEY` (and `REPLICATE_API_TOKEN` if used) in
+`~/.myndaix/.secrets`; one $≤0.2 t2i live call to confirm shapes; one 5s i2v; check the fal
+dashboard's real charge against the logged estimate before trusting cost math anywhere.

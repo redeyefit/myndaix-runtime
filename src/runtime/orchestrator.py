@@ -20,6 +20,12 @@ Per the build corollaries (docs/MX_QUALITY_ORCHESTRATOR.md), v1:
 motion_id is the live `/v1/motions` UUID (verified 2026-06-28: the API field takes the UUID;
 "Dolly In" etc. are human labels). image_url is rendered+uploaded UPSTREAM by mx-engine and
 handed in (a public Cloudinary secure_url that passes the runner's SSRF guard).
+
+2026-07-12 addition (Jefe-approved): stage 3 defaults to the PRICED SUPPLIER GATEWAY
+(supplier.py — the `supplier` ledger agent; fal.ai primary / Replicate secondary, per-call
+dollar pricing, cost logged in the ledger). `--backend higgsfield` keeps the legacy path;
+the Higgsfield MCP connector remains the v2 alternate. Same human cost gate, same
+charge-safety contract, same manifest handback that mx-engine's reelgen consumes.
 """
 from __future__ import annotations
 
@@ -34,6 +40,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from runtime import critic
+from runtime import supplier as gateway
 from runtime.registry import get as get_spec
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
@@ -88,6 +95,22 @@ PERSONA_NEGATIVES = ["no warped faces", "no morphing", "no identity change", "no
 
 # rough display-only cost estimate (credits) — UNVERIFIED; measure live before any cost LOGIC.
 COST_EST = {"hero": 40, "filler": 6}
+
+# stage-3 backends (2026-07-12 addition): the priced supplier GATEWAY (supplier.py; fal
+# primary, replicate secondary — dollars, per-call APIs) is the DEFAULT; the higgsfield
+# ledger agent stays as the alternate. The gateway's i2v models take no motion_id param —
+# the router's named camera move is delivered as a DETERMINISTIC prompt line instead
+# (_camera_line); the enum stays closed either way (the LLM only ever selects).
+GATEWAY_BACKENDS = gateway.BACKENDS            # ("fal", "replicate")
+DEFAULT_BACKEND = "fal"
+DEFAULT_I2V_SECONDS = 5.0
+
+
+def _camera_line(name: str, strength: float) -> str:
+    """The camera instruction for gateway i2v backends: built from the CLOSED motion enum +
+    a numeric intensity — never free prose from the LLM/brief. The intensity is the same
+    single variable the critic's bounded retry adjusts."""
+    return f"CAMERA_MOTION: {name}, intensity {strength:g} (single controlled move, no cuts)"
 
 POLL_INTERVAL_S = 3.0
 NOMINAL_DURATION_S = 3.0     # DoP/lite nominal; not measured in v1
@@ -177,22 +200,39 @@ def build_prompt(brief: str, brand: str, *, brands_dir: Optional[str] = None,
 
 # ============================ stage 2: model-router (in-process) ============================
 def route(shot: dict, *, role: str = "hero", motion: Optional[str] = None,
-          motion_strength: Optional[float] = None) -> dict:
-    """Trivial v1 router: one shot -> the higgsfield (dop/lite image->video) supplier; pick a
-    named motion from the pinned catalog (-> its UUID); attach a display-only cost estimate."""
+          motion_strength: Optional[float] = None, backend: str = "higgsfield",
+          duration: Optional[float] = None) -> dict:
+    """Trivial v1 router: one shot -> ONE i2v supplier; pick a named motion from the pinned
+    catalog; attach a display-only cost estimate. backend "fal"/"replicate" routes to the
+    priced gateway (`supplier` agent, dollars); "higgsfield" routes to the legacy ledger
+    agent (credits, motion_id UUID). This function's default stays "higgsfield" for
+    call-site compatibility — the PRODUCT default (fal) is set by the driver/CLI."""
     if role not in ("hero", "filler"):
         raise ValueError(f"bad role {role!r}")
+    if backend != "higgsfield" and backend not in GATEWAY_BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}; one of "
+                         f"{('higgsfield',) + tuple(GATEWAY_BACKENDS)}")
     name = motion or (HERO_MOTION if role == "hero" else FILLER_MOTION)
     if name not in MOTION_CATALOG:
         raise ValueError(f"unknown motion {name!r}; choices: {sorted(MOTION_CATALOG)}")
     ms = 0.5 if motion_strength is None else float(motion_strength)
+    if backend == "higgsfield":
+        to_agent, cost_est, units = "higgsfield", COST_EST.get(role, COST_EST["filler"]), "credits"
+    else:
+        to_agent, units = "supplier", "USD"
+        # fail-closed pricing: an unpriced (backend, op) raises HERE, pre-gate, pre-spend
+        cost_est = gateway.estimate_cost(
+            "i2v", backend, {"duration": duration or DEFAULT_I2V_SECONDS})
     return {
-        "to_agent": "higgsfield",
+        "to_agent": to_agent,
+        "backend": backend,
         "role": role,
         "motion_name": name,
         "motion_id": MOTION_CATALOG[name],
         "motion_strength": ms,
-        "cost_est": COST_EST.get(role, COST_EST["filler"]),
+        "cost_est": cost_est,
+        "cost_units": units,
+        "duration": duration or DEFAULT_I2V_SECONDS,
         "prompt": shot["prompt"],
         "locks": shot["locks"],
     }
@@ -231,10 +271,11 @@ class OrchestratorDriver:
             finally:
                 self._led = None
 
-    # ---- stage 3 (the only ledger job): submit to higgsfield, poll >=600s, read artifact ----
+    # ---- stage 3 (the only ledger job): submit to the supplier, poll >=600s, read artifact ----
     async def _supplier_ledger(self, context: dict, deadline_s: float) -> dict:
         led = await self._ledger()
-        jid = await led.submit_job(to_agent="higgsfield", prompt=context["prompt"],
+        to_agent = context.get("to_agent") or "higgsfield"   # "supplier" (gateway) | "higgsfield"
+        jid = await led.submit_job(to_agent=to_agent, prompt=context["prompt"],
                                    context=context, created_by="orchestrator",
                                    repo_id=context.get("repo_id"))
         loop = asyncio.get_event_loop()
@@ -271,8 +312,15 @@ class OrchestratorDriver:
             err = next((a.get("text") for a in (st.get("attempts") or [])
                         if a.get("status") == "failed" and a.get("text")), st.get("status"))
             raise RuntimeError(f"stage-3 supplier {st.get('status')}: {err}")
-        # get_status does NOT expose Result.cost -> v1 manifest uses the gate estimate (Open Q5).
-        return {"artifact_ref": st["artifact_ref"], "cost": float(context.get("cost_est", 0.0)),
+        # cost read-back: get_status now surfaces attempt.result cost — prefer the LOGGED
+        # Result.cost from the ok attempt (the gateway's list-price estimate, persisted in
+        # the ledger); fall back to the gate estimate if absent (legacy rows / old DBs).
+        cost = next((a.get("cost") for a in (st.get("attempts") or [])
+                     if a.get("status") == "ok"
+                     and isinstance(a.get("cost"), (int, float))
+                     and not isinstance(a.get("cost"), bool)), None)
+        return {"artifact_ref": st["artifact_ref"],
+                "cost": float(cost) if cost is not None else float(context.get("cost_est", 0.0)),
                 "job_id": str(jid)}
 
     async def _grab_frame(self, plate_ref: str, w: int = 64, h: int = 36) -> tuple:
@@ -406,6 +454,7 @@ class OrchestratorDriver:
                   motion: Optional[str] = None, motion_strength: Optional[float] = None,
                   end_image_url: Optional[str] = None, repo_id: Optional[str] = None,
                   max_retries: int = 2, brands_dir: Optional[str] = None,
+                  backend: str = DEFAULT_BACKEND, duration: Optional[float] = None,
                   supplier: Optional[SupplierFn] = None,
                   frame_grabber: Optional[FrameGrabber] = None, persona_judge=None) -> dict:
         supplier = supplier or self._supplier_ledger
@@ -415,7 +464,8 @@ class OrchestratorDriver:
         # stage 1 + 2 (free, in-process)
         shot = build_prompt(brief, brand, brands_dir=brands_dir, render_type=render_type)
         hexes = shot["locks"]["hexes"]               # resolved brand hexes (brand file or fallback)
-        routed = route(shot, role=role, motion=motion, motion_strength=motion_strength)
+        routed = route(shot, role=role, motion=motion, motion_strength=motion_strength,
+                       backend=backend, duration=duration)
         cost_est = estimate_cost(routed)
 
         # persona Soul-ID gate needs a reference embedding — resolve it BEFORE the cost gate so a
@@ -433,6 +483,7 @@ class OrchestratorDriver:
         # gate must approve the max, not a single attempt (cross-family CRITICAL).
         max_attempts = max_retries + 1
         plan = {"brief": brief, "brand": brand, "shot_id": shot_id, "image_url": image_url,
+                "backend": routed["backend"], "cost_units": routed["cost_units"],
                 "motion": routed["motion_name"], "motion_id": routed["motion_id"],
                 "motion_strength": routed["motion_strength"], "estimated_cost": cost_est,
                 "max_attempts": max_attempts,
@@ -441,16 +492,27 @@ class OrchestratorDriver:
             return {"status": "aborted", "reason": "cost gate not approved", "plan": plan}
 
         # ===== stage 3 (supplier, spends) + stage 4 (critic), bounded one-variable retry =====
-        spec = get_spec("higgsfield")
+        spec = get_spec(routed["to_agent"])
         prof_to = getattr(getattr(spec, "profile", None), "timeout_s", 600) if spec else 600
         deadline = max(600.0, float(prof_to or 600))
         ms = routed["motion_strength"]
         attempts = []
         result = None
         for attempt in range(max_attempts):
-            ctx = {"image_url": image_url, "prompt": routed["prompt"],
-                   "motion_id": routed["motion_id"], "motion_strength": ms,
-                   "cost_est": cost_est, "repo_id": repo_id}
+            if routed["to_agent"] == "supplier":
+                # gateway i2v: no motion_id param — the closed-enum camera move rides as a
+                # deterministic prompt line; its intensity is the ONE retry variable.
+                ctx = {"to_agent": "supplier", "op": "i2v", "backend": routed["backend"],
+                       "image_url": image_url,
+                       "prompt": routed["prompt"] + "\n" + _camera_line(routed["motion_name"], ms),
+                       "duration": routed["duration"],
+                       "motion_strength": ms,   # informational (rides in the camera line);
+                       "cost_est": cost_est,    # keeps the ONE retry variable ledger-visible
+                       "repo_id": repo_id}
+            else:
+                ctx = {"image_url": image_url, "prompt": routed["prompt"],
+                       "motion_id": routed["motion_id"], "motion_strength": ms,
+                       "cost_est": cost_est, "repo_id": repo_id}
             if end_image_url:
                 ctx["end_image_url"] = end_image_url
             # A supplier/frame-grab failure is NOT a critic FAIL: do NOT re-run stage 3 (a re-submit
@@ -497,7 +559,9 @@ class OrchestratorDriver:
             "status": "ok",
             "plate_url": sup["artifact_ref"],
             "shot_id": shot_id,
-            "duration": NOMINAL_DURATION_S,
+            "backend": routed["backend"],
+            "cost_units": routed["cost_units"],
+            "duration": routed.get("duration") or NOMINAL_DURATION_S,
             "render_type": render_type,
             "applied_locks": {"hexes": hexes, "camera_preset": routed["motion_name"],
                               "motion_id": routed["motion_id"],
@@ -516,12 +580,13 @@ def _render_gate(plan: dict) -> str:
     """The human-facing cost-gate text. MUST surface the WORST-CASE spend (max_attempts +
     max_estimated_cost), NOT a single attempt, so the operator approves what can actually be
     charged across the bounded retries (cross-family review CRITICAL)."""
-    keys = ("brief", "brand", "shot_id", "motion", "motion_strength",
+    keys = ("brief", "brand", "shot_id", "backend", "motion", "motion_strength",
             "estimated_cost", "max_attempts", "max_estimated_cost", "image_url")
     lines = ["=== MX QUALITY ORCHESTRATOR — COST GATE (no spend until you approve) ==="]
     lines += [f"  {k:18}: {plan.get(k)}" for k in keys]
+    units = plan.get("cost_units") or "credits"
     lines.append(f"  >> approving authorizes UP TO {plan.get('max_attempts')} charged attempt(s) "
-                 f"= up to {plan.get('max_estimated_cost')} credits (worst case incl. retries)")
+                 f"= up to {plan.get('max_estimated_cost')} {units} (worst case incl. retries)")
     return "\n".join(lines)
 
 
@@ -543,6 +608,7 @@ async def _amain(args) -> int:
             shot_id=args.shot_id, role=args.role, motion=args.motion,
             motion_strength=args.motion_strength, end_image_url=args.end_image_url,
             repo_id=args.repo, brands_dir=args.brands_dir,
+            backend=args.backend, duration=args.duration,
             render_type=args.render_type, ref_image=args.ref_image)
     finally:
         await drv.close()
@@ -564,6 +630,12 @@ def main(argv: Optional[list] = None) -> int:
                    help="persona = animate a SUBJECT; stage-4 runs the Soul-ID face gate vs --ref-image/seed")
     p.add_argument("--ref-image", dest="ref_image", default=None,
                    help="persona: local reference still for the identity gate (else the seed image_url)")
+    p.add_argument("--backend", default=DEFAULT_BACKEND,
+                   choices=["fal", "replicate", "higgsfield"],
+                   help="stage-3 supplier: the priced gateway (fal primary / replicate "
+                        "secondary, dollars) or the legacy higgsfield agent (credits)")
+    p.add_argument("--duration", type=float, default=None,
+                   help=f"i2v clip seconds (gateway backends; default {DEFAULT_I2V_SECONDS:g})")
     p.add_argument("--motion", default=None, help=f"motion name (default by role); one of {sorted(MOTION_CATALOG)}")
     p.add_argument("--motion-strength", dest="motion_strength", type=float, default=None)
     p.add_argument("--end-image-url", dest="end_image_url", default=None)

@@ -218,6 +218,24 @@ V1_ROSTER: list[AgentSpec] = [
                        "secret_ref": "HF_KEY",
                        "application": "/higgsfield-ai/dop/lite",
                        "non_idempotent": True}),
+    # Supplier gateway: the thin PRICED per-call media interface (t2i / multi-ref edit /
+    # i2v) backed by fal.ai (primary) and Replicate (secondary) — supplier.py. reach=API
+    # with adapter.kind 'supplier' routes to invoke_supplier. Every call is a ledger job;
+    # Result.cost logs the list-price estimate (the APIs return no spend in-band). The
+    # Higgsfield rows below stay as the ALTERNATE backend. Model/price catalog is DATA
+    # (supplier.DEFAULT_CATALOG; override via adapter["catalog"]).
+    AgentSpec(agent_id="supplier", reach=Reach.API, authority=Authority.RESPONDER,
+              model="fal+replicate", role="priced media gateway (t2i/edit/i2v)",
+              # 600s: seedance i2v renders run minutes; poll deadline must cover them
+              # (same false-timeout trap as higgsfield — read via spec.profile.timeout_s).
+              profile=Profile(timeout_s=600, cost_budget=2.0),
+              # non_idempotent: the submit POST charges money and is NOT deduplicated —
+              # same crash-requeue double-charge window as higgsfield; _requeue_safe
+              # sends a crashed paid job dead+surfaced, never resubmitted.
+              adapter={"kind": "supplier",
+                       "default_backend": "fal",
+                       "secret_refs": {"fal": "FAL_KEY", "replicate": "REPLICATE_API_TOKEN"},
+                       "non_idempotent": True}),
     # Stitcher: long video from a shot-list (generate per shot -> last-frame chain ->
     # ffmpeg concat -> deterministic brand overlay). reach=API + adapter.kind 'stitch'
     # routes to invoke_stitch. authority=WORKSPACE_ACTOR -> NEVER auto-retried (so the

@@ -528,6 +528,10 @@ async def invoke(agent_id: str, job: Job) -> Result:
         return await invoke_stitch(spec, job)
     if kind == "higgsfield":
         return await invoke_higgsfield(spec, job)
+    if kind == "supplier":
+        # lazy import: supplier imports this module's helpers (avoid a cycle)
+        from runtime.supplier import invoke_supplier
+        return await invoke_supplier(spec, job)
     return await invoke_api(spec, job)
 
 
