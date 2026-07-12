@@ -1656,6 +1656,84 @@ class PostgresLedger:
                     ORDER BY lq.rule_tag, lq.reviewer_family, lq.path""")
         return [dict(r) for r in rows]
 
+    # ---- shadow dial (docs/shadow-dial-design.md v0.6 PR-A): MEASURE-ONLY reads + the one
+    # opt-in append to the dial's OWN table. The SQL here is a PURE PROJECTION — every threshold
+    # lives in the verb (v0.2 D1), and dial_shadow_snapshot is NEVER read by review/prompt/gate
+    # code (design m1; its only reader is `mxr dial-shadow --eval`). --------------------------------
+
+    async def dial_shadow_labels(self, cutoff: int | None = None) -> list:
+        """One CURRENT human row per (finding, family) from finding_current_human (the admitted-set
+        view — machine sources structurally absent), joined to the finding's latest RAISE row for
+        provenance (ref + play: the design §2 anti-poisoning signal is that labels span independent
+        reviews, not one bulk dismissal). LEFT JOIN + ref fallback: a missing raise row degrades to
+        NO play provenance (fail-safe — fewer distinct, never more).
+
+        `cutoff` (the --snapshot path, xreview r1 HIGH): with a cutoff the read is BOUNDED to
+        seq <= cutoff (rows AND the provenance join) so a snapshot's cells are exactly consistent
+        with its data_cutoff_seq — the verb reads max_finding_seq() FIRST, then labels. A label
+        racing in during the snapshot lands seq > cutoff: absent from these cells, present in a
+        future eval cohort (seq > cutoff) — never lost, never double-counted. Edge (documented,
+        accepted): a CORRECTION racing into that window supersedes its finding's current row in
+        the view, so the finding drops from this snapshot's cells entirely and re-enters as
+        post-cutoff evidence — consistent, just not an as-of-cutoff reconstruction (which would
+        require duplicating the 0010 view SQL here; not worth the drift risk at one-label scale)."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT h.rule_tag, h.reviewer_family, h.outcome, h.outcome_source, h.seq,
+                          COALESCE(r.ref, h.ref) AS ref, r.source_event AS raise_event
+                     FROM finding_current_human h
+                     LEFT JOIN LATERAL (SELECT x.ref, x.source_event
+                                          FROM finding_outcome x
+                                         WHERE x.finding_key = h.finding_key
+                                           AND x.reviewer_family = h.reviewer_family
+                                           AND x.outcome_source = 'review_raised'
+                                           AND ($1::bigint IS NULL OR x.seq <= $1)
+                                         ORDER BY x.seq DESC LIMIT 1) r ON true
+                    WHERE ($1::bigint IS NULL OR h.seq <= $1)
+                    ORDER BY h.rule_tag, h.reviewer_family, h.seq""", cutoff)
+        out = []
+        for r in rows:
+            d = dict(r)
+            ev = d.pop("raise_event") or ""
+            # play provenance only from a well-formed 'review:<play>' raise event; anything else
+            # (missing raise, foreign shape) is None -> counts as NO provenance in the core.
+            d["play"] = ev[len("review:"):] if ev.startswith("review:") else None
+            out.append(d)
+        return out
+
+    async def max_finding_seq(self) -> int:
+        """The snapshot's data_cutoff_seq (design §4): max finding_outcome.seq at capture — the
+        'labels since' boundary a future eval measures against."""
+        async with self._pool.acquire() as con:
+            return await con.fetchval("SELECT COALESCE(max(seq), 0) FROM finding_outcome")
+
+    async def dial_shadow_snapshot_append(self, rows: list) -> int:
+        """Append fully-formed snapshot rows (the verb builds them — schema M5: every row carries
+        its complete policy context). Append-only; one transaction so a snapshot is all-or-nothing."""
+        if not rows:
+            return 0
+        cols = ["data_cutoff_seq", "rule_tag", "reviewer_family", "confirmed_real", "dismissed_fp",
+                "n", "precision", "wilson_lo", "wilson_hi", "n_recent", "wilson_recent_lo",
+                "wilson_recent_hi", "distinct_refs", "distinct_plays", "would_say", "suppressible",
+                "floor", "ceiling", "min_n", "min_refs", "min_plays", "min_fp", "recency_n", "z",
+                "stable_snaps", "eval_min_n", "eval_agree", "week_span_rule",
+                "suppressible_set_version", "taxonomy_version"]
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+        sql = (f"INSERT INTO dial_shadow_snapshot ({', '.join(cols)}) VALUES ({placeholders})")
+        async with self._pool.acquire() as con:
+            async with con.transaction():
+                for row in rows:
+                    await con.execute(sql, *[row[c] for c in cols])
+        return len(rows)
+
+    async def dial_shadow_snapshots(self) -> list:
+        """All snapshot rows, cell-grouped order — the --eval read (this table's ONLY reader)."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT * FROM dial_shadow_snapshot
+                    ORDER BY rule_tag, reviewer_family, captured_at, id""")
+        return [dict(r) for r in rows]
+
     # ---- self-labeling FENCE: the write verbs (docs/self-labeling-design.md v0.4) -----------------
     # Each labeled-write verb SERVER-MINTS outcome_source + source_event (never caller-supplied),
     # hard-codes its exact (source, outcome) PAIRS (§3 legal-pair table + the DB pair-CHECK backs it),
