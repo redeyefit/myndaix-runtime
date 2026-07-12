@@ -336,8 +336,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if (args.task is None) == (args.prompt_file is None):
         p.error("provide exactly one of <task> or --prompt-file")
     task = args.task
-    if args.prompt_file:
-        try:
+    if args.prompt_file is not None:                 # is-None, not truthiness: --prompt-file "" must
+        try:                                         # still enter here (and fail cleanly), never leave task=None
             task = Path(args.prompt_file).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:   # UnicodeDecodeError is a ValueError, not OSError
             p.error(f"--prompt-file: {e}")

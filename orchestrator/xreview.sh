@@ -41,11 +41,20 @@ have mxr || die "mxr not on PATH"
 # private scratch for prompt files + kilabz stderr; staged = the lobster synthesis snapshot (issue
 # #83 item 2). ONE consolidated EXIT trap: teardown the snapshot (best-effort; the age-reaper
 # backstops) then remove scratch. INT/TERM exit so cleanup runs exactly once; the EXIT trap ignores
-# re-signals so a second ^C can't strand the snapshot.
+# re-signals so a second ^C can't strand scratch.
+# LIVENESS DISCIPLINE (this PR's gate MED): a `mxr <agent>` sync call returns 1 for BOTH a terminal
+# failure AND a sync-wait TIMEOUT (the durable job may still be RUNNING). So the EXIT/cleanup path must
+# NEVER blind-`review-teardown` a snapshot a live lobster job may still hold as its cwd — that yanks a
+# running job's workdir. The snapshot is torn down INLINE only on the confirmed-terminal happy path
+# (we hold the synthesis result = proof the job finished); every other exit leaves it to the
+# LIVENESS-AWARE age-reaper (`mxr review-reap` skips workdirs any live job references). cleanup() thus
+# removes ONLY scratch.
 xtmp="$(mktemp -d)"; staged=""
-cleanup(){ [[ -n "$staged" ]] && { mxr review-teardown "$staged" >/dev/null 2>&1 || true; }
-           rm -rf "$xtmp" 2>/dev/null; return 0; }
+cleanup(){ rm -rf "$xtmp" 2>/dev/null; return 0; }   # NEVER teardown here — the reaper owns live snapshots
 trap 'trap "" INT TERM; cleanup' EXIT
+# reap prior orphaned review snapshots (liveness-aware, age-based) so manual xreview runs don't
+# accumulate them where no play-review startup reap runs. Best-effort.
+mxr review-reap >/dev/null 2>&1 || true
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -183,8 +192,8 @@ printf '\n\n'
 # CODE mode: stage a de-linked read-only snapshot of the reviewed tip as lobster's cwd (issue #83
 # item 2 — the registry's lobster-with-snapshot fabrication guard): synthesis can now VERIFY a
 # disputed claim against the actual code instead of only reconciling text. ADDITIVE + degradable —
-# a staging failure warns loudly and synthesis proceeds reconcile-only, exactly as before. The
-# consolidated EXIT trap tears the snapshot down (and the age-reaper backstops a hard kill).
+# a staging failure warns loudly and synthesis proceeds reconcile-only, exactly as before. Teardown
+# is liveness-safe: inline ONLY when we hold the result (terminal); else the age-reaper reclaims it.
 printf '== lobster (synthesis) ==\n' >&2
 lob_flags=(); verify_note=""
 if [[ "$mode" == code ]]; then
@@ -202,8 +211,16 @@ $(fence "$a_label" "$a_content" "$nonce_syn")
 
 $(fence "$b_label" "$b_content" "$nonce_syn")"
 triage="$(MXR_TIMEOUT_S="$WAIT" mxr lobster ${lob_flags[@]+"${lob_flags[@]}"} --prompt-file "$(_pf synth "$sprompt")" 2>/dev/null || true)"
-[[ -n "${triage//[[:space:]]/}" ]] || triage="(lobster synthesis unavailable — read the two reviews printed above)"
-# teardown promptly on the happy path (the EXIT trap is the belt for early exits)
-[[ -n "$staged" ]] && { mxr review-teardown "$staged" >/dev/null 2>&1 || true; staged=""; }
+if [[ -n "${triage//[[:space:]]/}" ]]; then
+  # NON-EMPTY result = the sync wait received the synthesis = the job is TERMINAL-done => safe to
+  # reclaim the snapshot now (no live job references it).
+  [[ -n "$staged" ]] && { mxr review-teardown "$staged" >/dev/null 2>&1 || true; staged=""; }
+else
+  # EMPTY = timeout OR terminal-fail — indistinguishable via the sync exit code. The durable lobster
+  # job may STILL be running and holding $staged as its cwd, so DO NOT teardown; leave it to the
+  # liveness-aware age-reaper (it won't reap a workdir a live job references).
+  triage="(lobster synthesis unavailable — read the two reviews printed above)"
+  [[ -n "$staged" ]] && printf 'xreview: NOTE — lobster timed out/failed; its snapshot is left for the liveness-aware age-reaper (a live job may still hold it)\n' >&2
+fi
 
 printf '=== XREVIEW VERDICT (%s) ===\n' "$mode"; printf '%s' "$triage" | clean; printf '\n'

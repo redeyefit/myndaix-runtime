@@ -28,6 +28,7 @@ if [[ "${1:-}" == "review-stage" ]]; then      # lobster synthesis snapshot (iss
   d="$HOME/stub-staging/review-stub"; mkdir -p "$d"; printf '%s\n' "$d"; exit 0
 fi
 [[ "${1:-}" == "review-teardown" ]] && exit 0
+[[ "${1:-}" == "review-reap" ]] && exit 0       # startup orphan reap (best-effort)
 if [[ "${1:-}" == "review" ]]; then            # `mxr review <agent> --repo .. --range ..` = code gate
   [[ -n "${STUB_KILABZ_FAIL:-}" ]] && { printf 'GATE-ROOT-CAUSE-XYZ\n' >&2; exit 1; }   # emit a root cause on stderr
   [[ -n "${STUB_DEGRADE:-}" ]] && printf 'kilabz review ran WITHOUT snapshot (staging failed, inline-only)\n' >&2
@@ -45,7 +46,7 @@ done
 case "$agent" in
   oracle)  [[ -n "${STUB_ORACLE_FAIL:-}" ]] && exit 1; printf '%s\n' "${STUB_ORACLE:-ORACLE review: reframe the thesis}"; exit 0 ;;
   kilabz)  [[ -n "${STUB_KILABZ_FAIL:-}" ]] && exit 1; printf '%s\n' "${STUB_KILABZ:-KILABZ review: complete}"; exit 0 ;;
-  lobster) printf '%s\n' "${STUB_TRIAGE:-1. fix the bug}"; exit 0 ;;
+  lobster) [[ -n "${STUB_LOBSTER_EMPTY:-}" ]] && exit 0; printf '%s\n' "${STUB_TRIAGE:-1. fix the bug}"; exit 0 ;;
   *) printf 'stub:%s\n' "$agent"; exit 0 ;;
 esac
 STUB
@@ -86,8 +87,15 @@ echo "1. code mode: kilabz GATE via 'mxr review' (SHA-PINNED range), oracle gets
   cko "$out" "kilabz-review (authoritative" "raw kilabz review printed to stdout (survives a lobster failure)"
   ck "$(log)" "review-stage $REPO" "lobster synthesis snapshot staged (issue #83 item 2)"
   ck "$(log)" "\-\-staged-workdir" "lobster call carries the staged snapshot cwd"
-  ck "$(log)" "review-teardown" "snapshot torn down on the happy path"
+  ck "$(log)" "review-teardown" "snapshot torn down on the happy path (lobster returned terminal)"
   ck "$(log)" "\-\-prompt-file" "oracle/lobster prompts ride --prompt-file, not argv (issue #83 item 1)"
+
+echo "1c. code mode: a lobster TIMEOUT/empty result must NOT teardown (liveness — a live job may hold the cwd)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+  out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_LOBSTER_EMPTY=1 bash "$SCRIPT" code "$REPO" "$RANGE" 2>"$ROOT/err")"; ckx $? 0 "empty-lobster review still exits 0"
+  ck "$(log)" "review-stage $REPO" "snapshot still staged"
+  if grep -q "review-teardown" "$(log)"; then echo "  FAIL: tore down a snapshot a live lobster job may hold"; FAIL=$((FAIL+1)); else echo "  ok: NO teardown after a lobster timeout (left to the age-reaper)"; PASS=$((PASS+1)); fi
+  ck "$ROOT/err" "age-reaper" "left-for-reaper noted on stderr"
+  cko "$out" "read the two reviews printed above" "fallback synthesis text on empty lobster"
 
 echo "2. code mode: the UPSTREAM-input nonce and the SYNTHESIS nonce DIFFER (r2 HIGH — no fence escape into lobster)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   run code "$REPO" "$RANGE" >/dev/null
