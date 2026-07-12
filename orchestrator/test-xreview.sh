@@ -19,6 +19,15 @@ mkdir -p "$FAKE/.local/bin"
 cat > "$FAKE/.local/bin/mxr" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$HOME/mxr-argv.log" 2>/dev/null || true
+# --prompt-file dispatch (issue #83): ALSO log the file's CONTENT so content assertions keep working
+argvv=("$@"); for ((j=0; j<${#argvv[@]}; j++)); do
+  [[ "${argvv[$j]}" == "--prompt-file" ]] && cat "${argvv[$((j+1))]}" >> "$HOME/mxr-argv.log" 2>/dev/null
+done
+if [[ "${1:-}" == "review-stage" ]]; then      # lobster synthesis snapshot (issue #83 item 2)
+  [[ -n "${STUB_STAGE_FAIL:-}" ]] && { echo "staging failed: stub" >&2; exit 1; }
+  d="$HOME/stub-staging/review-stub"; mkdir -p "$d"; printf '%s\n' "$d"; exit 0
+fi
+[[ "${1:-}" == "review-teardown" ]] && exit 0
 if [[ "${1:-}" == "review" ]]; then            # `mxr review <agent> --repo .. --range ..` = code gate
   [[ -n "${STUB_KILABZ_FAIL:-}" ]] && { printf 'GATE-ROOT-CAUSE-XYZ\n' >&2; exit 1; }   # emit a root cause on stderr
   [[ -n "${STUB_DEGRADE:-}" ]] && printf 'kilabz review ran WITHOUT snapshot (staging failed, inline-only)\n' >&2
@@ -75,6 +84,10 @@ echo "1. code mode: kilabz GATE via 'mxr review' (SHA-PINNED range), oracle gets
   ck "$(log)" "head-line" "the fenced diff carries the real change (base->head)"
   cko "$out" "XREVIEW VERDICT (code)" "prints a synthesized code verdict"
   cko "$out" "kilabz-review (authoritative" "raw kilabz review printed to stdout (survives a lobster failure)"
+  ck "$(log)" "review-stage $REPO" "lobster synthesis snapshot staged (issue #83 item 2)"
+  ck "$(log)" "\-\-staged-workdir" "lobster call carries the staged snapshot cwd"
+  ck "$(log)" "review-teardown" "snapshot torn down on the happy path"
+  ck "$(log)" "\-\-prompt-file" "oracle/lobster prompts ride --prompt-file, not argv (issue #83 item 1)"
 
 echo "2. code mode: the UPSTREAM-input nonce and the SYNTHESIS nonce DIFFER (r2 HIGH — no fence escape into lobster)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   run code "$REPO" "$RANGE" >/dev/null
@@ -109,7 +122,14 @@ echo "7. code mode: a staging DEGRADATION is surfaced LOUDLY, not swallowed (r1 
 
 echo "8. code mode: a MISSING objective-file does NOT abort the gate (r2 #4)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(run code "$REPO" "$RANGE" /no/such/obj.txt)"; ckx $? 0 "missing objf still exits 0"
-  if grep -q -- "--prompt-file" "$(log)"; then echo "  FAIL: passed --prompt-file for a missing objf"; FAIL=$((FAIL+1)); else echo "  ok: no --prompt-file for a missing objf"; PASS=$((PASS+1)); fi
+  # the GATE line specifically must not carry --prompt-file (oracle/lobster legitimately use it now)
+  if grep "^review kilabz" "$(log)" | grep -q -- "--prompt-file"; then echo "  FAIL: gate passed --prompt-file for a missing objf"; FAIL=$((FAIL+1)); else echo "  ok: no --prompt-file on the GATE for a missing objf"; PASS=$((PASS+1)); fi
+
+echo "8b. code mode: lobster snapshot staging FAILURE degrades LOUDLY to reconcile-only (issue #83)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+  out="$(env HOME="$FAKE" PATH="$FAKE/.local/bin:$PATH" STUB_STAGE_FAIL=1 bash "$SCRIPT" code "$REPO" "$RANGE" 2>"$ROOT/err")"; ckx $? 0 "stage-fail still exits 0 (additive, degradable)"
+  ck "$ROOT/err" "reconcile-only" "degradation warned loudly"
+  if grep -q -- "--staged-workdir" "$(log)"; then echo "  FAIL: lobster got a workdir despite stage failure"; FAIL=$((FAIL+1)); else echo "  ok: no --staged-workdir after a stage failure"; PASS=$((PASS+1)); fi
+  cko "$out" "XREVIEW VERDICT" "verdict still produced reconcile-only"
 
 echo "9. code mode: an unresolvable repo is a usage error (exit 2)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   run code /no/such/repo "$RANGE" >/dev/null 2>&1; ckx $? 2 "unresolvable repo -> exit 2"

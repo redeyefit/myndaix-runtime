@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from runtime.contracts import TransportEnvelope
@@ -304,7 +305,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         prog="mxr", description='submit a task to the MyndAIX runtime',
         epilog='for a task that starts with a dash, use --:  mxr recon -- "-v explain"')
     p.add_argument("agent", help="roster agent id (e.g. recon, higgsfield)")
-    p.add_argument("task", help="the prompt / task text")
+    p.add_argument("task", nargs="?", help="the prompt / task text (or use --prompt-file)")
+    p.add_argument("--prompt-file", metavar="PATH", dest="prompt_file",
+                   help="read the task text from this file instead of argv — sidesteps the OS "
+                        "argv/env size ceiling (E2BIG) for large embedded diffs/reviews "
+                        "(issue #83); trusted operator input, read verbatim")
     p.add_argument("--image", metavar="URL",
                    help="input image url (media agents, e.g. higgsfield image->video)")
     p.add_argument("--application", metavar="PATH",
@@ -327,7 +332,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "strictly inside $MYNDAIX_STAGING_ROOT, and fails the job TERMINAL "
                         "otherwise (it cannot select an arbitrary cwd)")
     args = p.parse_args(raw)
-    return asyncio.run(submit(args.agent, args.task, context=_build_context(args),
+    # exactly ONE task source: the positional or --prompt-file (operator error -> exit 2).
+    if (args.task is None) == (args.prompt_file is None):
+        p.error("provide exactly one of <task> or --prompt-file")
+    task = args.task
+    if args.prompt_file:
+        try:
+            task = Path(args.prompt_file).read_text()
+        except OSError as e:
+            p.error(f"--prompt-file: {e}")
+        if not task.strip():
+            p.error("--prompt-file: file is empty")
+    return asyncio.run(submit(args.agent, task, context=_build_context(args),
                               repo_id=args.repo_id, base_ref=args.base_ref))
 
 
