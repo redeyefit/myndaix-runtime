@@ -1396,9 +1396,10 @@ class PostgresLedger:
         feature branch whose fix never merged (design §2, v1 scope).
 
         OPEN — for each finding in `open_findings` INSERT an 'open' row, SKIPPING any (finding_key,
-        family) whose LATEST state is dismissed_* (sticky dismissals — a human 'this reviewer was
-        wrong' suppresses re-detection, which is what the stable key exists FOR). Re-raise after
-        'expired' or 'applied_fixed' is allowed (a regression).
+        family) whose current state carries a HUMAN label: dismissed_* (sticky dismissals — a human
+        'this reviewer was wrong' suppresses re-detection, which is what the stable key exists FOR)
+        and confirmed_real (0012: the human already ruled REAL — a re-detection must not re-ask via
+        keys-files). Re-raise after 'expired' or 'applied_fixed' is allowed (a regression).
 
         `open_findings` is a list of resolved dicts from runtime.outcomes (the wiring layer already ran
         parse_finding_lines + resolve_and_hash, per family), each:
@@ -1466,15 +1467,18 @@ class PostgresLedger:
                     if ins is not None:
                         closed += 1
                 # OPEN: insert 'open' rows per (finding_key, family), skipping any (key, family) whose
-                # latest state is dismissed_* (sticky). One state read per (key, family) via
-                # finding_current — both families' rows are independent (per-family dedup above).
+                # current state carries a HUMAN label (sticky): dismissed_* suppresses re-detection
+                # (the reviewer was wrong / declined), and confirmed_real (migration 0012 makes it the
+                # current winner) suppresses the re-ask — the human already ruled, so a re-detection
+                # must not resurface the finding in keys-files or the label queue. One state read per
+                # (key, family) via finding_current — both families' rows are independent.
                 for (fk, fam), f in by_key.items():
                     cur = await con.fetchrow(
                         """SELECT outcome FROM finding_current
                             WHERE finding_key = $1 AND reviewer_family = $2""",
                         fk, fam)
                     if cur is not None and cur["outcome"] in (
-                            "dismissed_false_positive", "dismissed_wontfix"):
+                            "dismissed_false_positive", "dismissed_wontfix", "confirmed_real"):
                         skipped += 1
                         continue
                     ins = await con.fetchval(

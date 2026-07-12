@@ -436,6 +436,35 @@ async def test_label_queue_shows_auto_closed_and_keys_roundtrip(led):
     assert await led.label_queue() == [], "human labels drain the queue"
 
 
+async def test_fp_to_real_correction_consistent_in_raw_current(led):
+    # code-gate MED (migration 0012): after an fp -> real correction the RAW finding_current must
+    # show the latest human word, not the stale fp (finding_current_human already did).
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)
+    await led.confirm_outcome(FK[:12], "all", "fp", principal_role="admin")
+    await led.confirm_outcome(FK[:12], "all", "real", principal_role="admin")
+    cur = await _val(led, "SELECT outcome FROM finding_current WHERE finding_key=$1", FK)
+    assert cur == "confirmed_real", "finding_current must show the LATEST human word after a correction"
+
+
+async def test_confirmed_real_sticky_no_reraise_and_outranks_machine(led):
+    # code-gate MED: a human-confirmed finding must (a) outrank any LATER machine row in
+    # finding_current, and (b) never be re-raised by a re-detection (no keys-file re-ask).
+    await _truncate(led)
+    of = [{"tag": "fail-open", "path": "src/x.py", "line_hash": "lh-1", "reviewer_family": "kilabz"}]
+    r1 = await led.record_findings("r", "refs/heads/main", "d" * 40, "p1", ["src/x.py"], of, None)
+    assert r1["opened"] == 1
+    fk = await _val(led, "SELECT finding_key FROM finding_current WHERE reviewer_family='kilabz'")
+    await led.confirm_outcome(fk[:12], "all", "real", principal_role="admin")
+    cur = await _val(led, "SELECT outcome FROM finding_current WHERE finding_key=$1", fk)
+    assert cur == "confirmed_real", "the human row outranks machine rows in the raw current view"
+    r2 = await led.record_findings("r", "refs/heads/main", "e" * 40, "p2", ["src/x.py"], of, None)
+    assert r2["opened"] == 0 and r2["opened_rows"] == [], \
+        "a re-detection of a human-confirmed finding must not re-open or resurface it"
+    assert r2["skipped_dismissed"] == 1, "the skip is counted"
+
+
 async def main():
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

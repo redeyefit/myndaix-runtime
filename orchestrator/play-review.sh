@@ -473,7 +473,7 @@ outcomes_record(){
       printf -- '- finding:%s @ %s  [%s]\n    mxr outcome %s real      # reviewer was RIGHT — confirmed ground truth\n    mxr outcome %s fp        # reviewer was WRONG\n    mxr outcome %s wontfix   # right, but declining\n' \
         "$tag" "$path" "$fam" "$k12" "$k12" "$k12"
     done
-    printf -- '\nBatch (one command; edit the kind per key as needed):\n    mxr outcome real %s\n' "${all12% }"
+    printf -- '\nBatch — ONE kind per command (a command applies its kind to EVERY listed key; for mixed labels move keys onto separate real/fp/wontfix commands):\n    mxr outcome real %s\n' "${all12% }"
   } > "$kf" 2>/dev/null || true
   return 0
 }
