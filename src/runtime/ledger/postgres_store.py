@@ -1632,6 +1632,26 @@ class PostgresLedger:
             "open_count": open_n,
         }
 
+    async def label_queue(self) -> list:
+        """Read surface for `mxr labelqueue` (label-throughput PR-A §2c): every finding awaiting a
+        human label, joined to its latest RAISE row. The join is on review_raised — NOT the latest
+        row's state — because the queue deliberately contains auto-closed (applied_fixed) findings
+        awaiting post-hoc human truth, and the browser must not hide them. Request-time join over
+        the fence views, never a materialized core view (self-labeling design §4). Read-only."""
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT lq.rule_tag, lq.reviewer_family, left(lq.finding_key, 12) AS key12,
+                          lq.path, r.ref, r.source_event, r.seq AS raise_seq
+                     FROM finding_labelqueue lq
+                     JOIN LATERAL (SELECT x.ref, x.source_event, x.seq
+                                     FROM finding_outcome x
+                                    WHERE x.finding_key = lq.finding_key
+                                      AND x.reviewer_family = lq.reviewer_family
+                                      AND x.outcome_source = 'review_raised'
+                                    ORDER BY x.seq DESC LIMIT 1) r ON true
+                    ORDER BY lq.rule_tag, lq.reviewer_family, lq.path""")
+        return [dict(r) for r in rows]
+
     # ---- self-labeling FENCE: the write verbs (docs/self-labeling-design.md v0.4) -----------------
     # Each labeled-write verb SERVER-MINTS outcome_source + source_event (never caller-supplied),
     # hard-codes its exact (source, outcome) PAIRS (§3 legal-pair table + the DB pair-CHECK backs it),

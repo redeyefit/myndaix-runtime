@@ -194,9 +194,32 @@ def test_dismiss_routing_and_fail_closed_prefix():
 
 
 def test_dismiss_bad_kind_argparse_fails_open():
-    # a kind not in {fp,wontfix} -> argparse SystemExit -> fail-open (rc 0), never raises.
+    # a kind not in {real,fp,wontfix} -> usage -> fail-open (rc 0), never raises.
     _, _, rc = _run(outcomerecord.dismiss_main, ["outcome", "0" * 12, "garbage"])
-    ok(rc == 0, "a bad dismissal kind fails open (rc 0)")
+    ok(rc == 0, "a bad label kind fails open (rc 0)")
+
+
+# ---- label-throughput PR-A: `real` kind + kind-first batch form (CLI arg surface) ----------
+def test_label_real_single_and_batch_forms():
+    _truncate()
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, base, tip = _make_repo(tmp)
+        out, _, _ = _run(outcomerecord.main, [
+            "outcome-record", "--kilabz", "finding:fail-open @ f.py:2", "--oracle", "",
+            "--", repo, base, tip, "main", "play1", "f.py"])
+        key12 = out.strip().split("\t")[0]
+        # single legacy form, new `real` kind -> the gating confirmed_real row
+        o1, _, rc1 = _run(outcomerecord.label_main, ["outcome", key12, "real"])
+        ok(rc1 == 0 and "confirmed 1" in o1, "single form labels real (confirmed_real minted)")
+        row = _q("SELECT outcome, outcome_source FROM finding_current_human "
+                 "WHERE finding_key LIKE $1 || '%'", key12, one=True)
+        ok(row["outcome"] == "confirmed_real" and row["outcome_source"] == "human_confirm",
+           "the real label landed as (human_confirm, confirmed_real)")
+        # kind-first batch form: valid key (idempotent re-issue -> 0 rows) + junk key refused,
+        # four-count summary printed
+        o2, _, rc2 = _run(outcomerecord.label_main, ["outcome", "real", key12, "zz!", key12])
+        ok(rc2 == 0 and "labeled 1 (0 rows), refused 1, duplicates 1" in o2,
+           "batch form: four-count summary (idempotent re-issue, junk refused, dup deduped)")
 
 
 # ---- outcome-stats ------------------------------------------------------------------------

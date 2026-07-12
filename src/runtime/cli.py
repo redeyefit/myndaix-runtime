@@ -244,10 +244,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     if raw and raw[0] == "outcome-stats":
         from runtime import outcomerecord
         return outcomerecord.stats_main(["outcome-stats", *raw[1:]])
-    # `mxr outcome <finding_key_prefix> fp|wontfix` — the human's per-finding dismissal label.
+    # `mxr labelqueue` — read-only browser of findings awaiting a human label, clustered by
+    # (rule_tag, family) with paste-ready keys (label-throughput PR-A §2c). OPERATOR tier:
+    # fail-CLOSED (exit 2) if the ledger is unreachable.
+    if raw and raw[0] == "labelqueue":
+        from runtime import outcomerecord
+        return outcomerecord.labelqueue_main(["labelqueue", *raw[1:]])
+    # `mxr outcome <key12> real|fp|wontfix` (single) or `mxr outcome <kind> <key12>...` (batch) —
+    # the human's per-finding label, ALL kinds routed through the fence's confirm_outcome
+    # (label-throughput PR-A D-1: `real` is the gating numerator and finally has a caller).
     if raw and raw[0] == "outcome":
         from runtime import outcomerecord
-        return outcomerecord.dismiss_main(["outcome", *raw[1:]])
+        return outcomerecord.label_main(["outcome", *raw[1:]])
 
     # `mxr knowledge-ingest / recall / knowledge-rebuild / curate` — the curator rung
     # (docs/curator-design.md v0.4). Same routing rationale as the verbs above (inherits

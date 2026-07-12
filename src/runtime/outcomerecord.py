@@ -197,34 +197,73 @@ async def record(repo_path: str, base: str, tip: str, ref: str, play: str,
             pass
 
 
-async def dismiss(prefix: str, kind: str) -> int:
-    """`mxr outcome <prefix> fp|wontfix` — the human's per-finding label across BOTH families open on
-    that key ('all'). Prints the result; FAIL-CLOSED on an ambiguous / <12-hex prefix (prints the
-    colliding keys). NEVER records anything on a bad prefix. Returns 0 always (a refusal is not a
-    caller error — the operator retries with a longer prefix)."""
+_LABEL_KINDS = ("real", "fp", "wontfix")
+_LABEL_BATCH_CAP = 200          # fat-finger guard on one invocation, not a quota (design §2b)
+
+
+async def label_batch(led, kind: str, keys: list) -> dict:
+    """Label 1..N findings as `kind` (design §2a/§2b). D-1: ALL kinds route through
+    confirm_outcome — the ONLY writer of the gating human rows — so `real` finally has a caller
+    and fp/wontfix gain the any-state semantics (post-hoc truth on auto-closed/expired findings;
+    queue membership untouched — human rows are terminal for it). PER-KEY fail-closed (an
+    ambiguous/junk key refuses THAT key, prints candidates, the loop continues), BATCH fail-open.
+    Duplicates within one invocation are deduped (first occurrence kept). Returns the four-count
+    summary {labeled, rows, refused, duplicates} — `rows` = ledger rows actually inserted this
+    call (0-2 per key via family expansion; idempotent re-issues insert 0)."""
+    seen, uniq, duplicates = set(), [], 0
+    for k in keys:
+        kk = (k or "").strip().lower()
+        if kk in seen:
+            duplicates += 1
+            continue
+        seen.add(kk)
+        uniq.append(kk)
+    if len(uniq) > _LABEL_BATCH_CAP:
+        print(f"refused: {len(uniq)} keys exceeds the {_LABEL_BATCH_CAP}/invocation cap — split the batch")
+        return {"labeled": 0, "rows": 0, "refused": len(uniq), "duplicates": duplicates}
+    labeled = rows = refused = 0
+    verb = "confirmed" if kind == "real" else "dismissed"
+    for key in uniq:
+        try:
+            res = await led.confirm_outcome(key, "all", kind, principal_role="admin")
+        except Exception as e:                   # per-key fail-open: one bad key never kills the batch
+            log(f"confirm_outcome failed for {key} ({e})")
+            print(f"refused: {key} — {e}")
+            refused += 1
+            continue
+        if "error" in res:
+            print(f"refused: {key} — {res['error']}")
+            for c in res.get("candidates", []):
+                print(f"  colliding key: {c}")
+            refused += 1
+            continue
+        labeled += 1
+        rows += res["written"]
+        print(f"{verb} {res['written']} row(s) as {kind} — finding {res['finding_key'][:12]} "
+              f"(full: {res['finding_key']})")
+    return {"labeled": labeled, "rows": rows, "refused": refused, "duplicates": duplicates}
+
+
+async def _label_cli(kind: str, keys: list, batch: bool) -> int:
+    """Connect + run label_batch; print the four-count summary in batch form. FAIL-OPEN on infra
+    (returns 0 always — a refusal is operator-retry, not a caller error)."""
     try:
         led = await PostgresLedger.connect(DSN)
     except Exception as e:
         log(f"ledger connect failed ({e})")
         return 0
     try:
-        res = await led.human_dismiss(prefix, "all", kind, principal_role="admin")
-    except ValueError as e:                      # bad kind (guarded before this call) / bad family
-        log(f"dismiss error: {e}"); return 0
+        s = await label_batch(led, kind, keys)
     except Exception as e:
-        log(f"human_dismiss failed ({e})"); return 0
+        log(f"label_batch failed ({e})"); return 0
     finally:
         try:
             await led.close()
         except Exception:
             pass
-    if "error" in res:
-        print(f"refused: {res['error']}")
-        for k in res.get("candidates", []):
-            print(f"  colliding key: {k}")
-        return 0
-    print(f"dismissed {res['dismissed']} row(s) as {kind} — finding {res['finding_key'][:12]} "
-          f"(full: {res['finding_key']})")
+    if batch:
+        print(f"labeled {s['labeled']} ({s['rows']} rows), refused {s['refused']}, "
+              f"duplicates {s['duplicates']}")
     return 0
 
 
@@ -307,25 +346,82 @@ def main(argv: list) -> int:
     return 0
 
 
-def dismiss_main(argv: list) -> int:
-    """`mxr outcome <finding_key_prefix> fp|wontfix` — routed separately from outcome-record because
-    it's a DIFFERENT verb shape (a human command, not the recorder). FAIL-OPEN. Gate mode does NOT
-    apply to a human dismissal — the human runs it manually, off the review path."""
+def label_main(argv: list) -> int:
+    """`mxr outcome` — the human's per-finding label (label-throughput PR-A). Two forms:
+        outcome <key12> <kind>              (single, back-compat — kind gains `real`)
+        outcome <kind> <key12> [<key12>…]   (kind-first batch)
+    kind ∈ real|fp|wontfix; a 12-hex key can never equal a kind word, so the forms can't collide.
+    Routed separately from outcome-record because it's a DIFFERENT verb shape (a human command,
+    not the recorder). FAIL-OPEN on infra + usage; per-key fail-closed inside the batch. Gate mode
+    does NOT apply — the human runs this manually, off the review path."""
     raw = argv[1:]
-    p = argparse.ArgumentParser(prog="outcome", add_help=False)
-    p.add_argument("prefix")
-    p.add_argument("kind", choices=["fp", "wontfix"])
-    try:
-        a = p.parse_args(raw)
-    except SystemExit:
-        log("usage: outcome <finding_key_prefix (>=12 hex)> fp|wontfix")
-        return 0
-    return asyncio.run(dismiss(a.prefix, a.kind))
+    if len(raw) >= 2 and raw[0] in _LABEL_KINDS:
+        return asyncio.run(_label_cli(raw[0], raw[1:], batch=True))
+    if len(raw) == 2 and raw[1] in _LABEL_KINDS:
+        return asyncio.run(_label_cli(raw[1], [raw[0]], batch=False))
+    log("usage: outcome <key12> real|fp|wontfix   |   outcome real|fp|wontfix <key12> [<key12>...]")
+    return 0
+
+
+dismiss_main = label_main        # back-compat alias (cli.py + tests migrated; belt for stragglers)
 
 
 def stats_main(argv: list) -> int:
     """`mxr outcome-stats` — the read surface for the morning brain-check. No args. FAIL-OPEN."""
     return asyncio.run(stats())
+
+
+def format_label_queue(rows: list) -> str:
+    """Pure formatter for `mxr labelqueue` (design §2c): cluster by (rule_tag, reviewer_family),
+    largest first; per cluster the count, first path (+N more), the latest raise's ref/play, and
+    the paste-ready 12-hex keys (VERBATIM round-trip into the batch verb is the contract)."""
+    if not rows:
+        return "label queue is empty"
+    clusters: dict = {}
+    for r in rows:
+        clusters.setdefault((r["rule_tag"], r["reviewer_family"]), []).append(r)
+    out = [f"{len(rows)} finding(s) awaiting a human label — "
+           f"label: mxr outcome real|fp|wontfix <key12> [<key12>...]"]
+    for (tag, fam), items in sorted(clusters.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        paths = []
+        for it in items:
+            if it["path"] not in paths:
+                paths.append(it["path"])
+        extra = f" +{len(paths) - 1} more paths" if len(paths) > 1 else ""
+        latest = max(items, key=lambda r: r["raise_seq"])
+        play = latest["source_event"] or ""
+        play = play[len("review:"):] if play.startswith("review:") else play
+        out.append(f"{tag}  {fam}  {len(items)}  {paths[0]}{extra}  "
+                   f"(latest raise: {latest['ref']} play {play})")
+        out.append(f"  keys: {'  '.join(it['key12'] for it in items)}")
+    return "\n".join(out)
+
+
+async def _labelqueue() -> int:
+    try:
+        led = await PostgresLedger.connect(DSN)
+    except Exception as e:
+        log(f"ledger unreachable ({e})")
+        return 2
+    try:
+        rows = await led.label_queue()
+    except Exception as e:
+        log(f"label_queue failed ({e})")
+        return 2
+    finally:
+        try:
+            await led.close()
+        except Exception:
+            pass
+    print(format_label_queue(rows))
+    return 0
+
+
+def labelqueue_main(argv: list) -> int:
+    """`mxr labelqueue` — the read-only evidence surface (design §2c). OPERATOR command tier:
+    FAIL-CLOSED (exit 2) on an unreachable ledger — misconfiguration must not read as an empty
+    queue. No args."""
+    return asyncio.run(_labelqueue())
 
 
 if __name__ == "__main__":

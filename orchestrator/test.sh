@@ -313,6 +313,8 @@ echo "39. follow-up keys file written ONLY when keys recorded"; reset; arm_outco
   kf="$(latest_outcomes_file)"
   ckfile "$kf" "keys file written when outcome-record surfaced a key"
   ck "keys file lists the paste-ready dismiss command" "mxr outcome deadbeef0123 fp" "$kf"
+  ck "keys file lists the paste-ready confirm command (PR-A)" "mxr outcome deadbeef0123 real" "$kf"
+  ck "keys file carries the batch hint (PR-A)" "mxr outcome real deadbeef0123" "$kf"
   ck "keys file lists the finding line" "finding:fail-open @ src/a.py" "$kf"
 
 echo "40. NO follow-up keys file when nothing recorded (empty outcome-record output)"; reset; arm_outcomes
