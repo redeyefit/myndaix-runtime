@@ -1,6 +1,6 @@
-# Shadow Dial — DESIGN (v0.4, post-fence measurement surface)
+# Shadow Dial — DESIGN (v0.5, post-fence measurement surface)
 
-_v0.4 folds the cross-family gauntlet on v0.3 (2 BLOCKER + 5 MAJOR + 1 MINOR): the Wilson gate
+_v0.5 folds the r2 gauntlet (eval-gate Wilson direction B1-again → the bound-direction invariant is now stated once and applied everywhere; snapshot captures eval params; unexpected-pair fail-safe). v0.4 folded the r1 gauntlet on v0.3 (2 BLOCKER + 5 MAJOR + 1 MINOR): the Wilson gate
 direction was inverted (B1), the eval/arming gate is now fully specified (B2/M2), the label
 include/exclude set is enumerated (M4), the snapshot schema is made reproducible (M5), and the
 small-n example is corrected (M1). The MEASURE-ONLY thesis was not challenged._
@@ -56,17 +56,22 @@ exactly ONE current human row, latest-by-seq (a correction supersedes). Then:
   precision signal), superseded rows (the DISTINCT ON keeps only the latest human row), and ANY
   future non-human source (they never enter `finding_current_human`). A builder must NOT widen the
   admitted set without a design change.
+- **Unexpected pairs (MINOR-r2, defensive):** the fence pair-CHECK makes an off-set human
+  `(source, outcome)` impossible, but the classifier still fail-safes — a current human row whose
+  pair is not INCLUDED above is EXCLUDED from `n` and provenance, counted into an `invalid` tally
+  surfaced in the verb output (a nonzero `invalid` = a visible fence-integrity alarm), and never
+  affects a classification count. A test injects such a row and asserts the counts are unmoved.
 
 Per (tag, family) over that set:
 - `n` = confirmed_real + dismissed_false_positive (the labeled denominator; `dismissed_wontfix`
   is excluded — "real but declining" is not a precision signal, matching the promoted view).
 - `precision` = confirmed_real / n (point estimate; NULL if n = 0).
 - **Wilson score interval** (z = 1.96, 95%) `[lo, hi]` on `precision` — the statistical-stability
-  fold. B1 direction (corrected): to be *confident precision is BELOW the floor* the whole interval
-  must sit below it → **`hi < FLOOR`** gates would-suppress (the LOWER bound is wrong: it fires on a
-  middling 50% sample). Symmetrically, to be *confident precision is ABOVE the ceiling* → **`lo ≥
-  CEILING`** gates would-trust. Both require the interval to actually clear the threshold, never the
-  noisy midpoint.
+  fold. **THE BOUND-DIRECTION INVARIANT (stated once, applied everywhere a CI gates a decision —
+  §2 classifier AND §4 eval):** *confident the true rate is BELOW a threshold T* ⟺ **`hi < T`**;
+  *confident the true rate is ABOVE T* ⟺ **`lo ≥ T`**. Never the midpoint, never the wrong end.
+  Applied here: would-suppress = precision confidently BELOW floor = **`hi < FLOOR`**; would-trust =
+  precision confidently ABOVE ceiling = **`lo ≥ CEILING`**.
 - `n_recent` / `wilson_recent` = the same interval over the last `SHADOW_RECENCY_N` (default 30)
   labeled events by `seq` (M3: a recovering class shows a rising recent precision even while all-time
   lags — and the eval/arming gate in §4 requires BOTH windows to clear, not just all-time).
@@ -132,9 +137,10 @@ A shadow prediction is only worth arming if it's STABLE and the human AGREES. Tw
 3. **Subsequent cohort size:** the post-cutoff human labels number ≥ `SHADOW_EVAL_MIN_N` (10), from
    ≥ `SHADOW_MIN_REFS` distinct refs AND ≥ `SHADOW_MIN_PLAYS` distinct plays (the §2 provenance/
    min-FP guards apply to the eval cohort, not just the classifier).
-4. **Agreement with a CI, not a point rate:** over that cohort, the Wilson **upper** bound of the
-   AGREEMENT rate (fraction of subsequent labels that are fp) must clear ≥ `SHADOW_EVAL_AGREE`
-   (0.70) — i.e. confidently-high agreement, not a bare 7/10.
+4. **Agreement with a CI, not a point rate:** the agreement rate = fraction of subsequent labels
+   that are fp (confirming the would-suppress). We arm only when confident this is HIGH, so by the
+   bound-direction invariant the Wilson **LOWER** bound of the agreement rate must clear ≥
+   `SHADOW_EVAL_AGREE` (0.70) — a bare 7/10 (lo ≈ 0.40) does NOT pass.
 5. **Empty-denominator = not eligible:** zero subsequent labels → `insufficient`, never a pass.
 
 Pre-committed (written here so it can't be rationalized away later): **PR-B (acting) is not even
@@ -145,8 +151,10 @@ that earns its own arming — or refuses it cheaply.
 alone): `captured_at`, `data_cutoff_seq` (max seq of finding_outcome at capture — the "labels
 since" boundary), `rule_tag`, `reviewer_family`, `confirmed_real`, `dismissed_fp`, `n`, `precision`,
 `wilson_lo`, `wilson_hi`, `n_recent`, `wilson_recent_lo`, `wilson_recent_hi`, `distinct_refs`,
-`distinct_plays`, `would_say`, `suppressible`, and the policy context `floor`, `ceiling`, `min_n`,
-`min_refs`, `min_plays`, `min_fp`, `recency_n`, `z`, `suppressible_set_version`,
+`distinct_plays`, `would_say`, `suppressible`, and the FULL policy context — classifier params
+`floor`, `ceiling`, `min_n`, `min_refs`, `min_plays`, `min_fp`, `recency_n`, `z`; **eval params
+`stable_snaps`, `eval_min_n`, `eval_agree`, `week_span_rule` (M5-r2 — so an eval verdict is
+reproducible from the snapshot alone, not a live config)**; and versions `suppressible_set_version`,
 `taxonomy_version`.
 
 ## 5. What this rung deliberately does NOT do (each with its un-gating condition)
@@ -187,8 +195,10 @@ since" boundary), `rule_tag`, `reviewer_family`, `confirmed_real`, `dismissed_fp
   reproducible (recomputing from the snapshot's own columns yields its would_say).
 - **eval gate (B2, each sub-gate):** stability needs 4 snaps across 4 distinct weeks (4 same-day →
   fail); both-windows required; subsequent cohort < EVAL_MIN_N → insufficient; agreement uses the
-  Wilson upper bound (7/10 point-rate that fails the CI → NOT eligible); zero subsequent labels →
-  insufficient, never a pass.
+  Wilson **LOWER** bound ≥ EVAL_AGREE (a 7/10 cohort, lo≈0.40, does NOT pass); zero subsequent
+  labels → insufficient, never a pass.
+- **unexpected-pair fail-safe (MINOR-r2):** an off-admitted-set human row → excluded from n +
+  provenance, counted as `invalid`, classification counts unmoved.
 - verb: fail-closed exit 2 on unreachable ledger; empty ledger → honest "insufficient everywhere".
 
 ## 8. Build plan
