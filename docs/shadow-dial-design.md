@@ -1,6 +1,6 @@
-# Shadow Dial — DESIGN (v0.5, post-fence measurement surface)
+# Shadow Dial — DESIGN (v0.6 — CONVERGED, post-fence measurement surface)
 
-_v0.5 folds the r2 gauntlet (eval-gate Wilson direction B1-again → the bound-direction invariant is now stated once and applied everywhere; snapshot captures eval params; unexpected-pair fail-safe). v0.4 folded the r1 gauntlet on v0.3 (2 BLOCKER + 5 MAJOR + 1 MINOR): the Wilson gate
+_v0.6 folds the r3 gauntlet's one residual MAJOR (three-way pair handling: legal-excluded dismissed_wontfix ≠ invalid off-set pair — a residual of the r2 fail-safe). r3 CONFIRMED the bound-direction invariant correct across all three gates + the measure-only boundary intact. v0.5 folded the r2 gauntlet (eval-gate Wilson direction B1-again → the bound-direction invariant is now stated once and applied everywhere; snapshot captures eval params; unexpected-pair fail-safe). v0.4 folded the r1 gauntlet on v0.3 (2 BLOCKER + 5 MAJOR + 1 MINOR): the Wilson gate
 direction was inverted (B1), the eval/arming gate is now fully specified (B2/M2), the label
 include/exclude set is enumerated (M4), the snapshot schema is made reproducible (M5), and the
 small-n example is corrected (M1). The MEASURE-ONLY thesis was not challenged._
@@ -56,11 +56,17 @@ exactly ONE current human row, latest-by-seq (a correction supersedes). Then:
   precision signal), superseded rows (the DISTINCT ON keeps only the latest human row), and ANY
   future non-human source (they never enter `finding_current_human`). A builder must NOT widen the
   admitted set without a design change.
-- **Unexpected pairs (MINOR-r2, defensive):** the fence pair-CHECK makes an off-set human
-  `(source, outcome)` impossible, but the classifier still fail-safes — a current human row whose
-  pair is not INCLUDED above is EXCLUDED from `n` and provenance, counted into an `invalid` tally
-  surfaced in the verb output (a nonzero `invalid` = a visible fence-integrity alarm), and never
-  affects a classification count. A test injects such a row and asserts the counts are unmoved.
+- **Pair handling is THREE-WAY (MAJOR-r3 — legal-excluded ≠ invalid):** a current human row is
+  classified by its exact `(source, outcome)` pair:
+  1. **Included precision pair** — `(human_confirm, confirmed_real)` / `(human_dismiss,
+     dismissed_false_positive)` → counted in `n` + provenance.
+  2. **Legal excluded pair** — `(human_dismiss, dismissed_wontfix)` → excluded from `n` +
+     provenance, and **NOT** `invalid` (it's a valid human label, just not a precision signal).
+  3. **Impossible / off-set pair** — anything else (the fence pair-CHECK makes it unreachable) →
+     excluded AND counted into an `invalid` tally surfaced in the verb (a nonzero `invalid` = a
+     visible fence-integrity alarm). Never affects a classification count.
+  Tests assert: a `dismissed_wontfix` row leaves `n`, provenance, AND `invalid` all unchanged; a
+  forged off-set row increments ONLY `invalid`.
 
 Per (tag, family) over that set:
 - `n` = confirmed_real + dismissed_false_positive (the labeled denominator; `dismissed_wontfix`
@@ -197,8 +203,8 @@ reproducible from the snapshot alone, not a live config)**; and versions `suppre
   fail); both-windows required; subsequent cohort < EVAL_MIN_N → insufficient; agreement uses the
   Wilson **LOWER** bound ≥ EVAL_AGREE (a 7/10 cohort, lo≈0.40, does NOT pass); zero subsequent
   labels → insufficient, never a pass.
-- **unexpected-pair fail-safe (MINOR-r2):** an off-admitted-set human row → excluded from n +
-  provenance, counted as `invalid`, classification counts unmoved.
+- **three-way pair handling (MAJOR-r3):** a dismissed_wontfix row leaves n + provenance + invalid
+  ALL unchanged (legal-excluded, not an alarm); a forged off-set row increments ONLY invalid.
 - verb: fail-closed exit 2 on unreachable ledger; empty ledger → honest "insufficient everywhere".
 
 ## 8. Build plan
