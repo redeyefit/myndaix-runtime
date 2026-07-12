@@ -154,6 +154,24 @@ async def test_machine_label_after_expiry_does_not_resurrect(led):
     assert not await _in_queue(led), "a machine label after expiry must NOT resurrect an expired finding"
 
 
+async def test_reraise_resets_ttl_age_not_first_raise(led):
+    # regression (0011 r2, kilabz HIGH): the labelqueue fix un-hides a re-raised finding, but expire_open
+    # must anchor TTL age on the LATEST review_raised, not min(created_at) over all history — else the
+    # re-raised finding (whose FIRST detection is old) is instantly re-expired on the next sweep, silently
+    # re-hiding a live finding. Backdate the first detection + expiry far past TTL; re-raise NOW.
+    await _truncate(led)
+    async with led._pool.acquire() as con:
+        await _seed(con)                                                             # first detection
+        await _seed(con, outcome="expired", source="ttl_sweep", source_event="sweep:old")
+        await con.execute(
+            "UPDATE finding_outcome SET created_at = now() - interval '99 days' WHERE finding_key=$1", FK)
+        await _seed(con, source_event="review:reraise")                             # re-raised NOW (recent)
+    assert await _in_queue(led), "re-raised finding is visible again"
+    n = await led.expire_open(30)
+    assert n == 0, "a finding re-raised within TTL must NOT be re-expired on its first-detection age"
+    assert await _in_queue(led), "re-raised finding stays in the queue (not immediately re-tombstoned)"
+
+
 async def test_no_double_count_on_repeat_and_correction(led):
     await _truncate(led)
     async with led._pool.acquire() as con:
