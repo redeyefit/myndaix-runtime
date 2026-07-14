@@ -33,6 +33,10 @@ if [[ -z "${WATCH_ALERT_IMESSAGE_TO-}" && -r "$WATCH_HOME/.alert-to" ]]; then
 fi
 export WATCH_ALERT_IMESSAGE_TO
 unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL 2>/dev/null || true
+# No MCP tools in the Watch session (r2 HIGH: under dontAsk, MCP file-read tools would be
+# auto-allowed and bypass the read fence). remote-control has no --strict-mcp-config flag; the
+# env var disables MCP loading entirely (v2.1.150+).
+export CLAUDE_CODE_DISABLE_MCP=1
 
 park() {
   local reason="$1"

@@ -82,8 +82,14 @@ def main():
                  "Long or special tasks: dispatch from a Mack terminal.")
         emit("ask", "mxr dispatch to %s — approve on phone" % m.group(1))
 
-    # not a Watch surface -> no decision (settings dontAsk default-deny governs)
-    return
+    # DEFAULT-DENY every other Bash command (r2 HIGH). Under dontAsk, read-only Bash (cat, grep,
+    # ls, find, head, ...) is auto-ALLOWED, so returning "no decision" here would let
+    # `cat ~/.myndaix/.secrets/...` run and exfil secrets around the fence. A hook `deny`
+    # overrides the read-only auto-allow (verified vs docs). Watch's ONLY Bash surface is the two
+    # read wrappers + an approved mxr dispatch; anything else is refused.
+    emit("deny",
+         "Watch runs only: mxr-read <id>, read-inbox [path], and an approved mxr dispatch. "
+         "All other Bash (including cat/grep/ls) is refused — read via the wrappers.")
 
 
 if __name__ == "__main__":

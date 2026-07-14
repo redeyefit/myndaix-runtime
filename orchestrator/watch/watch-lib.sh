@@ -77,7 +77,9 @@ sanitize_untrusted() {
   # bytes: if we actually got more than the cap, the input was truncated -> say so (MED-8; the old
   # WATCH_READ_TRUNCATED env flag was never set and the notice was dead code).
   local head_plus nbytes
-  head_plus="$(head -c $(( WATCH_READ_MAX_BYTES + 1 )))"
+  # sentinel X appended INSIDE the subshell so command-substitution's trailing-newline strip can't
+  # corrupt the byte count (MED-8b): head's trailing \n are no longer trailing once X follows.
+  head_plus="$(head -c $(( WATCH_READ_MAX_BYTES + 1 )); printf 'X')"; head_plus="${head_plus%X}"
   nbytes="$(printf '%s' "$head_plus" | LC_ALL=C wc -c | tr -dc '0-9')"; nbytes="$((10#${nbytes:-0}))"
   if (( nbytes > WATCH_READ_MAX_BYTES )); then truncated=" (TRUNCATED at ${WATCH_READ_MAX_BYTES}B)"; fi
   body="$(printf '%s' "$head_plus" | head -c "$WATCH_READ_MAX_BYTES" | watch_clean)"
@@ -88,7 +90,9 @@ sanitize_untrusted() {
   # drops carry them; they are handled by DEFANG below. Scan only for imperatives aimed at the
   # reading model + role-close tags. On any hit: DROP.
   hit=""
-  if printf '%s' "$body" | grep -iEq \
+  # LC_ALL=C forces byte-wise matching — under a UTF-8 locale, grep silently SKIPS a line with an
+  # invalid byte (e.g. \xFF), letting a payload on that line evade the fence (r2 HIGH).
+  if printf '%s' "$body" | LC_ALL=C grep -iEq \
       -e '(^|[[:space:]>])(ignore|disregard|forget|override)[[:space:]]+([a-z]+[[:space:]]+)?(previous|prior|above|earlier|preceding|your|these|those|my)[[:space:]]+(instructions|prompt|rules|context)' \
       -e '(^|[[:space:]])you[[:space:]]+are[[:space:]]+now[[:space:]]+' \
       -e '(new[[:space:]]+(system[[:space:]]+)?(instructions|directive|persona)[[:space:]]*:)' \

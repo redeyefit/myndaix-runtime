@@ -47,6 +47,9 @@ grep -qi 'DROPPED' <<<"$out" && bad "MED-7 'new task:' false-positive drops legi
 # MED-8: truncation notice actually fires past the cap
 big="$(WATCH_READ_MAX_BYTES=64 bash -c 'source '"$DIR"'/watch-lib.sh; head -c 200 /dev/zero | tr "\0" "x" | sanitize_untrusted inbox')"
 grep -q 'TRUNCATED at 64B' <<<"$big" && ok "oversize input -> TRUNCATED notice fires (MED-8)" || bad "MED-8 truncation notice"
+# MED-8b: truncation still detected when the boundary bytes are NEWLINES (the command-subst strip edge)
+nlbig="$(WATCH_READ_MAX_BYTES=64 bash -c 'source '"$DIR"'/watch-lib.sh; { head -c 64 /dev/zero | tr "\0" "x"; printf "\n\n\n\n\n"; } | sanitize_untrusted inbox')"
+grep -q 'TRUNCATED at 64B' <<<"$nlbig" && ok "truncation detected with trailing-newline boundary (MED-8b)" || bad "MED-8b newline-boundary truncation"
 
 echo "== dispatch-gate (positive grammar) =="
 gate() { printf '%s' "$1" | "$DIR/hooks/dispatch-gate.sh" 2>/dev/null; }
@@ -91,10 +94,15 @@ d="$(gate '{"tool_name":"Bash","tool_input":{"command":"read-inbox /Users/jefe/w
 [[ "$d" == "allow" ]] && ok "read-inbox <safe-abs-path> -> allow" || bad "safe read-inbox path (got: $d)"
 
 d="$(gate '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | decision)"
-[[ "$d" == "NONE" ]] && ok "non-mxr command -> no decision (settings governs)" || bad "passthrough (got: $d)"
+[[ "$d" == "deny" ]] && ok "arbitrary Bash (ls) -> DENY (default-deny, r2)" || bad "default-deny (got: $d)"
+
+d="$(gate '{"tool_name":"Bash","tool_input":{"command":"cat ~/.myndaix/.secrets/env/keys"}}' | decision)"
+[[ "$d" == "deny" ]] && ok "cat secrets (read-only Bash) -> DENY (r2 secrets exfil)" || bad "cat-secrets deny (got: $d)"
+d="$(gate '{"tool_name":"Bash","tool_input":{"command":"grep -r KEY /Users/jefe"}}' | decision)"
+[[ "$d" == "deny" ]] && ok "grep (read-only Bash) -> DENY" || bad "grep deny (got: $d)"
 
 d="$(gate '{"tool_name":"Read","tool_input":{"file_path":"/etc/passwd"}}' | decision)"
-[[ "$d" == "NONE" ]] && ok "non-Bash tool -> no decision" || bad "non-Bash passthrough (got: $d)"
+[[ "$d" == "NONE" ]] && ok "non-Bash tool -> no hook decision (settings deny governs)" || bad "non-Bash passthrough (got: $d)"
 
 echo "== read-inbox path-lock =="
 echo "a real verdict body" > "$WATCH_INBOX/v1.md"
@@ -116,11 +124,11 @@ p = s.get("permissions", {})
 ok = []
 ok.append(("defaultMode is dontAsk (valid fail-closed mode)", p.get("defaultMode") == "dontAsk"))
 ok.append(("allow list is empty (hook is sole allow-er)", p.get("allow") == []))
-deny = p.get("deny", [])
+deny = set(p.get("deny", []))
 ok.append(("no Bash(mxr:*) deny (would kill dispatch)", not any("Bash(mxr" in d for d in deny)))
-ok.append(("Read secret-denies use ~/ form (not settings-relative /)",
-           all(d.startswith("Read(~/") for d in deny if d.startswith("Read(")) and
-           any(d.startswith("Read(~/") for d in deny)))
+ok.append(("read tools denied wholesale by bare name (Read/Grep/Glob)",
+           {"Read", "Grep", "Glob"}.issubset(deny)))
+ok.append(("MCP + notebook + web read tools denied", {"mcp__*", "NotebookEdit", "WebFetch"}.issubset(deny)))
 hk = (s.get("hooks", {}).get("PreToolUse") or [{}])[0]
 ok.append(("PreToolUse hook matches Bash", hk.get("matcher") == "Bash"))
 bad = [n for n, v in ok if not v]

@@ -510,12 +510,21 @@ the code-review r1 CRITICAL/HIGHs (settings facts verified against current Claud
   glob is itself a smuggling hole (the r1 CRITICAL: `read-inbox ;mxr${IFS}recon${IFS}go` rode a
   loose `\S+` match), so the hook parses the program name and DENIES any wrapper-prefixed command
   carrying a shell metacharacter/operator — only an exact safe-char invocation is allowed.
-- **`Read()` secret-denies are LOAD-BEARING, not belt:** under `dontAsk` the built-in
-  Read/Grep/Glob tools are auto-allowed, so without these Watch could read secrets directly. They
-  use the filesystem-correct `~/` form (a single-slash `/Users/...` is settings-relative and
-  would miss — the r1 HIGH): `~/.ssh/**`, `~/.myndaix/.secrets/**`, `~/Library/Keychains/**`,
-  `~/.claude/**`, `~/.codex/**`, plus Grep on the same. Residual (accepted, matches curator):
-  Read on non-secret paths stays available; CLAUDE.md directs all real reads through `read-inbox`.
+- **Reads are fail-closed by REMOVING surfaces, not per-path denies (r2 architecture).** The r1
+  per-path `Read()`/`Grep()` globs leaked three ways under `dontAsk` (verified vs docs): read-only
+  Bash (`cat`/`grep`/`ls`) is auto-allowed and sidesteps tool denies; other read tools
+  (`NotebookEdit`, MCP file tools) weren't covered; and glob parity was easy to get wrong. The fix
+  removes the surfaces:
+  - **Hook default-denies ALL Bash** except the two wrappers + an approved dispatch — a hook
+    `deny` overrides `dontAsk`'s read-only-Bash auto-allow, so `cat ~/.myndaix/.secrets/...` is
+    refused. Watch has no general shell.
+  - **The file-reading TOOLS are denied wholesale by bare name** (`Read`, `Grep`, `Glob`,
+    `NotebookEdit`, `WebSearch`, `WebFetch`, `ReadMcpResourceTool`, `mcp__*`) — a bare-name deny
+    removes the tool from context entirely, so the ONLY read path left is the two fenced wrappers.
+  - **MCP is disabled at launch** via `CLAUDE_CODE_DISABLE_MCP=1` (rc-wrapper.sh; remote-control
+    has no `--strict-mcp-config`) so no MCP read tools exist to auto-allow.
+  Net: every read goes through `read-inbox`/`mxr-read` (fenced) by construction — no residual
+  Read-tool leak (the r1 curator-style residual is closed here).
 - **Approval-gated (never pre-approved):** every `mxr <agent> "<task>"` submit — one tap on the
   phone per dispatch via RC "Push when actions required." Dispatch only arises from Jefe's own
   request, so there is no unattended-stall tension; the tap is what converts "check inbox" from a
