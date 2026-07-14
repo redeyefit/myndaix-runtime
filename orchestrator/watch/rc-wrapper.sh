@@ -16,6 +16,12 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$DIR/watch-lib.sh"
 
+# The read wrappers are invoked by BARE name (CLAUDE.md rule 3; the hook allows the bare form).
+# They live symlinked in $WATCH_HOME/bin, which the default PATH above does NOT include — without
+# this prepend, `claude` inherits a PATH where `read-inbox`/`mxr-read` are command-not-found and
+# Watch's entire read surface is silently dead (r3 HIGH).
+export PATH="$WATCH_HOME/bin:$PATH"
+
 PARK_MARKER="$WATCH_HOME/.parked"
 FAST_EXIT_SECS=5
 FAST_EXIT_LIMIT=3
@@ -60,6 +66,12 @@ reachable() {
   fi
   return 1
 }
+
+# startup assertion: the read surface must actually be reachable, else Watch is deaf. Park loud
+# rather than run blind (r3 HIGH).
+if ! command -v read-inbox >/dev/null 2>&1 || ! command -v mxr-read >/dev/null 2>&1; then
+  park "read-wrappers-not-on-PATH (expected in $WATCH_HOME/bin)"
+fi
 
 fast_exits=0
 backoff="$BACKOFF_MIN"

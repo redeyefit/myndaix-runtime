@@ -56,6 +56,10 @@ bash orchestrator/watch/test.sh                                 # 17 local check
 Watch's PATH must include `~/watch/bin` (add it in `kit/settings.json` env or the shell that
 launchd inherits) so the wrappers resolve as bare `mxr-read` / `read-inbox`.
 
+**Accept the workspace-trust dialog for `/Users/jefe/watch`** (one-time; RC refuses to start in
+an untrusted folder — "Workspace not trusted"): `cd ~/watch && claude` → accept "trust the files
+in this folder" → `Ctrl-C`. Without this the wrapper's `claude` launches fast-fail and Watch parks.
+
 **Load the service.**
 ```
 cp orchestrator/watch/ai.myndaix.rc-keepalive.plist.example \

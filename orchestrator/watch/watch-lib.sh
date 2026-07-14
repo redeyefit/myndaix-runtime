@@ -9,6 +9,8 @@
 #   - sanitize_untrusted(): the mechanical read-side fence (B1/HIGH-2) both read wrappers share.
 #   - watch_alert(): the narrow, deterministic, park-only iMessage ping (V1/HIGH — never chat).
 
+WATCH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # for sibling helpers (watch-scan.py)
+
 # ---- config (env-overridable, all fail-safe defaults) ----
 WATCH_HOME="${WATCH_HOME:-/Users/jefe/watch}"
 WATCH_LOG="${WATCH_LOG:-$WATCH_HOME/watch.log}"
@@ -84,22 +86,13 @@ sanitize_untrusted() {
   if (( nbytes > WATCH_READ_MAX_BYTES )); then truncated=" (TRUNCATED at ${WATCH_READ_MAX_BYTES}B)"; fi
   body="$(printf '%s' "$head_plus" | head -c "$WATCH_READ_MAX_BYTES" | watch_clean)"
 
-  # injection-scan: positional/marker patterns. Conservative — anchored instruction verbs, not
-  # bare keywords, to avoid dropping legitimate technical text (security.md scanner rule). NOTE:
-  # fence markers (===BEGIN/END, BEGIN/END VERDICT) are NOT scanned here — legitimate verdict
-  # drops carry them; they are handled by DEFANG below. Scan only for imperatives aimed at the
-  # reading model + role-close tags. On any hit: DROP.
+  # injection-scan via watch-scan.py (robust decode/normalize; fence markers are NOT scanned —
+  # legit verdict drops carry them and DEFANG handles them below). Exit codes: 0=pattern matched,
+  # 1=clean, anything else=error. FAIL-CLOSED: 0 or error -> DROP; only a clean exit 1 forwards.
+  local scan_rc=0
+  printf '%s' "$body" | python3 "$WATCH_LIB_DIR/watch-scan.py" || scan_rc=$?
   hit=""
-  # LC_ALL=C forces byte-wise matching — under a UTF-8 locale, grep silently SKIPS a line with an
-  # invalid byte (e.g. \xFF), letting a payload on that line evade the fence (r2 HIGH).
-  if printf '%s' "$body" | LC_ALL=C grep -iEq \
-      -e '(^|[[:space:]>])(ignore|disregard|forget|override)[[:space:]]+([a-z]+[[:space:]]+)?(previous|prior|above|earlier|preceding|your|these|those|my)[[:space:]]+(instructions|prompt|rules|context)' \
-      -e '(^|[[:space:]])you[[:space:]]+are[[:space:]]+now[[:space:]]+' \
-      -e '(new[[:space:]]+(system[[:space:]]+)?(instructions|directive|persona)[[:space:]]*:)' \
-      -e '<[[:space:]]*/[[:space:]]*(system|assistant|user|task_content|user_input)[[:space:]]*>' \
-      -e '(disregard|bypass|skip|ignore)[[:space:]]+(the[[:space:]]+)?(fence|guard|approval|permission)' ; then
-    hit="1"
-  fi
+  [[ "$scan_rc" == "1" ]] || hit="1"
 
   printf '===BEGIN UNTRUSTED %s nonce=%s===\n' "$label" "$nonce"
   if [[ -n "$hit" ]]; then

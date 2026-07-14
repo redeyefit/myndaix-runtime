@@ -1,5 +1,5 @@
 {
-  "_comment": "Watch fail-closed permission posture (docs/always-on-agent-research.md §3.2). Deploys to /Users/jefe/watch/.claude/settings.json. Architecture (r2 fold): fail-closed by REMOVING read surfaces, not by per-path denies. defaultMode=dontAsk (the valid fail-closed mode; 'deny' is INVALID and would make Claude reject this whole file). allow is EMPTY: the PreToolUse dispatch-gate hook is the SOLE allow-er of the two read wrappers, the SOLE ask-er of a valid mxr dispatch, and DEFAULT-DENIES every other Bash command (so read-only Bash like cat/grep/ls cannot exfil around the fence — a hook deny overrides dontAsk's read-only auto-allow). The deny list uses BARE tool names to remove the file-reading tools from Claude's context ENTIRELY (per docs, a bare-name deny removes the tool), so the ONLY read path is read-inbox/mxr-read (both fenced). MCP is disabled at launch via CLAUDE_CODE_DISABLE_MCP=1 (rc-wrapper.sh); mcp__* here is belt. Edit the hook path if the checkout is elsewhere.",
+  "_comment": "Watch fail-closed permission posture (docs/always-on-agent-research.md §3.2). Deploys to /Users/jefe/watch/.claude/settings.json. Architecture (r2 fold): fail-closed by REMOVING read surfaces, not by per-path denies. defaultMode=dontAsk (the valid fail-closed mode; 'deny' is INVALID and would make Claude reject this whole file). allow is EMPTY: the PreToolUse dispatch-gate hook is the SOLE allow-er of the two read wrappers, the SOLE ask-er of a valid mxr dispatch, and DEFAULT-DENIES every other Bash command (so read-only Bash like cat/grep/ls cannot exfil around the fence — a hook deny overrides dontAsk's read-only auto-allow). The deny list uses BARE tool names to remove the file-reading tools from Claude's context ENTIRELY (per docs, a bare-name deny removes the tool), so the ONLY read path is read-inbox/mxr-read (both fenced). MCP is disabled at launch via CLAUDE_CODE_DISABLE_MCP=1 (rc-wrapper.sh); mcp__* here is belt. r3: also deny Agent/Task (a spawned subagent runs OUTSIDE Watch's dir with DEFAULT permissive settings and could read secrets — the scariest escape), Monitor/Cron*/RemoteTrigger/ScheduleWakeup (standing-duty tools auto-allowed under dontAsk that would break the no-loop contract), NotebookRead (read vector paired with NotebookEdit), and LSP. Edit the hook path if the checkout is elsewhere.",
   "permissions": {
     "defaultMode": "dontAsk",
     "allow": [],
@@ -7,11 +7,21 @@
       "Read",
       "Grep",
       "Glob",
+      "NotebookRead",
       "NotebookEdit",
       "WebSearch",
       "WebFetch",
       "ReadMcpResourceTool",
-      "mcp__*"
+      "mcp__*",
+      "Agent",
+      "Task",
+      "Monitor",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "RemoteTrigger",
+      "ScheduleWakeup",
+      "LSP"
     ]
   },
   "hooks": {
