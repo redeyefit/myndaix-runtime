@@ -82,7 +82,8 @@ if [[ "${1:-}" != "--worker" ]]; then
   self="${PLAY_SELF:-$ORCH/play-review.sh}"
   [[ -x "$self" ]] || self="$repo/orchestrator/play-review.sh"
   [[ -x "$self" ]] || self="$0"
-  while read -r localref localsha remoteref remotesha; do
+  while read -r _ localsha remoteref remotesha; do        # field 1 (local ref) unused
+    # shellcheck disable=SC2053  # unquoted RHS is INTENTIONAL glob matching vs TARGET_GLOB
     [[ "$remoteref" == $TARGET_GLOB ]] || continue          # any branch; skip tags (unquoted RHS = glob)
     [[ "$localsha" == "$ZERO" ]] && continue                # branch delete
     if [[ "$remotesha" != "$ZERO" ]] && git -C "$repo" cat-file -e "${remotesha}^{commit}" 2>/dev/null; then
@@ -168,7 +169,7 @@ note(){ jq -cn --arg p "$play" --arg s "$1" --arg n "${2:-}" \
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }   # strip C0 + DEL; keep \t \n
 
 deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits the fallback
-  local subj="$1" body="$2" f="$INBOX/$(date +%Y%m%d%H%M%S)-$play.md" msg
+  local subj="$1" body="$2" msg f; f="$INBOX/$(date +%Y%m%d%H%M%S)-$play.md"
   # strip C0/DEL (incl. ESC) from the reviewer/triage LLM output before it lands in the jefe
   # inbox file — the diff steering that text is untrusted, and the verdict is later cat'd/relayed
   # in a terminal, so an escape sequence could repaint/hide the report. Mirrors play-fix deliver().
@@ -463,7 +464,7 @@ outcomes_record(){
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
-  local kf="$INBOX/$(date +%Y%m%d%H%M%S)-$play-outcomes.md"
+  local kf; kf="$INBOX/$(date +%Y%m%d%H%M%S)-$play-outcomes.md"
   # all12 = the key12 column, space-joined — feeds the paste-ready batch hint (PR-A §2d)
   local all12; all12="$(printf '%s\n' "$out_keys" | cut -f1 | tr '\n' ' ' || true)"
   { printf '# outcome keys — %s\n\nplay: %s\nref: %s\n\nEach recorded finding below. Label it: real (reviewer was RIGHT — ground truth), fp (reviewer was WRONG), or wontfix (right, but declining):\n\n' \
@@ -589,8 +590,8 @@ deg_banner=""
 
 # --- gate: PASS iff trimmed == EXACTLY PLAY_PASS (no forgeable substring) ---
 if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimmed match — no embedded-space forgery
-  gate && { note done gate-pass; write_verdict "PASS"; exit 0; }   # automerge gate: structured PASS, no deliver/done/autofix
-  note done clean-pass
+  gate && { note "done" gate-pass; write_verdict "PASS"; exit 0; }   # automerge gate: structured PASS, no deliver/done/autofix
+  note "done" clean-pass
   if deliver "review PASS — $ref" "${deg_banner}Clean — no fixes needed.
 
 --- reviewer notes ---
@@ -599,8 +600,8 @@ $review"; then
     outcomes_record        # CLOSE phase runs on a clean PASS too (design §2); fail-open, bounded
   fi
 else
-  gate && { note done gate-needs-fix; write_verdict "NEEDS-FIX"; exit 1; }   # automerge gate: structured NEEDS-FIX
-  note done needs-fix
+  gate && { note "done" gate-needs-fix; write_verdict "NEEDS-FIX"; exit 1; }   # automerge gate: structured NEEDS-FIX
+  note "done" needs-fix
   # always stage the fix-list (single-writer run dir) + a copy-paste manual hint. The auto note is
   # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
   printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true
