@@ -14,7 +14,13 @@ cd "$REPO"
 # by a launchd agent. Provision a chmod-600 secret with exactly: Contents r/w + Pull requests
 # r/w + Checks r + Metadata r on the target repo. (Deploy prereq; see docs/automerge-design.md §0.)
 TOKEN_FILE="${MYNDAIX_AUTOMERGE_TOKEN_FILE:-$HOME/.myndaix/.automerge-token}"
-[[ -r "$TOKEN_FILE" ]] && GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")" && export GH_TOKEN
+# NOT a `&&`-chain: in `A && B && C`, set -e exempts the non-final B, so a `tr` failure would
+# silently skip `export` (short-circuit) and leave any ambient GH_TOKEN in force. The if-block
+# makes a token-load failure abort under set -e rather than run with a broken/ambient token.
+if [[ -r "$TOKEN_FILE" ]]; then
+  GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+  export GH_TOKEN
+fi
 
 export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://localhost/runtime}"
 export PYTHONPATH="src"

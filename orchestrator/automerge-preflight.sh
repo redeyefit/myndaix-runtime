@@ -10,7 +10,13 @@ ok=0; bad=0
 chk(){ if eval "$2" >/dev/null 2>&1; then echo "  ok: $1"; ok=$((ok+1)); else echo "  XX: $1"; bad=$((bad+1)); fi; }
 
 TOKEN_FILE="${MYNDAIX_AUTOMERGE_TOKEN_FILE:-$HOME/.myndaix/.automerge-token}"
-[[ -r "$TOKEN_FILE" ]] && GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")" && export GH_TOKEN
+# NOT a `&&`-chain: short-circuiting on a `tr` failure would skip `export` and leave any ambient
+# GH_TOKEN in force. The if-block always runs `export` when the file is readable so the token
+# actually loaded is the one the chk's below verify (no silent fall-through to an inherited token).
+if [[ -r "$TOKEN_FILE" ]]; then
+  GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+  export GH_TOKEN
+fi
 NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)"
 
 echo "auto-merge preflight ($REPO -> ${NWO:-?})"
