@@ -15,7 +15,7 @@ is officially shipped by Anthropic, or fails the "a gap on a map is not a need" 
 deferred behind written revisit triggers. This design was reopened ONLY because live use (Jefe's
 Remote Control test) started generating real requirements — the keep-warm-agent kill stands, and
 §2.6 shows the new evidence that distinguishes this from it rather than overturning it. Status:
-v0.3 fold complete; awaiting cross-family re-review, then Jefe's build call._
+v0.3-r2 — cross-family re-review folded (5 HIGHs), ready for Jefe's build call._
 
 _v0.3 fold provenance (2026-07-13): applies the full 2026-07-12 review
 (`/tmp/always-on-agent-review-mack-20260712.md` — 4-agent claim verification [49 verified / 7
@@ -31,6 +31,20 @@ conditional on the H5 live check (approval preview must show the full command, e
 to observe-only); (4) name = **Watch**; (5) FileVault: decision REOPENED by the live audit — the
 Mini currently runs FileVault ON with no auto-login (§2.6, §3.4); flip-or-accept is a deploy-time
 Jefe call that does not block the build._
+
+_v0.3-r2 fold (2026-07-13): the v0.3 fold was itself cross-family re-reviewed (xreview design
+mode, oracle lead + kilabz + lobster synthesis) — both NEEDS-FIX, 5 merged HIGHs, all NEW edges
+the fold created (all prior findings verified resolved). Folded: **HIGH-1** park recovery was
+mechanically impossible (wrapper-is-pane + marker-gated bootstrap → nothing to attach to) → the
+wrapper now `sleep infinity`s after parking and the runbook is corrected to `claude auth login` →
+`rm .parked` → kickstart (§3.1); **HIGH-2** `mxr-read` had only a C0-strip → now shares the full
+`sanitize_untrusted` pipeline with `read-inbox` (§3.8); **HIGH-3** dispatch cap → a POSITIVE
+ASCII grammar on the SERIALIZED bytes via a verified `PreToolUse` Bash hook that denies compound
+commands wholesale (oracle's "no such hook" premise was FALSE — the blind-design-review failure
+mode xreview exists to catch; kilabz's serialized-preview refinement was real, §3.2); **HIGH-4**
+`--capacity 2` re-opened the multi-session state race → `--capacity 1` single front desk (§3.1);
+**HIGH-5** env scrub → a clean `env -u` + fail-closed assertion immediately adjacent to `exec`,
+no sourced code between (§3.1)._
 
 _Design pass provenance: three candidate designs were drafted (session-based "Duty Officer",
 runtime-native "Porter", minimal-hybrid), cross-judged over three passes (minimal-hybrid won the
@@ -386,14 +400,21 @@ the process ends, and >~10 min awake-but-offline "times out and the process exit
 (https://code.claude.com/docs/en/remote-control). Layered per field prior art
 (https://www.mager.co/notes/2026-06-03-always-on-agent-across-reboots/):
 
-- **Launch shape (B2 resolution): SERVER MODE.** `claude remote-control --capacity 2` (explicit
-  cap, never the default 32 — forgotten parallel sessions with in-flight tool loops burn shared
-  quota invisibly, §6 F10/F1). `--continue`/`--session-id` are documented as mutually exclusive
-  with `--capacity`/`--spawn`/`--create-session-in-dir` (current RC docs, CLI 2.1.207) — v0.2's
-  §3.1 promised an illegal flag combination. Server mode wins on its own merits anyway: the
-  phone can open NEW sessions cold, reconnection to the registered server is automatic without
-  re-pairing (docs; live-verify in test.sh), and every relaunch is a clean-slate boundary
-  (§2.4). Continuity lives in `session_state.md`, never the transcript.
+- **Launch shape (B2 resolution): SERVER MODE, `--capacity 1` (v0.3-r2, HIGH-4).** `claude
+  remote-control --capacity 1` — Watch is ONE front desk; the review caught that v0.3's
+  `--capacity 2` re-opened the exact multi-session hazard the design claims to avoid: two
+  concurrent sessions in `/Users/jefe/watch/` both read the inbox, both request approvals, both
+  draw the same quota, and both write `session_state.md` with no lock → a corrupting race.
+  Single-session semantics removes it. Accepted edge (named, not a defect): if a session wedges,
+  the phone opening a new one may be refused until the wrapper's liveness recheck/park cycles the
+  server — acceptable for a single-operator front desk, and strictly better than a silent
+  state-corruption race. Belt anyway: `session_state.md` writes use atomic temp-write + `mv`
+  (house rule). `--continue`/`--session-id` are documented mutually exclusive with
+  `--capacity`/`--spawn`/`--create-session-in-dir` (current RC docs, CLI 2.1.207) — v0.2's §3.1
+  promised an illegal combination. Server mode wins on its own merits anyway: the phone can open
+  a session cold, reconnection to the registered server is automatic without re-pairing (docs;
+  live-verify in test.sh), and every relaunch is a clean-slate boundary (§2.4). Continuity lives
+  in `session_state.md`, never the transcript.
 - **LaunchAgent `ai.myndaix.rc-keepalive`** — RunAtLoad + StartInterval recheck running an
   idempotent bootstrap. NOT naked `KeepAlive=true` on tmux (boolean KeepAlive restart-loops every
   10s ThrottleInterval when the program manages its own lifecycle —
@@ -424,27 +445,42 @@ the process ends, and >~10 min awake-but-offline "times out and the process exit
   park-and-alert, never "create a new session"; (e) one disk-free check line (the JSONL
   transcripts share a disk with the Postgres ledger; the house has a logged no-space incident
   class — and the audit shows only ~29Gi actually available).
-- **In-tmux wrapper** — while-loop relaunching `claude remote-control --capacity 2` with
+- **In-tmux wrapper** — while-loop relaunching `claude remote-control --capacity 1` with
   exponential backoff capped (5s → 10min) and a pre-launch reachability gate (`curl -m5` to
   api.anthropic.com PLUS one IP-literal probe alongside it — M2, splits DNS failure from routing
   failure; on failure sleep without spawning so a multi-hour ISP outage doesn't thrash spawns).
-  **`unset CLAUDE_CODE_OAUTH_TOKEN` before exec (new, verified):** RC hard-rejects long-lived
-  setup-token credentials, and the Mini's pool environment exports exactly that variable — if it
-  leaks into the wrapper env, every relaunch dies as an auth-class failure; RC must ride the
-  keychain's full-scope interactive `/login`. **Park-and-alert branch (H4 amendment): "N
-  consecutive sub-5s exits" (N=3) is the SOLE park trigger class** — stderr/exit-text matching
-  may ACCELERATE parking but never gates it (preview-era error strings are brittle). On park:
-  write the `.parked` marker (reason + timestamp), fire ONE deterministic ping via the
-  narrowly-armed iMessage path (§3.5), and stop — no respawn thrash; recovery is the 2-line SSH
-  runbook (`ssh mini; tmux -S ~/.local/state/watch.tmux attach; /login` — paste-code flow works
-  headless) then delete the marker. RC is itself the phone channel, so the channel that would
-  say "I'm down" is the thing that's down — the alert must ride the independent substrate.
-  **M1: bound the evidence surfaces** — `history-limit 5000` on the session and a size-capped
-  wrapper log (rotate at ~1MB, keep 2).
+  **Clean env boundary immediately adjacent to `exec` (HIGH-5, hardened from v0.3's bare
+  `unset`):** RC hard-rejects long-lived setup-token credentials, and the Mini's pool env exports
+  exactly `CLAUDE_CODE_OAUTH_TOKEN` — but the wrapper ALSO sources the Mini's `~/.myndaix/.secrets/`
+  (for the alert recipient), and if `load.sh` re-exports the token, `ANTHROPIC_API_KEY`, or a
+  non-`api.anthropic.com` `ANTHROPIC_BASE_URL` AFTER a bare early `unset`, every relaunch
+  auth-fails and parks permanently. So: source secrets EARLY, capture only
+  `WATCH_ALERT_IMESSAGE_TO` into a local, then — with NO sourced code between this point and the
+  exec — scrub + ASSERT + launch as one step: `env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY`,
+  a fail-closed guard (`[[ -z "${CLAUDE_CODE_OAUTH_TOKEN-}" && -z "${ANTHROPIC_API_KEY-}" ]] || {
+  park "dirty-auth-env"; }` and assert `ANTHROPIC_BASE_URL` is empty or `api.anthropic.com`), then
+  `exec claude remote-control --capacity 1`. RC must ride the keychain's full-scope interactive
+  `/login`. **Park-and-alert branch (H4 amendment): "N consecutive sub-5s exits" (N=3) is the
+  SOLE park trigger class** — stderr/exit-text matching may ACCELERATE parking but never gates it
+  (preview-era error strings are brittle). On park: write the `.parked` marker (reason +
+  timestamp), fire ONE deterministic ping via the narrowly-armed iMessage path (§3.5), then
+  **`sleep infinity` (HIGH-1 — do NOT exit).** The wrapper IS the tmux pane command (L1), so
+  exiting would destroy the `watch` session and leave the operator with nothing to attach to AND
+  the bootstrap refusing to recreate (marker present) — the v0.3 runbook was mechanically
+  impossible. Sleeping keeps the pane alive (holds `has-session` true → no bootstrap thrash) and
+  displays the park reason to anyone attaching. **Corrected recovery runbook:** `ssh mini` →
+  `claude auth login` in a shell (refresh the keychain OAuth — NOT `/login` into a session with
+  no running claude) → `rm ~/.myndaix/watch/.parked` → `launchctl kickstart -k
+  gui/$(id -u)/ai.myndaix.rc-keepalive` (kills the sleeping wrapper; bootstrap recreates fresh,
+  marker gone). RC is itself the phone channel, so the channel that would say "I'm down" is the
+  thing that's down — the alert must ride the independent substrate. **M1: bound the evidence
+  surfaces** — `history-limit 5000` on the session and a size-capped wrapper log (rotate at ~1MB,
+  keep 2).
 - **test.sh** (per new-systems rules) must cover: kill claude → wrapper relaunches; **kill the
   wrapper, not claude** (pane dies → session dies → bootstrap recreates); park protocol (3 fast
-  exits → marker + exactly one ping + no further spawns; bootstrap refuses while the marker
-  exists); tmux server survives 30s after bootstrap exit under `launchctl kickstart` (terminal
+  exits → marker + exactly one ping + wrapper `sleep infinity` keeps the pane alive; attach shows
+  the park reason; the corrected recovery — `claude auth login` → `rm .parked` → kickstart —
+  actually restores service); tmux server survives 30s after bootstrap exit under `launchctl kickstart` (terminal
   runs won't reproduce process-group reaping); post-restart the session answers with its Watch
   identity (proves CLAUDE.md loaded, not just a process); **phone reconnects after an unattended
   restart with NO re-pairing** (Q1 — docs say yes, verify live); **H5 live check: a test `mxr`
@@ -471,16 +507,29 @@ closed (§6 F5–F8):
 - **Approval-gated (never pre-approved):** every `mxr <agent> "<task>"` submit — one tap on the
   phone per dispatch via RC "Push when actions required." Dispatch only arises from Jefe's own
   request, so there is no unattended-stall tension; the tap is what converts "check inbox" from a
-  potential injection-to-dispatch chain into read-only consent (§2.3). **H5 mechanical belt
-  (new):** approval pushes preview tool input TRUNCATED (~200 chars for channel relays —
-  https://code.claude.com/docs/en/channels-reference; RC's own prompt detail is a test.sh live
-  check), so a long task string could hide a poisoned tail beyond the visible window. A
-  PreToolUse hook therefore REJECTS any `mxr` dispatch command longer than 180 characters or
-  containing newlines/metachars — what Jefe approves is always the WHOLE command. Long task
-  bodies are simply not Watch's job — dispatch those from a Mack terminal (the hook also rejects
-  `--prompt-file` from Watch: a file-mediated prompt defeats the visible-command guarantee). If
-  the H5 live check shows the RC prompt does not display the Bash command at all → v1 falls back
-  to observe-only until `mxr-safe` exists (§7).
+  potential injection-to-dispatch chain into read-only consent (§2.3). **H5 mechanical belt —
+  POSITIVE-GRAMMAR gate (v0.3-r2, HIGH-3).** The enforcement is a `PreToolUse` hook matched to
+  the `Bash` tool. Verified against current Claude Code docs (2.1.x,
+  https://code.claude.com/docs/en/hooks — settles oracle's HIGH-3a, which claimed no such hook
+  exists: the hook DOES exist, fires BEFORE the permission prompt, can `permissionDecision:
+  "deny"` so the prompt never appears, and receives the FULL `tool_input.command` string
+  including every `;`/`&&`/pipe/newline/`$()`). v0.3's "≤180 chars, no metachars" was a
+  BLOCKLIST framed on codepoints — replaced by a POSITIVE grammar enforced on the SERIALIZED
+  bytes (kilabz HIGH-3b: a <180-codepoint command can still overflow the ~200-char
+  `input_preview` after JSON serialization). The hook ALLOWS a dispatch only if the whole command
+  matches, else denies:
+  1. exact argv shape: `mxr <AGENT> "<TASK>"` — one command, nothing before/after (a compound
+     line like `mxr x "ok"; curl evil` fails the whole-string match and is denied wholesale —
+     closes oracle's HIGH-3a bypass; the hook sees the entire `bash -c` string, not just the mxr
+     segment);
+  2. `<AGENT>` ∈ a hard-coded flat-rate allowlist (never recon/higgsfield);
+  3. `<TASK>` is printable ASCII only (0x20–0x7E), no shell metacharacters
+     (`;&|<>$\`(){}[]*?!\n`), no leading `-` (kills flag/`--prompt-file` smuggling);
+  4. a BYTE cap on the whole serialized command (≤160 bytes) so the visible approval preview
+     always contains the entire command — what Jefe approves is provably the whole thing.
+  Long or non-ASCII task bodies are simply not Watch's job — dispatch those from a Mack terminal.
+  If the H5 live check shows the RC prompt does not display the Bash command at all → v1 falls
+  back to observe-only until `mxr-safe` exists (§7).
 - **Denied outright:** metered agents (recon, higgsfield) in any dispatch form until
   ledger-enforced budgets exist; shell interpreters; network tools; `web_search`/`web_fetch`/
   browser tools; Monitor/loop/scheduled-task tools and unattended sleep-loop Bash forms (the
@@ -630,21 +679,26 @@ https://robservatory.com/fix-messages-broken-bundled-applescripts/) **and the Mi
 Both families' BLOCKER: content already in model context cannot be fenced after the fact, so
 fence-at-read must be MECHANICAL, not a CLAUDE.md convention — the read-side equivalent of the
 dispatch gate, demanded by this design's own mechanical-over-convention philosophy. Two tiny
-typed wrappers (~40 lines total), the ONLY pre-approved read/observe paths (§3.2):
+typed wrappers (~50 lines total), the ONLY pre-approved read/observe paths (§3.2). **Both share
+ONE `sanitize_untrusted()` function (v0.3-r2, HIGH-2 — v0.3 wrongly gave `mxr-read` only a
+C0-strip);** the pipeline, applied before ANY byte reaches the LLM:
+size cap (truncate-loud at 64KB) → C0-strip (`LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'` —
+the house `clean()` form, `orchestrator/play-review.sh:168`) → injection-scan (positional-context
+patterns; on hit, DROP with a one-line refusal naming the source — drop-don't-sanitize,
+`src/runtime/skillmatch.py:72-96`) → defang any embedded fence markers → RE-fence with a fresh
+session-local nonce. The writer's own fence is NEVER trusted (V2): the writer's nonce is not the
+reader's trust boundary.
 
-- **`read-inbox [file]`** — path-locked: resolves its argument (realpath, symlinks followed)
-  and refuses anything outside `~/.myndaix/bridge/inbox/jefe/` and `/Users/jefe/watch/`
-  (fail-closed, no traversal). Pipeline before ANY byte reaches the LLM: size cap
-  (truncate-loud at 64KB) → C0-strip (`LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'` — the
-  house `clean()` form, `orchestrator/play-review.sh:168`) → injection-scan
-  (positional-context patterns; on hit, DROP the file with a one-line refusal naming it —
-  drop-don't-sanitize, `src/runtime/skillmatch.py:72-96`) → defang any embedded fence markers →
-  RE-fence with a fresh session-local nonce (`===BEGIN UNTRUSTED inbox nonce=…===`). It never
-  trusts the drop's existing `===BEGIN VERDICT===` fence (V2): the writer's nonce is not the
-  reader's trust boundary.
-- **`mxr-read <JOB_ID>`** — validates the single argument against `^[0-9a-fA-F-]{8,36}$`, then
-  execs `mxr get <id>` directly (fixed argv, no shell re-parse); output passes the same
-  C0-strip. Anything else — flags, second arguments, metachars — is rejected loudly.
+- **`read-inbox [file]`** — path-locked: resolves its argument (realpath, symlinks followed) and
+  refuses anything outside `~/.myndaix/bridge/inbox/jefe/` and `/Users/jefe/watch/` (fail-closed,
+  no traversal), then `sanitize_untrusted` → `===BEGIN UNTRUSTED inbox nonce=…===`.
+- **`mxr-read <JOB_ID>`** — validates the single argument against `^[0-9a-fA-F-]{8,36}$`, execs
+  `mxr get <id>` directly (fixed argv, no shell re-parse), then runs the SAME
+  `sanitize_untrusted` pipeline → `===BEGIN UNTRUSTED ledger nonce=…===`. This is load-bearing:
+  `mxr get` returns agent reply bodies and execution/test logs derived from attacker-influenceable
+  PR content — a raw injection payload in a job's output would otherwise enter Watch's context
+  unfenced and unscanned, re-opening the exact F5 surface. Anything else — flags, extra args,
+  metachars — is rejected loudly.
 
 Both wrappers log each invocation (one line: timestamp, path/id, accept/drop) to the bounded
 wrapper log (M1) — the read-side audit trail RC otherwise lacks.
@@ -689,7 +743,7 @@ push-phishing banner) are handled by one-liners already listed in §3.1/§3.4/§
 | F2 | **HIGH** | Auth bootstrap paradox / silent OAuth expiry — RC accepts ONLY the interactive OAuth (the credential class the runtime fled for its "weekly re-auth churn", `src/runtime/registry.py:46-57`); on expiry the wrapper reloops into an auth prompt forever, and RC (the down thing) is the channel that would report it; a diverged keychain password stays LOCKED after auto-login | Wrapper park-and-alert branch: park on N consecutive sub-5s exits (H4 — text matching only accelerates), fire ONE deterministic ping via the narrowly-armed `WATCH_ALERT_IMESSAGE_TO` substrate (§3.5), stop looping; `unset CLAUDE_CODE_OAUTH_TOKEN` in the wrapper (RC hard-rejects the pool's long-lived token — a leaked env var would otherwise auth-fail every relaunch); SSH runbook (`tmux attach; /login`); keychain-password check in machine prep; smoke test verifies the session via `/status`, not just a launch (§3.1, §3.4, §3.5) |
 | F3 | **HIGH** | tmux `has-session` is a false health proxy — wrapper crash, loop break-out, or a wedged-alive claude leaves a "healthy" session with a dead agent indefinitely | Wrapper runs AS the pane command (wrapper death = session death; `has-session` is a true SUPERVISOR proxy — L1 deleted the pane-PID walk); claude-liveness is the wrapper loop's own job; the park protocol prevents wedge-thrash; test.sh covers "kill the wrapper, not claude" (§3.1) |
 | F4 | **HIGH** | Verdict push single-pathed through decaying AppleScript, failing SILENTLY (TCC resets, Messages sign-out, macOS 26 -1700) — quiet is indistinguishable from healthy, and a "breaks ≥2 times" trigger requires noticing breaks | Instrument the send (visible exit status + FAILED-PING marker in the inbox drop); real round-trip in every post-update smoke test, minor updates included; trigger tightened to FIRST silent break → build the Telegram NOTIFY shelf; Shortcuts-CLI documented as plan-B send path (§3.5, §2.2) |
-| F5 | **HIGH** | Prompt-injection via read content into a dispatch-capable context — inbox verdict bodies are reviewer output derived from attacker PR diffs (V2 correction: they ARE C0-stripped + nonce-fenced at write, `orchestrator/play-review.sh:168,175-177` — but a writer's fence is not the reading agent's trust boundary); "check inbox" is consent to READ, never to dispatch; fencing-on-forward misses that the session itself holds the power | Dispatch stripped from the pre-approved allowlist — every `mxr <agent>` submit needs a per-invocation phone approval, so a poisoned read can request but never execute; PLUS the mechanical read-side fence: all inbox reads go through `read-inbox` (B1, §3.8 — path-lock, C0-strip, injection-scan drop-don't-sanitize, session-local RE-fence), and the ≤180-char dispatch cap (H5, §3.2) closes the hidden-tail window (§2.3, §3.2, §3.8) |
+| F5 | **HIGH** | Prompt-injection via read content into a dispatch-capable context — inbox verdict bodies are reviewer output derived from attacker PR diffs (V2 correction: they ARE C0-stripped + nonce-fenced at write, `orchestrator/play-review.sh:168,175-177` — but a writer's fence is not the reading agent's trust boundary); "check inbox" is consent to READ, never to dispatch; fencing-on-forward misses that the session itself holds the power | Dispatch stripped from the pre-approved allowlist — every `mxr <agent>` submit needs a per-invocation phone approval, so a poisoned read can request but never execute; PLUS the mechanical read-side fence: ALL untrusted reads go through `read-inbox` AND `mxr-read`, both running the shared `sanitize_untrusted` pipeline (B1/HIGH-2, §3.8 — path-lock, size-cap, C0-strip, injection-scan drop-don't-sanitize, defang, fresh-nonce RE-fence), and the positive-grammar dispatch gate (H5/HIGH-3, §3.2 — exact argv, ASCII-only, ≤160-byte serialized cap) closes the hidden-tail window (§2.3, §3.2, §3.8) |
 | F6 | **HIGH** | Authority-admission bypass — generic `mxr <agent>` re-opens the capability the reviewed Telegram design withheld: no current agent passes the gate; recon spends unbudgeted real money (`src/runtime/registry.py:191-193`), lobster is CONTROLLER authority (`docs/telegram-transport-design.md:126-147`) | Same as F5, plus metered agents deny-listed at settings level regardless of approval; the authority-admission gate + queue isolation is the pre-written arming condition for ANY pre-approved or non-RC dispatch (§3.2, §3.7) |
 | F7 | **HIGH** | Allowlist bypass via shell-metachar smuggling — `Bash(mxr:*)`-style prefixes admit `mxr x "$(cat ~/.myndaix/.secrets)"` / `; curl … \| sh` through the shell wrapping mxr; mxr's argv safety is not the grant | No bare-mxr prefix ever pre-approved; v1 pre-approval is `mxr get`-only; the named future mechanism is the `mxr-safe` argv-exec wrapper (two argv, no shell, hard-coded agent list, metachar-rejecting), never a glob (§3.2, §7) |
 | F8 | **HIGH** | Invited heartbeat — "watch the ledger and ping me when the verdict lands" converts the zero-idle session into a frontier-model polling loop (the measured OpenClaw $18/night pattern — https://standardcompute.com/blog/why-does-nobody-talk-about-how-expensive-idle-openclaw-agents-are); RC's promptable push actively solicits the ask, and one CLAUDE.md sentence won't stop it | Mechanical, not conventional: Monitor/loop/scheduled tools and unattended sleep-loop Bash forms DENIED in settings; identity-kit rule #2 "check once, answer, stop"; the correct answer to the inevitable request is pre-written — the deterministic ping already does "tell me when" for zero tokens (§3.2, §3.3) |
@@ -738,8 +792,9 @@ authority.
    is automatic with no re-pairing (server registered under the account). Server mode is the v1
    shape regardless (B2). test.sh carries the live check.
 2. **Dispatch posture (Q2): per-invocation approval — LOCKED (Jefe, 2026-07-13)** — conditional
-   on the H5 live check, with the full command mechanically guaranteed visible by the ≤180-char
-   dispatch cap (§3.2); if RC's prompt hides the command entirely → observe-only fallback.
+   on the H5 live check, with the full command mechanically guaranteed visible by the
+   positive-grammar dispatch gate (§3.2 — exact argv, ASCII-only, ≤160-byte serialized cap); if
+   RC's prompt hides the command entirely → observe-only fallback.
 3. **Quota (Q3): shared + flip trigger — LOCKED (Jefe, 2026-07-13);** second seat on the first
    observed collision (RC supports Pro — the seat can be cheap).
 4. **Auth-failure detection (Q4): the sub-5s-exit counter is the SOLE trigger class (H4);**
