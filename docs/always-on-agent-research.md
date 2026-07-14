@@ -449,18 +449,20 @@ the process ends, and >~10 min awake-but-offline "times out and the process exit
   exponential backoff capped (5s → 10min) and a pre-launch reachability gate (`curl -m5` to
   api.anthropic.com PLUS one IP-literal probe alongside it — M2, splits DNS failure from routing
   failure; on failure sleep without spawning so a multi-hour ISP outage doesn't thrash spawns).
-  **Clean env boundary immediately adjacent to `exec` (HIGH-5, hardened from v0.3's bare
-  `unset`):** RC hard-rejects long-lived setup-token credentials, and the Mini's pool env exports
-  exactly `CLAUDE_CODE_OAUTH_TOKEN` — but the wrapper ALSO sources the Mini's `~/.myndaix/.secrets/`
-  (for the alert recipient), and if `load.sh` re-exports the token, `ANTHROPIC_API_KEY`, or a
-  non-`api.anthropic.com` `ANTHROPIC_BASE_URL` AFTER a bare early `unset`, every relaunch
-  auth-fails and parks permanently. So: source secrets EARLY, capture only
-  `WATCH_ALERT_IMESSAGE_TO` into a local, then — with NO sourced code between this point and the
-  exec — scrub + ASSERT + launch as one step: `env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY`,
-  a fail-closed guard (`[[ -z "${CLAUDE_CODE_OAUTH_TOKEN-}" && -z "${ANTHROPIC_API_KEY-}" ]] || {
-  park "dirty-auth-env"; }` and assert `ANTHROPIC_BASE_URL` is empty or `api.anthropic.com`), then
-  `exec claude remote-control --capacity 1`. RC must ride the keychain's full-scope interactive
-  `/login`. **Park-and-alert branch (H4 amendment): "N consecutive sub-5s exits" (N=3) is the
+  **Clean env boundary (HIGH-5, hardened past the fold in the build):** RC hard-rejects
+  long-lived setup-token credentials, and the Mini's pool env exports exactly
+  `CLAUDE_CODE_OAUTH_TOKEN`. The fold's plan was "source secrets, then scrub"; the BUILD strengthened
+  it to **not sourcing anything** — sourcing arbitrary code (`load.sh`) to fetch one value IS the
+  re-injection vector HIGH-5 named (a re-exported token or a proxy `ANTHROPIC_BASE_URL` would
+  break RC or false-park). The alert recipient comes only from a dedicated single-value file
+  `~/watch/.alert-to`. With no sourced code in the process: `unset CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_API_KEY ANTHROPIC_BASE_URL` up front; then per iteration a fail-closed guard
+  (`[[ -z "${CLAUDE_CODE_OAUTH_TOKEN-}" && -z "${ANTHROPIC_API_KEY-}" ]] || park "dirty-auth-env"`,
+  and a non-standard `ANTHROPIC_BASE_URL` → park) with `env -u CLAUDE_CODE_OAUTH_TOKEN -u
+  ANTHROPIC_API_KEY` as the belt on the launch line. RC rides the keychain's full-scope
+  interactive `/login`. (The loop runs `claude` as a CHILD and iterates on its exit — NOT `exec`,
+  which would end the supervisor loop; "wrapper is the pane command" still holds because tmux runs
+  the wrapper.) **Park-and-alert branch (H4 amendment): "N consecutive sub-5s exits" (N=3) is the
   SOLE park trigger class** — stderr/exit-text matching may ACCELERATE parking but never gates it
   (preview-era error strings are brittle). On park: write the `.parked` marker (reason +
   timestamp), fire ONE deterministic ping via the narrowly-armed iMessage path (§3.5), then

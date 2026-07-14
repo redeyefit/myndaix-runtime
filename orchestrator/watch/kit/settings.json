@@ -1,0 +1,54 @@
+{
+  "_comment": "Watch fail-closed permission posture (docs/always-on-agent-research.md §3.2). Deploys to /Users/jefe/watch/.claude/settings.json. defaultMode=deny: nothing runs unless explicitly allowed here or allowed by the dispatch-gate PreToolUse hook. The two read wrappers (mxr-read, read-inbox) are the ONLY pre-approved observe paths; every mxr dispatch is gated to a phone tap by the hook. Edit the hook path if the checkout is elsewhere.",
+  "permissions": {
+    "defaultMode": "deny",
+    "allow": [
+      "Bash(mxr-read:*)",
+      "Bash(mxr-read.sh:*)",
+      "Bash(read-inbox:*)",
+      "Bash(read-inbox.sh:*)"
+    ],
+    "deny": [
+      "Bash(mxr:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(nc:*)",
+      "Bash(ncat:*)",
+      "Bash(scp:*)",
+      "Bash(rsync:*)",
+      "Bash(ssh:*)",
+      "Bash(ftp:*)",
+      "Bash(sh:*)",
+      "Bash(bash:*)",
+      "Bash(zsh:*)",
+      "Bash(node:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(eval:*)",
+      "Bash(osascript:*)",
+      "WebSearch",
+      "WebFetch",
+      "Read(/Users/jefe/.myndaix/.secrets/**)",
+      "Read(/Users/jefe/.ssh/**)",
+      "Read(/Users/jefe/Library/Keychains/**)",
+      "Read(/Users/jefe/.claude/**)",
+      "Read(/Users/jefe/.codex/**)",
+      "Read(/Users/jefe/.myndaix/bridge/inbox/jefe/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/jefe/code/active/myndaix-runtime/orchestrator/watch/hooks/dispatch-gate.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

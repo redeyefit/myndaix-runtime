@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Watch — the Mini's phone-reachable remote-control session ("the front desk").
+  Design: docs/always-on-agent-research.md §3.1. This is a LaunchAgent (gui domain), NOT a
+  LaunchDaemon and NOT cron: Claude Code needs the logged-in OAuth/keychain context, and iMessage
+  (the park alert) needs a GUI Messages session.
+
+  Install (Mini, as jefe — AFTER machine-prep + the test.sh smoke run in orchestrator/watch/):
+    cp orchestrator/watch/ai.myndaix.rc-keepalive.plist.example \
+       ~/Library/LaunchAgents/ai.myndaix.rc-keepalive.plist
+    launchctl load ~/Library/LaunchAgents/ai.myndaix.rc-keepalive.plist
+  Rollback (instant):
+    launchctl unload ~/Library/LaunchAgents/ai.myndaix.rc-keepalive.plist
+  Edit the wrapper path below if your runtime checkout is not /Users/jefe/code/active/myndaix-runtime.
+
+  NOT KeepAlive=true: booleans restart-loop every 10s ThrottleInterval when the program manages
+  its own lifecycle. rc-bootstrap.sh is idempotent, so RunAtLoad + a StartInterval recheck is the
+  right shape — it re-creates the tmux session only if it has died, and refuses if parked.
+
+  AbandonProcessGroup=true is LOAD-BEARING: the short-lived bootstrap detaches a long-lived tmux
+  server + wrapper; without this key launchd reaps the whole process group when bootstrap exits,
+  killing the session it just created.
+
+  WorkingDirectory pins cwd so the dir-keyed CLAUDE.md identity (Watch) loads; launchd's default
+  cwd is / (wrong identity / no identity otherwise).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.myndaix.rc-keepalive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jefe/code/active/myndaix-runtime/orchestrator/watch/rc-bootstrap.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/Users/jefe/watch</string>
+  <key>StandardOutPath</key>
+  <string>/Users/jefe/.myndaix/orchestrator/rc-keepalive.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jefe/.myndaix/orchestrator/rc-keepalive.out</string>
+</dict>
+</plist>
