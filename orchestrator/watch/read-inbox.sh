@@ -49,6 +49,5 @@ under_allowed_root "$real" || { echo "read-inbox: path outside allowed roots (re
 [[ -f "$real" ]] || { echo "read-inbox: not a regular file" >&2; exit 2; }
 
 watch_log "read-inbox ACCEPT path=$real"
-WATCH_READ_TRUNCATED=0
 # feed the file through the shared fence; label is the basename (defanged inside).
 sanitize_untrusted "inbox:$(basename "$real")" < "$real"

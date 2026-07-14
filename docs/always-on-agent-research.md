@@ -496,16 +496,26 @@ the process ends, and >~10 min awake-but-offline "times out and the process exit
 
 ### 3.2 Fail-closed permission posture (this IS the runtime bridge)
 
-Configuration, not code — and the place where three of the security pass's four HIGH attacks are
-closed (§6 F5–F8):
+Configuration, not code — closes three of the security pass's four HIGH attacks (§6 F5–F8), plus
+the code-review r1 CRITICAL/HIGHs (settings facts verified against current Claude Code docs):
 
-- **Pre-approved:** ONLY the two typed wrappers (H1/H2, spec in §3.8): `mxr-read <JOB_ID>`
-  (validates the id shape, execs `mxr get` with fixed argv — no shell forms) and
-  `read-inbox [file]` (path-locked to `~/.myndaix/bridge/inbox/jefe/` + `/Users/jefe/watch/`).
-  **Never `Bash(mxr get *)`** — even the read verb, shell-mediated, has metachar/expansion
-  edges; a PreToolUse hook rejects any pre-approved invocation containing metachars or newlines.
-  Settings additionally carry credential/env-var denies and explicit Read() path denies for
-  secrets (`~/.myndaix/.secrets*`, keychains, `~/.claude/*token*`, `~/.codex/auth.json`).
+- **`defaultMode: "dontAsk"`** (the valid fail-closed mode; `"deny"` is NOT a valid value and
+  would make Claude reject the whole settings file → posture silently gone — a deploy check must
+  validate it). **`allow: []` — empty on purpose:** the PreToolUse hook is the SOLE allow-er of
+  the two read wrappers and the SOLE ask-er of a valid dispatch (docs precedence: a `deny` rule
+  overrides even a hook `ask`/`allow`, so we keep NO `Bash(mxr…)` deny — v1's `Bash(mxr:*)` deny
+  would have silently killed every dispatch).
+- **Pre-approved reads = ONLY the two typed wrappers, allowed by the HOOK not a settings glob**
+  (H1/H2, §3.8): `mxr-read <JOB_ID>` and `read-inbox [safe-path]`. A settings `Bash(read-inbox:*)`
+  glob is itself a smuggling hole (the r1 CRITICAL: `read-inbox ;mxr${IFS}recon${IFS}go` rode a
+  loose `\S+` match), so the hook parses the program name and DENIES any wrapper-prefixed command
+  carrying a shell metacharacter/operator — only an exact safe-char invocation is allowed.
+- **`Read()` secret-denies are LOAD-BEARING, not belt:** under `dontAsk` the built-in
+  Read/Grep/Glob tools are auto-allowed, so without these Watch could read secrets directly. They
+  use the filesystem-correct `~/` form (a single-slash `/Users/...` is settings-relative and
+  would miss — the r1 HIGH): `~/.ssh/**`, `~/.myndaix/.secrets/**`, `~/Library/Keychains/**`,
+  `~/.claude/**`, `~/.codex/**`, plus Grep on the same. Residual (accepted, matches curator):
+  Read on non-secret paths stays available; CLAUDE.md directs all real reads through `read-inbox`.
 - **Approval-gated (never pre-approved):** every `mxr <agent> "<task>"` submit — one tap on the
   phone per dispatch via RC "Push when actions required." Dispatch only arises from Jefe's own
   request, so there is no unattended-stall tension; the tap is what converts "check inbox" from a

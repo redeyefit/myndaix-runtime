@@ -25,5 +25,4 @@ watch_log "mxr-read ACCEPT id=$id"
 # fixed argv: the id can never become a flag or a second word past the regex. Capture then fence
 # (never stream an agent-controlled body straight to the model).
 out="$(mxr get "$id" 2>&1 || true)"
-WATCH_READ_TRUNCATED=0
 printf '%s' "$out" | sanitize_untrusted "ledger:$id"

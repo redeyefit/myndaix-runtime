@@ -27,10 +27,11 @@ fi
 
 # (b) disk-free floor — JSONL transcripts share the disk with the Postgres ledger; the house has
 # a logged no-space incident class, and the Mini shows only ~29Gi available.
-avail_kb="$(df -k "$WATCH_HOME" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+avail_kb="$(df -k "$WATCH_HOME" 2>/dev/null | awk 'NR==2{print $4}' | tr -dc '0-9' || true)"
 avail_kb="$((10#${avail_kb:-0}))"
-if (( avail_kb > 0 && avail_kb < 524288 )); then          # < 512MB
-  watch_log "bootstrap: LOW DISK ${avail_kb}KB free, not starting"
+# fail-closed: < 512MB (INCLUDING 0 = disk full or df failed/unparseable) -> do not start.
+if (( avail_kb < 524288 )); then
+  watch_log "bootstrap: LOW/UNKNOWN DISK ${avail_kb}KB free, not starting (fail-closed)"
   exit 0
 fi
 

@@ -3,13 +3,30 @@
 # Reads the hook JSON on stdin, prints a permissionDecision JSON (or nothing = no decision).
 # Invoked by dispatch-gate.sh (which sets PATH and execs this so stdin flows through).
 #
-# Verified vs current Claude Code docs (2.1.x, https://code.claude.com/docs/en/hooks): a
-# PreToolUse Bash hook fires BEFORE the permission prompt, receives the FULL tool_input.command
-# (every ; && | newline $() included), and can deny so the prompt never appears. So a compound
-# line like  mxr x "ok"; curl evil  is denied WHOLE (closes oracle HIGH-3a).
+# Verified vs current Claude Code docs (2.1.x, hooks/permissions): a PreToolUse Bash hook fires
+# BEFORE the permission prompt, receives the FULL tool_input.command (every ; && | newline $()
+# included), and can deny so the prompt never appears. This hook is the SOLE allow-er of the two
+# read wrappers (settings.json has an EMPTY allow list + defaultMode dontAsk), so it must be
+# airtight: any command whose program is a wrapper OR mxr but is not a STRICT safe invocation is
+# DENIED explicitly — never left to fall through (a fall-through under dontAsk is a deny for Bash,
+# but we deny loudly so the reason is legible and so we never depend on that ordering).
+#
+# CRITICAL-1 fix (code review r1): the old read-wrapper allow used `\S+`, so
+# `read-inbox ;mxr${IFS}recon${IFS}go` (no whitespace after ';') fullmatched and got `allow`,
+# then bash expanded ${IFS} and ran a metered dispatch. Now: metachars/operators on a wrapper
+# command -> deny; only an exact safe-char invocation -> allow.
 import json
 import re
 import sys
+
+READ_WRAPPERS = {"read-inbox", "read-inbox.sh", "mxr-read", "mxr-read.sh"}
+# operators + expansion that make a "single command" actually compound/expanding. Dangerous even
+# inside our wrapper surface; any presence -> deny.
+SHELL_META = set(";&|<>$`(){}[]\\\n\r*?~!")
+FLAT_RATE_AGENTS = "kilabz|lobster|oracle|mini|mack|codex"     # never recon/higgsfield (metered)
+# printable-ASCII task body: no double-quote, no shell-expansion chars ($ ` \), no metachars.
+TASK = r"[A-Za-z0-9 ._,:/?!'@#%+=-]"
+DISPATCH = re.compile(r'^mxr (' + FLAT_RATE_AGENTS + r') "(?!-)(' + TASK + r'+)"$')
 
 
 def emit(decision, reason):
@@ -27,45 +44,46 @@ def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
-        return  # unparseable -> no decision, let the normal flow handle it
-
+        return  # unparseable -> no decision
     if data.get("tool_name") != "Bash":
         return
     cmd = (data.get("tool_input") or {}).get("command", "")
-    if not isinstance(cmd, str):
+    if not isinstance(cmd, str) or not cmd.strip():
         return
-
     stripped = cmd.strip()
 
-    # pre-approved read wrappers pass straight through (argument-shape checked).
-    if re.fullmatch(r"(?:\S*/)?mxr-read(?:\.sh)? [0-9a-fA-F-]{8,36}", stripped) or \
-       re.fullmatch(r"(?:\S*/)?read-inbox(?:\.sh)?(?: \S+)?", stripped):
-        emit("allow", "pre-approved read wrapper")
+    # program name = first whitespace-delimited token; basename for wrapper/mxr identification.
+    prog = re.match(r"\s*(\S+)", cmd).group(1)
+    base = prog.rsplit("/", 1)[-1]
 
-    # is this an mxr DISPATCH attempt? (mxr as a word, not mxr-read/mxr-safe.)
-    looks_like_mxr = re.search(r"(^|[^\w./-])mxr(\s|$)", cmd) is not None
-    if not looks_like_mxr:
-        return  # not a dispatch attempt; settings default-deny governs
+    # ---- read wrappers: STRICT or DENY (never allow-on-loose-match) ----
+    if base in READ_WRAPPERS:
+        if any(c in cmd for c in SHELL_META):
+            emit("deny", "read wrapper with shell metacharacters/operators refused")
+        if base.startswith("mxr-read"):
+            if re.fullmatch(r"(?:\S*/)?mxr-read(?:\.sh)? [0-9a-fA-F-]{8,36}", stripped):
+                emit("allow", "pre-approved ledger read")
+            emit("deny", "malformed mxr-read (want: mxr-read <8-36 hex/hyphen id>)")
+        else:  # read-inbox
+            if re.fullmatch(r"(?:\S*/)?read-inbox(?:\.sh)?(?: [A-Za-z0-9./_-]+)?", stripped):
+                emit("allow", "pre-approved inbox read")
+            emit("deny", "malformed read-inbox (want: read-inbox [safe-path])")
 
-    # byte cap on the SERIALIZED command (HIGH-3b: <180 codepoints can still overflow the
-    # ~200-char approval preview after serialization).
-    if len(cmd.encode("utf-8", "surrogatepass")) > 160:
-        emit("deny", "dispatch too long: >160 bytes cannot be shown whole in the approval preview")
+    # ---- mxr dispatch: STRICT grammar or DENY ----
+    if base == "mxr":
+        if len(cmd.encode("utf-8", "surrogatepass")) > 160:
+            emit("deny", "dispatch >160 bytes cannot be shown whole in the approval preview")
+        m = DISPATCH.fullmatch(stripped)
+        if m is None:
+            emit("deny",
+                 "dispatch rejected: must be exactly  mxr <flat-rate-agent> \"<printable-ascii "
+                 "task, no shell metacharacters>\"  — one command, <=160 bytes. Metered agents "
+                 "(recon/higgsfield), compound commands, flags, and --prompt-file are refused. "
+                 "Long or special tasks: dispatch from a Mack terminal.")
+        emit("ask", "mxr dispatch to %s — approve on phone" % m.group(1))
 
-    AGENTS = "kilabz|lobster|oracle|mini|mack|codex"
-    # printable-ASCII task, no shell metacharacters, no quotes, no leading dash. One command only.
-    TASK = r"[A-Za-z0-9 ._,:/?!'@#%+=-]"
-    grammar = re.compile(r'^mxr (' + AGENTS + r') "(?!-)(' + TASK + r'+)"$')
-
-    m = grammar.fullmatch(stripped)
-    if m is None:
-        emit("deny",
-             "dispatch rejected: must be exactly  mxr <flat-rate-agent> \"<printable-ascii task, "
-             "no shell metacharacters>\"  — one command, <=160 bytes. Metered agents "
-             "(recon/higgsfield), compound commands, flags, and --prompt-file are refused. Long "
-             "or special tasks: dispatch from a Mack terminal.")
-
-    emit("ask", "mxr dispatch to %s — approve on phone" % m.group(1))
+    # not a Watch surface -> no decision (settings dontAsk default-deny governs)
+    return
 
 
 if __name__ == "__main__":

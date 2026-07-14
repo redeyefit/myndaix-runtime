@@ -73,10 +73,14 @@ sanitize_untrusted() {
   label="$(printf '%s' "$label" | LC_ALL=C tr -cd 'a-zA-Z0-9_-' | cut -c1-24)"
   nonce="$(openssl rand -hex 16 2>/dev/null || echo "0000000000000000")"
 
-  # size cap FIRST (bound everything downstream), then C0-strip.
-  body="$(head -c "$WATCH_READ_MAX_BYTES" | watch_clean)"
-  # was there more than the cap? (best-effort truncation notice)
-  if [[ "${WATCH_READ_TRUNCATED:-}" == "1" ]]; then truncated=" (TRUNCATED at ${WATCH_READ_MAX_BYTES}B)"; fi
+  # size cap FIRST (bound everything downstream, incl. memory), then C0-strip. Read at most cap+1
+  # bytes: if we actually got more than the cap, the input was truncated -> say so (MED-8; the old
+  # WATCH_READ_TRUNCATED env flag was never set and the notice was dead code).
+  local head_plus nbytes
+  head_plus="$(head -c $(( WATCH_READ_MAX_BYTES + 1 )))"
+  nbytes="$(printf '%s' "$head_plus" | LC_ALL=C wc -c | tr -dc '0-9')"; nbytes="$((10#${nbytes:-0}))"
+  if (( nbytes > WATCH_READ_MAX_BYTES )); then truncated=" (TRUNCATED at ${WATCH_READ_MAX_BYTES}B)"; fi
+  body="$(printf '%s' "$head_plus" | head -c "$WATCH_READ_MAX_BYTES" | watch_clean)"
 
   # injection-scan: positional/marker patterns. Conservative — anchored instruction verbs, not
   # bare keywords, to avoid dropping legitimate technical text (security.md scanner rule). NOTE:
@@ -85,9 +89,9 @@ sanitize_untrusted() {
   # reading model + role-close tags. On any hit: DROP.
   hit=""
   if printf '%s' "$body" | grep -iEq \
-      -e '(^|[[:space:]>])(ignore|disregard|forget|override)[[:space:]]+(all[[:space:]]+)?(the[[:space:]]+)?(previous|prior|above|earlier|preceding|your)[[:space:]]+(instructions|prompt|rules|context)' \
+      -e '(^|[[:space:]>])(ignore|disregard|forget|override)[[:space:]]+([a-z]+[[:space:]]+)?(previous|prior|above|earlier|preceding|your|these|those|my)[[:space:]]+(instructions|prompt|rules|context)' \
       -e '(^|[[:space:]])you[[:space:]]+are[[:space:]]+now[[:space:]]+' \
-      -e '(new[[:space:]]+(system[[:space:]]+)?(instructions|directive|task|persona)[[:space:]]*:)' \
+      -e '(new[[:space:]]+(system[[:space:]]+)?(instructions|directive|persona)[[:space:]]*:)' \
       -e '<[[:space:]]*/[[:space:]]*(system|assistant|user|task_content|user_input)[[:space:]]*>' \
       -e '(disregard|bypass|skip|ignore)[[:space:]]+(the[[:space:]]+)?(fence|guard|approval|permission)' ; then
     hit="1"
