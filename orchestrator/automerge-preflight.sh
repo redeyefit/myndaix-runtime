@@ -10,7 +10,7 @@ ok=0; bad=0
 chk(){ if eval "$2" >/dev/null 2>&1; then echo "  ok: $1"; ok=$((ok+1)); else echo "  XX: $1"; bad=$((bad+1)); fi; }
 
 TOKEN_FILE="${MYNDAIX_AUTOMERGE_TOKEN_FILE:-$HOME/.myndaix/.automerge-token}"
-[[ -r "$TOKEN_FILE" ]] && export GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+[[ -r "$TOKEN_FILE" ]] && GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")" && export GH_TOKEN
 NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)"
 
 echo "auto-merge preflight ($REPO -> ${NWO:-?})"

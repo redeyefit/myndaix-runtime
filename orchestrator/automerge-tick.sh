@@ -14,7 +14,7 @@ cd "$REPO"
 # by a launchd agent. Provision a chmod-600 secret with exactly: Contents r/w + Pull requests
 # r/w + Checks r + Metadata r on the target repo. (Deploy prereq; see docs/automerge-design.md §0.)
 TOKEN_FILE="${MYNDAIX_AUTOMERGE_TOKEN_FILE:-$HOME/.myndaix/.automerge-token}"
-[[ -r "$TOKEN_FILE" ]] && export GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+[[ -r "$TOKEN_FILE" ]] && GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")" && export GH_TOKEN
 
 export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://localhost/runtime}"
 export PYTHONPATH="src"

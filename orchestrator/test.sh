@@ -96,7 +96,7 @@ run(){ env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/hea
 run_af(){ env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" \
             bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "${1:-}" 2>"$ROOT/stderr"; }
 af_repos(){ mkdir -p "$(dirname "$REPOS_JSON")"; printf '%s' "$1" > "$REPOS_JSON"; }
-wait_fixer(){ local i; for i in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
+wait_fixer(){ for _ in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
 settle(){ sleep 0.6; }   # let a (possible) detached fire either land or prove absent
 latest(){ ls -t "$INBOX"/*.md 2>/dev/null | head -1; }
 ck(){ # ck <label> <substr> <file-or-empty>
@@ -323,6 +323,7 @@ echo "40. NO follow-up keys file when nothing recorded (empty outcome-record out
 
 echo "41. keys file does NOT touch the verdict file (verdict untouched)"; reset; arm_outcomes
   STUB_OUTCOME_KEYS="$(printf 'cafebabe4567\toracle\ttoctou-race\tf.py')" STUB_TRIAGE="1. fix it" run
+  # shellcheck disable=SC2010  # ls -t sorts by mtime (a glob can't); test-only newest-match
   vf="$(ls -t "$INBOX"/*.md 2>/dev/null | grep -v -- '-outcomes.md' | head -1)"
   if [[ -n "$vf" ]] && ! grep -q "cafebabe4567" "$vf"; then echo "  ok: verdict file has no injected keys (separate file)"; PASS=$((PASS+1)); else echo "  FAIL: keys leaked into the verdict file"; FAIL=$((FAIL+1)); fi
 
