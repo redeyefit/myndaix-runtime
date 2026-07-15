@@ -53,9 +53,11 @@ $report"
       log "canary: FAILED to write alert to $alert — will retry next interval (not latched)"
     fi
   else
-    log "canary: OPERATOR_INBOX unavailable ($OPERATOR_INBOX) — alert not delivered:"$'\n'"$msg"
-    : > "$ALERTED_FILE"   # latch here too — a missing inbox is a stable condition, not retryable;
-                          # without this the no-inbox path re-logs every interval (r4 regression).
+    # Do NOT latch: the alert was NOT delivered. Latching a missing inbox at threshold would
+    # permanently suppress the alert even after the inbox is restored (it only clears on a clean
+    # dry-run) — a fail-open (r5 gate). Re-logging each interval is noisy-but-recoverable, and the
+    # next interval retries delivery once the inbox returns, then latches on success.
+    log "canary: OPERATOR_INBOX unavailable (${OPERATOR_INBOX:-<unset>}) — alert not delivered:"$'\n'"$msg"
   fi
 fi
 exit 0
