@@ -200,5 +200,3 @@ Order rationale: PR-1 is the load-bearing wound-closer and is self-contained; ea
 
 - **Current-state inventory:** full deploy-surface / machine-config / OSS-blocker inventory produced 2026-07-14 (deploy surfaces, `$ORCH` copies, launchd jobs, hardcoded paths). Key confirmations: no automated inter-machine sync exists; no "if mini/macbook" code branching (config-driven already); the half-deploy risk was documented yet still drifted.
 - **Prior-art brief:** GitOps pull-reconcile (ArgoCD/Flux/ansible-pull — borrow idea, reject tools), drift = dry-run reconcile + SHA canary, Hermes Agent as the personal-agent reference, 12-factor dev/prod parity, launchd as the macOS-native always-on. Sources cited in the research brief (this session).
-</content>
-</invoke>
