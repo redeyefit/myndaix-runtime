@@ -1,0 +1,9 @@
+{
+  "label": "ai.myndaix.fix-sweep",
+  "roles": ["factory"],
+  "program": ["/bin/bash", "{DEPLOY_CLONE}/orchestrator/fix-sweep.sh"],
+  "schedule": {"StartInterval": 3600},
+  "run_at_load": true,
+  "stdout": "{MYNDAIX_HOME}/orchestrator/fix-sweep.out",
+  "env": {"MYNDAIX_DSN": "MYNDAIX_DSN", "MYNDAIX_HOME": "MYNDAIX_HOME", "PATH": "AGENT_CLI_PATH"}
+}

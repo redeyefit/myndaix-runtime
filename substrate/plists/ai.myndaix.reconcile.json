@@ -1,0 +1,8 @@
+{
+  "label": "ai.myndaix.reconcile",
+  "roles": ["factory"],
+  "program": ["/bin/bash", "{MYNDAIX_HOME}/bin/bootstrap-fetch"],
+  "schedule": {"StartInterval": "{POLL_INTERVAL_S}"},
+  "stdout": "{MYNDAIX_HOME}/state/reconcile.out",
+  "env": {"MYNDAIX_HOME": "MYNDAIX_HOME", "PATH": "AGENT_CLI_PATH"}
+}

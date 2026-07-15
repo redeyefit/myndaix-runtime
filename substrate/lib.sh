@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# lib.sh — shared helpers for the two-machine substrate. Sourced by reconcile.sh and
+# drift-canary.sh (both run from the FRESH deploy clone, so this file is post-reset).
+#
+# NOT sourced by bootstrap-fetch (which must stay self-contained: it is the static
+# fetcher that survives a bricked reconcile in origin/main — design §2.2 Stage 0).
+#
+# Callers own `set -euo pipefail`; we set it too for defence when sourced early.
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# Resolve the substrate dir + deploy clone from THIS file's location (source of truth
+# for where we are actually running — cross-checked against config's DEPLOY_CLONE).
+SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_CLONE="$(cd "$SUBSTRATE_DIR/.." && pwd)"
+LA_DOMAIN="gui/$(id -u)"
+
+log() { printf '[%s] [substrate] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { log "ALARM: $*" >&2; exit 1; }
+
+# ---- config -----------------------------------------------------------------
+# MYNDAIX_HOME is bootstrapped from env (the plist injects it) or the default; the
+# config file lives under it. Every OTHER value comes from the validated config.
+substrate_resolve_home() {
+  MYNDAIX_HOME="${MYNDAIX_HOME:-$HOME/.myndaix}"
+  CONFIG_FILE="$MYNDAIX_HOME/config.env"
+  [[ -f "$CONFIG_FILE" ]] || die "no config.env at $CONFIG_FILE (run reconcile --update-bootstrap / SETUP)"
+}
+
+# cfg_get KEY — validated single value (config_parse fails closed on bad config).
+cfg_get() {
+  python3 "$SUBSTRATE_DIR/config_parse.py" "$CONFIG_FILE" --get "$1"
+}
+
+# substrate_load_config — validate the whole config once, then export resolved values.
+# A validation failure here aborts under set -e (fail-closed: no restart on bad config).
+substrate_load_config() {
+  substrate_resolve_home
+  # One full-file validation up front; --get calls below re-validate cheaply.
+  python3 "$SUBSTRATE_DIR/config_parse.py" "$CONFIG_FILE" >/dev/null \
+    || die "config validation failed ($CONFIG_FILE)"
+  MACHINE_ROLE="$(cfg_get MACHINE_ROLE)"
+  DEPLOY_CLONE="$(cfg_get DEPLOY_CLONE)"
+  MYNDAIX_DSN="$(cfg_get MYNDAIX_DSN)"
+  OPERATOR_INBOX="$(cfg_get OPERATOR_INBOX)"
+  POLL_INTERVAL_S="$(cfg_get POLL_INTERVAL_S)"
+  export MYNDAIX_HOME MACHINE_ROLE DEPLOY_CLONE MYNDAIX_DSN OPERATOR_INBOX POLL_INTERVAL_S
+}
+
+# substrate_assert_deploy_clone — before ANY mutating op, prove we run from exactly the
+# clone config names as DEPLOY_CLONE. Blocks a reset --hard on the wrong tree.
+substrate_assert_deploy_clone() {
+  local cfg_clone; cfg_clone="$(cd "$DEPLOY_CLONE" 2>/dev/null && pwd || true)"
+  [[ -n "$cfg_clone" ]] || die "DEPLOY_CLONE does not exist: $DEPLOY_CLONE"
+  [[ "$SELF_CLONE" == "$cfg_clone" ]] \
+    || die "running from $SELF_CLONE but config DEPLOY_CLONE=$cfg_clone — refusing to mutate"
+}
+
+# ---- atomic install ---------------------------------------------------------
+# atomic_install SRC DST MODE — render/produce SRC (a temp), then rename over DST.
+# APFS rename is atomic; a running process keeps the old inode, new invocations get new.
+atomic_install() {
+  local src="$1" dst="$2" mode="$3"
+  chmod "$mode" "$src"
+  mv -f "$src" "$dst"
+}
+
+# ---- launchctl --------------------------------------------------------------
+la_loaded()    { launchctl print "$LA_DOMAIN/$1" >/dev/null 2>&1; }
+la_bootout()   { launchctl bootout "$LA_DOMAIN/$1" 2>/dev/null || true; }   # idempotent
+la_bootstrap() { launchctl bootstrap "$LA_DOMAIN" "$1"; }                   # $1 = plist path
+la_kickstart() { launchctl kickstart -k "$LA_DOMAIN/$1"; }
+
+# la_wait_gone LABEL TIMEOUT — poll until the label's process is actually gone after a
+# bootout (bootout can return before the process dies; the Option-A reset must not race
+# a still-reading tick — design §2.3). Best-effort: returns 0 when unloaded.
+la_wait_gone() {
+  local label="$1" timeout="${2:-30}" deadline
+  deadline=$(( $(date +%s) + timeout ))
+  while la_loaded "$label"; do
+    [[ $(date +%s) -ge $deadline ]] && { log "WARN: $label still loaded after ${timeout}s"; return 1; }
+    sleep 1
+  done
+  return 0
+}
