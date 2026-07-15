@@ -30,7 +30,11 @@ fi
 streak="$(cat "$STREAK_FILE" 2>/dev/null || echo 0)"
 [[ "$streak" =~ ^[0-9]+$ ]] || streak=0
 streak=$(( 10#$streak + 1 ))
-printf '%s\n' "$streak" > "$STREAK_FILE.tmp" && mv -f "$STREAK_FILE.tmp" "$STREAK_FILE"
+# Explicit fail-closed write (a `printf > tmp && mv` &&-chain is exempt from set -e on the non-final
+# link — the #89 class; cross-family review MAJOR).
+if ! { printf '%s\n' "$streak" > "$STREAK_FILE.tmp" && mv -f "$STREAK_FILE.tmp" "$STREAK_FILE"; }; then
+  die "could not write drift streak"
+fi
 log "canary: DRIFT (streak=$streak)"
 
 if [[ "$streak" -ge "$THRESHOLD" && ! -e "$ALERTED_FILE" ]]; then
@@ -39,11 +43,17 @@ if [[ "$streak" -ge "$THRESHOLD" && ! -e "$ALERTED_FILE" ]]; then
 $report"
   if [[ -n "${OPERATOR_INBOX:-}" && -d "$OPERATOR_INBOX" ]]; then
     alert="$OPERATOR_INBOX/drift-alert-$(date '+%Y%m%d%H%M%S').md"
-    printf '%s\n' "$msg" > "$alert.tmp" && mv -f "$alert.tmp" "$alert"
-    log "canary: alert dropped -> $alert"
+    # Latch ONLY after the alert write actually succeeds — else a failed write (disk full) would
+    # latch $ALERTED_FILE and silently suppress ALL future alerts (cross-family review MAJOR).
+    if { printf '%s\n' "$msg" > "$alert.tmp" && mv -f "$alert.tmp" "$alert"; }; then
+      : > "$ALERTED_FILE"
+      log "canary: alert dropped -> $alert"
+    else
+      rm -f "$alert.tmp"
+      log "canary: FAILED to write alert to $alert — will retry next interval (not latched)"
+    fi
   else
     log "canary: OPERATOR_INBOX unavailable ($OPERATOR_INBOX) — alert not delivered:"$'\n'"$msg"
   fi
-  : > "$ALERTED_FILE"   # latch: one alert per drift streak (no per-interval spam)
 fi
 exit 0

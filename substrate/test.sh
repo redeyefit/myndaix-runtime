@@ -193,6 +193,29 @@ print("ok")
 PYEOF
 ok 'python3 "$TMP/orphan.py" "$SUB" >/dev/null 2>&1' "manifest.drift_list flags an orphaned managed label"
 
+echo "== r3 folds: descriptor type-validation (rc2), venv-health drift, tree-check-before-dry-run =="
+# a malformed descriptor (roles is an int) must exit 2 (schema error), NOT 1 (=other role -> skip)
+printf '{"label":"ai.myndaix.x","roles":5}' > "$TMP/bad.json"
+python3 "$RP" role-check "$TMP/bad.json" factory >/dev/null 2>&1; rcbad=$?
+ok '[[ "$rcbad" -eq 2 ]]' "role-check on a non-list roles -> exit 2 (fail closed, not silent skip)"
+printf '{"label":"ai.myndaix.x","roles":["factory"]}' > "$TMP/good.json"
+python3 "$RP" role-check "$TMP/good.json" lab >/dev/null 2>&1; rcother=$?
+ok '[[ "$rcother" -eq 1 ]]' "role-check on a valid other-role descriptor -> exit 1 (skip)"
+# manifest venv-health surfaces as drift
+cat > "$TMP/venv.py" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import manifest
+m = {"origin_sha":"a"*40,"deploy_sha":"a"*40,"plists_expected":{},"plists_installed":{},
+     "labels_loaded":{},"orphans":{},"venv_ok":False}
+assert any("venv" in d for d in manifest.drift_list(m)), "missing venv must be drift"
+assert not manifest.drift_list(dict(m, venv_ok=True)), "healthy venv + equal SHA = clean"
+print("ok")
+PYEOF
+ok 'python3 "$TMP/venv.py" "$SUB" >/dev/null 2>&1' "manifest.drift_list flags a missing/invalid venv"
+# BLOCKER fix: the short-circuit checks the clone tree is clean BEFORE trusting its dry-run
+ok 'grep -B2 -- "reconcile.sh\" --dry-run" "$SUB/bootstrap-fetch.sh" | grep -q "status --porcelain"' "short-circuit verifies tree clean before the clone dry-run"
+
 echo "== bootstrap-fetch --only-if-changed short-circuit is DRIFT-GATED (scratch git, SAFE) =="
 # The skip now requires SHA-unchanged AND a clean reconcile --dry-run (BLOCKER fix). Build a fully
 # self-contained scratch deploy clone with the substrate deps but NO plist descriptors, so the
@@ -208,6 +231,9 @@ done
 # Mirror the real repo: __pycache__/.venv are gitignored, so running the substrate python in the
 # deploy clone does NOT dirty the tree (a bare fixture without this would false-drift on the .pyc).
 printf '__pycache__/\n*.pyc\n.venv/\n' > "$SC/clone/.gitignore"
+# A converged machine has a healthy venv; the manifest venv-health check must see one (else the
+# dry-run would report venv drift and the short-circuit would correctly fall through to converge).
+mkdir -p "$SC/clone/.venv/bin"; printf '#!/bin/sh\n' > "$SC/clone/.venv/bin/pip"; chmod +x "$SC/clone/.venv/bin/pip"
 ( cd "$SC/clone" && git config user.email t@t && git config user.name t && \
   git add -A && git commit -qm init && git branch -M main && git push -q origin main ) >/dev/null 2>&1
 CHEAD="$(git -C "$SC/clone" rev-parse HEAD)"

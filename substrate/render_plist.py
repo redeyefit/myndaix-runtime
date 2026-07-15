@@ -77,14 +77,24 @@ def _load_descriptor(path: str) -> dict:
         _err(f"descriptor not found: {path}")
     except json.JSONDecodeError as e:
         _err(f"descriptor is not valid JSON: {e}")
-    if not isinstance(desc, dict) or "label" not in desc or "roles" not in desc:
-        _err("descriptor must be a JSON object with at least 'label' and 'roles'")
+    # Validate TYPES, not just key presence (cross-family review MAJOR): a non-list `roles` (int, str)
+    # would make `role in roles` raise TypeError -> Python exits rc1, which reconcile maps to "skip
+    # this role" and then orphan-prunes the label. Any schema error must exit 2 (a hard fail), so it
+    # is never confused with rc1 = "valid descriptor for another role".
+    if not isinstance(desc, dict):
+        _err("descriptor must be a JSON object")
+    label = desc.get("label")
+    roles = desc.get("roles")
+    if not isinstance(label, str) or not label:
+        _err("descriptor 'label' must be a non-empty string")
+    if not isinstance(roles, list) or not roles or not all(isinstance(r, str) and r for r in roles):
+        _err("descriptor 'roles' must be a non-empty list of non-empty strings")
     return desc
 
 
 def role_check(desc_path: str, role: str) -> int:
-    desc = _load_descriptor(desc_path)
-    return 0 if role in desc.get("roles", []) else 1
+    desc = _load_descriptor(desc_path)   # validates label/roles types; exits 2 on any schema error
+    return 0 if role in desc["roles"] else 1
 
 
 def _env_dict(desc: dict, resolved: dict) -> dict:

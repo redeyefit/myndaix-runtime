@@ -79,16 +79,18 @@ head_sha="$(git -C "$real_deploy" rev-parse HEAD)"
 running_sha="$(cat "$MYNDAIX_HOME/state/RUNNING_SHA" 2>/dev/null || echo none)"
 if [[ "$origin_sha" == "$head_sha" && "$head_sha" == "$running_sha" ]]; then
   # SHA unchanged AND the last converge fully succeeded (RUNNING_SHA is written last). Skip the
-  # expensive quiesce/reset ONLY if there is also NO artifact drift — otherwise fall through to
-  # converge so same-SHA drift (a hand-edited plist, an orphan, an unloaded label) is AUTO-CORRECTED,
-  # not merely canary-alerted (design G3: detect + correct are the same path — cross-family review
-  # BLOCKER). Safe to run the clone's reconcile --dry-run here: at a matching RUNNING_SHA the code is
-  # the last-converged-GOOD code, not a possibly-broken new origin.
-  if /bin/bash "$real_deploy/substrate/reconcile.sh" --dry-run >/dev/null 2>&1; then
-    log "already converged at ${origin_sha:0:8}; origin unchanged + no drift — skip (only-if-changed)"
+  # expensive quiesce/reset ONLY if there is also NO drift — otherwise fall through to converge so
+  # same-SHA drift (a hand-edited plist, an orphan, an unloaded label) is AUTO-CORRECTED, not merely
+  # canary-alerted (design G3 — cross-family review BLOCKER).
+  # BUT verify the clone WORKING TREE is clean FIRST, with git here in the trusted static fetcher —
+  # a working-tree-only tamper of the clone's reconcile.sh/manifest.py could otherwise false-green the
+  # clone's own dry-run (cross-family review r3 BLOCKER). A dirty tree => converge (reset+clean fixes it).
+  if [[ -z "$(git -C "$real_deploy" status --porcelain)" ]] \
+     && /bin/bash "$real_deploy/substrate/reconcile.sh" --dry-run >/dev/null 2>&1; then
+    log "already converged at ${origin_sha:0:8}; origin unchanged + tree clean + no drift — skip (only-if-changed)"
     exit 0
   fi
-  log "origin unchanged but DRIFT detected — converging to auto-correct"
+  log "origin unchanged but tree-dirty or DRIFT — converging to auto-correct"
 else
   log "converge needed: origin=${origin_sha:0:8} head=${head_sha:0:8} running=${running_sha:0:8}"
 fi

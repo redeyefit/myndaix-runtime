@@ -154,6 +154,10 @@ def build(config_path: str) -> dict:
     head_txt = Path(deploy) / "substrate" / "migration_head.txt"
     m["migration_head"] = (head_txt.read_text().strip() if head_txt.exists() else None)
     m["venv_source_hash"] = _sha256_file(Path(deploy) / "pyproject.toml")
+    # venv health so the dry-run gate SEES a missing/corrupt in-tree venv (cross-family review MAJOR):
+    # otherwise a same-SHA machine with a deleted .venv reads "no drift" and is never repaired.
+    _pip = Path(deploy) / ".venv" / "bin" / "pip"
+    m["venv_ok"] = _pip.is_file() and os.access(_pip, os.X_OK)
     m["config_hash"] = _config_hash(resolved)
 
     # Orphan detection (cross-family review CRITICAL): a label reconcile PREVIOUSLY managed but that
@@ -192,6 +196,8 @@ def drift_list(m: dict) -> list[str]:
     for label, o in m.get("orphans", {}).items():
         drift.append(f"orphaned managed label still present: {label} "
                      f"(installed={o['installed']} loaded={o['loaded']})")
+    if not m.get("venv_ok", True):
+        drift.append("venv missing/invalid (.venv/bin/pip not executable) — converge to repair")
     return drift
 
 

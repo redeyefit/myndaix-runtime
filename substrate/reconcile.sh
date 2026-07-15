@@ -100,18 +100,25 @@ if ! porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain)"; then die "git sta
 [[ -z "$porcelain" ]] || die "deploy clone NOT clean after reset+clean — refusing to converge:"$'\n'"$porcelain"
 log "converging to $(git -C "$DEPLOY_CLONE" rev-parse --short HEAD)"
 
-# 2. dep-sync — pip install only when pyproject.toml changed (venv is in-tree for PR-1).
+# 2. dep-sync — pip install when pyproject.toml changed OR the venv was just (re)created / is invalid.
+#    A missing/corrupt .venv at an UNCHANGED pyproject would otherwise never be repaired: the
+#    venv_source.sha still matches so the install is skipped (cross-family review MAJOR). Force it.
 VENV="$DEPLOY_CLONE/.venv"
+need_install=0
 if [[ ! -x "$VENV/bin/pip" ]]; then
   log "creating venv $VENV"
   python3 -m venv "$VENV" || die "venv creation failed"
+  need_install=1                      # a fresh (or repaired) venv has no packages yet
 fi
 cur_dep="$(shasum -a 256 "$DEPLOY_CLONE/pyproject.toml" | cut -d' ' -f1)"
 dep_rec="$STATE_DIR/venv_source.sha"
-if [[ ! -f "$dep_rec" || "$(cat "$dep_rec" 2>/dev/null || true)" != "$cur_dep" ]]; then
-  log "deps changed — pip install"
+[[ ! -f "$dep_rec" || "$(cat "$dep_rec" 2>/dev/null || true)" != "$cur_dep" ]] && need_install=1
+if [[ "$need_install" == 1 ]]; then
+  log "installing deps into venv"
   "$VENV/bin/pip" install -q -e "$DEPLOY_CLONE" || die "pip install failed"
-  printf '%s\n' "$cur_dep" > "$dep_rec.tmp" && mv -f "$dep_rec.tmp" "$dep_rec"
+  if ! { printf '%s\n' "$cur_dep" > "$dep_rec.tmp" && mv -f "$dep_rec.tmp" "$dep_rec"; }; then
+    die "could not write venv_source.sha"
+  fi
 fi
 
 # 3. install artifacts ATOMICALLY — render each role-matching plist, plutil-lint, mv into place.
