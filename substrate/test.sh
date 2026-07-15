@@ -167,6 +167,48 @@ print("ok")
 PYEOF
 ok 'python3 "$TMP/drcheck.py" "$SUB" >/dev/null 2>&1' "origin_sha=None -> drift; equal SHAs -> clean"
 
+echo "== cross-family folds: SQL guard, orphan-prune scoping, RUNNING_SHA-last, orphan drift =="
+# HEAD_OBJ interpolated into SQL is guarded by a strict-identifier regex + die (MAJOR)
+ok 'grep -qE "migration_head.txt not a plain identifier" "$SUB/reconcile.sh"' "reconcile validates HEAD_OBJ as an identifier before SQL"
+# orphan prune is SCOPED to state/managed_labels — NEVER a wildcard over ai.myndaix.* (risk #1)
+ok 'grep -q "MANAGED_REC" "$SUB/reconcile.sh"' "orphan prune reads the recorded managed-label set"
+ok '! grep -qE "for .* in .*(LA_DIR|LaunchAgents).*/ai\.myndaix\.\*\.plist" "$SUB/reconcile.sh"' "orphan prune does NOT iterate a bare ai.myndaix.* plist glob"
+# RUNNING_SHA is written AFTER manifest.json (commit marker last) — MAJOR
+ok 'python3 - "$SUB/reconcile.sh" <<PYEOF
+import sys
+t = open(sys.argv[1]).read()
+sys.exit(0 if t.index("manifest.json.tmp") < t.index("RUNNING_SHA.tmp") else 1)
+PYEOF' "manifest.json built before RUNNING_SHA (RUNNING_SHA is the final commit marker)"
+# manifest flags an orphaned managed label as drift (CRITICAL)
+cat > "$TMP/orphan.py" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import manifest
+m = {"origin_sha": "a"*40, "deploy_sha": "a"*40, "plists_expected": {}, "plists_installed": {},
+     "labels_loaded": {}, "orphans": {"ai.myndaix.gone": {"installed": True, "loaded": True}}}
+assert any("orphaned" in d for d in manifest.drift_list(m)), "orphan must be drift"
+m2 = dict(m, orphans={})
+assert not manifest.drift_list(m2), "no orphan + equal SHA = clean"
+print("ok")
+PYEOF
+ok 'python3 "$TMP/orphan.py" "$SUB" >/dev/null 2>&1' "manifest.drift_list flags an orphaned managed label"
+
+echo "== bootstrap-fetch --only-if-changed short-circuit (scratch git) =="
+# scratch: a bare origin + a factory deploy clone already converged at HEAD == origin/main == RUNNING_SHA
+SC="$TMP/sc"; mkdir -p "$SC"
+git init -q --bare "$SC/origin.git"
+git clone -q "$SC/origin.git" "$SC/clone" 2>/dev/null
+( cd "$SC/clone" && git config user.email t@t && git config user.name t && \
+  mkdir -p substrate && cp "$SUB/reconcile.sh" substrate/ && git add -A && git commit -qm init && git push -q origin HEAD:main ) >/dev/null 2>&1
+CHEAD="$(git -C "$SC/clone" rev-parse HEAD)"
+mkdir -p "$SC/home/state"
+printf '%s\n' "$CHEAD" > "$SC/home/state/RUNNING_SHA"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s/home\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/home/i\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s/clone\n' "$SC" "$SC" "$SC" > "$SC/home/config.env"
+MYNDAIX_HOME="$SC/home" /bin/bash "$SUB/bootstrap-fetch.sh" > "$SC/bf.out" 2>&1; bfrc=$?
+ok '[[ "$bfrc" -eq 0 ]] && grep -q "only-if-changed" "$SC/bf.out"' "converged+unchanged -> bootstrap-fetch skips (exit 0, only-if-changed)"
+ok '[[ "$CHEAD" == "$(git -C "$SC/clone" rev-parse HEAD)" ]]' "short-circuit did not reset the clone"
+ok '! grep -qi "bootout\|reset to" "$SC/bf.out"' "short-circuit never quiesced or reset"
+
 echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) =="
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"
 ok 'grep -q "deny network" "$REPO/orchestrator/play-fix.sh"' "play-fix sandbox denies network (no live-ledger reach)"

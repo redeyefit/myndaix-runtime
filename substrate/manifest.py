@@ -149,6 +149,21 @@ def build(config_path: str) -> dict:
     m["migration_head"] = (head_txt.read_text().strip() if head_txt.exists() else None)
     m["venv_source_hash"] = _sha256_file(Path(deploy) / "pyproject.toml")
     m["config_hash"] = _config_hash(resolved)
+
+    # Orphan detection (cross-family review CRITICAL): a label reconcile PREVIOUSLY managed but that
+    # is no longer expected (its descriptor was removed, or its role no longer matches) yet remains
+    # installed/loaded. SCOPED to the recorded managed set (state/managed_labels) — NEVER a bare
+    # ai.myndaix.* glob, which would treat unrelated jobs (audio-player, deadman, …) as orphans.
+    m["orphans"] = {}
+    managed_rec = Path(resolved["MYNDAIX_HOME"]) / "state" / "managed_labels"
+    if managed_rec.exists():
+        for label in managed_rec.read_text().split():
+            if not label or label in m["plists_expected"] or label == "ai.myndaix.runtime":
+                continue
+            inst = _sha256_file(la / f"{label}.plist")
+            loaded = _label_loaded(uid, label)
+            if inst is not None or loaded:
+                m["orphans"][label] = {"installed": inst is not None, "loaded": loaded}
     return m
 
 
@@ -168,6 +183,9 @@ def drift_list(m: dict) -> list[str]:
             drift.append(f"plist drift: {label} (installed {str(installed)[:8]} != expected {expected[:8]})")
         if not m["labels_loaded"].get(label):
             drift.append(f"label not loaded: {label}")
+    for label, o in m.get("orphans", {}).items():
+        drift.append(f"orphaned managed label still present: {label} "
+                     f"(installed={o['installed']} loaded={o['loaded']})")
     return drift
 
 

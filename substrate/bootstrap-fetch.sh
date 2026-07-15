@@ -11,6 +11,8 @@
 # re-execs the (now-fresh) reconcile exactly once via the RECONCILE_BOOTSTRAPPED guard.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# Bound the network fetch so a hung SSH connection can't stall the poll (macOS has no `timeout`).
+export GIT_SSH_COMMAND="ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes"
 
 log() { printf '[%s] [bootstrap-fetch] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { log "ALARM: $*" >&2; exit 1; }
@@ -49,23 +51,47 @@ case "$DEPLOY_CLONE" in
 esac
 [[ "$DEPLOY_CLONE" == *".."* ]] && die "DEPLOY_CLONE contains '..': $DEPLOY_CLONE"
 [[ -d "$DEPLOY_CLONE/.git" ]] || die "DEPLOY_CLONE is not a git repo: $DEPLOY_CLONE"
-top="$(git -C "$DEPLOY_CLONE" rev-parse --show-toplevel 2>/dev/null || true)"
-real_deploy="$(cd "$DEPLOY_CLONE" && pwd)"
-[[ "$top" == "$real_deploy" ]] || die "DEPLOY_CLONE is not a git worktree TOPLEVEL ($DEPLOY_CLONE -> $top)"
+# Compare PHYSICAL paths (pwd -P): git --show-toplevel resolves symlinks, and on macOS a clone
+# under /tmp or /var is symlinked to /private/... — a logical `pwd` would falsely mismatch.
+top="$(cd "$(git -C "$DEPLOY_CLONE" rev-parse --show-toplevel 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)"
+real_deploy="$(cd "$DEPLOY_CLONE" && pwd -P)"
+[[ -n "$top" && "$top" == "$real_deploy" ]] || die "DEPLOY_CLONE is not a git worktree TOPLEVEL ($DEPLOY_CLONE -> $top)"
 
-# QUIESCE-BRACKETS-THE-RESET (design §2.3, risk #2). Under Option A launchd runs the tick
-# scripts DIRECTLY from the clone; a `reset --hard` rewrites those files in place (git
-# working-tree writes are NOT atomic), so a mutating tick mid-read could execute a
-# half-written script. Bootout the mutating ticks and PROVE they are gone BEFORE the reset.
-# EXPLICIT allowlist (risk #1) — never a wildcard. The read-only drift-canary is deliberately
-# NOT quiesced (a transient half-read just makes it re-run; keeping it up preserves the alarm).
-# NOTE: this hardcoded list is asserted == the mutating-tick descriptors by substrate/test.sh.
 QUIESCE_LABELS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
 DOMAIN="gui/$(id -u)"
 LA_DIR="$HOME/Library/LaunchAgents"
 
-# If we abort AFTER quiescing but BEFORE handing off to reconcile, RESTORE the ticks so a
-# failed converge never leaves autonomy silently down (the drift-canary still shouts either way).
+# --only-if-changed SHORT-CIRCUIT (borrowed from ansible-pull; the one gap prior-art review found).
+# Do the READ-ONLY fetch FIRST, then skip the whole expensive quiesce/reset/converge dance when the
+# machine is already converged at an unchanged origin/main. This shrinks the quiesce blast radius to
+# REAL deploys only. Safe because RUNNING_SHA is written LAST (the receipt) — so equality across all
+# three proves the LAST converge fully succeeded at this SHA. A new SHA, or an incomplete/failed
+# prior converge (RUNNING_SHA != HEAD), or a never-converged machine all fall through and proceed.
+# (Same-SHA artifact drift is still detected + alerted by the drift-canary's --dry-run; the poll just
+# doesn't auto-correct it — a documented tradeoff, since pull-only FACTORY shouldn't drift at a fixed SHA.)
+log "fetching origin/main into $real_deploy"
+# One retry absorbs a transient refs/remotes/origin/main.lock race with the canary's fetch.
+git -C "$real_deploy" fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main' \
+  || { log "fetch failed — one retry"; sleep 2; git -C "$real_deploy" fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main'; } \
+  || die "git fetch failed twice (retry next poll)"
+origin_sha="$(git -C "$real_deploy" rev-parse refs/remotes/origin/main)"
+head_sha="$(git -C "$real_deploy" rev-parse HEAD)"
+running_sha="$(cat "$MYNDAIX_HOME/state/RUNNING_SHA" 2>/dev/null || echo none)"
+if [[ "$origin_sha" == "$head_sha" && "$head_sha" == "$running_sha" ]]; then
+  log "already converged at ${origin_sha:0:8}; origin unchanged — skip (only-if-changed)"
+  exit 0
+fi
+log "converge needed: origin=${origin_sha:0:8} head=${head_sha:0:8} running=${running_sha:0:8}"
+
+# QUIESCE-BRACKETS-THE-RESET (design §2.3, risk #2). Under Option A launchd runs the tick scripts
+# DIRECTLY from the clone; a `reset --hard` rewrites those files in place (git working-tree writes
+# are NOT atomic), so a mutating tick mid-read could execute a half-written script. Bootout the
+# mutating ticks and PROVE they are gone BEFORE the reset. EXPLICIT allowlist (risk #1) — never a
+# wildcard. The read-only drift-canary is deliberately NOT quiesced. NOTE: QUIESCE_LABELS is asserted
+# == the mutating-tick descriptors by substrate/test.sh.
+#
+# If we abort AFTER quiescing but BEFORE handing off to reconcile, RESTORE the ticks so a failed
+# converge never leaves autonomy silently down (the drift-canary still shouts either way).
 restore_ticks() {
   local l
   for l in "${QUIESCE_LABELS[@]}"; do
@@ -107,14 +133,13 @@ if pgrep -f "$real_deploy/orchestrator/play-" >/dev/null 2>&1; then
   die "quiesce FAILED: a worker is still running from the deploy clone — refusing reset (retry next poll)"
 fi
 
-log "fetching origin/main into $real_deploy"
-# One retry absorbs a transient refs/remotes/origin/main.lock race with the un-quiesced canary's
-# fetch (fetch-vs-fetch); a persistent failure aborts (fail-closed) and retries next poll.
-git -C "$real_deploy" fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main' \
-  || { log "fetch failed — one retry"; sleep 2; git -C "$real_deploy" fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main'; } \
-  || die "git fetch failed twice (retry next poll)"
 git -C "$real_deploy" reset --hard refs/remotes/origin/main
-log "reset to $(git -C "$real_deploy" rev-parse --short HEAD)"
+# Remove stray UNTRACKED files too (cross-family review BLOCKER): reset --hard only reverts tracked
+# files, so an untracked substrate/plists/*.json could otherwise be rendered+installed by reconcile.
+# `-ffd` (NOT -x) removes untracked files+dirs but KEEPS gitignored state (the in-tree .venv). The
+# deploy clone is pull-only, so nothing legitimate is untracked here.
+git -C "$real_deploy" clean -ffd
+log "reset+clean to $(git -C "$real_deploy" rev-parse --short HEAD)"
 
 RECONCILE="$real_deploy/substrate/reconcile.sh"
 [[ -f "$RECONCILE" ]] || die "reconcile.sh missing after reset: $RECONCILE"

@@ -8,6 +8,8 @@
 # Callers own `set -euo pipefail`; we set it too for defence when sourced early.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# Bound network git over SSH so a hung fetch can't stall reconcile / the drift-canary (no `timeout` on macOS).
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes}"
 
 # Resolve the substrate dir + deploy clone from THIS file's location (source of truth
 # for where we are actually running — cross-checked against config's DEPLOY_CLONE).
@@ -57,12 +59,18 @@ substrate_assert_deploy_clone() {
 }
 
 # ---- atomic install ---------------------------------------------------------
-# atomic_install SRC DST MODE — render/produce SRC (a temp), then rename over DST.
-# APFS rename is atomic; a running process keeps the old inode, new invocations get new.
+# atomic_install SRC DST MODE — install SRC's contents at DST via a SAME-DIRECTORY rename so the
+# swap is truly atomic. A bare `mv /tmp/x $dst` degrades to copy+unlink across filesystems (mktemp
+# lands in /private/tmp, which may be a different volume than $MYNDAIX_HOME / ~/Library) — a crash
+# mid-copy then leaves a partial file (cross-family review MAJOR). Staging in dirname($dst)
+# guarantees rename(2), not copy. A running process keeps the old inode; new invocations get new.
 atomic_install() {
-  local src="$1" dst="$2" mode="$3"
-  chmod "$mode" "$src"
-  mv -f "$src" "$dst"
+  local src="$1" dst="$2" mode="$3" tmp
+  tmp="$(mktemp "$(dirname "$dst")/.reconcile.XXXXXX")"
+  cp "$src" "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dst"
+  rm -f "$src"
 }
 
 # ---- launchctl --------------------------------------------------------------

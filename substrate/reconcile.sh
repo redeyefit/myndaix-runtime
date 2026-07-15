@@ -52,7 +52,10 @@ fetch_origin() {
 
 # ---- --dry-run: the real drift detector (design §2.6) -----------------------------------
 if [[ "$MODE" == dry-run ]]; then
-  fetch_origin 2>/dev/null || log "WARN: fetch failed — drift computed vs last-known origin"
+  # A fetch failure means we CANNOT know the remote state — that is drift/UNKNOWN, never "clean"
+  # (cross-family review MAJOR: "ambiguity => drift"). Comparing against a stale local ref would
+  # false-green a machine that has fallen behind an unreachable origin.
+  fetch_origin 2>/dev/null || { log "DRIFT: fetch failed — cannot determine remote state (UNKNOWN)"; exit 1; }
   set +e
   report="$(python3 "$SUBSTRATE_DIR/manifest.py" check "$CONFIG_FILE" 2>&1)"; rc=$?
   set -e
@@ -86,9 +89,12 @@ reconcile_restore_ticks() {
 LA_DIR="$HOME/Library/LaunchAgents"
 trap 'reconcile_restore_ticks' EXIT
 
-# 1. tree guard — post-reset the tree MUST be clean; a dirty tree is a loud hand-edit signal.
+# 1. tree guard — FAIL CLOSED on a dirty tree (cross-family review BLOCKER). bootstrap-fetch did
+#    reset --hard + clean -ffd, so any remaining tracked-change OR untracked file is a hand-edit /
+#    tamper signal — and rendering/installing plists from a dirty tree could ship an unreviewed
+#    descriptor. `--porcelain` includes untracked (not gitignored .venv). Refuse before any mutation.
 porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain || true)"
-[[ -n "$porcelain" ]] && log "WARN: deploy clone not clean after reset (hand-edit?):"$'\n'"$porcelain"
+[[ -z "$porcelain" ]] || die "deploy clone NOT clean after reset+clean — refusing to converge:"$'\n'"$porcelain"
 log "converging to $(git -C "$DEPLOY_CLONE" rev-parse --short HEAD)"
 
 # 2. dep-sync — pip install only when pyproject.toml changed (venv is in-tree for PR-1).
@@ -123,6 +129,25 @@ for desc in "$SUBSTRATE_DIR"/plists/*.json; do
   log "installed plist: $label"
 done
 
+# 3.5 ORPHAN PRUNE (cross-family review CRITICAL): a label reconcile previously managed but no longer
+#     in ROLE_LABELS (descriptor removed / role changed) must be torn down + its plist removed, else
+#     it runs forever + resurrects on reboot, invisible to drift. SCOPED to state/managed_labels (what
+#     reconcile ITSELF installed) — NEVER a wildcard over ai.myndaix.* (that would tear down the
+#     unrelated jobs: audio-player, deadman, model-watch, … — the risk-#1 catastrophe).
+MANAGED_REC="$STATE_DIR/managed_labels"
+if [[ -f "$MANAGED_REC" ]]; then
+  while IFS= read -r prev; do
+    [[ -n "$prev" ]] || continue
+    [[ "$prev" == "ai.myndaix.runtime" || "$prev" == "ai.myndaix.reconcile" ]] && continue
+    still=0; for l in "${ROLE_LABELS[@]}"; do [[ "$l" == "$prev" ]] && { still=1; break; }; done
+    if [[ "$still" == 0 ]]; then
+      log "orphan prune: $prev no longer managed — bootout + remove plist"
+      la_bootout "$prev"
+      rm -f "$LA_DIR/$prev.plist"
+    fi
+  done < "$MANAGED_REC"
+fi
+
 # 4. RESTART serve (sole migration owner). Serve's plist is hand-managed in PR-1 (ownership
 #    deferred), so we kickstart the EXISTING label — no bootout/bootstrap of the pool here.
 if la_loaded ai.myndaix.runtime; then
@@ -141,10 +166,14 @@ fi
 #    known Mini asyncpg blip) still stabilizes on the recovered pid. (Adversarial review MED.)
 HEAD_OBJ="$(cat "$SUBSTRATE_DIR/migration_head.txt")"
 [[ -n "$HEAD_OBJ" ]] || die "migration_head.txt is empty"
+# HEAD_OBJ is interpolated into SQL — require a STRICT unquoted-identifier so a malformed pin can't
+# inject a false-green expression (cross-family review MAJOR). The probe runs ON_ERROR_STOP with a
+# bounded statement_timeout so a hang/error can't stall the converge or read as satisfied.
+[[ "$HEAD_OBJ" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "migration_head.txt not a plain identifier: '$HEAD_OBJ'"
 deadline=$(( $(date +%s) + 120 )); prev_pid=""
 while :; do
   pid="$(launchctl print "$LA_DOMAIN/ai.myndaix.runtime" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid =/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
-  head_ok="$(psql "$MYNDAIX_DSN" -tAc "SELECT to_regclass('public.$HEAD_OBJ') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')"
+  head_ok="$(PGOPTIONS='-c statement_timeout=10s' psql "$MYNDAIX_DSN" -v ON_ERROR_STOP=1 -tAc "SELECT to_regclass('public.$HEAD_OBJ') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')"
   [[ -n "$pid" && "$pid" == "$prev_pid" && "$head_ok" == "t" ]] && break
   prev_pid="$pid"
   [[ $(date +%s) -ge $deadline ]] && die "serve not healthy/stable / migration head '$HEAD_OBJ' not applied within 120s"
@@ -182,11 +211,17 @@ if [[ "$vrc" -ne 0 || -n "$porcelain" ]]; then
   die "post-converge verify FAILED — manifest/tree drift remains"
 fi
 
-# 8. COMMIT POINT — write RUNNING_SHA + the manifest receipt LAST (atomic).
+# 8. COMMIT POINT — write the manifest receipt FIRST, then RUNNING_SHA as the FINAL commit marker
+#    (cross-family review MAJOR: RUNNING_SHA is what --only-if-changed + drift trust as "fully
+#    converged", so a manifest-build failure must NOT leave RUNNING_SHA claiming success).
 sha="$(git -C "$DEPLOY_CLONE" rev-parse HEAD)"
-printf '%s\n' "$sha" > "$STATE_DIR/RUNNING_SHA.tmp" && mv -f "$STATE_DIR/RUNNING_SHA.tmp" "$STATE_DIR/RUNNING_SHA"
+# Record the labels reconcile now manages (drives the NEXT converge's orphan prune + manifest orphan
+# detection). Written before RUNNING_SHA so a converge that reaches the commit point has an accurate set.
+printf '%s\n' "${ROLE_LABELS[@]}" > "$STATE_DIR/managed_labels.tmp" && mv -f "$STATE_DIR/managed_labels.tmp" "$STATE_DIR/managed_labels"
 python3 "$SUBSTRATE_DIR/manifest.py" build "$CONFIG_FILE" > "$STATE_DIR/manifest.json.tmp" \
-  && mv -f "$STATE_DIR/manifest.json.tmp" "$STATE_DIR/manifest.json"
+  && mv -f "$STATE_DIR/manifest.json.tmp" "$STATE_DIR/manifest.json" \
+  || die "manifest build failed — NOT writing RUNNING_SHA (converge incomplete, retry next poll)"
+printf '%s\n' "$sha" > "$STATE_DIR/RUNNING_SHA.tmp" && mv -f "$STATE_DIR/RUNNING_SHA.tmp" "$STATE_DIR/RUNNING_SHA"
 log "CONVERGED at ${sha:0:8} — receipt written"
 
 # Non-blocking canary (design Q1): a green mxr proves end-to-end drain, but a quota-drained
