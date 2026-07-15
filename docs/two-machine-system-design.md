@@ -1,6 +1,6 @@
-# MyndAIX Two-Machine System — Design (v0.3)
+# MyndAIX Two-Machine System — Design (v0.4)
 
-**Status:** v0.3 — folds cross-family review rounds 1 (4C/3H/5M) + 2 (2 new CRITICAL / 3 HIGH / 3 MEDIUM). Core GitOps model validated by both families in BOTH rounds. For Jefe's read + r3 convergence check. NOT approved to build.
+**Status:** v0.4 — PR-1 BUILT + MERGED (#91, `410e01b`) through a 12-agent adversarial pass + 6 cross-family rounds (findings 7→6→4→2→1→0, kilabz APPROVE + PLAY_PASS). v0.4 adds **§2.8 rollback safety** (auto-revert to last-good + enforced additive migrations — closes the forward-only gap; PR-1c). Prior: v0.3 = folds of cross-family rounds 1 (4C/3H/5M) + 2 (2C/3H/3M). Core GitOps model validated both families both rounds; prior-art check (ansible-pull/nix-darwin) confirmed keep-bash (HIGH confidence, 4 families converged).
 **Branch:** `design/two-machine-system`
 **Author:** Mack, 2026-07-14
 **Supersedes the ad-hoc:** `DEPLOY.md` + `docs/controller-migration-to-mini.md` (become history; this is the live process).
@@ -101,15 +101,19 @@ reconcile.sh [--dry-run]
      (c) WAIT (poll w/ timeout, r2-C1-tail) until serve is healthy AND migration head == latest,
      (d) THEN start the ticks (now guaranteed new-code-against-new-schema). launchd: plist DEFINITION
      changed → bootout→bootstrap; else `kickstart`. Killed in-flight ticks must be idempotent/retryable.
-  5. VERIFY (post-restart health, C3): serve up? migration head == latest? full artifact manifest
-     matches (§2.6)? git status --porcelain empty? If not → ALARM, exit nonzero.
-  6. commit point: write RUNNING_SHA + the artifact manifest to $MYNDAIX_HOME/state (temp + atomic mv).
+  5. VERIFY (post-restart health, C3): serve up (pid-stable)? migration head present? full artifact
+     manifest matches (§2.6)? git status --porcelain empty? If not → AUTO-REVERT to last-good (§2.8),
+     then ALARM. (The old "just ALARM, exit nonzero" was FORWARD-ONLY: it left FACTORY on the broken
+     SHA with serve possibly crash-looping until a human rescued it — the exact unattended window
+     autonomy must not have. §2.8 closes it.)
+  6. commit point: write the artifact manifest + managed-labels, then RUNNING_SHA LAST (the last-good
+     pointer §2.8 reverts to) to $MYNDAIX_HOME/state (temp + atomic mv).
   --dry-run (the drift detector, §2.6): NON-DESTRUCTIVE `git fetch` (NEVER Stage-0 reset — r2-H2),
      then compute the diff for 2-5 (what WOULD change + manifest mismatch) WITHOUT touching the tree or
      any service. Write NOTHING; exit nonzero on any drift.
 ```
 
-Migrations must remain **backward-compatible / additive** (`IF NOT EXISTS`) so a migration applied at serve-restart can't break a controller tick that fires mid-reconcile against the new schema (kilabz P0-#3 tail).
+Migrations must remain **backward-compatible / additive** (`IF NOT EXISTS`; no `DROP`/`RENAME`/`ALTER … TYPE`/`SET NOT NULL`-without-default) so a migration applied at serve-restart can't break a controller tick that fires mid-reconcile against the new schema (kilabz P0-#3 tail) — AND so the auto-revert (§2.8) is safe: reverting *code* to the last-good SHA leaves the already-applied *migration* a compatible superset the old code still runs against (expand-contract / ParallelChange). This is no longer just convention: a **migration lint** (in the automerge gate + a reconcile/CI check) rejects non-additive DDL (§2.8).
 
 ### 2.3 DECISION — do `$ORCH` script copies still exist? (Jefe picks at review)
 
@@ -145,6 +149,19 @@ One resolved role object, not scattered branches:
 ### 2.7 Trigger — poll-only (decision; resolves the N3 contradiction)
 
 **FACTORY polls `origin` on a launchd `StartInterval` (15-min floor; tunable).** No inbound surface. r1 correctly flagged that a "post-merge webhook" is *inbound* and contradicts N3; a LAB-side hook can't reach FACTORY without FACTORY listening (inbound) — so there is no honest latency win over polling. 15-min convergence vs *days* (tonight) is the whole win. LAB never auto-reconciles (dev machine); it gets `reconcile.sh --dry-run` as a pre-push sanity check.
+
+### 2.8 Rollback safety — auto-revert to last-good + enforced additive migrations (closes the FORWARD-ONLY gap)
+
+*Added post-PR-1 (borrowed from Argo Rollouts / Flagger revert-to-stable + Fowler ParallelChange). PR-1 shipped forward-only: a post-restart health-gate failure `die`s and ALARMs, but leaves the always-on FACTORY brain running the **broken** SHA (serve possibly crash-looping) until a human or a forward-fix commit rescues it. Autonomy-widening must not have that unattended window.*
+
+**The invariant that makes revert safe:** every migration is **additive** (expand-contract — §2.2). So the schema only ever *grows*; the last-good code is always compatible with a newer (superset) schema. Reverting *code* to the last-good SHA is therefore safe even though serve already applied the new SHA's migration. Without the additive guarantee a code-revert-against-new-schema could itself break — so **enforce it, don't assume it.**
+
+- **Migration lint (the precondition — do FIRST):** a cheap grep-level check rejects non-additive DDL (`DROP TABLE/COLUMN`, `RENAME`, `ALTER … TYPE`, `SET NOT NULL` without a default, `DROP NOT NULL`-dependent code). Runs in (a) the automerge gate (substrate/migration files already require human approval, but the lint blocks a *human* mistake too) and (b) a reconcile/CI pre-check. A genuine contract (a real column drop) is a deliberate, human-gated two-release dance, never an auto-deploy.
+- **`last_good_sha`:** at converge START, `prev_good="$(cat $STATE_DIR/RUNNING_SHA)"` (the receipt from the last *fully-successful* converge — written LAST, so it only ever names a proven-good SHA). Capture it before any mutation.
+- **Auto-revert (§2.2 step 5 on VERIFY failure):** `reset --hard $prev_good` in the deploy clone → re-run the strict restart sequence (quiesce → restart serve → wait pid-stable + head → start ticks) → re-VERIFY. If it recovers: ALARM `"reverted <bad>→<prev_good>; investigate"` (loud, but FACTORY is back on known-good code, self-healed). If the revert *also* fails (or there is no `prev_good` — first-ever converge): fall back to the old `die` + ALARM (a genuine two-fault case a human must own). Bounded: exactly one revert attempt per converge (no revert-loop).
+- **What revert does NOT undo:** the already-applied additive migration (harmless — old code tolerates the superset) and the write-area work clones (separate, §2.1). Only the deploy-clone *code* + the launchd artifacts revert.
+
+Effort: migration-lint **S** (do first), auto-revert **M**. Ships as its own cross-family-reviewed PR (§9 PR-1c) on top of the merged PR-1 substrate; the FACTORY cutover can proceed before it (the cutover converges to *known-good* main), but PR-1c should land before FACTORY begins auto-deploying *future* commits unattended.
 
 ---
 
@@ -221,7 +238,8 @@ Autonomous git work (automerge/play-fix) ─> separate ephemeral clones under $M
 
 ## §9 Staged build plan (each PR cross-family reviewed before merge)
 
-- **PR-1 — the substrate + its trust boundary, as ONE unit (r2-C2; folds v0.1 PR-1+2+3):** three-area layout (deploy clone + work-area isolation **incl. scratch DSN** + state dir) + `bootstrap-fetch` (once-only, path-validated) + `reconcile.sh` (non-destructive dry-run + expanded manifest + atomic install + serve-owns-migration + strict restart sequence + bootout/bootstrap) + plist templating + config parse/validate + **substrate-file automerge-denylist (M4)** + the FACTORY poll timer + drift-canary. **The trust boundary (work isolation + denylist) MUST ship with the substrate — not after — or "pull-only" is false during the window (r2-C2).** Only this whole unit closes the wound. Rollback = old enumerated launchd labels restored via bootout/bootstrap.
+- **PR-1 — the substrate + its trust boundary, as ONE unit (r2-C2; folds v0.1 PR-1+2+3):** three-area layout (deploy clone + work-area isolation **incl. scratch DSN** + state dir) + `bootstrap-fetch` (once-only, path-validated) + `reconcile.sh` (non-destructive dry-run + expanded manifest + atomic install + serve-owns-migration + strict restart sequence + bootout/bootstrap) + plist templating + config parse/validate + **substrate-file automerge-denylist (M4)** + the FACTORY poll timer + drift-canary. **The trust boundary (work isolation + denylist) MUST ship with the substrate — not after — or "pull-only" is false during the window (r2-C2).** Only this whole unit closes the wound. Rollback = old enumerated launchd labels restored via bootout/bootstrap. **✅ MERGED to main (#91, `410e01b`)** — 12-agent adversarial + 6 cross-family rounds (findings 7→6→4→2→1→0); borrowed ansible-pull `--only-if-changed`.
+- **PR-1c — rollback safety (§2.8):** the migration lint (S, do first) + auto-revert-to-last-good on health-gate failure (M). Closes the forward-only gap. **Should land before FACTORY begins auto-deploying future commits unattended** (the cutover itself converges to known-good main, so it can precede this).
 - **PR-2 — config-driven de-personalization** (allowlist, inbox, DSN pin folded properly) + `SETUP.md` extraction rewrite.
 - **PR-3+ — the agent layer** (librarian edit/act rung, Hermes-borrowed structure) on the solid substrate. Separate design pass.
 - **Tiny pre-fix (D4):** pin `automerge-tick` DSN to `127.0.0.1` as a one-line PR *now* so the FACTORY gate stops dying while PR-1 is built; the proper `config.env` home lands in PR-2.
