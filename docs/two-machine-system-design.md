@@ -1,9 +1,20 @@
-# MyndAIX Two-Machine System — Design (v0.2)
+# MyndAIX Two-Machine System — Design (v0.3)
 
-**Status:** v0.2 — folds cross-family review round 1 (kilabz + oracle, lobster synthesis: 4 CRITICAL / 3 HIGH / 5 MEDIUM, all accepted). For Jefe's read + re-review. NOT approved to build.
+**Status:** v0.3 — folds cross-family review rounds 1 (4C/3H/5M) + 2 (2 new CRITICAL / 3 HIGH / 3 MEDIUM). Core GitOps model validated by both families in BOTH rounds. For Jefe's read + r3 convergence check. NOT approved to build.
 **Branch:** `design/two-machine-system`
 **Author:** Mack, 2026-07-14
 **Supersedes the ad-hoc:** `DEPLOY.md` + `docs/controller-migration-to-mini.md` (become history; this is the live process).
+
+### Changelog v0.2 → v0.3 (r2 folds)
+- **r2-C1 (work-area DB isolation, NEW CRIT):** the work area (§2.1 area 2) gets a dedicated **scratch DSN** — autonomous git work never touches the live FACTORY Postgres. §2.1.
+- **r2-C2 (PR staging broke the trust boundary, NEW CRIT):** work-area isolation + substrate automerge-denylist are folded INTO PR-1 — the safety property ships with the substrate, not after. §9. *This also resolves the A/B conflict → Option A (§2.3).*
+- **r2-H1 (restart race, convergent):** strict restart sequence — stop ticks → restart serve → wait healthy+migrated → start ticks. §2.2.
+- **r2-H2 (dry-run/bootstrap paradox):** `--dry-run` does a NON-destructive `git fetch` + diff vs origin/main, never invokes the bootstrap-fetcher, never touches the tree. §2.2, §2.6.
+- **r2-H3 (bootstrap-fetcher lifecycle):** once-per-invocation sentinel (no re-exec loop), expected-path validation, explicit fetcher update/rollback policy. §2.2.
+- **r2-M1 (manifest gaps):** manifest expanded — loaded launchd-definition identity, venv package state, config render-inputs (no secrets), symlink→realpath resolution, process provenance, and `git status --porcelain` empty. §2.6.
+- **r2-M2 (mixed-version symlink reads):** entrypoints resolve `current`→`realpath` once at process start (immutable release dir). §2.3.
+- **r2-M3 (launchd labels/idempotency):** explicit old-label enumeration to `bootout`; killed ticks must be idempotent/retryable. §2.4.
+- **A/B DECISION RESOLVED → Option A** (eliminate `$ORCH` copies), now that isolation ships in PR-1. §2.3.
 
 ### Changelog v0.1 → v0.2 (what the r1 gauntlet forced)
 - **C1 (migration deadlock):** `serve` is the SOLE migration owner. reconcile restarts-then-verifies (never verify-then-abort). §2.2, §2.6.
@@ -59,7 +70,7 @@ On 2026-07-14 the bill came due three ways: a merged HIGH fix (#84) **sat undepl
 The single biggest v0.2 change. FACTORY has three cleanly separated areas — the "pull-only" promise is only true if git *work* never touches the deploy checkout:
 
 1. **DEPLOY CLONE** — e.g. `$MYNDAIX_HOME/deploy/myndaix-runtime`. Pull-only, `reset --hard`-safe, launchd/services resolve code from here. NEVER used for commits, worktrees, automerge, or hand-edits. This is the "prod = a nameable SHA" guarantee made literal.
-2. **WORK AREA** — automerge and play-fix create **ephemeral, dedicated clones/worktrees** under `$MYNDAIX_HOME/work/` (or `/tmp`), entirely separate from the deploy clone. A `reset --hard` in deploy can never nuke in-flight autonomous git work because that work isn't there. (Verify during build: does `automerge` mutate a local checkout, or is it purely `gh pr merge` server-side? play-fix definitely makes worktrees — those move to the work area regardless.)
+2. **WORK AREA** — automerge and play-fix create **ephemeral, dedicated clones/worktrees** under `$MYNDAIX_HOME/work/` (or `/tmp`), entirely separate from the deploy clone. A `reset --hard` in deploy can never nuke in-flight autonomous git work because that work isn't there. (Verify during build: does `automerge` mutate a local checkout, or is it purely `gh pr merge` server-side? play-fix definitely makes worktrees — those move to the work area regardless.) **DB isolation (r2-C1):** the work area is injected with a **scratch/test DSN** (`MYNDAIX_WORK_DSN`, a dedicated DB), NEVER the live FACTORY `MYNDAIX_DSN`. Autonomous verification (play-fix tests, agent runs) must not read/write prod data or apply an undeployed PR's migration against the live ledger. File isolation without DB isolation is a half-fix.
 3. **STATE DIR** — `$MYNDAIX_HOME` holds ALL mutable state: `config.env`, sentinels, `RUNNING_SHA`, logs, the local Postgres, agent scratch. NOTHING mutable lives under a checkout, so `reset --hard` (and even `git clean -fdx`) in the deploy clone is always safe. `.venv` lives outside the tree or is treated as a reconcile-managed artifact (explicit `pip install`, §2.2).
 
 ### 2.2 `reconcile.sh` (repo root, run from the deploy clone)
@@ -71,6 +82,11 @@ reconcile.sh [--dry-run]
   #   ($MYNDAIX_HOME/bin/bootstrap-fetch) does: git fetch origin && git reset --hard origin/main.
   #   reconcile.sh proper is re-exec'd from the freshly checked-out copy AFTER this. A broken
   #   reconcile.sh in origin/main thus can't brick the fetch — bootstrap-fetch always runs the fix in.
+  #   LIFECYCLE (r2-H3): a $RECONCILE_BOOTSTRAPPED sentinel guards re-exec to EXACTLY ONCE per
+  #   invocation (no infinite Stage-0→re-exec loop); bootstrap-fetch VALIDATES it's operating on the
+  #   expected deploy-clone path before any reset; the fetcher is itself updated only by an explicit
+  #   `reconcile --update-bootstrap` step (versioned, human-approved) — NOT auto — so its semantics
+  #   can't silently drift stale forever. --dry-run NEVER calls Stage 0 (r2-H2).
   0. resolve+validate config: MYNDAIX_HOME, MACHINE_ROLE∈{lab,factory} (fail-closed if missing/invalid),
      REPO=deploy-clone dir, PYTHON. (strict dotenv parse — §2.4, never `source`.)
   1. (bootstrap already fetched+checked-out origin/main into the deploy clone.)
@@ -79,15 +95,18 @@ reconcile.sh [--dry-run]
   3. install artifacts ATOMICALLY (H1): render plists (plistlib, §2.4) + place scripts via
      `install`/`mv` (inode swap) or releases/<sha> + `current` symlink flip. Bootout old labels if
      definitions changed (§2.4). (§2.3 decides whether $ORCH copies exist at all.)
-  4. restart (C1, C4): serve is the SOLE migration owner. Reconcile RESTARTS serve — serve applies
-     migrations on startup under its advisory lock — it does NOT verify-then-abort. launchd: if a plist
-     DEFINITION changed → bootout→bootstrap; else `kickstart`. In-flight ticks may be killed → they
-     must be retryable (they already re-fire).
-  5. VERIFY (post-restart health, C3): serve up? migration head == latest file? artifact manifest
-     matches (rendered plist hashes, installed script hashes, service pids)? If not → ALARM, exit nonzero.
+  4. restart — STRICT SEQUENCE (C1, C4, r2-H1): serve is the SOLE migration owner. Order MUST be:
+     (a) QUIESCE dependent jobs (bootout/stop controller+automerge+fix-sweep ticks so none fire mid-
+     migration), (b) restart serve — serve applies migrations on startup under its advisory lock,
+     (c) WAIT (poll w/ timeout, r2-C1-tail) until serve is healthy AND migration head == latest,
+     (d) THEN start the ticks (now guaranteed new-code-against-new-schema). launchd: plist DEFINITION
+     changed → bootout→bootstrap; else `kickstart`. Killed in-flight ticks must be idempotent/retryable.
+  5. VERIFY (post-restart health, C3): serve up? migration head == latest? full artifact manifest
+     matches (§2.6)? git status --porcelain empty? If not → ALARM, exit nonzero.
   6. commit point: write RUNNING_SHA + the artifact manifest to $MYNDAIX_HOME/state (temp + atomic mv).
-  --dry-run: STAGES 0-1 fetch + compute the diff for 2-5 (what WOULD change + manifest mismatch),
-     write NOTHING, exit nonzero if any drift. THIS is the drift detector (§2.6).
+  --dry-run (the drift detector, §2.6): NON-DESTRUCTIVE `git fetch` (NEVER Stage-0 reset — r2-H2),
+     then compute the diff for 2-5 (what WOULD change + manifest mismatch) WITHOUT touching the tree or
+     any service. Write NOTHING; exit nonzero on any drift.
 ```
 
 Migrations must remain **backward-compatible / additive** (`IF NOT EXISTS`) so a migration applied at serve-restart can't break a controller tick that fires mid-reconcile against the new schema (kilabz P0-#3 tail).
@@ -99,14 +118,16 @@ The `$ORCH/*.sh` copies exist today as a *trusted-installed-copy* defense: the w
 - **Option A — Eliminate `$ORCH` copies.** launchd + the pre-push hook resolve scripts directly from the pull-only deploy clone. Removes the copy step that drifted tonight *entirely*; one fewer surface. Cost: re-establishes the untrusted-worktree defense a different way (the defense becomes "untrusted work never happens in the deploy clone" — which the three-area model already guarantees). Trust model shifts from "trusted copy" to "trusted location."
 - **Option B — Keep copies, make them atomic.** Retain `$ORCH` copies but install via `releases/<sha>/` + a `current` symlink flip (atomic, fixes H1). Smaller conceptual change; preserves the existing copy-based defense verbatim. Cost: keeps the copy surface (now atomic + reconcile-verified, so drift is caught, but the surface remains).
 
-*Mack's lean:* **A**, if the build confirms the three-area isolation is airtight — it deletes the exact surface that failed tonight. B is the safe fallback if any untrusted-worktree path can still reach the deploy clone. Decide at review with the isolation proof in hand.
+**DECISION (r2 → resolved): Option A.** r2 split — oracle chose A (reduced surface; on a single-user Mini the `$ORCH` symlink is no more protected than a deploy-clone file, so A is security-equivalent and simpler); kilabz chose B *only until* work-area isolation is "mechanically proven and deployed." Lobster identified the conflict is blocked on the PR-staging critical (r2-C2). **Folding work-area isolation + the substrate automerge-denylist INTO PR-1 (§9) satisfies kilabz's exact condition in the same PR** → both families now agree on A. A deletes the copy surface that drifted tonight.
+
+**Consequence A introduces (for r3 to validate):** because launchd/hooks reference scripts *directly* from the deploy clone by absolute path, the Stage-1 `git reset --hard` rewrites live-referenced script files in place (git working-tree writes are not atomic). So with A, the tick QUIESCE (§2.2 step 4a) must bracket the *reset itself*, not just the serve restart: fetch → **quiesce ticks** → reset+install → restart serve → wait → verify → **start ticks**. Entrypoints resolve their own path once at process start (r2-M2). (Option B avoided this by keeping ticks on the old copies until an atomic swap — A trades that for a wider quiesce window. Acceptable: reconcile is infrequent and ticks are short + retryable.)
 
 ### 2.4 Config model — validated, not sourced (M1, M2)
 
 - **`$MYNDAIX_HOME/config.env`** (git-ignored, `chmod 600`, per-machine): `MACHINE_ROLE`, `MYNDAIX_DSN` (FACTORY pins `127.0.0.1` — fixes issue #B), `MYNDAIX_HOME`, `OPERATOR_INBOX`, `AUTHOR_ALLOWLIST`, agent-CLI PATH additions.
 - **Never `source` it** (arbitrary shell execution). Parse a **strict dotenv subset** (KEY=value, quoted, no expansion), validate each value against a whitelist/type, fail-closed on missing/invalid `MACHINE_ROLE`.
 - **Plists generated with `plistlib`** (or an XML-safe templater), never `sed`/`envsubst` (a `&`/`<`/`>` in a value corrupts the XML and wedges `bootstrap`).
-- **Transition safety (M2):** the installer `bootout`s the exact set of *old* (hardcoded-label) plists before `bootstrap`ing the new templated ones — else old+new run concurrently (double-processing).
+- **Transition safety (M2, r2-M3):** the installer carries an EXPLICIT enumerated list of *old* (hardcoded-label) plists — `ai.myndaix.{controller,automerge,fix-sweep,disk-cleanup,runtime}` etc. — and `bootout`s exactly those before `bootstrap`ing the new templated ones, else old+new run concurrently (double-processing). Ticks killed mid-flight by a quiesce/bootout must be **idempotent/retryable** (they already re-fire) — reconcile relies on this in §2.2 step 4.
 
 ### 2.5 Role model (`MACHINE_ROLE`)
 
@@ -117,8 +138,8 @@ One resolved role object, not scattered branches:
 
 ### 2.6 Drift detection — `--dry-run` + manifest, NOT a SHA (C3)
 
-- **`reconcile.sh --dry-run` is the real detector.** It re-fetches and reports any pending operation: files to (re)install, plists to re-render, migration head behind, service down, manifest mismatch. A stale/hand-edited `$ORCH` script or a stale loaded plist is caught even when the SHA matches origin — the exact hole in v0.1.
-- **Artifact manifest:** the receipt is not just `RUNNING_SHA` — it's `{sha, per-script hash, per-plist hash, migration head, service pids}`. The canary compares *live artifacts* to the manifest + `origin/main`.
+- **`reconcile.sh --dry-run` is the real detector.** NON-destructive `git fetch` (never Stage-0 reset — r2-H2), then reports any pending operation: files to (re)install, plists to re-render, migration head behind, service down, manifest mismatch, `git status --porcelain` non-empty. A stale/hand-edited script or a stale loaded plist is caught even when the SHA matches origin — the exact hole in v0.1.
+- **Artifact manifest (expanded, r2-M1):** the receipt is not just `RUNNING_SHA`. It covers `{sha; per-script hash (resolved via realpath, not the symlink); per-rendered-plist hash; LOADED launchd-definition identity post-bootstrap (launchctl print), not just pid; migration head; venv package-state hash; config render-input hash (no secrets); process provenance — each service pid's exe resolves to the expected release path}`. The canary compares *live artifacts* to the manifest + `origin/main`. A pid alone is weak evidence (kilabz M-1); provenance closes it.
 - **Drift-canary launchd job** (cheap `StartInterval`): runs `reconcile.sh --dry-run`; if it reports drift for >N min, alert via `mxr`/jefe-inbox. Loud smoke alarm; it does NOT auto-fix (reconcile's own timer does that).
 
 ### 2.7 Trigger — poll-only (decision; resolves the N3 contradiction)
@@ -200,11 +221,10 @@ Autonomous git work (automerge/play-fix) ─> separate ephemeral clones under $M
 
 ## §9 Staged build plan (each PR cross-family reviewed before merge)
 
-- **PR-1 — the substrate, whole (folds v0.1 PR-1+2+3 per M3):** three-area layout + `bootstrap-fetch` + `reconcile.sh` (dry-run + manifest + atomic install + serve-owns-migration + bootout/bootstrap) + plist templating + config parse/validate + the FACTORY poll timer + drift-canary. *Only this whole unit closes the wound* — a manual reconcile that can be forgotten doesn't. Ships with a rollback (revert = old launchd labels restored via bootout/bootstrap).
-- **PR-2 — automerge/play-fix work-area isolation** (ephemeral clones under `$MYNDAIX_HOME/work`) + substrate-file automerge exclusion (M4). Makes "pull-only" true.
-- **PR-3 — config-driven de-personalization** (allowlist, inbox, DSN pin folded properly) + `SETUP.md` extraction rewrite.
-- **PR-4+ — the agent layer** (librarian edit/act rung, Hermes-borrowed structure) on the solid substrate. Separate design pass.
-- **Tiny pre-fix (D4):** pin `automerge-tick` DSN to `127.0.0.1` as a one-line PR *now* so the FACTORY gate stops dying while PR-1 is built; the proper `config.env` home lands in PR-3.
+- **PR-1 — the substrate + its trust boundary, as ONE unit (r2-C2; folds v0.1 PR-1+2+3):** three-area layout (deploy clone + work-area isolation **incl. scratch DSN** + state dir) + `bootstrap-fetch` (once-only, path-validated) + `reconcile.sh` (non-destructive dry-run + expanded manifest + atomic install + serve-owns-migration + strict restart sequence + bootout/bootstrap) + plist templating + config parse/validate + **substrate-file automerge-denylist (M4)** + the FACTORY poll timer + drift-canary. **The trust boundary (work isolation + denylist) MUST ship with the substrate — not after — or "pull-only" is false during the window (r2-C2).** Only this whole unit closes the wound. Rollback = old enumerated launchd labels restored via bootout/bootstrap.
+- **PR-2 — config-driven de-personalization** (allowlist, inbox, DSN pin folded properly) + `SETUP.md` extraction rewrite.
+- **PR-3+ — the agent layer** (librarian edit/act rung, Hermes-borrowed structure) on the solid substrate. Separate design pass.
+- **Tiny pre-fix (D4):** pin `automerge-tick` DSN to `127.0.0.1` as a one-line PR *now* so the FACTORY gate stops dying while PR-1 is built; the proper `config.env` home lands in PR-2.
 
 ---
 
@@ -216,14 +236,20 @@ Autonomous git work (automerge/play-fix) ─> separate ephemeral clones under $M
 - *"reconcile migrates" vs "serve auto-migrates"* → **serve is the sole migration owner**; reconcile restarts-then-verifies (§2.2).
 - *"post-merge hook" vs "no inbound deploy"* → **poll-only**, hook idea dropped (§2.7).
 
-**Remaining for Jefe:**
-- **§2.3 — `$ORCH` copies: Option A (eliminate) vs B (atomic-keep).** Mack leans A pending the isolation proof. *(Design-both, decide at review — Jefe.)*
-- **D1 (cadence):** 15-min poll floor — tune later if needed.
-- **D5:** keep `DEPLOY.md` + migration doc as history with a header pointing here.
+- *"work-area isolated" but DB shared* (r2-C1) → work area gets a scratch DSN, never the live ledger (§2.1).
+
+**Resolved decisions:**
+- **§2.3 `$ORCH` copies → Option A (eliminate),** unblocked by folding isolation into PR-1 (§2.3). Both families agree.
+- **D1 cadence → 15-min poll floor** (tunable).
+- **D5 → keep `DEPLOY.md` + migration doc as history** with a header pointing here.
+
+**Remaining for Jefe (ratify, not blocking r3):**
+- The Option-A quiesce-brackets-the-reset consequence (§2.3) — a wider quiesce window; confirm acceptable (Mack: yes, reconcile is infrequent + ticks retryable).
 
 ---
 
 ## Appendix — grounding & review log
 - **Current-state inventory (2026-07-14):** deploy surfaces, `$ORCH` copies, launchd jobs, hardcoded paths; confirmed no automated inter-machine sync, no if-mini/if-macbook code branching, serve auto-migrates, separate Postgres per host.
 - **Prior-art brief (2026-07-14):** GitOps pull-reconcile (borrow idea, reject tools), drift = dry-run + manifest, Hermes Agent as the personal-agent reference, 12-factor dev/prod parity, launchd as macOS-native always-on. Sources cited in the research brief.
-- **r1 cross-family review (2026-07-14):** oracle (lead) + kilabz + lobster synthesis; 4 CRITICAL / 3 HIGH / 5 MEDIUM, all accepted + folded above. Core GitOps model validated by both families.
+- **r1 cross-family review (2026-07-14):** oracle (lead) + kilabz + lobster; 4C/3H/5M, all folded (v0.2). Core GitOps model validated by both families.
+- **r2 cross-family review (2026-07-14):** most r1 folds confirmed resolved; 2 new CRITICAL (work-area DB isolation, PR-staging trust-boundary) + 3 HIGH (restart race, dry-run/bootstrap paradox, bootstrap lifecycle) + 3 MEDIUM, all folded (v0.3). A/B resolved → Option A. Core validated again. → r3 convergence check pending.
