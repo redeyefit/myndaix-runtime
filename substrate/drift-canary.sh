@@ -54,6 +54,8 @@ $report"
     fi
   else
     log "canary: OPERATOR_INBOX unavailable ($OPERATOR_INBOX) — alert not delivered:"$'\n'"$msg"
+    : > "$ALERTED_FILE"   # latch here too — a missing inbox is a stable condition, not retryable;
+                          # without this the no-inbox path re-logs every interval (r4 regression).
   fi
 fi
 exit 0

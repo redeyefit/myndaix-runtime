@@ -85,7 +85,11 @@ if [[ "$origin_sha" == "$head_sha" && "$head_sha" == "$running_sha" ]]; then
   # BUT verify the clone WORKING TREE is clean FIRST, with git here in the trusted static fetcher —
   # a working-tree-only tamper of the clone's reconcile.sh/manifest.py could otherwise false-green the
   # clone's own dry-run (cross-family review r3 BLOCKER). A dirty tree => converge (reset+clean fixes it).
-  if [[ -z "$(git -C "$real_deploy" status --porcelain)" ]] \
+  # Capture status as the FIRST && operand so a git ERROR (non-zero exit, possibly empty stdout —
+  # repo corruption / stale lock) short-circuits to converge, not a false "clean" (r4 BLOCKER: a
+  # bare `[[ -z "$(git status)" ]]` drops git's exit code).
+  if tree_status="$(git -C "$real_deploy" status --porcelain)" \
+     && [[ -z "$tree_status" ]] \
      && /bin/bash "$real_deploy/substrate/reconcile.sh" --dry-run >/dev/null 2>&1; then
     log "already converged at ${origin_sha:0:8}; origin unchanged + tree clean + no drift — skip (only-if-changed)"
     exit 0
