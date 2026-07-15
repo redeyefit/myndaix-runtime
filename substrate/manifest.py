@@ -154,7 +154,13 @@ def build(config_path: str) -> dict:
 
 def drift_list(m: dict) -> list[str]:
     drift: list[str] = []
-    if m["origin_sha"] and m["deploy_sha"] and m["deploy_sha"] != m["origin_sha"]:
+    # Fail TOWARD drift: an unresolvable origin/deploy SHA must not read as "converged" (that
+    # would silently defeat the canary — adversarial review MED). Only a resolved-and-equal pair
+    # is clean.
+    if not m["deploy_sha"] or not m["origin_sha"]:
+        drift.append(f"unresolvable SHA (deploy={m['deploy_sha']}, origin={m['origin_sha']}) — "
+                     "treat as drift")
+    elif m["deploy_sha"] != m["origin_sha"]:
         drift.append(f"deploy behind origin: {m['deploy_sha'][:8]} != {m['origin_sha'][:8]}")
     for label, expected in m["plists_expected"].items():
         installed = m["plists_installed"].get(label)

@@ -64,6 +64,12 @@ fresh `reconcile.sh` exactly once (`$RECONCILE_BOOTSTRAPPED` guard).
 Rollback: the old enumerated launchd labels are unchanged names — `launchctl bootout` + re-bootstrap
 the prior plists, or `git reset` the deploy clone to a known SHA and re-run reconcile.
 
+> **Note (reconcile-poll self-plist):** reconcile runs *under* the `ai.myndaix.reconcile` label, so
+> it never bootout/bootstraps its OWN plist (self-suicide). A change to `POLL_INTERVAL_S` or the
+> reconcile poll's env re-renders + installs the plist to disk but does NOT take effect until one
+> manual `launchctl bootout gui/$(id -u)/ai.myndaix.reconcile && launchctl bootstrap gui/$(id -u) \
+> ~/Library/LaunchAgents/ai.myndaix.reconcile.plist` (or the next reboot).
+
 ## Test
 
 `substrate/test.sh` — fixture-only smoke + security harness (config fail-closed, plist

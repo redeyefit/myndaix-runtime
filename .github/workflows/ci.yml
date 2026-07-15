@@ -54,3 +54,8 @@ jobs:
               echo "== pytest $t =="; python -m pytest -q "$t"
             fi
           done
+
+      - name: Substrate smoke + security harness
+        # Fixture-only; portable (plistlib not macOS plutil; shellcheck skipped if absent). Catches
+        # a stale migration_head.txt pin, config-parser/denylist regressions, quiesce-list drift.
+        run: bash substrate/test.sh

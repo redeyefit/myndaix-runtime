@@ -71,6 +71,21 @@ fi
 [[ "$MACHINE_ROLE" == "factory" ]] || die "converge is factory-only (role=$MACHINE_ROLE); LAB uses --dry-run"
 substrate_assert_deploy_clone
 
+# Autonomy-halt guard (adversarial review MED): bootstrap-fetch quiesced the mutating ticks
+# before handing off. If this converge dies BEFORE step 6 restarts them, they'd stay down until
+# a later poll succeeds. Restore them on any abnormal exit (best-effort; the tree is already at
+# origin/main, so their code is good) — cleared once step 6 has restarted them. Must match
+# bootstrap-fetch QUIESCE_LABELS (substrate/test.sh asserts consistency).
+MUTATING_TICKS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
+reconcile_restore_ticks() {
+  local l
+  for l in "${MUTATING_TICKS[@]}"; do
+    if [[ -f "$LA_DIR/$l.plist" ]]; then launchctl bootstrap "$LA_DOMAIN" "$LA_DIR/$l.plist" 2>/dev/null || true; fi
+  done
+}
+LA_DIR="$HOME/Library/LaunchAgents"
+trap 'reconcile_restore_ticks' EXIT
+
 # 1. tree guard — post-reset the tree MUST be clean; a dirty tree is a loud hand-edit signal.
 porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain || true)"
 [[ -n "$porcelain" ]] && log "WARN: deploy clone not clean after reset (hand-edit?):"$'\n'"$porcelain"
@@ -91,7 +106,6 @@ if [[ ! -f "$dep_rec" || "$(cat "$dep_rec" 2>/dev/null || true)" != "$cur_dep" ]
 fi
 
 # 3. install artifacts ATOMICALLY — render each role-matching plist, plutil-lint, mv into place.
-LA_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$LA_DIR"
 ROLE_LABELS=()
 for desc in "$SUBSTRATE_DIR"/plists/*.json; do
@@ -118,18 +132,25 @@ else
   die "serve (ai.myndaix.runtime) is not loaded — it is hand-managed in PR-1; load it before converging"
 fi
 
-# 5. WAIT until serve is healthy AND the migration head object exists (fail-closed on timeout).
+# 5. WAIT until serve is healthy AND migrated (fail-closed on timeout). Health = the pool runs
+#    with a STABLE pid AND the migration head object exists. pid-stability is load-bearing: a
+#    `state = running` snapshot is true at PID-spawn (before serve's async migrate()), and
+#    to_regclass() is satisfied by a head object PERSISTED from a prior boot — so new code whose
+#    migrate() crash-loops (respawning with a NEW pid each time) could transiently pass both. A
+#    stable pid across a poll interval rules the crash-loop out; a single transient restart (the
+#    known Mini asyncpg blip) still stabilizes on the recovered pid. (Adversarial review MED.)
 HEAD_OBJ="$(cat "$SUBSTRATE_DIR/migration_head.txt")"
 [[ -n "$HEAD_OBJ" ]] || die "migration_head.txt is empty"
-deadline=$(( $(date +%s) + 120 ))
-until launchctl print "$LA_DOMAIN/ai.myndaix.runtime" 2>/dev/null | grep -qE 'state = running' \
-   && [[ "$(psql "$MYNDAIX_DSN" -tAc "SELECT to_regclass('public.$HEAD_OBJ') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')" == "t" ]]; do
-  if [[ $(date +%s) -ge $deadline ]]; then
-    die "serve not healthy / migration head '$HEAD_OBJ' not applied within 120s"
-  fi
+deadline=$(( $(date +%s) + 120 )); prev_pid=""
+while :; do
+  pid="$(launchctl print "$LA_DOMAIN/ai.myndaix.runtime" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid =/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+  head_ok="$(psql "$MYNDAIX_DSN" -tAc "SELECT to_regclass('public.$HEAD_OBJ') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$pid" && "$pid" == "$prev_pid" && "$head_ok" == "t" ]] && break
+  prev_pid="$pid"
+  [[ $(date +%s) -ge $deadline ]] && die "serve not healthy/stable / migration head '$HEAD_OBJ' not applied within 120s"
   sleep 3
 done
-log "serve healthy; migration head '$HEAD_OBJ' present"
+log "serve healthy (pid $pid stable); migration head '$HEAD_OBJ' present"
 
 # 6. START the ticks (now new-code-against-new-schema). bootstrap-fetch quiesced the mutating
 #    ticks; bring them + the canary up on the fresh plists. NEVER bootout ourselves (the
@@ -142,9 +163,13 @@ for label in "${ROLE_LABELS[@]}"; do
     continue
   fi
   la_bootout "$label"
-  la_bootstrap "$LA_DIR/$label.plist"
+  la_wait_gone "$label" 10 || true          # let the old job fully exit before re-bootstrap (avoid EBUSY)
+  # one retry absorbs a transient launchctl EBUSY so a blip can't abort the converge mid-loop
+  la_bootstrap "$LA_DIR/$label.plist" || { sleep 2; la_bootstrap "$LA_DIR/$label.plist"; } \
+    || die "could not bootstrap $label"
   log "started tick: $label"
 done
+trap - EXIT   # ticks are back up — clear the autonomy-halt restore trap
 
 # 7. VERIFY (post-restart): manifest clean + tree clean, else ALARM.
 set +e

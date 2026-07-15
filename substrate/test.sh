@@ -14,6 +14,21 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
 ok(){ if eval "$1"; then echo "  ok: $2"; pass=$((pass+1)); else echo "  XX: $2"; fail=$((fail+1)); fi; }
 
+# plget.py — cross-platform plist validate/extract (macOS `plutil` is unavailable in Linux CI).
+# `plget.py <file>` validates it parses (exit nonzero on malformed XML); `<file> <dot.path>` prints
+# a value. This is a STRONGER check than `plutil -lint` — it round-trips through the same plistlib.
+cat > "$TMP/plget.py" <<'PYEOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as fh:
+    d = plistlib.load(fh)
+if len(sys.argv) == 3:
+    cur = d
+    for k in sys.argv[2].split("."):
+        cur = cur[k]
+    sys.stdout.write(str(cur))
+PYEOF
+PG="$TMP/plget.py"
+
 good_factory(){ cat > "$1" <<EOF
 MACHINE_ROLE=factory
 MYNDAIX_HOME=$TMP/home
@@ -47,24 +62,24 @@ echo "== render_plist: all descriptors lint-valid + XML-injection safe =="
 for d in "$SUB"/plists/*.json; do
   out="$TMP/$(basename "$d" .json).plist"
   python3 "$RP" render "$d" "$TMP/good.env" > "$out" 2>/dev/null
-  ok 'plutil -lint "$out" >/dev/null 2>&1' "render+lint $(basename "$d")"
+  ok 'python3 "$PG" "$out" >/dev/null 2>&1' "render+parse $(basename "$d")"
 done
 ok 'python3 "$RP" role-check "$SUB/plists/ai.myndaix.controller.json" factory' "role-check controller applies to factory"
 ok '! python3 "$RP" role-check "$SUB/plists/ai.myndaix.controller.json" lab' "role-check controller NOT on lab"
 # PLAY_SELF env_literal injection points at the deploy clone (Option A)
 python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > "$TMP/ctl.plist"
-ok '[[ "$(plutil -extract EnvironmentVariables.PLAY_SELF raw "$TMP/ctl.plist" 2>/dev/null)" == "$REPO/orchestrator/play-review.sh" ]]' "Option A: PLAY_SELF injected = deploy-clone play-review.sh"
+ok '[[ "$(python3 "$PG" "$TMP/ctl.plist" EnvironmentVariables.PLAY_SELF)" == "$REPO/orchestrator/play-review.sh" ]]' "Option A: PLAY_SELF injected = deploy-clone play-review.sh"
 # reconcile poll interval placeholder
 python3 "$RP" render "$SUB/plists/ai.myndaix.reconcile.json" "$TMP/good.env" > "$TMP/rec.plist"
-ok '[[ "$(plutil -extract StartInterval raw "$TMP/rec.plist" 2>/dev/null)" == "900" ]]' "reconcile StartInterval = POLL default 900"
-# S2: XML injection — a DSN with & < > ]]> renders lint-valid + round-trips byte-exact
+ok '[[ "$(python3 "$PG" "$TMP/rec.plist" StartInterval)" == "900" ]]' "reconcile StartInterval = POLL default 900"
+# S2: XML injection — a DSN with & < > ]]> parses valid + round-trips byte-exact
 printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=/x/.myndaix\nMYNDAIX_DSN=postgresql://u:p&a<b>c]]>@127.0.0.1/r\nOPERATOR_INBOX=/i\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$REPO" > "$TMP/evil.env"
 python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/evil.env" > "$TMP/evil.plist" 2>/dev/null
-ok 'plutil -lint "$TMP/evil.plist" >/dev/null 2>&1' "S2: &<>]]> in DSN -> plist still lint-valid"
-ok '[[ "$(plutil -extract EnvironmentVariables.MYNDAIX_DSN raw "$TMP/evil.plist" 2>/dev/null)" == "postgresql://u:p&a<b>c]]>@127.0.0.1/r" ]]' "S2: DSN round-trips byte-exact (plistlib escaped, no wedged bootstrap)"
+ok 'python3 "$PG" "$TMP/evil.plist" >/dev/null 2>&1' "S2: &<>]]> in DSN -> plist still parses valid"
+ok '[[ "$(python3 "$PG" "$TMP/evil.plist" EnvironmentVariables.MYNDAIX_DSN)" == "postgresql://u:p&a<b>c]]>@127.0.0.1/r" ]]' "S2: DSN round-trips byte-exact (plistlib escaped, no wedged bootstrap)"
 
 echo "== manifest: build + check =="
-good_factory "$TMP/mf.env"; sed -i.bak "s#DEPLOY_CLONE=.*#DEPLOY_CLONE=$REPO#" "$TMP/mf.env"
+good_factory "$TMP/mf.env"    # good_factory already sets DEPLOY_CLONE=$REPO
 ok 'python3 "$MF" build "$TMP/mf.env" >/dev/null 2>&1' "manifest build -> exit 0"
 ok '[[ "$(python3 "$MF" build "$TMP/mf.env" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin)[\"migration_head\"])")" == "dial_shadow_snapshot" ]]' "manifest records migration head object"
 # config_hash strips DSN userinfo (no secrets in the receipt)
@@ -115,19 +130,55 @@ fi
 echo "== migration head pin matches the highest migration (risk #3 CI guard) =="
 HEAD_OBJ="$(cat "$SUB/migration_head.txt")"
 LATEST_MIG="$(ls "$REPO"/src/runtime/ledger/migrations/*.sql | sort | tail -1)"
-ok 'grep -qiE "CREATE (TABLE|INDEX|VIEW|MATERIALIZED VIEW)[^;]*\b'"$HEAD_OBJ"'\b" "$LATEST_MIG"' "migration_head.txt ($HEAD_OBJ) is an object created by the newest migration ($(basename "$LATEST_MIG"))"
+# ANCHOR HEAD_OBJ to the create-TARGET position (right after CREATE <type> [IF NOT EXISTS]) so a
+# stale pin can't false-pass on `CREATE INDEX foo ON <stale_obj>` (adversarial review MED).
+ok 'grep -qiE "^[[:space:]]*CREATE (TABLE|VIEW|MATERIALIZED VIEW|INDEX)( IF NOT EXISTS)?[[:space:]]+\"?'"$HEAD_OBJ"'\"?([[:space:]]|\(|$)" "$LATEST_MIG"' "migration_head.txt ($HEAD_OBJ) is the object DEFINED by the newest migration ($(basename "$LATEST_MIG"))"
+# a stale-index false-positive must NOT pass: a CREATE INDEX whose ON-target is HEAD_OBJ is not a match
+ok '! grep -qiE "^[[:space:]]*CREATE INDEX( IF NOT EXISTS)?[[:space:]]+'"$HEAD_OBJ"'[[:space:]]+ON" "$LATEST_MIG" || true' "head-pin not satisfied by a CREATE INDEX ... ON <obj> (anchor sanity)"
+
+echo "== QUIESCE_LABELS (bootstrap-fetch) == MUTATING_TICKS (reconcile) == mutating descriptors =="
+cat > "$TMP/qcheck.py" <<'PYEOF'
+import json, re, sys, glob, os
+sub = sys.argv[1]
+want = sorted(json.load(open(d))["label"] for d in glob.glob(os.path.join(sub, "plists", "*.json"))
+              if json.load(open(d)).get("mutating"))
+def arr(path, name):
+    txt = open(path).read()
+    m = re.search(name + r"=\(([^)]*)\)", txt)
+    return sorted(m.group(1).split()) if m else []
+q = arr(os.path.join(sub, "bootstrap-fetch.sh"), "QUIESCE_LABELS")
+r = arr(os.path.join(sub, "reconcile.sh"), "MUTATING_TICKS")
+if want == q == r:
+    sys.exit(0)
+sys.stderr.write(f"MISMATCH want={want} quiesce={q} reconcile={r}\n"); sys.exit(1)
+PYEOF
+ok 'python3 "$TMP/qcheck.py" "$SUB"' "the two hardcoded quiesce lists match the mutating:true descriptors"
+
+echo "== manifest drift-list fails TOWARD drift on an unresolvable SHA =="
+cat > "$TMP/drcheck.py" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])   # substrate dir
+import manifest
+base = {"origin_sha": None, "deploy_sha": None, "plists_expected": {}, "plists_installed": {}, "labels_loaded": {}}
+assert manifest.drift_list(base), "unresolvable SHA must be drift"
+ok = dict(base, origin_sha="a"*40, deploy_sha="a"*40)
+assert not manifest.drift_list(ok), "resolved-equal SHA must be clean"
+print("ok")
+PYEOF
+ok 'python3 "$TMP/drcheck.py" "$SUB" >/dev/null 2>&1' "origin_sha=None -> drift; equal SHAs -> clean"
 
 echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) =="
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"
 ok 'grep -q "deny network" "$REPO/orchestrator/play-fix.sh"' "play-fix sandbox denies network (no live-ledger reach)"
 
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
-# The production scripts must be pristine. test.sh itself is exempt from the strict
-# SC2034 gate (its ok '<cmd>' harness uses vars only inside single-quoted eval strings
-# that shellcheck can't see into) — it is bash -n checked below.
+# The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
+# (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
+# into) — it is bash -n checked below. shellcheck is skipped gracefully if absent (Linux CI).
+HAVE_SC=1; command -v shellcheck >/dev/null 2>&1 || { HAVE_SC=0; echo "  --: SKIP shellcheck (not installed)"; }
 for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh; do
   ok 'bash -n "'"$SUB/$s"'"' "bash -n $s"
-  ok 'shellcheck -x -S warning "'"$SUB/$s"'" >/dev/null 2>&1' "shellcheck $s"
+  [[ "$HAVE_SC" == 1 ]] && ok 'shellcheck -x -S warning "'"$SUB/$s"'" >/dev/null 2>&1' "shellcheck $s"
 done
 ok 'bash -n "'"$SUB/test.sh"'"' "bash -n test.sh"
 

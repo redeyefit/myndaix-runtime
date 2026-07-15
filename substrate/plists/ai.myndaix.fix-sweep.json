@@ -1,6 +1,7 @@
 {
   "label": "ai.myndaix.fix-sweep",
   "roles": ["factory"],
+  "mutating": true,
   "program": ["/bin/bash", "{DEPLOY_CLONE}/orchestrator/fix-sweep.sh"],
   "schedule": {"StartInterval": 3600},
   "run_at_load": true,

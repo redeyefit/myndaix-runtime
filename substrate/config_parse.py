@@ -47,7 +47,7 @@ def _abspath(key: str, val: str) -> str:
     (config may be validated before the tree is provisioned)."""
     if not val.startswith("/"):
         _err(f"{key}: must be an absolute path (got {val!r})")
-    if "\x00" in val or any(ord(c) < 0x20 for c in val):
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in val):  # C0 + DEL + C1 controls
         _err(f"{key}: control character in path")
     parts = val.split("/")
     if ".." in parts:
@@ -178,6 +178,10 @@ def parse(path: str) -> dict:
 def _emit_value(resolved: dict, key: str) -> None:
     if key not in _SCHEMA:
         _err(f"--get: unknown key {key!r}")
+    # An absent OPTIONAL key prints an empty string with exit 0 BY DESIGN — callers (lib.sh
+    # substrate_load_config) read optional keys like OPERATOR_INBOX unconditionally and an empty
+    # value is the correct "not set" signal. No security decision keys off an empty --get here
+    # (required keys already fail validation above; the automerge author gate reads its own env).
     val = resolved.get(key, "")
     if isinstance(val, list):
         # AUTHOR_ALLOWLIST / AGENT_CLI_PATH re-serialize with their natural separator.

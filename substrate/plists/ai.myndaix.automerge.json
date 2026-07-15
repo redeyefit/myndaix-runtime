@@ -1,6 +1,7 @@
 {
   "label": "ai.myndaix.automerge",
   "roles": ["factory"],
+  "mutating": true,
   "program": ["/bin/bash", "{DEPLOY_CLONE}/orchestrator/automerge-tick.sh"],
   "schedule": {"StartCalendarInterval": {"Minute": 30}},
   "stdout": "{MYNDAIX_HOME}/orchestrator/automerge.out",
