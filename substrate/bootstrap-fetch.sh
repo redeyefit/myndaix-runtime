@@ -78,10 +78,20 @@ origin_sha="$(git -C "$real_deploy" rev-parse refs/remotes/origin/main)"
 head_sha="$(git -C "$real_deploy" rev-parse HEAD)"
 running_sha="$(cat "$MYNDAIX_HOME/state/RUNNING_SHA" 2>/dev/null || echo none)"
 if [[ "$origin_sha" == "$head_sha" && "$head_sha" == "$running_sha" ]]; then
-  log "already converged at ${origin_sha:0:8}; origin unchanged — skip (only-if-changed)"
-  exit 0
+  # SHA unchanged AND the last converge fully succeeded (RUNNING_SHA is written last). Skip the
+  # expensive quiesce/reset ONLY if there is also NO artifact drift — otherwise fall through to
+  # converge so same-SHA drift (a hand-edited plist, an orphan, an unloaded label) is AUTO-CORRECTED,
+  # not merely canary-alerted (design G3: detect + correct are the same path — cross-family review
+  # BLOCKER). Safe to run the clone's reconcile --dry-run here: at a matching RUNNING_SHA the code is
+  # the last-converged-GOOD code, not a possibly-broken new origin.
+  if /bin/bash "$real_deploy/substrate/reconcile.sh" --dry-run >/dev/null 2>&1; then
+    log "already converged at ${origin_sha:0:8}; origin unchanged + no drift — skip (only-if-changed)"
+    exit 0
+  fi
+  log "origin unchanged but DRIFT detected — converging to auto-correct"
+else
+  log "converge needed: origin=${origin_sha:0:8} head=${head_sha:0:8} running=${running_sha:0:8}"
 fi
-log "converge needed: origin=${origin_sha:0:8} head=${head_sha:0:8} running=${running_sha:0:8}"
 
 # QUIESCE-BRACKETS-THE-RESET (design §2.3, risk #2). Under Option A launchd runs the tick scripts
 # DIRECTLY from the clone; a `reset --hard` rewrites those files in place (git working-tree writes

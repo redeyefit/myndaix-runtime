@@ -42,6 +42,21 @@ if [[ "$MODE" == converge && -z "${RECONCILE_BOOTSTRAPPED:-}" ]]; then
   exec /bin/bash "$BF"
 fi
 
+# Autonomy-halt guard (cross-family review MAJOR): in a BOOTSTRAPPED converge, bootstrap-fetch has
+# already quiesced the mutating ticks and cleared its own restore trap. Arm OUR restore trap NOW —
+# BEFORE config-load / deploy-clone-assert — so a failure in that early window can't leave autonomy
+# silently down. The restore uses only fixed labels + LA_DIR (no config), so it's valid this early.
+# Cleared after step 6 restarts the ticks. Must match bootstrap-fetch QUIESCE_LABELS (test.sh asserts).
+MUTATING_TICKS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
+LA_DIR="$HOME/Library/LaunchAgents"
+reconcile_restore_ticks() {
+  local l
+  for l in "${MUTATING_TICKS[@]}"; do
+    if [[ -f "$LA_DIR/$l.plist" ]]; then launchctl bootstrap "$LA_DOMAIN" "$LA_DIR/$l.plist" 2>/dev/null || true; fi
+  done
+}
+[[ "$MODE" == converge && -n "${RECONCILE_BOOTSTRAPPED:-}" ]] && trap 'reconcile_restore_ticks' EXIT
+
 substrate_load_config
 STATE_DIR="$MYNDAIX_HOME/state"
 mkdir -p "$STATE_DIR"
@@ -60,7 +75,9 @@ if [[ "$MODE" == dry-run ]]; then
   report="$(python3 "$SUBSTRATE_DIR/manifest.py" check "$CONFIG_FILE" 2>&1)"; rc=$?
   set -e
   printf '%s\n' "$report"
-  porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain || true)"
+  if ! porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain)"; then
+    log "DRIFT: git status failed — unknown tree state"; exit 1
+  fi
   if [[ -n "$porcelain" ]]; then
     log "DRIFT: working tree not clean"; printf '%s\n' "$porcelain"; rc=1
   fi
@@ -72,28 +89,14 @@ fi
 # CONVERGE (factory only; reached bootstrapped, so the tree is already reset to origin/main)
 # =========================================================================================
 [[ "$MACHINE_ROLE" == "factory" ]] || die "converge is factory-only (role=$MACHINE_ROLE); LAB uses --dry-run"
-substrate_assert_deploy_clone
-
-# Autonomy-halt guard (adversarial review MED): bootstrap-fetch quiesced the mutating ticks
-# before handing off. If this converge dies BEFORE step 6 restarts them, they'd stay down until
-# a later poll succeeds. Restore them on any abnormal exit (best-effort; the tree is already at
-# origin/main, so their code is good) — cleared once step 6 has restarted them. Must match
-# bootstrap-fetch QUIESCE_LABELS (substrate/test.sh asserts consistency).
-MUTATING_TICKS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
-reconcile_restore_ticks() {
-  local l
-  for l in "${MUTATING_TICKS[@]}"; do
-    if [[ -f "$LA_DIR/$l.plist" ]]; then launchctl bootstrap "$LA_DOMAIN" "$LA_DIR/$l.plist" 2>/dev/null || true; fi
-  done
-}
-LA_DIR="$HOME/Library/LaunchAgents"
-trap 'reconcile_restore_ticks' EXIT
+substrate_assert_deploy_clone   # restore trap already armed above (bootstrapped converge)
 
 # 1. tree guard — FAIL CLOSED on a dirty tree (cross-family review BLOCKER). bootstrap-fetch did
 #    reset --hard + clean -ffd, so any remaining tracked-change OR untracked file is a hand-edit /
 #    tamper signal — and rendering/installing plists from a dirty tree could ship an unreviewed
-#    descriptor. `--porcelain` includes untracked (not gitignored .venv). Refuse before any mutation.
-porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain || true)"
+#    descriptor. A `git status` ERROR (corrupt repo / stale lock) must ALSO fail closed — not read as
+#    clean via `|| true` (cross-family review MAJOR). `--porcelain` includes untracked (not .venv).
+if ! porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain)"; then die "git status failed — unknown tree state"; fi
 [[ -z "$porcelain" ]] || die "deploy clone NOT clean after reset+clean — refusing to converge:"$'\n'"$porcelain"
 log "converging to $(git -C "$DEPLOY_CLONE" rev-parse --short HEAD)"
 
@@ -115,10 +118,17 @@ fi
 mkdir -p "$LA_DIR"
 ROLE_LABELS=()
 for desc in "$SUBSTRATE_DIR"/plists/*.json; do
-  label="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["label"])' "$desc")"
-  if ! python3 "$SUBSTRATE_DIR/render_plist.py" role-check "$desc" "$MACHINE_ROLE"; then
-    continue
-  fi
+  # Distinguish role-check rc1 (does not apply to this role — skip) from rc2 (BROKEN descriptor).
+  # Conflating them would silently drop a malformed descriptor from ROLE_LABELS, then orphan-prune
+  # its label (cross-family review MAJOR). rc2 must fail closed.
+  set +e; python3 "$SUBSTRATE_DIR/render_plist.py" role-check "$desc" "$MACHINE_ROLE"; rcheck=$?; set -e
+  case "$rcheck" in
+    0) : ;;                                                       # applies to this role
+    1) continue ;;                                                # legitimately not this role
+    *) die "descriptor error (role-check rc=$rcheck): $desc" ;;   # broken descriptor — fail closed
+  esac
+  label="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["label"])' "$desc")" \
+    || die "cannot read label from $desc"
   ROLE_LABELS+=("$label")
   tmp="$(mktemp)"
   if ! python3 "$SUBSTRATE_DIR/render_plist.py" render "$desc" "$CONFIG_FILE" > "$tmp" 2>>"$STATE_DIR/reconcile.err"; then
@@ -204,7 +214,7 @@ trap - EXIT   # ticks are back up — clear the autonomy-halt restore trap
 set +e
 verify="$(python3 "$SUBSTRATE_DIR/manifest.py" check "$CONFIG_FILE" 2>&1)"; vrc=$?
 set -e
-porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain || true)"
+if ! porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain)"; then die "post-converge: git status failed — unknown tree state"; fi
 if [[ "$vrc" -ne 0 || -n "$porcelain" ]]; then
   printf '%s\n' "$verify"
   [[ -n "$porcelain" ]] && printf 'tree dirty:\n%s\n' "$porcelain"
@@ -217,11 +227,18 @@ fi
 sha="$(git -C "$DEPLOY_CLONE" rev-parse HEAD)"
 # Record the labels reconcile now manages (drives the NEXT converge's orphan prune + manifest orphan
 # detection). Written before RUNNING_SHA so a converge that reaches the commit point has an accurate set.
-printf '%s\n' "${ROLE_LABELS[@]}" > "$STATE_DIR/managed_labels.tmp" && mv -f "$STATE_DIR/managed_labels.tmp" "$STATE_DIR/managed_labels"
-python3 "$SUBSTRATE_DIR/manifest.py" build "$CONFIG_FILE" > "$STATE_DIR/manifest.json.tmp" \
-  && mv -f "$STATE_DIR/manifest.json.tmp" "$STATE_DIR/manifest.json" \
-  || die "manifest build failed — NOT writing RUNNING_SHA (converge incomplete, retry next poll)"
-printf '%s\n' "$sha" > "$STATE_DIR/RUNNING_SHA.tmp" && mv -f "$STATE_DIR/RUNNING_SHA.tmp" "$STATE_DIR/RUNNING_SHA"
+# Each write is an explicit if-block: `printf > tmp && mv` under set -e exempts the non-final && link,
+# so a printf failure (disk full) would silently skip mv and proceed with stale state (the #89 class,
+# cross-family review MAJOR). Fail closed on each.
+if ! { printf '%s\n' "${ROLE_LABELS[@]}" > "$STATE_DIR/managed_labels.tmp" && mv -f "$STATE_DIR/managed_labels.tmp" "$STATE_DIR/managed_labels"; }; then
+  die "failed to write managed_labels (converge incomplete, retry next poll)"
+fi
+if ! { python3 "$SUBSTRATE_DIR/manifest.py" build "$CONFIG_FILE" > "$STATE_DIR/manifest.json.tmp" && mv -f "$STATE_DIR/manifest.json.tmp" "$STATE_DIR/manifest.json"; }; then
+  die "manifest build failed — NOT writing RUNNING_SHA (converge incomplete, retry next poll)"
+fi
+if ! { printf '%s\n' "$sha" > "$STATE_DIR/RUNNING_SHA.tmp" && mv -f "$STATE_DIR/RUNNING_SHA.tmp" "$STATE_DIR/RUNNING_SHA"; }; then
+  die "failed to write RUNNING_SHA (converge incomplete, retry next poll)"
+fi
 log "CONVERGED at ${sha:0:8} — receipt written"
 
 # Non-blocking canary (design Q1): a green mxr proves end-to-end drain, but a quota-drained

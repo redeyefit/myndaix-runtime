@@ -193,21 +193,33 @@ print("ok")
 PYEOF
 ok 'python3 "$TMP/orphan.py" "$SUB" >/dev/null 2>&1' "manifest.drift_list flags an orphaned managed label"
 
-echo "== bootstrap-fetch --only-if-changed short-circuit (scratch git) =="
-# scratch: a bare origin + a factory deploy clone already converged at HEAD == origin/main == RUNNING_SHA
+echo "== bootstrap-fetch --only-if-changed short-circuit is DRIFT-GATED (scratch git, SAFE) =="
+# The skip now requires SHA-unchanged AND a clean reconcile --dry-run (BLOCKER fix). Build a fully
+# self-contained scratch deploy clone with the substrate deps but NO plist descriptors, so the
+# dry-run's manifest check finds NO drift (empty expected set, SHA match, clean tree) -> skip -> exit
+# BEFORE any launchctl. This is why it's safe to run against a machine with real ai.myndaix.* jobs.
 SC="$TMP/sc"; mkdir -p "$SC"
 git init -q --bare "$SC/origin.git"
 git clone -q "$SC/origin.git" "$SC/clone" 2>/dev/null
+mkdir -p "$SC/clone/substrate/plists"
+for f in reconcile.sh lib.sh bootstrap-fetch.sh config_parse.py render_plist.py manifest.py migration_head.txt; do
+  cp "$SUB/$f" "$SC/clone/substrate/$f"
+done
+# Mirror the real repo: __pycache__/.venv are gitignored, so running the substrate python in the
+# deploy clone does NOT dirty the tree (a bare fixture without this would false-drift on the .pyc).
+printf '__pycache__/\n*.pyc\n.venv/\n' > "$SC/clone/.gitignore"
 ( cd "$SC/clone" && git config user.email t@t && git config user.name t && \
-  mkdir -p substrate && cp "$SUB/reconcile.sh" substrate/ && git add -A && git commit -qm init && git push -q origin HEAD:main ) >/dev/null 2>&1
+  git add -A && git commit -qm init && git branch -M main && git push -q origin main ) >/dev/null 2>&1
 CHEAD="$(git -C "$SC/clone" rev-parse HEAD)"
 mkdir -p "$SC/home/state"
 printf '%s\n' "$CHEAD" > "$SC/home/state/RUNNING_SHA"
 printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s/home\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/home/i\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s/clone\n' "$SC" "$SC" "$SC" > "$SC/home/config.env"
 MYNDAIX_HOME="$SC/home" /bin/bash "$SUB/bootstrap-fetch.sh" > "$SC/bf.out" 2>&1; bfrc=$?
-ok '[[ "$bfrc" -eq 0 ]] && grep -q "only-if-changed" "$SC/bf.out"' "converged+unchanged -> bootstrap-fetch skips (exit 0, only-if-changed)"
+ok '[[ "$bfrc" -eq 0 ]] && grep -q "no drift — skip" "$SC/bf.out"' "unchanged + no drift -> skip (exit 0)"
 ok '[[ "$CHEAD" == "$(git -C "$SC/clone" rev-parse HEAD)" ]]' "short-circuit did not reset the clone"
-ok '! grep -qi "bootout\|reset to" "$SC/bf.out"' "short-circuit never quiesced or reset"
+ok '! grep -qi "bootout\|reset+clean to" "$SC/bf.out"' "short-circuit never quiesced or reset (no launchctl)"
+# code-structure: the skip is GATED on a dry-run (not a bare SHA-equality exit) — BLOCKER fix
+ok 'grep -q -- "reconcile.sh\" --dry-run" "$SUB/bootstrap-fetch.sh"' "skip is gated on reconcile --dry-run (drift falls through to converge)"
 
 echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) =="
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"

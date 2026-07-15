@@ -8,13 +8,18 @@
 # Callers own `set -euo pipefail`; we set it too for defence when sourced early.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# Don't write .pyc into the PULL-ONLY deploy clone — keep it pristine (belt-and-suspenders beyond
+# .gitignore so the tree-guard never sees a stray __pycache__).
+export PYTHONDONTWRITEBYTECODE=1
 # Bound network git over SSH so a hung fetch can't stall reconcile / the drift-canary (no `timeout` on macOS).
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes}"
 
 # Resolve the substrate dir + deploy clone from THIS file's location (source of truth
 # for where we are actually running — cross-checked against config's DEPLOY_CLONE).
-SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF_CLONE="$(cd "$SUBSTRATE_DIR/.." && pwd)"
+# pwd -P (physical): must match bootstrap-fetch's pwd -P + git --show-toplevel, else a symlinked
+# DEPLOY_CLONE (/tmp, /var) passes bootstrap but fails reconcile's assert (cross-family review MAJOR).
+SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SELF_CLONE="$(cd "$SUBSTRATE_DIR/.." && pwd -P)"
 LA_DOMAIN="gui/$(id -u)"
 
 log() { printf '[%s] [substrate] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
@@ -52,7 +57,7 @@ substrate_load_config() {
 # substrate_assert_deploy_clone — before ANY mutating op, prove we run from exactly the
 # clone config names as DEPLOY_CLONE. Blocks a reset --hard on the wrong tree.
 substrate_assert_deploy_clone() {
-  local cfg_clone; cfg_clone="$(cd "$DEPLOY_CLONE" 2>/dev/null && pwd || true)"
+  local cfg_clone; cfg_clone="$(cd "$DEPLOY_CLONE" 2>/dev/null && pwd -P || true)"
   [[ -n "$cfg_clone" ]] || die "DEPLOY_CLONE does not exist: $DEPLOY_CLONE"
   [[ "$SELF_CLONE" == "$cfg_clone" ]] \
     || die "running from $SELF_CLONE but config DEPLOY_CLONE=$cfg_clone — refusing to mutate"
@@ -67,9 +72,11 @@ substrate_assert_deploy_clone() {
 atomic_install() {
   local src="$1" dst="$2" mode="$3" tmp
   tmp="$(mktemp "$(dirname "$dst")/.reconcile.XXXXXX")"
-  cp "$src" "$tmp"
-  chmod "$mode" "$tmp"
-  mv -f "$tmp" "$dst"
+  # Clean the dest-side temp on ANY failure path (else .reconcile.* garbage accumulates in $LA_DIR
+  # under repeated cp/chmod/mv failures — cross-family review MINOR) and propagate the error.
+  if ! cp "$src" "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
+    rm -f "$tmp"; return 1
+  fi
   rm -f "$src"
 }
 

@@ -137,9 +137,15 @@ def build(config_path: str) -> dict:
             desc = json.loads(desc_path.read_text())
         except (json.JSONDecodeError, OSError) as e:
             _err(f"bad descriptor {desc_path}: {e}")
+        # Fail CLOSED on a schema-broken descriptor (missing/typed-wrong label or roles) rather than
+        # silently skipping it — a silent skip drops it from plists_expected and it reads as an orphan
+        # (cross-family review MAJOR). Only a well-formed descriptor for another role is skipped.
         label = desc.get("label")
-        if not label or role not in desc.get("roles", []):
-            continue  # not a job this role installs
+        roles = desc.get("roles")
+        if not isinstance(label, str) or not isinstance(roles, list):
+            _err(f"descriptor missing/invalid 'label' or 'roles': {desc_path}")
+        if role not in roles:
+            continue  # well-formed, but not a job this role installs
         m["plists_expected"][label] = _sha256_bytes(
             render_plist.render_bytes(str(desc_path), config_path))
         m["plists_installed"][label] = _sha256_file(la / f"{label}.plist") or "absent"
