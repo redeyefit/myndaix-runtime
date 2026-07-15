@@ -266,7 +266,12 @@ autofix_fire(){
   # TRUSTED INSTALL ONLY on the auto path: the worktree copy is attacker-writable AND play-fix runs
   # unsandboxed (it builds the sandbox). PLAY_FIX_SELF honored only under the test seam; reject any
   # fixer resolving under $repo.
-  local fixer="$ORCH/play-fix.sh"
+  # The fixer is a SIBLING of the trusted play-review.sh: with Option A a reconcile-managed
+  # FACTORY injects PLAY_SELF=<deploy-clone>/orchestrator/play-review.sh, so the fixer resolves
+  # to the deploy clone too; with PLAY_SELF unset (current topology) it stays $ORCH/play-fix.sh.
+  # Either way the fixer lives OUTSIDE any reviewed $repo (the symlink + anti-$repo guards below
+  # still enforce that). PLAY_FIX_SELF is honored ONLY under the test seam.
+  local fixer; fixer="$(dirname "${PLAY_SELF:-$ORCH/play-review.sh}")/play-fix.sh"
   [[ "${PLAY_AUTOFIX_TEST_MODE:-}" == "1" && -n "${PLAY_FIX_SELF:-}" ]] && fixer="$PLAY_FIX_SELF"
   # the fixer must be a real regular file, NOT a symlink — else a symlinked $ORCH/play-fix.sh ->
   # $repo/orchestrator/play-fix.sh would run attacker-controlled, UNSANDBOXED code (codex BLOCKER).

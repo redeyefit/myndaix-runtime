@@ -92,7 +92,11 @@ _STATUS_RE = re.compile(r"^(A|D|M|R\d{1,3}|C\d{1,3})$")
 # Files that are NOT inert docs even though they end in .md — they are read as live
 # instructions/config by an agent/tool, or are operational ground truth (DESIGN v0.3 §3).
 # A change to one of these is routed to a human even within the docs-only class.
-_DENY_DIRS = {".github", ".claude", ".codex", ".cursor", ".agents", "rules", "skills", "prompts"}
+# `substrate` (M4, two-machine design §5): the deploy substrate self-deploys to FACTORY within
+# one poll; a malformed/compromised substrate commit must require human review — so ANY doc under
+# substrate/ is denylisted (substrate CODE — reconcile.sh, *.plist, config.env.example, migration
+# *.sql — is already blocked as non-.md by the docs-only whitelist, and needs no rule here).
+_DENY_DIRS = {".github", ".claude", ".codex", ".cursor", ".agents", "rules", "skills", "prompts", "substrate"}
 _DENY_BASENAMES = {"CLAUDE.md", "AGENTS.md", "GEMINI.md", "CODEOWNERS", "DESIGN.md", ".cursorrules"}
 
 
