@@ -146,6 +146,12 @@ def build(config_path: str) -> dict:
             _err(f"descriptor missing/invalid 'label' or 'roles': {desc_path}")
         if role not in roles:
             continue  # well-formed, but not a job this role installs
+        # A sentinel-gated job (the reconcile poll, requires_sentinel=RECONCILE_ARMED) is only
+        # EXPECTED when its sentinel exists — else an unarmed, deliberately-not-installed poll would
+        # read as drift (§2.8). reconcile applies the identical gate at install time.
+        sentinel = desc.get("requires_sentinel")
+        if sentinel and not (Path(resolved["MYNDAIX_HOME"]) / sentinel).exists():
+            continue
         m["plists_expected"][label] = _sha256_bytes(
             render_plist.render_bytes(str(desc_path), config_path))
         m["plists_installed"][label] = _sha256_file(la / f"{label}.plist") or "absent"

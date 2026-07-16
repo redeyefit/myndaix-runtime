@@ -1,6 +1,7 @@
 {
   "label": "ai.myndaix.reconcile",
   "roles": ["factory"],
+  "requires_sentinel": "RECONCILE_ARMED",
   "program": ["/bin/bash", "{MYNDAIX_HOME}/bin/bootstrap-fetch"],
   "schedule": {"StartInterval": "{POLL_INTERVAL_S}"},
   "stdout": "{MYNDAIX_HOME}/state/reconcile.out",

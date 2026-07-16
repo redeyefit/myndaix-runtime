@@ -13,6 +13,10 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 export PYTHONDONTWRITEBYTECODE=1
 # Bound network git over SSH so a hung fetch can't stall reconcile / the drift-canary (no `timeout` on macOS).
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes}"
+# Bound psql CONNECT so a flaky loopback (the Mini's intermittent 127.0.0.1 wedge) can't hang the
+# health-WAIT forever: PGOPTIONS statement_timeout does NOT bound connection establishment, so without
+# this the WAIT blocks on connect instead of failing-closed at its deadline (found live on the Mini cutover).
+export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-8}"
 
 # Resolve the substrate dir + deploy clone from THIS file's location (source of truth
 # for where we are actually running — cross-checked against config's DEPLOY_CLONE).

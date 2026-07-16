@@ -247,6 +247,38 @@ ok '! grep -qi "bootout\|reset+clean to" "$SC/bf.out"' "short-circuit never quie
 # code-structure: the skip is GATED on a dry-run (not a bare SHA-equality exit) — BLOCKER fix
 ok 'grep -q -- "reconcile.sh\" --dry-run" "$SUB/bootstrap-fetch.sh"' "skip is gated on reconcile --dry-run (drift falls through to converge)"
 
+echo "== PR-1c: migration lint (additive-only) =="
+printf 'ALTER TABLE t DROP COLUMN c;\n' > "$TMP/badA.sql"
+printf 'ALTER TABLE t ALTER COLUMN c SET NOT NULL;\n' > "$TMP/badB.sql"
+printf 'ALTER TABLE t RENAME COLUMN a TO b;\n' > "$TMP/badC.sql"
+printf 'CREATE TABLE IF NOT EXISTS t (id int);\nALTER TABLE t ADD COLUMN IF NOT EXISTS c int NOT NULL DEFAULT 0;\nCREATE INDEX IF NOT EXISTS t_i ON t(id);\nDROP INDEX IF EXISTS old_i;\n' > "$TMP/goodM.sql"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/badA.sql" >/dev/null 2>&1' "lint rejects DROP COLUMN"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/badB.sql" >/dev/null 2>&1' "lint rejects SET NOT NULL"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/badC.sql" >/dev/null 2>&1' "lint rejects RENAME COLUMN"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/goodM.sql" >/dev/null 2>&1' "lint passes additive (ADD COLUMN NOT NULL DEFAULT / CREATE IF NOT EXISTS / CREATE+DROP INDEX)"
+printf -- '-- DROP TABLE old;\n/* DROP COLUMN x */\n' > "$TMP/cmt.sql"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/cmt.sql" >/dev/null 2>&1' "lint ignores commented-out contractions"
+
+echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
+cat > "$TMP/sg.py" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import manifest
+m = manifest.build(sys.argv[2])
+print("armed" if "ai.myndaix.reconcile" in m["plists_expected"] else "unarmed")
+PYEOF
+mkdir -p "$TMP/armhome"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s/armhome\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/armhome/i\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$TMP" "$TMP" "$REPO" > "$TMP/armhome/config.env"
+ok '[[ "$(python3 "$TMP/sg.py" "$SUB" "$TMP/armhome/config.env" 2>/dev/null)" == "unarmed" ]]' "poll NOT expected without RECONCILE_ARMED (no false drift)"
+touch "$TMP/armhome/RECONCILE_ARMED"
+ok '[[ "$(python3 "$TMP/sg.py" "$SUB" "$TMP/armhome/config.env" 2>/dev/null)" == "armed" ]]' "poll expected once RECONCILE_ARMED exists"
+
+echo "== PR-1c: connect-timeout + auto-revert wiring =="
+ok 'grep -q "PGCONNECT_TIMEOUT" "$SUB/lib.sh"' "lib.sh bounds psql connect (the Mini-cutover hang fix)"
+ok 'grep -q "AUTO-REVERT to last-good" "$SUB/reconcile.sh"' "reconcile has the auto-revert path (§2.8)"
+ok 'grep -q "migration_lint.py" "$SUB/reconcile.sh"' "reconcile lints the prev_good..HEAD migration delta"
+ok 'grep -q "requires_sentinel" "$SUB/manifest.py"' "manifest honors requires_sentinel"
+
 echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) =="
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"
 ok 'grep -q "deny network" "$REPO/orchestrator/play-fix.sh"' "play-fix sandbox denies network (no live-ledger reach)"
