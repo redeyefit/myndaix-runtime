@@ -146,6 +146,15 @@ def build(config_path: str) -> dict:
             _err(f"descriptor missing/invalid 'label' or 'roles': {desc_path}")
         if role not in roles:
             continue  # well-formed, but not a job this role installs
+        # A sentinel-gated job (the reconcile poll, requires_sentinel=RECONCILE_ARMED) is only
+        # EXPECTED when its sentinel exists — else an unarmed, deliberately-not-installed poll would
+        # read as drift (§2.8). reconcile applies the identical gate at install time.
+        sentinel = desc.get("requires_sentinel")
+        if sentinel and not (Path(resolved["MYNDAIX_HOME"]) / sentinel).exists():
+            m.setdefault("disarmed", []).append(label)   # transitionally being disarmed — NOT an orphan
+            if _label_loaded(uid, label):                # ...but a STILL-LOADED disarmed job IS drift
+                m.setdefault("disarmed_loaded", []).append(label)  #   (full check only) so the poll
+            continue                                     #   auto-deployer actually gets unloaded (r2 CRIT #2)
         m["plists_expected"][label] = _sha256_bytes(
             render_plist.render_bytes(str(desc_path), config_path))
         m["plists_installed"][label] = _sha256_file(la / f"{label}.plist") or "absent"
@@ -165,10 +174,15 @@ def build(config_path: str) -> dict:
     # installed/loaded. SCOPED to the recorded managed set (state/managed_labels) — NEVER a bare
     # ai.myndaix.* glob, which would treat unrelated jobs (audio-player, deadman, …) as orphans.
     m["orphans"] = {}
+    _disarmed = set(m.get("disarmed", []))
     managed_rec = Path(resolved["MYNDAIX_HOME"]) / "state" / "managed_labels"
     if managed_rec.exists():
         for label in managed_rec.read_text().split():
-            if not label or label in m["plists_expected"] or label == "ai.myndaix.runtime":
+            # Skip a label that is transitionally DISARMED (sentinel-gated + currently unarmed) — it is
+            # deliberately being torn down this converge (reconcile bootouts it), not a stray orphan
+            # (cross-family review CRITICAL #2 — else the disarmed-but-still-loaded poll reads as drift
+            # and the disarm converge fails before it can unload the poll).
+            if not label or label in m["plists_expected"] or label == "ai.myndaix.runtime" or label in _disarmed:
                 continue
             inst = _sha256_file(la / f"{label}.plist")
             loaded = _label_loaded(uid, label)
@@ -177,16 +191,23 @@ def build(config_path: str) -> dict:
     return m
 
 
-def drift_list(m: dict) -> list[str]:
+def drift_list(m: dict, health_only: bool = False) -> list[str]:
     drift: list[str] = []
-    # Fail TOWARD drift: an unresolvable origin/deploy SHA must not read as "converged" (that
-    # would silently defeat the canary — adversarial review MED). Only a resolved-and-equal pair
-    # is clean.
-    if not m["deploy_sha"] or not m["origin_sha"]:
-        drift.append(f"unresolvable SHA (deploy={m['deploy_sha']}, origin={m['origin_sha']}) — "
-                     "treat as drift")
-    elif m["deploy_sha"] != m["origin_sha"]:
-        drift.append(f"deploy behind origin: {m['deploy_sha'][:8]} != {m['origin_sha'][:8]}")
+    # deploy-vs-origin SHA currency is a DRIFT-DETECTOR concern (are we behind origin?), NOT a
+    # post-converge HEALTH concern. health_gate's verify passes health_only=True so an AUTO-REVERT
+    # (deploy=last-good while origin=bad) isn't reported as a failed converge (cross-family review
+    # CRITICAL #1). The dry-run + drift-canary keep the full check (they WANT the SHA-currency signal).
+    if not health_only:
+        if not m["deploy_sha"] or not m["origin_sha"]:
+            drift.append(f"unresolvable SHA (deploy={m['deploy_sha']}, origin={m['origin_sha']}) — "
+                         "treat as drift")
+        elif m["deploy_sha"] != m["origin_sha"]:
+            drift.append(f"deploy behind origin: {m['deploy_sha'][:8]} != {m['origin_sha'][:8]}")
+        # A sentinel-disarmed job that is STILL LOADED is drift in the FULL check (so the drift-canary /
+        # a poll's dry-run forces a converge whose final step boots it out) — but NOT under --health-only
+        # (so the disarming converge's own verify can pass and reach that bootout). (r2 CRITICAL #2)
+        for label in m.get("disarmed_loaded", []):
+            drift.append(f"sentinel-disarmed job still loaded: {label} — converge to bootout it")
     for label, expected in m["plists_expected"].items():
         installed = m["plists_installed"].get(label)
         if installed != expected:
@@ -202,15 +223,21 @@ def drift_list(m: dict) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in ("build", "check"):
-        _err("usage: manifest.py build|check <config.env>")
-    m = build(argv[2])
-    if argv[1] == "build":
+    # manifest.py build <config> | check [--health-only] <config>
+    args = argv[1:]
+    health_only = False
+    if "--health-only" in args:
+        health_only = True
+        args = [a for a in args if a != "--health-only"]
+    if len(args) != 2 or args[0] not in ("build", "check"):
+        _err("usage: manifest.py build|check [--health-only] <config.env>")
+    m = build(args[1])
+    if args[0] == "build":
         json.dump(m, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0
     # check
-    drift = drift_list(m)
+    drift = drift_list(m, health_only=health_only)
     out = {"manifest": m, "drift": drift}
     json.dump(out, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")

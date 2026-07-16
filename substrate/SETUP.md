@@ -56,10 +56,28 @@ fresh `reconcile.sh` exactly once (`$RECONCILE_BOOTSTRAPPED` guard).
 4. Point `$MYNDAIX_HOME/orchestrator/repos.json`'s runtime entry at a **work clone** (NOT the
    deploy clone) so review/fix git work never mutates the pull-only clone.
 5. From the deploy clone: `substrate/reconcile.sh --update-bootstrap`, then `substrate/reconcile.sh`.
-   reconcile renders + installs the tick / poll / drift-canary plists (injecting
+   reconcile renders + installs the tick / drift-canary plists (injecting
    `PLAY_SELF=<deploy-clone>/orchestrator/play-review.sh` — Option A, so the `$ORCH` script
    copies are no longer referenced), restarts serve, waits for the migration head, starts the
    ticks, and writes the `state/RUNNING_SHA` + `state/manifest.json` receipt.
+
+### Arming the unattended auto-deploy poll (`RECONCILE_ARMED` — §2.8)
+
+The 15-min `ai.myndaix.reconcile` poll (which auto-converges FACTORY to `origin/main` unattended)
+is **sentinel-gated**: reconcile installs it ONLY if `$MYNDAIX_HOME/RECONCILE_ARMED` exists. Until
+then FACTORY is **manual** — run `reconcile.sh` on demand to deploy a reviewed change. Arm it with:
+
+```
+touch $MYNDAIX_HOME/RECONCILE_ARMED    # then run reconcile.sh once to install + start the poll
+```
+
+Only arm once you trust unattended deploy — reconcile has **auto-revert** (§2.8): a post-restart
+health-gate failure `reset --hard`s the deploy clone back to the last-good `RUNNING_SHA`, re-runs the
+restart sequence, and drops a `reconcile-revert-*.md` alert in `OPERATOR_INBOX` — so a bad merge
+self-heals to known-good code instead of stranding the always-on brain. This relies on the
+**additive-migration lint** (`migration_lint.py`, run by reconcile on the `prev_good..HEAD` delta):
+a non-additive migration (drop/rename/retype/tighten) is REFUSED for unattended deploy — a
+contraction is a deliberate, human-gated two-release change.
 
 Rollback: the old enumerated launchd labels are unchanged names — `launchctl bootout` + re-bootstrap
 the prior plists, or `git reset` the deploy clone to a known SHA and re-run reconcile.

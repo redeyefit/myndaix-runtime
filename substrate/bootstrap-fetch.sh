@@ -44,6 +44,17 @@ DEPLOY_CLONE="$(read_key DEPLOY_CLONE)"
 # installed); a stray invocation on LAB must not reset a dev checkout.
 [[ "$MACHINE_ROLE" == "factory" ]] || die "bootstrap-fetch only runs on a factory machine (role=$MACHINE_ROLE)"
 
+# DISARM belt (cross-family r3 HIGH #4c): the reconcile POLL injects RECONCILE_POLL=1 (its plist's
+# env_literal). If a poll-fired invocation finds the arm-sentinel gone — a "disarmed" poll that a
+# failed bootout left LOADED — HOLD: do not fetch/reset/deploy. This is defence-in-depth behind
+# reconcile's disarm bootout; it must NOT gate MANUAL converges (a human running reconcile.sh has no
+# RECONCILE_POLL set), which are legitimate while the poll is disarmed. Keep the sentinel name in sync
+# with reconcile.sh RECONCILE_SENTINEL + the poll descriptor's requires_sentinel (test.sh asserts).
+if [[ "${RECONCILE_POLL:-0}" == "1" && ! -e "$MYNDAIX_HOME/RECONCILE_ARMED" ]]; then
+  log "poll fired while DISARMED (RECONCILE_ARMED absent) — holding, not deploying (a stale loaded poll?)"
+  exit 0
+fi
+
 # Hard-validate DEPLOY_CLONE before ANY reset — this is the path we `reset --hard`.
 case "$DEPLOY_CLONE" in
   /*) : ;;                                   # absolute
@@ -77,6 +88,15 @@ git -C "$real_deploy" fetch --no-tags --prune origin '+refs/heads/main:refs/remo
 origin_sha="$(git -C "$real_deploy" rev-parse refs/remotes/origin/main)"
 head_sha="$(git -C "$real_deploy" rev-parse HEAD)"
 running_sha="$(cat "$MYNDAIX_HOME/state/RUNNING_SHA" 2>/dev/null || echo none)"
+# QUARANTINE HOLD (review M2): a prior converge auto-reverted this exact origin SHA (it failed the
+# health gate). Do NOT reset to it again — that would thrash (reset→converge→fail→revert) every poll
+# until a human pushes a fix. Hold at the last-good RUNNING_SHA; reconcile already alerted (once). The
+# quarantine is cleared by reconcile on the next clean converge (when origin advances to a good SHA).
+quarantined="$(cat "$MYNDAIX_HOME/state/QUARANTINED_SHA" 2>/dev/null || echo none)"
+if [[ "$quarantined" != none && "$origin_sha" == "$quarantined" ]]; then
+  log "origin ${origin_sha:0:8} is QUARANTINED (a prior auto-revert) — holding at last-good, not deploying"
+  exit 0
+fi
 if [[ "$origin_sha" == "$head_sha" && "$head_sha" == "$running_sha" ]]; then
   # SHA unchanged AND the last converge fully succeeded (RUNNING_SHA is written last). Skip the
   # expensive quiesce/reset ONLY if there is also NO drift — otherwise fall through to converge so

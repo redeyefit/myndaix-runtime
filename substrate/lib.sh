@@ -13,6 +13,10 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 export PYTHONDONTWRITEBYTECODE=1
 # Bound network git over SSH so a hung fetch can't stall reconcile / the drift-canary (no `timeout` on macOS).
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes}"
+# Bound psql CONNECT so a flaky loopback (the Mini's intermittent 127.0.0.1 wedge) can't hang the
+# health-WAIT forever: PGOPTIONS statement_timeout does NOT bound connection establishment, so without
+# this the WAIT blocks on connect instead of failing-closed at its deadline (found live on the Mini cutover).
+export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-8}"
 
 # Resolve the substrate dir + deploy clone from THIS file's location (source of truth
 # for where we are actually running — cross-checked against config's DEPLOY_CLONE).
@@ -97,4 +101,18 @@ la_wait_gone() {
     sleep 1
   done
   return 0
+}
+
+# la_ensure_gone LABEL [T1] [T2] — bootout ALREADY issued by the caller; wait T1s, then SIGKILL-
+# escalate, then wait T2s. Returns 0 iff the process is proven gone, 1 if it SURVIVED SIGKILL. This
+# is the escalation bootstrap-fetch inlines for its pre-reset quiesce (§2.3); the auto-revert path
+# uses it so a mutating tick that won't die can't have its scripts rewritten by `reset --hard`
+# mid-run. NO die (the caller decides): reconcile's health_gate must never die, but its revert path
+# turns a 1 into die (a tick surviving SIGKILL is a genuine human-needed anomaly).
+la_ensure_gone() {
+  local label="$1" t1="${2:-30}" t2="${3:-10}"
+  la_wait_gone "$label" "$t1" && return 0
+  log "WARN: $label survived ${t1}s bootout — SIGKILL escalate"
+  launchctl kill -9 "$LA_DOMAIN/$label" 2>/dev/null || true
+  la_wait_gone "$label" "$t2"
 }
