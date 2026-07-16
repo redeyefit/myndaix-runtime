@@ -701,6 +701,17 @@ ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_seq
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_unifold.sql" >/dev/null 2>&1' "PR-1d r2: a 63-byte non-ASCII (İ) pre-existing name REJECTS — ASCII-fold parity, no Unicode-.lower() truncation miss"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_kelvin.sql" >/dev/null 2>&1' "PR-1d r2: a Kelvin-sign (U+212A) pre-existing name REJECTS (ASCII-fold doesn'\''t shrink it like Python .lower())"
 ok 'grep -q "_pg_fold" "$SUB/migration_lint.py" && grep -q "ident.translate" "$SUB/migration_lint.py"' "PR-1d r2: identifier folding mirrors Postgres (ASCII downcase + 63-byte truncate) on both sides via _pg_fold"
+# PR-1d r3 fold: Postgres inheritance-wildcard (name*) must not read as a new relation.
+printf 'job\nusers\n' > "$TMP/prevw.txt"
+printf 'ALTER TABLE job* DROP COLUMN context;\n' > "$TMP/d_w1.sql"
+printf 'ALTER TABLE public.job* DROP COLUMN context;\n' > "$TMP/d_w2.sql"
+printf 'ALTER TABLE job * DROP COLUMN context;\n' > "$TMP/d_w3.sql"
+printf 'CREATE TABLE IF NOT EXISTS newt (id int);\nALTER TABLE newt* ADD COLUMN c int;\n' > "$TMP/d_w4.sql"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w1.sql" >/dev/null 2>&1' "PR-1d r3: ALTER TABLE job* (inheritance wildcard) DROP COLUMN REJECTS (targets pre-existing job, not a new relation)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w2.sql" >/dev/null 2>&1' "PR-1d r3: schema-qualified public.job* wildcard DROP REJECTS"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w3.sql" >/dev/null 2>&1' "PR-1d r3: spaced wildcard 'job *' DROP REJECTS"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w4.sql" >/dev/null 2>&1' "PR-1d r3: newt* ADD COLUMN on a genuinely-new table still PASSES (wildcard doesn'\''t block additive)"
+ok '! grep -qE "\(\[\^..s\(\]\+\)" "$SUB/migration_lint.py"' "PR-1d r3: no name-capture regex uses the *-including class ([^\\s(]+) — all exclude the inheritance wildcard"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

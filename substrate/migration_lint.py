@@ -414,12 +414,12 @@ def _additive_alter_table_clause(c: str) -> bool:
 # match can't identify a specific table. The set is built INCREMENTALLY in lint_file (a CREATE only blesses
 # LATER statements), so a create can't retroactively bless an EARLIER op (r10 order-reversal shape).
 _CREATE_TABLE_NAME_RE = re.compile(
-    r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*TABLE\s+(?!IF\s+NOT\s+EXISTS\b)([^\s(]+)",
+    r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*TABLE\s+(?!IF\s+NOT\s+EXISTS\b)([^\s(*]+)",
     re.IGNORECASE)
 
 
 def _target_after_on(s: str) -> str | None:
-    m = re.search(r"\bON\s+(?:ONLY\s+)?([^\s(]+)", s, re.IGNORECASE)
+    m = re.search(r"\bON\s+(?:ONLY\s+)?([^\s(*]+)", s, re.IGNORECASE)
     return m.group(1) if m else None
 
 
@@ -487,7 +487,7 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
             # the view is NEW this deploy (PR-1d: not already a relation in prev_good). CREATE OR REPLACE
             # FUNCTION etc. stays rejected (opaque). Absent prev_objects -> reject (a view is never in the
             # table-only `created` fallback set).
-            vm = re.match(r"^CREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+            vm = re.match(r"^CREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(*]+)",
                           s, re.IGNORECASE)
             return bool(vm) and _new_this_deploy(vm.group(1), created, prev_objects)
         if re.search(r"^CREATE\s+(?:\w+\s+)*?UNIQUE\s+INDEX\b", s, re.IGNORECASE):
@@ -495,7 +495,10 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
             return tgt is not None and _new_this_deploy(tgt, created, prev_objects)
         return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
     if re.match(r"^ALTER\s+TABLE\b", s, re.IGNORECASE):
-        m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(]+)\s+", s, re.IGNORECASE)
+        # `([^\s(*]+)\*?` — exclude the inheritance wildcard from the NAME and consume it separately:
+        # `ALTER TABLE job* DROP COLUMN` targets the pre-existing `job` (+ its children), so capturing `job*`
+        # would read as new-this-deploy and skip the clause checks (cross-family PR-1d r3).
+        m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(*]+)\s*\*?\s+", s, re.IGNORECASE)
         if not m:
             return False
         if _new_this_deploy(m.group(1), created, prev_objects):
