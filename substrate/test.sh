@@ -446,7 +446,7 @@ cases = {
     "r8uidx": "CREATE UNIQUE INDEX u ON t(c);\n",
     "r8seq": "ALTER SEQUENCE job_id_seq RESTART WITH 1;\n",
     "r8addval": "ALTER TYPE status ADD VALUE 'archived';\n",                        # additive enum add -> PASS
-    "r8attach": "ALTER TABLE parent ATTACH PARTITION p FOR VALUES IN (1);\n",       # additive -> PASS
+    "r8attach": "CREATE TABLE parent (id int) PARTITION BY RANGE (id);\nCREATE TABLE p (id int);\nALTER TABLE parent ATTACH PARTITION p FOR VALUES FROM (1) TO (2);\n",  # both new -> additive -> PASS (r6)
     "r8cidx": "CREATE INDEX idx ON t(c);\n",                                        # non-unique index -> PASS
     "r8dollar": "INSERT INTO cfg(k,v) VALUES('h', $§$ has DROP TABLE text $§$);\n", # high-bit dollar tag -> PASS
     "r8trig": "CREATE TRIGGER t AFTER INSERT ON job EXECUTE FUNCTION f();\n",
@@ -465,7 +465,7 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r8gen.sql" >/dev/null 2>&1' "r8: SE
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r8uidx.sql" >/dev/null 2>&1' "r8: CREATE UNIQUE INDEX rejected (uniqueness tightening)"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r8seq.sql" >/dev/null 2>&1' "r8: ALTER SEQUENCE RESTART rejected (ID reissue -> PK collision)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8addval.sql" >/dev/null 2>&1' "r8: ALTER TYPE ADD VALUE PASSES (additive enum add, not over-flagged)"
-ok 'python3 "$SUB/migration_lint.py" "$TMP/r8attach.sql" >/dev/null 2>&1' "r8: ATTACH PARTITION PASSES (additive)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r8attach.sql" >/dev/null 2>&1' "r8/r6: ATTACH PARTITION of a NEW child into a NEW parent PASSES (additive — no old code touches either)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8cidx.sql" >/dev/null 2>&1' "r8: non-unique CREATE INDEX PASSES (performance-only)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8dollar.sql" >/dev/null 2>&1' "r8 FP (fleet): a high-bit dollar tag is recognized as a string (no false positive)"
 ok 'python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r8trig.sql" >/dev/null 2>&1' "r8: --allow-routine permits a blessed CREATE TRIGGER"
@@ -646,6 +646,159 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r14launder2.sql" >/dev/null 2>&1' "
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r14luidx.sql" >/dev/null 2>&1' "r14: a schema-qualified quoted CREATE doesn'\''t bless a UNIQUE INDEX on a different existing table"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r14fp.sql" >/dev/null 2>&1' "r14: a legit ADD COLUMN on a schema-qualified quoted table PASSES (false-positive fixed)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r14unq.sql" >/dev/null 2>&1' "r14: unquoted schema-qualified same-migration (CREATE public.orders + UNIQUE INDEX) still PASSES"
+
+echo "== PR-1d: pg_catalog pre-existing-relation context (--existing) =="
+printf 'job\nusers\nfinding_current\nexisting_v\n' > "$TMP/prev.txt"   # the live-DB relation set (prev_good schema)
+printf '' > "$TMP/prev_empty.txt"                                      # DB with no relations (every object new)
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "d_newuidx": "CREATE TABLE IF NOT EXISTS finding_outcome (id int);\nCREATE UNIQUE INDEX u ON finding_outcome(id);\n",
+    "d_newview": "CREATE OR REPLACE VIEW v AS SELECT 1;\n",
+    "d_launder": "CREATE TABLE IF NOT EXISTS users (id int);\nALTER TABLE users DROP COLUMN pw;\n",
+    "d_replexist": "CREATE OR REPLACE VIEW existing_v AS SELECT a, b FROM t;\n",
+    "d_uidxexist": "CREATE UNIQUE INDEX u ON job (x);\n",
+    "d_dropexist": "ALTER TABLE public.\"job\" DROP COLUMN context;\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_newuidx.sql" >/dev/null 2>&1' "PR-1d: with --existing, a NEW table + its UNIQUE INDEX PASSES (finding_outcome not in pg_catalog = born this deploy)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_newview.sql" >/dev/null 2>&1' "PR-1d: a NEW view (CREATE OR REPLACE VIEW, not in pg_catalog) PASSES"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_launder.sql" >/dev/null 2>&1' "PR-1d: launder STILL closed — DROP COLUMN on a pre-existing table (users in pg_catalog) REJECTS even with --existing"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_replexist.sql" >/dev/null 2>&1' "PR-1d: CREATE OR REPLACE of a PRE-EXISTING view (existing_v in pg_catalog) REJECTS (a redef could narrow un-revertibly)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_uidxexist.sql" >/dev/null 2>&1' "PR-1d: UNIQUE INDEX on a PRE-EXISTING table (job) REJECTS (tightening)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_dropexist.sql" >/dev/null 2>&1' "PR-1d: schema-qualified DROP on a pre-existing table (public.\"job\", bare job in pg_catalog) REJECTS"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/d_newuidx.sql" >/dev/null 2>&1' "PR-1d fallback: WITHOUT --existing the new-table UNIQUE INDEX stays conservative-REJECT (current behavior preserved)"
+for m in 0008 0009 0011 0012; do
+  f=$(ls "$REPO"/src/runtime/ledger/migrations/${m}_*.sql)
+  ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev_empty.txt" "'"$f"'" >/dev/null 2>&1' "PR-1d: real $m PASSES when its objects are new (empty pg_catalog) — the idempotent create+index/view false-positive is fixed"
+done
+ok 'grep -q "pg_catalog for pre-existing" "$SUB/reconcile.sh" && grep -q -- "--existing" "$SUB/reconcile.sh"' "PR-1d: reconcile queries pg_catalog (fail-closed) and passes --existing to the lint"
+# PR-1d review folds (r-pr1d): identifier truncation + foreign tables; + codify the whitespace-dot non-hole.
+L63="aaaaaaaaaa_bbbbbbbbbb_cccccccccc_dddddddddd_eeeeeeeeee_ffffffff"   # exactly 63 bytes
+printf 'job\nexisting_v\n%s\n' "$L63" > "$TMP/prevd.txt"
+printf 'ALTER TABLE %sg DROP COLUMN context;\n' "$L63" > "$TMP/d_trunc.sql"          # 64-byte -> PG 63-byte existing
+printf 'ALTER TABLE public . job DROP COLUMN x;\n' > "$TMP/d_wsalter.sql"            # whitespace-around-dot
+printf 'CREATE OR REPLACE VIEW public . existing_v AS SELECT 1;\n' > "$TMP/d_wsview.sql"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_trunc.sql" >/dev/null 2>&1' "PR-1d HIGH: a 64-byte name PG truncates to a pre-existing 63-byte relation REJECTS (NAMEDATALEN truncation)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_wsalter.sql" >/dev/null 2>&1' "PR-1d: whitespace-around-dot ALTER (public . job) REJECTS (r14 dot-collapse; not a denylist bypass)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_wsview.sql" >/dev/null 2>&1' "PR-1d: whitespace-around-dot CREATE OR REPLACE VIEW (public . existing_v) REJECTS"
+ok 'relk="$(grep -oE "relkind IN \(([^)]*)\)" "$SUB/reconcile.sh")"; for k in r i I S v m c f p; do echo "$relk" | grep -q "'\''$k'\''" || exit 1; done' "PR-1d r2 HIGH: pg_catalog query covers ALL user relkinds (r/i/I/S/v/m/c/f/p) so no pre-existing object (sequence, index, composite) is seen as new"
+# PR-1d r2 folds: identifier folding parity (ASCII-only downcase + 63-byte truncate on BOTH sides).
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+n63 = "a" * 61 + "İ"     # 61 'a' + İ (U+0130, 2 bytes) = exactly 63 bytes; Python .lower() would expand it
+prev = ["job", "job_id_seq", n63, "a" * 61 + "K"]   # + Kelvin-K name
+open(os.path.join(d, "prev_r2.txt"), "w", encoding="utf-8").write("\n".join(prev) + "\n")
+open(os.path.join(d, "d_seqrename.sql"), "w", encoding="utf-8").write("ALTER TABLE job_id_seq RENAME TO job_id_seq_old;\n")
+open(os.path.join(d, "d_unifold.sql"), "w", encoding="utf-8").write(f"ALTER TABLE {n63} DROP COLUMN x;\n")
+open(os.path.join(d, "d_kelvin.sql"), "w", encoding="utf-8").write(f"ALTER TABLE {'a'*61}K DROP COLUMN x;\n")
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_seqrename.sql" >/dev/null 2>&1' "PR-1d r2: ALTER TABLE <pre-existing sequence> RENAME REJECTS (sequence now in the pg_catalog set)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_unifold.sql" >/dev/null 2>&1' "PR-1d r2: a 63-byte non-ASCII (İ) pre-existing name REJECTS — ASCII-fold parity, no Unicode-.lower() truncation miss"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_kelvin.sql" >/dev/null 2>&1' "PR-1d r2: a Kelvin-sign (U+212A) pre-existing name REJECTS (ASCII-fold doesn'\''t shrink it like Python .lower())"
+ok 'grep -q "_pg_fold" "$SUB/migration_lint.py" && grep -q "ident.translate" "$SUB/migration_lint.py"' "PR-1d r2: identifier folding mirrors Postgres (ASCII downcase + 63-byte truncate) on both sides via _pg_fold"
+# PR-1d r3 fold: Postgres inheritance-wildcard (name*) must not read as a new relation.
+printf 'job\nusers\n' > "$TMP/prevw.txt"
+printf 'ALTER TABLE job* DROP COLUMN context;\n' > "$TMP/d_w1.sql"
+printf 'ALTER TABLE public.job* DROP COLUMN context;\n' > "$TMP/d_w2.sql"
+printf 'ALTER TABLE job * DROP COLUMN context;\n' > "$TMP/d_w3.sql"
+printf 'CREATE TABLE IF NOT EXISTS newt (id int);\nALTER TABLE newt* ADD COLUMN c int;\n' > "$TMP/d_w4.sql"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w1.sql" >/dev/null 2>&1' "PR-1d r3: ALTER TABLE job* (inheritance wildcard) DROP COLUMN REJECTS (targets pre-existing job, not a new relation)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w2.sql" >/dev/null 2>&1' "PR-1d r3: schema-qualified public.job* wildcard DROP REJECTS"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w3.sql" >/dev/null 2>&1' "PR-1d r3: spaced wildcard 'job *' DROP REJECTS"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w4.sql" >/dev/null 2>&1' "PR-1d r3: newt* ADD COLUMN on a genuinely-new table still PASSES (wildcard doesn'\''t block additive)"
+ok '! grep -qE "\(\[\^..s\(\]\+\)" "$SUB/migration_lint.py"' "PR-1d r3: no name-capture regex uses the *-including class ([^\\s(]+) — all exclude the inheritance wildcard"
+# PR-1d r4 fold: inheritance/partition target-set expansion — a recursing op on a "new" parent that gained
+# a PRE-EXISTING descendant must not skip the clause checks.
+printf 'child\nexisting_part\n' > "$TMP/previ.txt"
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "d_inhren":  "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent* RENAME COLUMN c TO d;\n",
+    "d_inhdrop": "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent DROP COLUMN c;\n",
+    "d_inhck":   "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent ADD CONSTRAINT ck CHECK (c>0);\n",
+    "d_partui":  "CREATE TABLE p (id int) PARTITION BY RANGE (id);\nALTER TABLE p ATTACH PARTITION existing_part FOR VALUES FROM (1) TO (100);\nCREATE UNIQUE INDEX u ON p (id);\n",
+    "d_newfull": "CREATE TABLE fresh (a int);\nCREATE UNIQUE INDEX u ON fresh (a);\nALTER TABLE fresh ADD CONSTRAINT pk PRIMARY KEY (a);\n",
+    "d_inhadd":  "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent ADD COLUMN e int;\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhren.sql" >/dev/null 2>&1' "PR-1d r4: RENAME on a new parent that INHERITs a pre-existing child REJECTS (recurses to the pre-existing child)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhdrop.sql" >/dev/null 2>&1' "PR-1d r4: DROP COLUMN on a new INHERIT-parent REJECTS (recurses)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhck.sql" >/dev/null 2>&1' "PR-1d r4: ADD CONSTRAINT CHECK on a new INHERIT-parent REJECTS (CHECK recurses to the pre-existing child)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_partui.sql" >/dev/null 2>&1' "PR-1d r4: UNIQUE INDEX on a new partitioned table with a PRE-EXISTING attached partition REJECTS"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_newfull.sql" >/dev/null 2>&1' "PR-1d r4: a genuinely-new table (no INHERIT/ATTACH) + UNIQUE INDEX + ADD CONSTRAINT PK still PASSES"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhadd.sql" >/dev/null 2>&1' "PR-1d r4: ADD COLUMN on a new INHERIT-parent still PASSES (additive even when recursed to the child)"
+
+# PR-1d r5 fold: PARTITION OF is a linkage too (a new partition catches the pre-existing parent's routed
+# inserts), and the linkage guard must be DEPLOY-global (linkage in file N, tightening in file N+1).
+printf 'events\njob\n' > "$TMP/prevp.txt"          # events + job pre-exist
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # Path A: a CONSTRAINED partition of a PRE-EXISTING parent tightens the parent's routed inserts -> REJECT
+    "d_paconstr": "CREATE TABLE events_us PARTITION OF events (CONSTRAINT ck CHECK (amount > 0)) FOR VALUES IN ('US');\n",
+    "d_padefck":  "CREATE TABLE events_def PARTITION OF events (CHECK (amount > 0)) DEFAULT;\n",
+    # r7: a BARE partition of a PRE-EXISTING parent also tightens (shrinks a pre-existing DEFAULT partition's
+    # implicit bound), so it REJECTS too; a partition (bare or constrained) of a NEW parent still PASSES.
+    "d_pabare":   "CREATE TABLE events_us PARTITION OF events FOR VALUES IN ('US');\n",
+    "d_pabarenew": "CREATE TABLE ev0 (region text) PARTITION BY LIST (region);\nCREATE TABLE ev0_us PARTITION OF ev0 FOR VALUES IN ('US');\n",
+    "d_panew":    "CREATE TABLE ev (region text, amount int) PARTITION BY LIST (region);\nCREATE TABLE ev_us PARTITION OF ev (CONSTRAINT ck CHECK (amount > 0)) FOR VALUES IN ('US');\n",
+    # Path B: split-form partition tightening in ONE file -> REJECT (PARTITION OF now sets `linked`)
+    "d_pbsplit":  "CREATE TABLE events_us PARTITION OF events FOR VALUES IN ('US');\nALTER TABLE events_us ADD CONSTRAINT ck CHECK (amount > 0);\nCREATE UNIQUE INDEX uq ON events_us (email);\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+# BLOCKER 2 cross-file: linkage in 001, tightening in 002 (deploy-global `linked`)
+open(os.path.join(d, "d_x001.sql"), "w", encoding="utf-8").write(
+    "CREATE TABLE new_parent (id int) PARTITION BY RANGE (id);\nALTER TABLE new_parent ATTACH PARTITION pre_existing FOR VALUES FROM (1) TO (100);\n")
+open(os.path.join(d, "d_x002.sql"), "w", encoding="utf-8").write(
+    "CREATE UNIQUE INDEX u ON new_parent (id);\nALTER TABLE new_parent DROP COLUMN context;\n")
+PYEOF
+printf 'pre_existing\n' > "$TMP/prevx.txt"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_paconstr.sql" >/dev/null 2>&1' "PR-1d r5: constrained PARTITION OF a pre-existing parent REJECTS (partition-local CHECK tightens routed parent inserts)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_padefck.sql" >/dev/null 2>&1' "PR-1d r5: constrained DEFAULT partition of a pre-existing parent REJECTS"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pabare.sql" >/dev/null 2>&1' "PR-1d r7: BARE partition of a PRE-EXISTING parent REJECTS (shrinks a pre-existing DEFAULT partition'\''s implicit bound — fail-closed)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pabarenew.sql" >/dev/null 2>&1' "PR-1d r7: BARE partition of a NEW parent (same deploy) PASSES (no old code touches it)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_panew.sql" >/dev/null 2>&1' "PR-1d r5: constrained partition of a NEW parent (same deploy) PASSES (no old code depends on it)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pbsplit.sql" >/dev/null 2>&1' "PR-1d r5: split-form ADD CONSTRAINT / UNIQUE INDEX on a partition of a pre-existing parent REJECTS (PARTITION OF sets linked)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x001.sql" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2: cross-file linkage (001 ATTACH) + tightening (002 DROP/UNIQUE) REJECTS (deploy-global linked)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2 control: 002 ALONE (no linkage file) PASSES — proving the deploy-global carry is what closes it"
+ok 'grep -q "deploy_linked" "$SUB/migration_lint.py" && grep -q "PARTITION\\\\s+OF" "$SUB/migration_lint.py"' "PR-1d r5: linkage guard is deploy-global (deploy_linked) and includes PARTITION OF"
+
+# PR-1d r6 fold: ATTACH PARTITION tightens on BOTH sides — a pre-existing PARENT re-routes its inserts into
+# the attached partition (its CHECK/NOT NULL/UNIQUE can reject rows the parent used to accept), and a
+# pre-existing CHILD gains the implicit partition-bound CHECK. Additive ONLY when parent AND child are both
+# new this deploy. (kilabz found the parent side; the child side is the same class, closed together.)
+printf 'events\nexisting_child\n' > "$TMP/prevat.txt"    # events + existing_child pre-exist
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # parent-side (kilabz r6): a NEW constrained child attached to a PRE-EXISTING parent -> REJECT
+    "d_atpar":  "CREATE TABLE events_us (region text, amount integer, CONSTRAINT ck CHECK (amount > 0));\nALTER TABLE events ATTACH PARTITION events_us FOR VALUES IN ('US');\n",
+    # parent-side, bare new child, still a PRE-EXISTING parent -> REJECT fail-closed (both-new rule)
+    "d_atparb": "CREATE TABLE events_us (region text, amount integer);\nALTER TABLE events ATTACH PARTITION events_us FOR VALUES IN ('US');\n",
+    # child-side: a PRE-EXISTING child attached to a NEW parent -> the child gains a partition bound -> REJECT
+    "d_atchild": "CREATE TABLE p (id int) PARTITION BY RANGE (id);\nALTER TABLE p ATTACH PARTITION existing_child FOR VALUES FROM (1) TO (100);\n",
+    # both new (even a constrained child) -> PASS (no old code touches either relation)
+    "d_atboth":  "CREATE TABLE p (region text, amount integer) PARTITION BY LIST (region);\nCREATE TABLE p_us (region text, amount integer, CONSTRAINT ck CHECK (amount > 0));\nALTER TABLE p ATTACH PARTITION p_us FOR VALUES IN ('US');\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atpar.sql" >/dev/null 2>&1' "PR-1d r6: constrained partition ATTACHed to a PRE-EXISTING parent REJECTS (partition-local CHECK tightens routed parent inserts)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atparb.sql" >/dev/null 2>&1' "PR-1d r6: ATTACH to a PRE-EXISTING parent REJECTS fail-closed (both parent and child must be new)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atchild.sql" >/dev/null 2>&1' "PR-1d r6: ATTACH a PRE-EXISTING child to a new parent REJECTS (child gains the partition-bound CHECK)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atboth.sql" >/dev/null 2>&1' "PR-1d r6: ATTACH where parent AND child are both new PASSES (no old code touches either)"
+ok '! grep -q "ATTACH..s.PARTITION..b., c" "$SUB/migration_lint.py"' "PR-1d r6: _additive_alter_table_clause no longer unconditionally blesses an ATTACH clause"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
