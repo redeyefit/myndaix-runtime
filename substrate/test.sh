@@ -430,6 +430,46 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r7b.sql" >/dev/null 2>&1' "r7 CRIT:
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r7c.sql" >/dev/null 2>&1' "r7 HIGH-FP: a \$café\$ Unicode dollar tag is recognized as a string (no false positive)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r7ok.sql" >/dev/null 2>&1' "r7: ADD COLUMN with a Unicode name still PASSES (additive, not over-flagged)"
 
+echo "== PR-1c cross-family r8 + attack-fleet folds: rule-set semantic coverage (live-PG confirmed) =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "r8crit": "CREATE RULE r AS ON DELETE TO job DO INSTEAD NOTHING;\n",           # fleet CRITICAL: silent DML rewrite
+    "r8trunc": "TRUNCATE TABLE job;\n",
+    "r8detach": "ALTER TABLE parent DETACH PARTITION p2026;\n",
+    "r8noinh": "ALTER TABLE child NO INHERIT parent;\n",
+    "r8dropattr": "ALTER TYPE address DROP ATTRIBUTE zip;\n",
+    "r8renval": "ALTER TYPE status RENAME VALUE 'active' TO 'enabled';\n",         # enum contraction; operands strip to ''
+    "r8gen": "ALTER TABLE job ALTER COLUMN id SET GENERATED ALWAYS;\n",
+    "r8uidx": "CREATE UNIQUE INDEX u ON t(c);\n",
+    "r8seq": "ALTER SEQUENCE job_id_seq RESTART WITH 1;\n",
+    "r8addval": "ALTER TYPE status ADD VALUE 'archived';\n",                        # additive enum add -> PASS
+    "r8attach": "ALTER TABLE parent ATTACH PARTITION p FOR VALUES IN (1);\n",       # additive -> PASS
+    "r8cidx": "CREATE INDEX idx ON t(c);\n",                                        # non-unique index -> PASS
+    "r8dollar": "INSERT INTO cfg(k,v) VALUES('h', $§$ has DROP TABLE text $§$);\n", # high-bit dollar tag -> PASS
+    "r8trig": "CREATE TRIGGER t AFTER INSERT ON job EXECUTE FUNCTION f();\n",
+    "r8trigdrop": "CREATE TRIGGER t AFTER INSERT ON job EXECUTE FUNCTION f();\nDROP TABLE x;\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8crit.sql" >/dev/null 2>&1' "r8 CRIT (fleet, live-PG): CREATE RULE ... DO INSTEAD is rejected (silent DML rewrite survives a code-revert)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8trunc.sql" >/dev/null 2>&1' "r8: TRUNCATE rejected (data loss a code-revert can'\''t undo)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8detach.sql" >/dev/null 2>&1' "r8: DETACH PARTITION rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8noinh.sql" >/dev/null 2>&1' "r8: NO INHERIT rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8dropattr.sql" >/dev/null 2>&1' "r8: ALTER TYPE DROP ATTRIBUTE rejected (composite-type contraction)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8renval.sql" >/dev/null 2>&1' "r8: ALTER TYPE RENAME VALUE rejected (enum label gone; matched on the keyword)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8gen.sql" >/dev/null 2>&1' "r8: SET GENERATED ALWAYS rejected (rejects old explicit-value INSERTs)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8uidx.sql" >/dev/null 2>&1' "r8: CREATE UNIQUE INDEX rejected (uniqueness tightening)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r8seq.sql" >/dev/null 2>&1' "r8: ALTER SEQUENCE RESTART rejected (ID reissue -> PK collision)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r8addval.sql" >/dev/null 2>&1' "r8: ALTER TYPE ADD VALUE PASSES (additive enum add, not over-flagged)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r8attach.sql" >/dev/null 2>&1' "r8: ATTACH PARTITION PASSES (additive)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r8cidx.sql" >/dev/null 2>&1' "r8: non-unique CREATE INDEX PASSES (performance-only)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r8dollar.sql" >/dev/null 2>&1' "r8 FP (fleet): a high-bit dollar tag is recognized as a string (no false positive)"
+ok 'python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r8trig.sql" >/dev/null 2>&1' "r8: --allow-routine permits a blessed CREATE TRIGGER"
+ok '! python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r8trigdrop.sql" >/dev/null 2>&1' "r8: --allow-routine stays NARROW — a DROP TABLE alongside a trigger still REJECTS"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys
