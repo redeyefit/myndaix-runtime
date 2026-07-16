@@ -337,7 +337,11 @@ def _normalize(sql: str, keep_quoted: bool = False) -> str:
             i = j
         else:
             out.append(c); i += 1
-    return re.sub(r"\s+", " ", "".join(out))
+    # Collapse whitespace, THEN collapse whitespace AROUND DOTS so a schema-qualified name whose quoted
+    # part became ` qi ` reconnects: `public. qi ` -> `public.qi` (cross-family r14). Without this the name
+    # extractors capture only the bare `public.` prefix — laundering a DROP onto an existing table and
+    # false-rejecting a legit ADD COLUMN. A `qi` component still marks the whole name unresolvable.
+    return re.sub(r"\s*\.\s*", ".", re.sub(r"\s+", " ", "".join(out)))
 
 
 # =====================================================================================================
@@ -414,6 +418,13 @@ def _target_after_on(s: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _resolvable_table(name: str) -> bool:
+    # A table name is a reliable "born this migration" key ONLY if every dot-component is a plain
+    # identifier — NOT `qi` (a quoted, neutralized component, so the real name is unknowable) and not a
+    # bare `qi`. `public.orders` is resolvable; `public.qi` (was public."orders") and `qi` are not (r14).
+    return name != "qi" and "qi" not in name.split(".")
+
+
 def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str] = frozenset()) -> bool:
     """True iff `stmt` (already _normalize'd) is a provably-additive migration statement — the allowlist."""
     s = stmt.strip()
@@ -440,13 +451,13 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
             return False
         if re.search(r"^CREATE\s+(?:\w+\s+)*?UNIQUE\s+INDEX\b", s, re.IGNORECASE):
             tgt = _target_after_on(s)                      # additive ONLY on a table born this migration
-            return tgt is not None and tgt != "qi" and tgt in created
+            return tgt is not None and _resolvable_table(tgt) and tgt in created
         return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
     if re.match(r"^ALTER\s+TABLE\b", s, re.IGNORECASE):
         m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(]+)\s+", s, re.IGNORECASE)
         if not m:
             return False
-        if m.group(1) != "qi" and m.group(1) in created:
+        if _resolvable_table(m.group(1)) and m.group(1) in created:
             return True                                    # any op on a same-migration new table is additive
         return all(_additive_alter_table_clause(c) for c in _top_level_clauses(s[m.end():]))
     if re.match(r"^ALTER\s+TYPE\b", s, re.IGNORECASE):     # enum ADD VALUE / composite ADD ATTRIBUTE only
@@ -514,7 +525,7 @@ def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
         # Register an unconditional CREATE TABLE AFTER checking this statement, so it can only bless LATER
         # ops on the genuinely-new table — never retroactively an earlier op (r10 order-reversal).
         m = _CREATE_TABLE_NAME_RE.match(stmt)
-        if m and m.group(1) != "qi":
+        if m and _resolvable_table(m.group(1)):
             created.add(m.group(1))
     return out
 

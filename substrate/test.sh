@@ -624,6 +624,29 @@ ok 'python3 "$SUB/migration_lint.py" "$TMP/r13okgen.sql" >/dev/null 2>&1' "r13: 
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r13okdef.sql" >/dev/null 2>&1' "r13: DEFAULT (0) (parenthesized non-null) still PASSES"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r13okuid.sql" >/dev/null 2>&1' "r13: a legit non-dblink U& identifier column still PASSES (decoded, additive)"
 
+echo "== PR-1c cross-family r14: schema-qualified quoted-identifier name extraction =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # r14 launder: a schema-qualified quoted CREATE must NOT bless a DROP on a DIFFERENT existing table
+    "r14launder": 'CREATE TABLE public."new_table" (id int);\nALTER TABLE public."existing_table" DROP COLUMN important_data;\n',
+    "r14launder2": 'CREATE TABLE "new" (id int);\nALTER TABLE "existing" DROP COLUMN x;\n',
+    "r14luidx": 'CREATE TABLE public."new" (id int);\nCREATE UNIQUE INDEX u ON public."existing"(email);\n',
+    # r14 false-positive fix: a legit ADD COLUMN on a schema-qualified quoted table must PASS
+    "r14fp": 'ALTER TABLE public."users" ADD COLUMN new_col int;\n',
+    # unquoted schema-qualified same-migration still works
+    "r14unq": 'CREATE TABLE public.orders (id int);\nCREATE UNIQUE INDEX u ON public.orders(id);\n',
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r14launder.sql" >/dev/null 2>&1' "r14 BLOCKER: schema-qualified quoted CREATE doesn'\''t launder a DROP COLUMN on a different existing table"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r14launder2.sql" >/dev/null 2>&1' "r14: a bare quoted CREATE doesn'\''t launder a DROP COLUMN on a different quoted table"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r14luidx.sql" >/dev/null 2>&1' "r14: a schema-qualified quoted CREATE doesn'\''t bless a UNIQUE INDEX on a different existing table"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r14fp.sql" >/dev/null 2>&1' "r14: a legit ADD COLUMN on a schema-qualified quoted table PASSES (false-positive fixed)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r14unq.sql" >/dev/null 2>&1' "r14: unquoted schema-qualified same-migration (CREATE public.orders + UNIQUE INDEX) still PASSES"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys
