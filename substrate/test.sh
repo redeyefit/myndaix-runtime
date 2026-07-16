@@ -568,6 +568,30 @@ ok 'python3 "$SUB/migration_lint.py" "$TMP/r11okdef.sql" >/dev/null 2>&1' "r11: 
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r11oklock.sql" >/dev/null 2>&1' "r11: 0002's locking SELECT (plain column list) still PASSES"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r11okins.sql" >/dev/null 2>&1' "r11: 0002's INSERT ... SELECT count(*) backfill still PASSES (function in INSERT-SELECT is fine)"
 
+echo "== PR-1c cross-family r12: quoted-dblink bypass + ALTER TYPE multi-action =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "r12qdb": 'INSERT INTO rs(status) SELECT public."dblink_exec"(\'db\',\'ALTER TABLE job DROP COLUMN context\');\n',
+    "r12qext": 'CREATE EXTENSION IF NOT EXISTS "dblink" WITH SCHEMA public;\n',
+    "r12atmulti": "ALTER TYPE my_composite ADD ATTRIBUTE new_attr int, DROP ATTRIBUTE old_attr;\n",
+    "r12atren": "ALTER TYPE t ADD ATTRIBUTE a int, RENAME VALUE 'x' TO 'y';\n",
+    "r12dbcomment": "-- dblink is deliberately NOT used here\nCREATE TABLE t (id int);\n",  # comment mention -> PASS
+    "r12dbstring": "INSERT INTO notes(msg) VALUES ('dblink is banned') ON CONFLICT DO NOTHING;\n",  # string -> PASS
+    "r12atmultiok": "ALTER TYPE addr ADD ATTRIBUTE city text, ADD ATTRIBUTE zip text;\n",  # all ADD -> PASS
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r12qdb.sql" >/dev/null 2>&1' "r12 HIGH: a QUOTED \"dblink_exec\" is rejected (de-identified file-level check, not defeated by qi-neutralization)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r12qext.sql" >/dev/null 2>&1' "r12: CREATE EXTENSION \"dblink\" (quoted) rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r12atmulti.sql" >/dev/null 2>&1' "r12 HIGH: ALTER TYPE ADD ATTRIBUTE, DROP ATTRIBUTE rejected (per-clause, not prefix-only)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r12atren.sql" >/dev/null 2>&1' "r12: ALTER TYPE ADD ATTRIBUTE, RENAME VALUE rejected (a trailing contraction clause is caught)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r12dbcomment.sql" >/dev/null 2>&1' "r12: dblink mentioned only in a COMMENT does NOT false-positive (stripped before the check)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r12dbstring.sql" >/dev/null 2>&1' "r12: dblink mentioned only in a STRING does NOT false-positive"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r12atmultiok.sql" >/dev/null 2>&1' "r12: ALTER TYPE with ALL ADD ATTRIBUTE clauses still PASSES (additive multi-action)"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys

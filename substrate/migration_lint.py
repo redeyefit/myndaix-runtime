@@ -245,11 +245,14 @@ def _scan_quoted(sql: str, j: int, n: int, escape: bool) -> int:
     return n   # unterminated (Postgres would reject too)
 
 
-def _normalize(sql: str) -> str:
+def _normalize(sql: str, keep_quoted: bool = False) -> str:
     """Neutralize comments, string/dollar-quoted bodies, and double-quoted identifiers by scanning the SQL
     exactly as Postgres's lexer would, then collapse whitespace. Comments -> ' ', strings/dollar bodies ->
     "''", double-quoted identifiers -> 'qi' (a safe bareword: a "..." token is always a NAME, never a
-    keyword, so it can't smuggle a keyword or hide a space/digit past a rule)."""
+    keyword, so it can't smuggle a keyword or hide a space/digit past a rule).
+
+    keep_quoted=True instead emits a quoted identifier's DE-QUOTED CONTENT (comments/strings still stripped)
+    — used only to detect a dangerous NAME (dblink) that quoting would otherwise hide behind `qi` (r12)."""
     out: list[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -293,7 +296,11 @@ def _normalize(sql: str) -> str:
                         j += 1; break
                 else:
                     j += 1
-            out.append(" qi "); i = j
+            if keep_quoted:
+                out.append(" " + sql[i + 1:j - 1].replace('""', '"') + " ")  # de-quoted content (dblink scan)
+            else:
+                out.append(" qi ")
+            i = j
         else:
             out.append(c); i += 1
     return re.sub(r"\s+", " ", "".join(out))
@@ -410,7 +417,12 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
         return all(_additive_alter_table_clause(c) for c in _top_level_clauses(s[m.end():]))
     if re.match(r"^ALTER\s+TYPE\b", s, re.IGNORECASE):     # enum ADD VALUE / composite ADD ATTRIBUTE only
         m = re.match(r"^ALTER\s+TYPE\s+(?:IF\s+EXISTS\s+)?\S+\s+", s, re.IGNORECASE)
-        return bool(m and re.match(r"^ADD\s+(?:VALUE|ATTRIBUTE)\b", s[m.end():], re.IGNORECASE))
+        if not m:
+            return False
+        # PER top-level clause, exactly like ALTER TABLE: a composite ALTER TYPE takes comma-separated
+        # actions, so `ADD ATTRIBUTE x, DROP ATTRIBUTE y` must NOT pass on its first clause alone (r12 HIGH).
+        return all(re.match(r"^ADD\s+(?:VALUE|ATTRIBUTE)\b", c.strip(), re.IGNORECASE)
+                   for c in _top_level_clauses(s[m.end():]))
     if re.match(r"^COMMENT\s+ON\b", s, re.IGNORECASE):     # metadata only
         return True
     # Schema-NEUTRAL data DML is out of scope for a SCHEMA-additivity gate (the schema is unchanged, so old
@@ -449,9 +461,18 @@ def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
     # ALLOWLIST gate: reject any statement that is not provably additive (fail-closed). allow_routine
     # (operator-gated via RECONCILE_ALLOW_ROUTINE) additionally blesses a routine/behavioral CREATE/DROP —
     # narrow: a DROP TABLE alongside is its own statement and still fails (r5 FP-7).
+    raw = path.read_text()
+    # FILE-LEVEL dblink guard on the DE-IDENTIFIED text (quoted-ident content preserved, comments/strings
+    # stripped): the per-statement check runs on _normalize output where `"dblink_exec"` became `qi`, so a
+    # quoted/schema-qualified dblink would slip past it (cross-family r12 HIGH). dblink has no legitimate use
+    # in an additive migration — any reference disqualifies the whole file (a comment/string mention doesn't
+    # count; it was stripped). Deeper obfuscation via a pre-existing wrapper function is ceiling-class.
+    if _DBLINK_RE.search(_normalize(raw, keep_quoted=True)):
+        return [f"{path.name}: NON-ADDITIVE — references dblink (runs DDL from a DML/SELECT expression); "
+                "not additive — set RECONCILE_ALLOW_CONTRACTION=1 for a blessed one"]
     out: list[str] = []
     created: set[str] = set()   # tables UNCONDITIONALLY created in a PRECEDING statement (order-aware, r10)
-    for stmt in (s.strip() for s in _normalize(path.read_text()).split(";")):
+    for stmt in (s.strip() for s in _normalize(raw).split(";")):
         if not stmt:
             continue
         if not _is_additive(stmt, allow_routine, frozenset(created)):
