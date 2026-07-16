@@ -29,32 +29,56 @@ _NOT_NULL_RE = re.compile(r"\bNOT\s+NULL\b", re.IGNORECASE)
 _DEFAULT_RE = re.compile(r"\bDEFAULT\b", re.IGNORECASE)
 _ALTER_TABLE_RE = re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE)
 _NOT_VALID_RE = re.compile(r"\bNOT\s+VALID\b", re.IGNORECASE)
+# ADD [CONSTRAINT <name>] (CHECK|UNIQUE|PRIMARY KEY|FOREIGN KEY|EXCLUDE) — named OR unnamed (r2 #5d).
+_ADD_TIGHTENING_RE = re.compile(
+    r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE|PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b", re.IGNORECASE)
+
+
+def _top_level_clauses(stmt: str) -> list[str]:
+    """Split on TOP-LEVEL commas only (paren-depth 0) so a comma inside a type/args — numeric(10,2),
+    CHECK(a,b) — does not break a clause (cross-family r2 #5c). Strings are already stripped upstream."""
+    out: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in stmt:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return out
 
 
 def _add_column_not_null_no_default(stmt: str) -> bool:
-    # ADD COLUMN ... NOT NULL without a DEFAULT is not additive (breaks old INSERTs / fails on a
-    # populated table). Check PER COMMA-CLAUSE: a DEFAULT on a DIFFERENT added column must not spoof
-    # the check (cross-family review #4 — `ADD COLUMN a NOT NULL, ADD COLUMN b DEFAULT 0`).
+    # ADD COLUMN ... NOT NULL without a DEFAULT is not additive. PER top-level clause so a DEFAULT on a
+    # DIFFERENT added column can't spoof it (r2 #4), paren-aware so numeric(10,2) doesn't mis-split (r2 #5c).
     if not _ADD_COL_RE.search(stmt):
         return False
-    return any(_ADD_COL_RE.search(seg) and _NOT_NULL_RE.search(seg) and not _DEFAULT_RE.search(seg)
-               for seg in stmt.split(","))
+    return any(_ADD_COL_RE.search(c) and _NOT_NULL_RE.search(c) and not _DEFAULT_RE.search(c)
+               for c in _top_level_clauses(stmt))
 
 
 def _drop_column(stmt: str) -> bool:
-    # ALTER TABLE ... DROP [COLUMN] <ident> — the COLUMN keyword is OPTIONAL in Postgres (cross-family
-    # review #3). Exclude the additive DROP DEFAULT / DROP NOT NULL and the separately-ruled
-    # DROP CONSTRAINT / DROP TABLE|VIEW|... .
+    # ALTER TABLE ... DROP [COLUMN] [IF EXISTS] <ident> — COLUMN + IF EXISTS are optional in Postgres
+    # (r2 #5a). Exclude only the genuinely-additive DROP DEFAULT / DROP NOT NULL / DROP EXPRESSION /
+    # DROP IDENTITY and the separately-ruled DROP CONSTRAINT. (A column literally named e.g. `type` is
+    # still flagged — the earlier reserved-word exclusions were a bypass, r2 #5b.)
     return bool(_ALTER_TABLE_RE.search(stmt) and re.search(
-        r"\bDROP\s+(?:COLUMN\s+)?(?!TABLE\b|VIEW\b|MATERIALIZED\b|SEQUENCE\b|SCHEMA\b|TYPE\b|"
-        r"CONSTRAINT\b|DEFAULT\b|NOT\s+NULL\b|IF\b|EXPRESSION\b|IDENTITY\b)\"?[A-Za-z_]", stmt, re.IGNORECASE))
+        r"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?"
+        r"(?!CONSTRAINT\b|DEFAULT\b|NOT\s+NULL\b|EXPRESSION\b|IDENTITY\b)\"?[A-Za-z_]", stmt, re.IGNORECASE))
 
 
 def _add_constraint_tightening(stmt: str) -> bool:
-    # ALTER TABLE ... ADD CONSTRAINT (CHECK/UNIQUE/FK/PK) tightens a guarantee old code doesn't honor
-    # after a revert. NOT VALID is the additive escape (doesn't validate existing rows). (review #3)
-    return bool(_ALTER_TABLE_RE.search(stmt) and re.search(r"\bADD\s+CONSTRAINT\b", stmt, re.IGNORECASE)
-                and not _NOT_VALID_RE.search(stmt))
+    # ALTER TABLE ... ADD [CONSTRAINT] CHECK/UNIQUE/PK/FK/EXCLUDE tightens a guarantee old code doesn't
+    # honor after a revert. PER top-level clause + NOT VALID is the per-clause additive escape (r2 #5b).
+    if not _ALTER_TABLE_RE.search(stmt):
+        return False
+    return any(_ADD_TIGHTENING_RE.search(c) and not _NOT_VALID_RE.search(c) for c in _top_level_clauses(stmt))
 
 
 # (checker, why). A checker is a compiled regex (matched with .search) or a callable(stmt)->bool.

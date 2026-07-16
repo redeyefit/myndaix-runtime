@@ -199,8 +199,11 @@ install_artifacts() {
 serve_pid() { launchctl print "$LA_DOMAIN/ai.myndaix.runtime" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid =/{gsub(/[^0-9]/,"",$2); print $2; exit}'; }
 health_gate() {
   local HEAD_OBJ deadline old_pid prev_pid pid head_ok label vrc verify porcelain
-  HEAD_OBJ="$(cat "$SUBSTRATE_DIR/migration_head.txt")"
-  [[ "$HEAD_OBJ" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "migration_head.txt not a plain identifier: '$HEAD_OBJ'"
+  HEAD_OBJ="$(cat "$SUBSTRATE_DIR/migration_head.txt" 2>/dev/null || true)"
+  # health_gate must NEVER die (its contract is return 0/1 so the caller can auto-revert). A bad
+  # migration_head.txt on the NEW SHA must fall through to the revert — if the reverted SHA has the
+  # same problem, the two-fault die fires (cross-family r2 CRITICAL #1).
+  [[ "$HEAD_OBJ" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || { log "migration_head.txt not a plain identifier: '$HEAD_OBJ'"; return 1; }
   # 4. restart serve (sole migration owner; hand-managed plist — kickstart the existing label).
   #    Capture the OLD pid FIRST: kickstart -k does NOT block on the old process exiting (serve does a
   #    graceful multi-worker drain), so without requiring the pid to CHANGE the WAIT could false-green
@@ -249,6 +252,11 @@ else
   log "HEALTH-GATE FAILED at ${HEAD_SHA:0:8}"
   if prev_recoverable; then
     log "AUTO-REVERT to last-good ${PREV_GOOD:0:8} (§2.8) — FACTORY must not stay on broken code"
+    # QUIESCE the mutating ticks BEFORE the reset — health_gate may have already started them (step 6
+    # runs before its verify), and a `reset --hard` rewrites their in-clone scripts in place. Prove
+    # them gone first, exactly like bootstrap-fetch (cross-family r2 HIGH #3).
+    for _t in "${MUTATING_TICKS[@]}"; do la_bootout "$_t"; done
+    for _t in "${MUTATING_TICKS[@]}"; do la_wait_gone "$_t" 30 || log "WARN: $_t still up before revert reset"; done
     git -C "$DEPLOY_CLONE" reset --hard "$PREV_GOOD" && git -C "$DEPLOY_CLONE" clean -ffd || die "auto-revert reset failed — human needed"
     install_artifacts
     if health_gate; then
@@ -266,7 +274,12 @@ trap - EXIT   # converged (possibly reverted) — clear the autonomy-halt restor
 # it and thrash forever (origin/main is still the bad SHA until a human pushes a fix). bootstrap-fetch
 # HOLDS while origin == QUARANTINED_SHA. A clean (non-reverted) converge clears any stale quarantine.
 if [[ "$reverted" == 1 ]]; then
-  { printf '%s\n' "$HEAD_SHA" > "$STATE_DIR/QUARANTINED_SHA.tmp" && mv -f "$STATE_DIR/QUARANTINED_SHA.tmp" "$STATE_DIR/QUARANTINED_SHA"; } || rm -f "$STATE_DIR/QUARANTINED_SHA.tmp"
+  # FAIL-CLOSED: without QUARANTINED_SHA, bootstrap-fetch has no hold and the next poll redeploys the
+  # bad SHA -> thrash. A write failure must alarm, not be swallowed (cross-family r2 HIGH #4).
+  if ! { printf '%s\n' "$HEAD_SHA" > "$STATE_DIR/QUARANTINED_SHA.tmp" && mv -f "$STATE_DIR/QUARANTINED_SHA.tmp" "$STATE_DIR/QUARANTINED_SHA"; }; then
+    rm -f "$STATE_DIR/QUARANTINED_SHA.tmp"
+    die "failed to write QUARANTINED_SHA after auto-revert — quarantine NOT set; a human must hold FACTORY off ${HEAD_SHA:0:8}"
+  fi
 else
   rm -f "$STATE_DIR/QUARANTINED_SHA"
 fi

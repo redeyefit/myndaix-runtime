@@ -152,7 +152,9 @@ def build(config_path: str) -> dict:
         sentinel = desc.get("requires_sentinel")
         if sentinel and not (Path(resolved["MYNDAIX_HOME"]) / sentinel).exists():
             m.setdefault("disarmed", []).append(label)   # transitionally being disarmed — NOT an orphan
-            continue
+            if _label_loaded(uid, label):                # ...but a STILL-LOADED disarmed job IS drift
+                m.setdefault("disarmed_loaded", []).append(label)  #   (full check only) so the poll
+            continue                                     #   auto-deployer actually gets unloaded (r2 CRIT #2)
         m["plists_expected"][label] = _sha256_bytes(
             render_plist.render_bytes(str(desc_path), config_path))
         m["plists_installed"][label] = _sha256_file(la / f"{label}.plist") or "absent"
@@ -201,6 +203,11 @@ def drift_list(m: dict, health_only: bool = False) -> list[str]:
                          "treat as drift")
         elif m["deploy_sha"] != m["origin_sha"]:
             drift.append(f"deploy behind origin: {m['deploy_sha'][:8]} != {m['origin_sha'][:8]}")
+        # A sentinel-disarmed job that is STILL LOADED is drift in the FULL check (so the drift-canary /
+        # a poll's dry-run forces a converge whose final step boots it out) — but NOT under --health-only
+        # (so the disarming converge's own verify can pass and reach that bootout). (r2 CRITICAL #2)
+        for label in m.get("disarmed_loaded", []):
+            drift.append(f"sentinel-disarmed job still loaded: {label} — converge to bootout it")
     for label, expected in m["plists_expected"].items():
         installed = m["plists_installed"].get(label)
         if installed != expected:

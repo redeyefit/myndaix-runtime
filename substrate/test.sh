@@ -296,6 +296,25 @@ printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0);\n' > "$TMP/addc.sql"; ok '!
 printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0) NOT VALID;\n' > "$TMP/addcnv.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/addcnv.sql" >/dev/null 2>&1' "lint passes ADD CONSTRAINT ... NOT VALID (additive)"
 printf 'ALTER TABLE t ADD COLUMN a INT NOT NULL, ADD COLUMN b INT DEFAULT 0;\n' > "$TMP/multi.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/multi.sql" >/dev/null 2>&1' "lint catches per-clause: NOT NULL col spoofed by a DEFAULT on another col"
 
+echo "== PR-1c cross-family r2 folds: paren-aware lint + revert/disarm robustness =="
+printf 'ALTER TABLE t DROP COLUMN IF EXISTS c;\n' > "$TMP/r2a.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r2a.sql" >/dev/null 2>&1' "r2 lint: DROP COLUMN IF EXISTS caught"
+printf 'ALTER TABLE t ADD CHECK (x>0);\n' > "$TMP/r2b.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r2b.sql" >/dev/null 2>&1' "r2 lint: unnamed ADD CHECK caught"
+printf 'ALTER TABLE t ADD COLUMN c numeric(10,2) NOT NULL;\n' > "$TMP/r2c.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r2c.sql" >/dev/null 2>&1' "r2 lint: numeric(10,2) comma doesn'\''t mis-split (paren-aware)"
+printf 'ALTER TABLE t ADD CONSTRAINT c1 CHECK (x>0), ADD CONSTRAINT c2 CHECK (y>0) NOT VALID;\n' > "$TMP/r2d.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r2d.sql" >/dev/null 2>&1' "r2 lint: per-clause — a NOT VALID clause doesn'\''t exempt an earlier tightening one"
+# disarmed-but-LOADED job is drift in the FULL check but NOT under --health-only (CRIT #2)
+cat > "$TMP/dl.py" <<'PYEOF'
+import sys; sys.path.insert(0, sys.argv[1]); import manifest
+m = {"deploy_sha":"a"*40,"origin_sha":"a"*40,"plists_expected":{},"plists_installed":{},"labels_loaded":{},
+     "orphans":{}, "disarmed":["ai.myndaix.reconcile"], "disarmed_loaded":["ai.myndaix.reconcile"]}
+assert manifest.drift_list(m), "full check: a still-loaded disarmed job MUST be drift"
+assert not manifest.drift_list(m, health_only=True), "health_only: disarmed-loaded must NOT block the converge"
+print("ok")
+PYEOF
+ok 'python3 "$TMP/dl.py" "$SUB" >/dev/null 2>&1' "r2 CRIT#2: disarmed-but-loaded = drift (full) / ignored (--health-only)"
+ok 'grep -q "migration_head.txt not a plain identifier" "$SUB/reconcile.sh" && grep -A1 "migration_head.txt not a plain identifier" "$SUB/reconcile.sh" | grep -q "return 1"' "r2 CRIT#1: health_gate returns 1 (not die) on a bad migration_head"
+ok 'grep -B3 "reset --hard \"\$PREV_GOOD\"" "$SUB/reconcile.sh" | grep -q "la_bootout"' "r2 HIGH#3: mutating ticks quiesced before the auto-revert reset"
+ok 'grep -q "quarantine NOT set" "$SUB/reconcile.sh"' "r2 HIGH#4: QUARANTINED_SHA write is fail-closed (die on failure)"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys
