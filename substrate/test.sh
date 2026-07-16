@@ -387,6 +387,29 @@ ok 'grep -q "RECONCILE_ALLOW_ROUTINE" "$SUB/reconcile.sh" && grep -q -- "--allow
 ok 'grep -A6 "manual converge" "$SUB/reconcile.sh" | grep -q "la_ensure_gone \"\$label\" 10 5"' "r5 #8: manual poll reload fail-closes via la_ensure_gone (no silent bootstrap skip)"
 ok 'grep -A8 "RECONCILE_POLL:-0" "$SUB/reconcile.sh" | grep -q "sleep 2; la_bootstrap"' "r5 HIGH-5: poll bootstrap retries a transient launchd EBUSY like every other tick"
 
+echo "== PR-1c cross-family r6 folds: hand-written Postgres-lexer scanner (E''/nested comments/Unicode/CR) =="
+# These fixtures need a literal backslash-quote, a CR, a nested comment, and a UTF-8 identifier char —
+# written via python so the exact bytes are unambiguous (printf escaping would mangle them).
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "r6a":  "SELECT E'prefix\\'--not a comment'; DROP TABLE victims;\n",       # E'' \' escape (CRIT)
+    "r6b":  "/* outer /* inner */ -- still inside outer */ DROP TABLE victims;\n",  # nested comment (CRIT)
+    "r6c":  "SELECT 1 AS ä$tag$; DROP TABLE victims; SELECT $tag$ $tag$;\n",   # unicode ident (CRIT)
+    "r6d":  "-- innocuous\r DROP TABLE victims;\n",                            # CR ends PG comment (HIGH)
+    "r6ok": "ALTER TABLE t ADD COLUMN c text DEFAULT E'a\\nb';\n",             # legit E'' -> PASS
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r6a.sql" >/dev/null 2>&1' "r6 CRIT: E'' backslash-escaped quote doesn'\''t close the string early (a -- inside can'\''t swallow a DROP)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r6b.sql" >/dev/null 2>&1' "r6 CRIT: nested block comment tracked by depth (a -- in the still-open outer can'\''t swallow a DROP)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r6c.sql" >/dev/null 2>&1' "r6 CRIT: a Unicode identifier char before \$tag\$ doesn'\''t open a spurious dollar-quote"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r6d.sql" >/dev/null 2>&1' "r6 HIGH: a CR terminates a Postgres -- comment (a DROP after the CR is seen)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r6ok.sql" >/dev/null 2>&1' "r6: a legit E'' string default still PASSES (scanner regression)"
+ok 'grep -q "_scan_quoted" "$SUB/migration_lint.py" && ! grep -q "_TOKEN_RE" "$SUB/migration_lint.py"' "r6: _normalize is the hand-written lexer scanner (regex _TOKEN_RE retired)"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys

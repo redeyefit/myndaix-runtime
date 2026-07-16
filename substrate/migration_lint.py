@@ -9,11 +9,12 @@ against a compatible superset. A destructive change (drop/rename/retype/tighten 
 constraint) breaks the old code against the new schema and can't be undone by a code-revert.
 
 Matching runs on text whose comments, string/dollar-quoted bodies, and double-quoted identifiers are
-neutralized in ONE interleaving-aware pass (a comment delimiter inside a string, or a quote inside a
-quoted identifier, can no longer swallow real DDL — the sequential-regex bug cross-family review found),
-then whitespace-collapsed and split per statement. So a keyword split across a newline (`DROP\\n TABLE`)
-is caught, a string literal containing "DROP TABLE" is NOT a false positive, and a quoted identifier
-cannot smuggle a keyword or hide a space/digit past a rule. It FAILS CLOSED on constructs it cannot
+neutralized by a hand-written character SCANNER that models Postgres's lexer (NOT a regex — a regex can't
+count nested block-comment depth, and it kept diverging from the engine's scanner on E'' escapes, Unicode
+identifiers, and CR line-endings across several review rounds), then whitespace-collapsed and split per
+statement. So a keyword split across a newline (`DROP\\n TABLE`) is caught, a delimiter hidden inside a
+string/comment/quoted-ident is never mis-acted-upon, a string literal containing "DROP TABLE" is NOT a
+false positive, and a quoted identifier cannot smuggle a keyword or hide a space/digit past a rule. It FAILS CLOSED on constructs it cannot
 reason about: DO/EXECUTE/CALL and CREATE FUNCTION/PROCEDURE (dynamic/opaque bodies the linter can't
 inspect) are rejected outright, and NOT VALID is NOT an additive escape (Postgres still enforces the
 constraint on new writes). A blessed contraction is a deliberate, human-gated two-release change via
@@ -154,40 +155,96 @@ _RULES = [
 ]
 
 
-# SINGLE interleaving-aware token scan (cross-family r4 CRIT-1/-3). SEQUENTIAL re.subs mis-parse
-# overlapping boundaries: a `/*` or `--` INSIDE a '...' string opened a comment match that swallowed
-# real DDL between it and a later delimiter; a `'` inside a "..." identifier unbalanced the single-quote
-# pass the same way. One left-to-right alternation consumes each lexical token WHOLE, so a delimiter that
-# lives inside an already-open token is never re-interpreted. Order matters only for a tie at the SAME
-# position; these openers can't tie (each starts with a distinct char), so any order is safe here.
-_TOKEN_RE = re.compile(
-    r"""
-      (?P<block>/\*.*?\*/)                                  # /* block comment */  (non-greedy)
-    | (?P<line>--[^\n]*)                                    # -- line comment (to EOL)
-    | (?P<dollar>(?<![A-Za-z0-9_$])\$(?P<tag>(?:[A-Za-z_][A-Za-z0-9_]*)?)\$.*?\$(?P=tag)\$)  # $tag$ body $tag$
-    | (?P<sq>'(?:[^']|'')*')                                # 'single-quoted' string ('' escapes)
-    | (?P<dq>"(?:[^"]|"")*")                                # "double-quoted" identifier ("" escapes)
-    """,
-    re.DOTALL | re.VERBOSE,
-)
+# A hand-written character scanner, NOT a regex (cross-family r4-r6). A regex cannot model Postgres's
+# scanner: block comments NEST (not a regular language — a regex can't count depth, r6 CRIT), E'' strings
+# take backslash escapes while plain '' strings don't (r6 CRIT), identifiers include Unicode chars (r6
+# CRIT), and `--` ends at CR or LF (r6 HIGH). Three review rounds of "one more regex edge" is the tell.
+# This scanner consumes each lexical token exactly as Postgres does, so a delimiter INSIDE an open token
+# is never re-interpreted and the linter's token boundaries match the engine that actually runs the SQL.
+#
+# Fail-closed direction: for WELL-FORMED SQL the scanner matches Postgres exactly. The only divergence is
+# on malformed input (an unclosed token) — which Postgres also rejects, so nothing executes — and the
+# safe direction on any doubt is to UNDER-consume (expose text to the rules → at worst a false positive),
+# never OVER-consume (which could swallow a real DROP). A tag/prefix the scanner doesn't recognize is left
+# as ordinary text, so its contents stay visible to the rules.
+_DOLLAR_OPEN = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|)\$")   # $tag$ open; tag = ASCII identifier or empty
 
 
-def _neutralize_token(m: "re.Match[str]") -> str:
-    # A "..." token is always a NAME, never a keyword -> a safe bareword `qi` (keeps identifier shape so
-    # rules still see "a column here", but a quoted name can't smuggle a keyword or hide a space/digit).
-    if m.group("dq") is not None:
-        return " qi "
-    # Comments vanish (whitespace); strings and dollar-quoted bodies collapse to an empty-string literal.
-    if m.group("block") is not None or m.group("line") is not None:
-        return " "
-    return " '' "
+def _ident_char(c: str) -> bool:
+    # Postgres identifier character (Unicode-aware via str.isalnum) or the SQL identifier '_' / '$'.
+    return c.isalnum() or c == "_" or c == "$"
+
+
+def _scan_quoted(sql: str, j: int, n: int, escape: bool) -> int:
+    # From the OPENING quote at j, return the index just past the CLOSING quote. `''` always escapes a
+    # quote; a backslash escapes the next char only in an E'' string (escape=True).
+    k = j + 1
+    while k < n:
+        ch = sql[k]
+        if escape and ch == "\\":
+            k += 2
+        elif ch == "'":
+            if k + 1 < n and sql[k + 1] == "'":
+                k += 2
+            else:
+                return k + 1
+        else:
+            k += 1
+    return n   # unterminated (Postgres would reject too)
 
 
 def _normalize(sql: str) -> str:
-    """Neutralize comments, string/dollar-quoted bodies, and double-quoted identifiers in ONE pass, then
-    collapse whitespace — so a keyword split across a newline is caught, a delimiter hidden inside a
-    string/quoted-ident is never mis-acted-upon (r4), and a quoted name can't smuggle a keyword."""
-    return re.sub(r"\s+", " ", _TOKEN_RE.sub(_neutralize_token, sql))
+    """Neutralize comments, string/dollar-quoted bodies, and double-quoted identifiers by scanning the SQL
+    exactly as Postgres's lexer would, then collapse whitespace. Comments -> ' ', strings/dollar bodies ->
+    "''", double-quoted identifiers -> 'qi' (a safe bareword: a "..." token is always a NAME, never a
+    keyword, so it can't smuggle a keyword or hide a space/digit past a rule)."""
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        two = sql[i:i + 2]
+        if two == "--":                                   # line comment -> end at CR or LF (r6 HIGH)
+            j = i + 2
+            while j < n and sql[j] not in "\r\n":
+                j += 1
+            out.append(" "); i = j
+        elif two == "/*":                                 # block comment -> NESTED depth count (r6 CRIT)
+            depth, j = 1, i + 2
+            while j < n and depth > 0:
+                pair = sql[j:j + 2]
+                if pair == "/*":
+                    depth += 1; j += 2
+                elif pair == "*/":
+                    depth -= 1; j += 2
+                else:
+                    j += 1
+            out.append(" "); i = j
+        elif c == "$" and not (i > 0 and _ident_char(sql[i - 1])):   # $tag$ dollar body (not mid-ident)
+            m = _DOLLAR_OPEN.match(sql, i)
+            close = ("$" + m.group(1) + "$") if m else ""
+            k = sql.find(close, m.end()) if m else -1
+            if m and k != -1:
+                out.append(" '' "); i = k + len(close)
+            else:
+                out.append(c); i += 1                     # not a real dollar-quote -> literal $, keep scanning
+        elif c in "Ee" and i + 1 < n and sql[i + 1] == "'" and not (i > 0 and _ident_char(sql[i - 1])):
+            out.append(" '' "); i = _scan_quoted(sql, i + 1, n, escape=True)    # E'' string (\ escapes)
+        elif c == "'":
+            out.append(" '' "); i = _scan_quoted(sql, i, n, escape=False)       # plain '' string
+        elif c == '"':                                    # "..." identifier ("" escapes) -> safe bareword
+            j = i + 1
+            while j < n:
+                if sql[j] == '"':
+                    if j + 1 < n and sql[j + 1] == '"':
+                        j += 2
+                    else:
+                        j += 1; break
+                else:
+                    j += 1
+            out.append(" qi "); i = j
+        else:
+            out.append(c); i += 1
+    return re.sub(r"\s+", " ", "".join(out))
 
 
 def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
