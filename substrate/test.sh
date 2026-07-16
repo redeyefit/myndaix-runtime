@@ -592,6 +592,38 @@ ok 'python3 "$SUB/migration_lint.py" "$TMP/r12dbcomment.sql" >/dev/null 2>&1' "r
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r12dbstring.sql" >/dev/null 2>&1' "r12: dblink mentioned only in a STRING does NOT false-positive"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r12atmultiok.sql" >/dev/null 2>&1' "r12: ALTER TYPE with ALL ADD ATTRIBUTE clauses still PASSES (additive multi-action)"
 
+echo "== PR-1c cross-family r13: U&-escaped dblink + generated-name + nested-paren NULL default =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # r13: U&"\0064blink..." decodes to dblink -> caught (the 3rd PG identifier syntax)
+    "r13uesc": 'INSERT INTO sink SELECT public.U&"\\0064blink_exec"(\'db\',\'DROP TABLE users\');\n',
+    "r13uext": 'CREATE EXTENSION IF NOT EXISTS U&"\\0064blink";\n',
+    # r13: column literally named `generated` (unreserved kw) no longer exempts the NOT-NULL-no-default check
+    "r13gen": "ALTER TABLE t ADD COLUMN generated int NOT NULL;\n",
+    # r13: nested-paren / wrapped-cast NULL defaults
+    "r13ndbl": "ALTER TABLE t ADD COLUMN age int NOT NULL DEFAULT ((NULL));\n",
+    "r13ncast": "ALTER TABLE t ADD COLUMN age int NOT NULL DEFAULT (CAST(NULL AS int));\n",
+    "r13nset": "ALTER TABLE t ALTER COLUMN c SET DEFAULT ((NULL));\n",
+    # must still PASS: real generated columns, DEFAULT (0), a legit U& identifier that isn't dblink
+    "r13okgen": "ALTER TABLE t ADD COLUMN g int NOT NULL GENERATED ALWAYS AS IDENTITY;\n",
+    "r13okdef": "ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT (0);\n",
+    "r13okuid": 'ALTER TABLE t ADD COLUMN U&"caf\\00E9" int;\n',
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r13uesc.sql" >/dev/null 2>&1' "r13 HIGH: a U&-escaped dblink identifier (U&\"\\0064blink_exec\") is decoded and rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r13uext.sql" >/dev/null 2>&1' "r13: CREATE EXTENSION U&\"\\0064blink\" (unicode-escaped) rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r13gen.sql" >/dev/null 2>&1' "r13 HIGH: ADD COLUMN generated (a column named as the keyword) NOT NULL no-default is rejected (exemption anchored to GENERATED ALWAYS/BY DEFAULT)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r13ndbl.sql" >/dev/null 2>&1' "r13 HIGH: ADD COLUMN NOT NULL DEFAULT ((NULL)) (nested parens) rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r13ncast.sql" >/dev/null 2>&1' "r13: NOT NULL DEFAULT (CAST(NULL AS int)) (wrapped cast) rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r13nset.sql" >/dev/null 2>&1' "r13: SET DEFAULT ((NULL)) rejected"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r13okgen.sql" >/dev/null 2>&1' "r13: a real GENERATED ALWAYS AS IDENTITY column still PASSES (exemption intact)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r13okdef.sql" >/dev/null 2>&1' "r13: DEFAULT (0) (parenthesized non-null) still PASSES"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r13okuid.sql" >/dev/null 2>&1' "r13: a legit non-dblink U& identifier column still PASSES (decoded, additive)"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys

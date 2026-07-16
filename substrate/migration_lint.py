@@ -69,8 +69,10 @@ _ADD_COL_RE = re.compile(r"\bADD\s+COLUMN\b", re.IGNORECASE)
 _NOT_NULL_RE = re.compile(r"\bNOT\s+NULL\b", re.IGNORECASE)
 _DEFAULT_RE = re.compile(r"\bDEFAULT\b", re.IGNORECASE)
 # A GENERATED column (stored expr, or GENERATED ... AS IDENTITY) supplies its own value on old INSERTs,
-# so `ADD COLUMN c ... NOT NULL GENERATED ...` is additive even without a DEFAULT keyword (r5 FP-6).
-_GENERATED_RE = re.compile(r"\bGENERATED\b", re.IGNORECASE)
+# so `ADD COLUMN c ... NOT NULL GENERATED ALWAYS ...` is additive even without a DEFAULT keyword (r5 FP-6).
+# Anchor to the actual GENERATED { ALWAYS | BY DEFAULT } clause — the bare word also matches a column
+# literally NAMED `generated` (an unreserved keyword), which wrongly exempted a real contraction (r13).
+_GENERATED_RE = re.compile(r"\bGENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\b", re.IGNORECASE)
 _ALTER_TABLE_RE = re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE)
 # ADD [CONSTRAINT <name>] (CHECK|UNIQUE|PRIMARY KEY|FOREIGN KEY|EXCLUDE) — named OR unnamed (r2 #5d).
 _ADD_TIGHTENING_RE = re.compile(
@@ -245,6 +247,20 @@ def _scan_quoted(sql: str, j: int, n: int, escape: bool) -> int:
     return n   # unterminated (Postgres would reject too)
 
 
+def _decode_uescape(body: str) -> str:
+    # Decode a Postgres U&"..." identifier body's default (backslash) escapes: \\ -> \, \XXXX -> char,
+    # \+XXXXXX -> char. Used only to see a name obfuscated as U&"\0064blink" (= dblink) for the dblink
+    # guard (r13). Best-effort: an invalid escape is dropped (it wouldn't be a valid identifier anyway).
+    def repl(m: "re.Match[str]") -> str:
+        if m.group(1):
+            return "\\"
+        try:
+            return chr(int(m.group(2) or m.group(3), 16))
+        except ValueError:
+            return ""
+    return re.sub(r"\\(?:(\\)|\+([0-9A-Fa-f]{6})|([0-9A-Fa-f]{4}))", repl, body)
+
+
 def _normalize(sql: str, keep_quoted: bool = False) -> str:
     """Neutralize comments, string/dollar-quoted bodies, and double-quoted identifiers by scanning the SQL
     exactly as Postgres's lexer would, then collapse whitespace. Comments -> ' ', strings/dollar bodies ->
@@ -286,6 +302,24 @@ def _normalize(sql: str, keep_quoted: bool = False) -> str:
             out.append(" '' "); i = _scan_quoted(sql, i + 1, n, escape=True)    # E'' string (\ escapes)
         elif c == "'":
             out.append(" '' "); i = _scan_quoted(sql, i, n, escape=False)       # plain '' string
+        elif c in "Uu" and sql[i + 1:i + 3] == '&"' and not (i > 0 and _ident_char(sql[i - 1])):
+            # U&"..." unicode-escape identifier (Postgres): the 3rd identifier syntax. Body uses "" escapes;
+            # for keep_quoted DECODE its \XXXX escapes so an obfuscated name (U&"\0064blink" = dblink) is
+            # seen by the dblink guard (r13). Normal path -> qi like any identifier.
+            j = i + 3
+            while j < n:
+                if sql[j] == '"':
+                    if j + 1 < n and sql[j + 1] == '"':
+                        j += 2
+                    else:
+                        j += 1; break
+                else:
+                    j += 1
+            if keep_quoted:
+                out.append(" " + _decode_uescape(sql[i + 3:j - 1].replace('""', '"')) + " ")
+            else:
+                out.append(" qi ")
+            i = j
         elif c == '"':                                    # "..." identifier ("" escapes) -> safe bareword
             j = i + 1
             while j < n:
@@ -329,7 +363,7 @@ _ADDITIVE_CREATE_RE = re.compile(
 # obvious/accidental forms `DEFAULT NULL`, `DEFAULT (NULL)`, `DEFAULT CAST(NULL AS t)` (cross-family r11).
 # A semantically-null expression (`DEFAULT coalesce(null,null)`) is beyond a static lint — see the ceiling
 # note in the module docstring.
-_NULL_DEFAULT_RE = re.compile(r"\bDEFAULT\s+(?:CAST\s*\(\s*)?\(?\s*NULL\b", re.IGNORECASE)
+_NULL_DEFAULT_RE = re.compile(r"\bDEFAULT\s*(?:\(\s*|CAST\s*\(\s*)*NULL\b", re.IGNORECASE)
 # dblink is Postgres's built-in mechanism to run DDL from a DML/SELECT expression (dblink_exec('…',
 # 'ALTER TABLE … DROP COLUMN …')). Reject ANY reference to it outright — it defeats the allowlist by
 # smuggling a contraction into an otherwise-additive INSERT/UPDATE/RETURNING/locked-SELECT (r11).
