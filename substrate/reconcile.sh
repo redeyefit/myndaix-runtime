@@ -116,10 +116,15 @@ if prev_recoverable; then
   new_migs=()
   while IFS= read -r m; do [[ -n "$m" ]] && new_migs+=("$m"); done <<< "$delta"
   if [[ ${#new_migs[@]} -gt 0 ]]; then
+    # RECONCILE_ALLOW_ROUTINE (operator-gated) is a NARROW escape: it drops only the CREATE/DROP-routine
+    # rules (for a blessed additive trigger/util function), keeping every other contraction check active
+    # — unlike RECONCILE_ALLOW_CONTRACTION, which skips the whole lint (r5 FP-7).
+    lint_flags=()
+    [[ "${RECONCILE_ALLOW_ROUTINE:-0}" == "1" ]] && lint_flags+=(--allow-routine)
     if [[ "${RECONCILE_ALLOW_CONTRACTION:-0}" == "1" ]]; then
       log "WARN: RECONCILE_ALLOW_CONTRACTION=1 — skipping the additive-migration lint (blessed contraction)"
-    elif ! ( cd "$DEPLOY_CLONE" && python3 "$SUBSTRATE_DIR/migration_lint.py" "${new_migs[@]}" ); then
-      die "NON-ADDITIVE migration in ${PREV_GOOD:0:8}..HEAD — refusing unattended auto-deploy (§2.8; RECONCILE_ALLOW_CONTRACTION=1 to override a blessed one)"
+    elif ! ( cd "$DEPLOY_CLONE" && python3 "$SUBSTRATE_DIR/migration_lint.py" ${lint_flags[@]+"${lint_flags[@]}"} "${new_migs[@]}" ); then
+      die "NON-ADDITIVE migration in ${PREV_GOOD:0:8}..HEAD — refusing unattended auto-deploy (§2.8; RECONCILE_ALLOW_CONTRACTION=1 to override a blessed one, or RECONCILE_ALLOW_ROUTINE=1 for a blessed function)"
     fi
   fi
 fi
@@ -230,13 +235,20 @@ health_gate() {
   for label in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do
     [[ "$label" == "ai.myndaix.runtime" ]] && continue
     if [[ "$label" == "ai.myndaix.reconcile" ]]; then
-      # Reload so a CHANGED plist/env (e.g. the RECONCILE_POLL marker added by an upgrade) takes effect
-      # on an ALREADY-loaded poll (cross-family r4 HIGH-2). Only a MANUAL converge (RECONCILE_POLL unset)
-      # can safely bootout+re-bootstrap the poll — a poll-TRIGGERED run is the poll's own launchd process
-      # and would SIGKILL itself mid-reload, so it merely ensures the job is loaded (its env is current by
-      # definition, being what launched it). Arming is a manual converge, so the fresh env lands on arm.
-      if [[ "${RECONCILE_POLL:-0}" != "1" ]]; then la_bootout "$label"; la_wait_gone "$label" 10 || true; fi
-      la_loaded "$label" || la_bootstrap "$LA_DIR/$label.plist" || { log "could not bootstrap $label"; return 1; }
+      # Reload so a CHANGED plist/env (e.g. the RECONCILE_POLL marker added by an upgrade) takes effect on
+      # an ALREADY-loaded poll (cross-family r4 HIGH-2). Only a MANUAL converge (RECONCILE_POLL unset) can
+      # safely bootout+re-bootstrap the poll — a poll-TRIGGERED run is the poll's own launchd process and
+      # would SIGKILL itself mid-reload, so it merely ensures the job is loaded (its env is current by
+      # definition). Arming is a manual converge, so the fresh env lands on arm. Both paths retry a
+      # transient launchd EBUSY (r5 HIGH-5) like every other tick, and the manual path fail-CLOSES via
+      # la_ensure_gone rather than silently skipping the bootstrap on a slow unload (r5 #8).
+      if [[ "${RECONCILE_POLL:-0}" != "1" ]]; then
+        la_bootout "$label"
+        la_ensure_gone "$label" 10 5 || { log "poll won't quiesce for reload"; return 1; }
+        la_bootstrap "$LA_DIR/$label.plist" || { sleep 2; la_bootstrap "$LA_DIR/$label.plist"; } || { log "could not (re)bootstrap poll"; return 1; }
+      else
+        la_loaded "$label" || la_bootstrap "$LA_DIR/$label.plist" || { sleep 2; la_bootstrap "$LA_DIR/$label.plist"; } || { log "could not bootstrap poll"; return 1; }
+      fi
       continue
     fi
     la_bootout "$label"; la_wait_gone "$label" 10 || true

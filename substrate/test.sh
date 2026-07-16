@@ -364,7 +364,28 @@ printf 'ALTER TABLE t DROP expression;\n' > "$TMP/r4h3.sql"; ok '! python3 "$SUB
 # no-false-positive: DROP NOT NULL relaxation still PASSES (the one genuinely-additive property drop).
 printf 'ALTER TABLE t ALTER COLUMN c DROP NOT NULL;\n' > "$TMP/r4nn.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r4nn.sql" >/dev/null 2>&1' "r4: DROP NOT NULL still PASSES (additive relaxation, not over-flagged)"
 # r4 HIGH-2 — a manual converge reloads an already-loaded poll so a new plist/env (RECONCILE_POLL) lands.
-ok 'grep -q "RECONCILE_POLL:-0.* != .1." "$SUB/reconcile.sh" && grep -B2 "la_loaded \"\$label\" || la_bootstrap" "$SUB/reconcile.sh" | grep -q "la_bootout \"\$label\""' "r4 HIGH-2: a manual converge (RECONCILE_POLL unset) bootout+reloads the poll so a changed env takes effect"
+ok 'grep -q "RECONCILE_POLL:-0.* != .1." "$SUB/reconcile.sh"' "r4 HIGH-2: a manual converge (RECONCILE_POLL unset) reloads the poll so a changed env takes effect"
+
+echo "== PR-1c cross-family r5 folds: dollar-tag lexer + SET DEFAULT (NULL) + DROP ROUTINE + FP fixes =="
+# r5 CRIT-1 — a digit-bearing dollar tag ($a1$) is a real string; a -- inside it must not swallow the DROP.
+printf 'SELECT $a1$--$a1$; DROP TABLE victims;\n' > "$TMP/r5c1.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r5c1.sql" >/dev/null 2>&1' "r5 CRIT-1: digit dollar-tag \$a1\$ tokenized; a -- inside doesn'\''t swallow a DROP TABLE"
+# r5 CRIT-2 — $$ embedded in an identifier (a\$\$) must NOT open a spurious dollar-quote that eats the DROP.
+printf 'ALTER TABLE t ADD COLUMN a$$ int; DROP TABLE users; SELECT b$$;\n' > "$TMP/r5c2.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r5c2.sql" >/dev/null 2>&1' "r5 CRIT-2: \$\$ inside an identifier doesn'\''t open a spurious dollar-quote (lookbehind anchor)"
+# r5 HIGH-3 — parenthesized SET DEFAULT (NULL) is the same contraction as SET DEFAULT NULL.
+printf 'ALTER TABLE t ALTER COLUMN c SET DEFAULT (NULL);\n' > "$TMP/r5h3.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r5h3.sql" >/dev/null 2>&1' "r5 HIGH-3: SET DEFAULT (NULL) parenthesized form is caught"
+# r5 HIGH-4 — DROP ROUTINE drops a function/procedure dependency.
+printf 'DROP ROUTINE IF EXISTS public.old_fn();\n' > "$TMP/r5h4.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r5h4.sql" >/dev/null 2>&1' "r5 HIGH-4: DROP ROUTINE is rejected"
+# r5 FP-6 — a GENERATED NOT NULL column is additive (Postgres supplies its value); must PASS.
+printf 'ALTER TABLE t ADD COLUMN g int GENERATED ALWAYS AS (a + b) STORED NOT NULL;\n' > "$TMP/r5fp6.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r5fp6.sql" >/dev/null 2>&1' "r5 FP-6: GENERATED ... NOT NULL column PASSES (additive, not a bare NOT NULL add)"
+# regression: a legit dollar-quoted string default still parses fine and PASSES.
+printf 'ALTER TABLE t ADD COLUMN note text DEFAULT $tag$ hi $tag$;\n' > "$TMP/r5reg.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r5reg.sql" >/dev/null 2>&1' "r5: a legit \$tag\$ string default still PASSES (lexer regression)"
+# r5 FP-7 — --allow-routine is a NARROW escape: it lets CREATE FUNCTION through but STILL rejects a DROP TABLE.
+printf 'CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql;\n' > "$TMP/r5rt.sql"; ok 'python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r5rt.sql" >/dev/null 2>&1' "r5 FP-7: --allow-routine permits a blessed CREATE FUNCTION"
+printf 'CREATE FUNCTION f() RETURNS void AS $$ x $$ LANGUAGE sql;\nDROP TABLE victims;\n' > "$TMP/r5rt2.sql"; ok '! python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r5rt2.sql" >/dev/null 2>&1' "r5 FP-7: --allow-routine is NARROW — a DROP TABLE alongside still REJECTS"
+ok 'grep -q "RECONCILE_ALLOW_ROUTINE" "$SUB/reconcile.sh" && grep -q -- "--allow-routine" "$SUB/reconcile.sh"' "r5 FP-7: reconcile passes --allow-routine from the operator-gated RECONCILE_ALLOW_ROUTINE"
+# r5 HIGH-5 / #8 — the poll bootstrap has the EBUSY retry, and the manual reload is fail-closed (ensure_gone).
+ok 'grep -A6 "manual converge" "$SUB/reconcile.sh" | grep -q "la_ensure_gone \"\$label\" 10 5"' "r5 #8: manual poll reload fail-closes via la_ensure_gone (no silent bootstrap skip)"
+ok 'grep -A8 "RECONCILE_POLL:-0" "$SUB/reconcile.sh" | grep -q "sleep 2; la_bootstrap"' "r5 HIGH-5: poll bootstrap retries a transient launchd EBUSY like every other tick"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

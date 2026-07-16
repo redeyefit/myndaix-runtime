@@ -17,7 +17,9 @@ cannot smuggle a keyword or hide a space/digit past a rule. It FAILS CLOSED on c
 reason about: DO/EXECUTE/CALL and CREATE FUNCTION/PROCEDURE (dynamic/opaque bodies the linter can't
 inspect) are rejected outright, and NOT VALID is NOT an additive escape (Postgres still enforces the
 constraint on new writes). A blessed contraction is a deliberate, human-gated two-release change via
-RECONCILE_ALLOW_CONTRACTION=1.
+RECONCILE_ALLOW_CONTRACTION=1; a blessed additive ROUTINE (a trigger/util function the opaque-body rule
+would otherwise block) has a NARROWER escape, RECONCILE_ALLOW_ROUTINE=1 (`--allow-routine`), which drops
+ONLY the CREATE/DROP-routine rules and keeps every other contraction check active.
 
 Regex is not a SQL parser: this is a conservative gate, not a proof. Its bias is fail-closed — an
 ambiguous construct is rejected (a false positive costs a human sign-off), never silently passed.
@@ -40,6 +42,9 @@ from pathlib import Path
 _ADD_COL_RE = re.compile(r"\bADD\s+COLUMN\b", re.IGNORECASE)
 _NOT_NULL_RE = re.compile(r"\bNOT\s+NULL\b", re.IGNORECASE)
 _DEFAULT_RE = re.compile(r"\bDEFAULT\b", re.IGNORECASE)
+# A GENERATED column (stored expr, or GENERATED ... AS IDENTITY) supplies its own value on old INSERTs,
+# so `ADD COLUMN c ... NOT NULL GENERATED ...` is additive even without a DEFAULT keyword (r5 FP-6).
+_GENERATED_RE = re.compile(r"\bGENERATED\b", re.IGNORECASE)
 _ALTER_TABLE_RE = re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE)
 # ADD [CONSTRAINT <name>] (CHECK|UNIQUE|PRIMARY KEY|FOREIGN KEY|EXCLUDE) — named OR unnamed (r2 #5d).
 _ADD_TIGHTENING_RE = re.compile(
@@ -76,9 +81,11 @@ def _top_level_clauses(stmt: str) -> list[str]:
 def _add_column_not_null_no_default(stmt: str) -> bool:
     # ADD COLUMN ... NOT NULL without a DEFAULT is not additive. PER top-level clause so a DEFAULT on a
     # DIFFERENT added column can't spoof it (r2 #4), paren-aware so numeric(10,2) doesn't mis-split (r2 #5c).
+    # A GENERATED column is exempt — Postgres computes its value for old INSERTs, so it's additive (r5 FP-6).
     if not _ADD_COL_RE.search(stmt):
         return False
-    return any(_ADD_COL_RE.search(c) and _NOT_NULL_RE.search(c) and not _DEFAULT_RE.search(c)
+    return any(_ADD_COL_RE.search(c) and _NOT_NULL_RE.search(c)
+               and not _DEFAULT_RE.search(c) and not _GENERATED_RE.search(c)
                for c in _top_level_clauses(stmt))
 
 
@@ -121,18 +128,23 @@ def _add_constraint_tightening(stmt: str) -> bool:
     return any(_ADD_TIGHTENING_RE.search(c) for c in _top_level_clauses(stmt))
 
 
+# DROP FUNCTION|PROCEDURE|ROUTINE (PG's ROUTINE drops either — r5 HIGH-4). Named so the narrow
+# RECONCILE_ALLOW_ROUTINE escape can filter the routine rules without disabling the whole lint.
+_DROP_ROUTINE_RE = re.compile(r"\bDROP\s+(FUNCTION|PROCEDURE|ROUTINE)\b", re.I)
+_ROUTINE_CHECKERS = (_CREATE_ROUTINE_RE, _DROP_ROUTINE_RE)
+
 # (checker, why). A checker is a compiled regex (matched with .search) or a callable(stmt)->bool.
 _RULES = [
     (_DYNAMIC_DDL_RE,                                                "DO/EXECUTE/CALL — dynamic DDL the linter can't inspect (a contraction can hide in the body); fail-closed"),
     (_CREATE_ROUTINE_RE,                                             "CREATE FUNCTION/PROCEDURE — opaque body can run DDL when invoked (a stripped body defeats inspection); fail-closed"),
-    (re.compile(r"\bDROP\s+(FUNCTION|PROCEDURE)\b", re.I),           "DROP FUNCTION/PROCEDURE — old code may depend on it"),
+    (_DROP_ROUTINE_RE,                                               "DROP FUNCTION/PROCEDURE/ROUTINE — old code may depend on it"),
     (re.compile(r"\bDROP\s+TABLE\b", re.I),                          "DROP TABLE — old code reads a table that's gone"),
     (re.compile(r"\bDROP\s+(MATERIALIZED\s+VIEW|VIEW)\b", re.I),     "DROP VIEW — old code reads a relation that's gone"),
     (re.compile(r"\bDROP\s+(SEQUENCE|SCHEMA|TYPE)\b", re.I),         "DROP SEQUENCE/SCHEMA/TYPE — old code depends on it"),
     (re.compile(r"\bDROP\s+CONSTRAINT\b", re.I),                     "DROP CONSTRAINT — relaxes/changes a guarantee old code assumes"),
     (_drop_column,                                                   "DROP COLUMN (optional COLUMN kw) — old code reads a column that's gone"),
     (_drop_default,                                                  "DROP DEFAULT — a NOT NULL column with no default breaks old INSERTs that omit it after a revert"),
-    (re.compile(r"\bSET\s+DEFAULT\s+NULL\b", re.I),                  "SET DEFAULT NULL — removes a column's effective default (like DROP DEFAULT); breaks old INSERTs on a NOT NULL column after a revert"),
+    (re.compile(r"\bSET\s+DEFAULT\s+\(?\s*NULL\b", re.I),            "SET DEFAULT NULL — removes a column's effective default (like DROP DEFAULT); breaks old INSERTs on a NOT NULL column after a revert"),
     (re.compile(r"\bRENAME\s+(?:COLUMN\s+|CONSTRAINT\s+)?\S+\s+TO\b", re.I), "RENAME COLUMN/CONSTRAINT — old code reads the old name"),
     (re.compile(r"\bRENAME\s+TO\b", re.I),                           "RENAME TABLE — old code reads the old name"),
     (re.compile(r"\bALTER\s+(?:COLUMN\s+)?\S+\s+(SET\s+DATA\s+)?TYPE\b", re.I), "column TYPE change (optional COLUMN kw) — old code mis-reads the type"),
@@ -152,7 +164,7 @@ _TOKEN_RE = re.compile(
     r"""
       (?P<block>/\*.*?\*/)                                  # /* block comment */  (non-greedy)
     | (?P<line>--[^\n]*)                                    # -- line comment (to EOL)
-    | (?P<dollar>\$(?P<tag>[A-Za-z_]*)\$.*?\$(?P=tag)\$)    # $tag$ dollar-quoted body $tag$
+    | (?P<dollar>(?<![A-Za-z0-9_$])\$(?P<tag>(?:[A-Za-z_][A-Za-z0-9_]*)?)\$.*?\$(?P=tag)\$)  # $tag$ body $tag$
     | (?P<sq>'(?:[^']|'')*')                                # 'single-quoted' string ('' escapes)
     | (?P<dq>"(?:[^"]|"")*")                                # "double-quoted" identifier ("" escapes)
     """,
@@ -178,13 +190,17 @@ def _normalize(sql: str) -> str:
     return re.sub(r"\s+", " ", _TOKEN_RE.sub(_neutralize_token, sql))
 
 
-def lint_file(path: Path) -> list[str]:
+def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
+    # allow_routine (operator-gated via RECONCILE_ALLOW_ROUTINE) drops ONLY the CREATE/DROP-routine rules
+    # — a narrow escape for a genuinely-additive trigger/util function, without the blanket
+    # RECONCILE_ALLOW_CONTRACTION that suppresses EVERY contraction check (r5 FP-7).
+    rules = [(c, w) for (c, w) in _RULES if not (allow_routine and c in _ROUTINE_CHECKERS)]
     out: list[str] = []
     for stmt in _normalize(path.read_text()).split(";"):
         stmt = stmt.strip()
         if not stmt:
             continue
-        for checker, why in _RULES:
+        for checker, why in rules:
             hit = checker.search(stmt) if isinstance(checker, re.Pattern) else checker(stmt)
             if hit:
                 out.append(f"{path.name}: NON-ADDITIVE — {why}\n    {stmt[:140]}")
@@ -192,11 +208,14 @@ def lint_file(path: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        sys.stderr.write("usage: migration_lint.py <file.sql|dir> ...\n")
+    args = argv[1:]
+    allow_routine = "--allow-routine" in args
+    args = [a for a in args if a != "--allow-routine"]
+    if not args:
+        sys.stderr.write("usage: migration_lint.py [--allow-routine] <file.sql|dir> ...\n")
         return 2
     files: list[Path] = []
-    for a in argv[1:]:
+    for a in args:
         p = Path(a)
         if p.is_dir():
             files.extend(sorted(p.glob("*.sql")))
@@ -205,7 +224,7 @@ def main(argv: list[str]) -> int:
     violations: list[str] = []
     for sql in files:
         try:
-            violations.extend(lint_file(sql))
+            violations.extend(lint_file(sql, allow_routine=allow_routine))
         except OSError as e:
             sys.stderr.write(f"migration_lint: cannot read {sql}: {e}\n")
             return 2
