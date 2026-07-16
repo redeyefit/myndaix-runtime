@@ -26,13 +26,16 @@ fi
 # SINGLE-FLIGHT LOCK (KilaBz 2026-07-16): launchd is single-instance per label, but a manual
 # run overlapping the scheduled tick would pull the same slice, race the cursor CAS, and
 # double-draft. Atomic mkdir (the house pattern); a crashed run's stale lock clears after
-# 900s. Held for the WHOLE tick — released by the EXIT trap (which is why the python call
-# below must NOT be `exec`: exec replaces the shell and the trap never fires).
+# 3600s — that must exceed the worst LEGITIMATE tick (3 classify chunks + 5 draft composes
+# at 300s each = 2400s + Gmail/backoff overhead; Oracle round-2: a 900s clear would steal a
+# live long tick's lock and resurrect the exact races this lock exists to stop). Held for
+# the WHOLE tick — released by the EXIT trap (which is why the python call below must NOT
+# be `exec`: exec replaces the shell and the trap never fires).
 LOCK="$HOME/.myndaix/inbox-assistant.tick.lock"
 mkdir -p "$HOME/.myndaix"
 if ! mkdir "$LOCK" 2>/dev/null; then
   lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || echo 0) ))
-  if [[ "$lock_age" -lt 900 ]]; then
+  if [[ "$lock_age" -lt 3600 ]]; then
     echo "[inbox-assistant] another tick holds the lock (age ${lock_age}s) — exiting"
     exit 0
   fi

@@ -113,9 +113,12 @@ def _clean(text: str) -> str:
 
 
 def _one_line(text: str) -> str:
-    """Model/board text normalized to one line (C0/DEL stripped, whitespace collapsed) —
-    a newline inside a reason/subject would break the board's one-item-per-line format."""
-    return " ".join(_clean(text).split())
+    """Model/board text normalized to one line (C0/DEL stripped, whitespace collapsed —
+    a newline inside a reason/subject would break the board's one-item-per-line format),
+    with fence markers DEFANGED (KilaBz round-2): board fields (subject/sender/reason) are
+    re-emitted inside the delivered brief's own UNTRUSTED fence, so a subject spelling
+    ===END UNTRUSTED=== would close THAT fence for the downstream reader."""
+    return " ".join(_FENCE_MARKER_RE.sub("[fence-marker stripped]", _clean(text)).split())
 
 
 def _fence(account: str, thread_id: str, body: str, nonce: str) -> str:
@@ -219,9 +222,13 @@ def _claude(prompt: str) -> Optional[str]:
     env = {k: v for k, v in os.environ.items() if k in _CLAUDE_ENV_KEEP}
     with tempfile.TemporaryDirectory(prefix="inbox-claude-") as scratch:
         try:
+            # one comma-joined value, NOT *-splatted: variadic flag parsing verified working
+            # (2026-07-16, stdin prompt survives) but is exactly the kind of CLI contract
+            # that drifts across versions — a single argv token cannot be re-read as a
+            # positional prompt by any parser.
             r = subprocess.run(
                 ["claude", "-p", "--output-format", "text",
-                 "--disallowedTools", *_CLAUDE_DENY_TOOLS],
+                 "--disallowedTools", ",".join(_CLAUDE_DENY_TOOLS)],
                 input=prompt, capture_output=True, text=True,
                 timeout=CLAUDE_TIMEOUT, check=False, env=env, cwd=scratch)
         except (subprocess.TimeoutExpired, OSError) as e:
@@ -262,22 +269,26 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
     entry dies here — and the category must be a known member. The echoed 'account' field is
     ignored: we already know each thread's account and never trust the echo. Returns
     thread_id -> row, or None when the payload is unusable (caller ships 'unclassified')."""
-    end = raw.rfind("]")
-    if end < 0:
-        return None
-    # anchor-scan (Oracle 2026-07-16): the FIRST '[' may sit in model prose ("here are the
-    # results [1/2]:") and poison the slice; try each '[' until one parses, bounded so
-    # pathological output can't spin the loop.
+    # anchor-scan (Oracle round-1 + KilaBz round-2): prose brackets can precede AND follow
+    # the array ("results [1 of 2]: [...] Done [ok]"), so there is NO end anchor —
+    # raw_decode parses one complete JSON value from each candidate '[' and ignores
+    # whatever trails it. A candidate wins only if it is a list holding at least one dict:
+    # prose that happens to parse ("[1, 2]") must not steal the slot and silently
+    # unclassify the batch WITH a cursor advance. No qualifying candidate -> None
+    # (caller ships 'unclassified' AND holds cursors — safe retry, never data loss).
+    decoder = json.JSONDecoder()
     data = None
-    for tries, m in enumerate(re.finditer(r"\[", raw[:end + 1])):
-        if tries >= 20:
+    for tries, m in enumerate(re.finditer(r"\[", raw)):
+        if tries >= 20:   # bounded — pathological output must not spin the loop
             break
         try:
-            data = json.loads(raw[m.start():end + 1])
-            break
-        except (json.JSONDecodeError, ValueError):
+            cand, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
             continue
-    if not isinstance(data, list):
+        if isinstance(cand, list) and any(isinstance(r, dict) for r in cand):
+            data = cand
+            break
+    if data is None:
         return None
     rows: dict[str, dict] = {}
     for row in data:
@@ -544,10 +555,14 @@ def deliver_jefe_drop(board: str, date_str: str) -> bool:
         ts = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
         tok = uuid.uuid4().hex[:8]
         nonce = uuid.uuid4().hex
+        # belt for the fence: board fields are already defanged at assembly (_one_line),
+        # but the WHOLE board is re-defanged here so no current or future board line can
+        # spell the marker grammar inside the fence we are about to add.
+        safe_board = _FENCE_MARKER_RE.sub("[fence-marker stripped]", _clean(board))
         text = ("---\nfrom: inbox-assistant\nto: jefe\ntype: brief\n"
                 f"subject: Inbox brief — {date_str}\n---\n\n"
                 f"===BEGIN UNTRUSTED inbox-brief nonce={nonce}===\n"
-                f"{_clean(board)}\n"
+                f"{safe_board}\n"
                 f"===END UNTRUSTED nonce={nonce}===\n")
         tmp = JEFE_INBOX / f"{ts}-{tok}-inbox-brief.md.tmp"
         tmp.write_text(text)
