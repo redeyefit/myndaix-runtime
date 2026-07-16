@@ -267,14 +267,15 @@ printf 'ALTER TABLE t ADD COLUMN c int NOT NULL;\n' > "$TMP/nndef.sql"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/nndef.sql" >/dev/null 2>&1' "lint rejects ADD COLUMN NOT NULL without DEFAULT"
 printf 'ALTER TABLE t DROP CONSTRAINT t_pk;\n' > "$TMP/dcon.sql"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/dcon.sql" >/dev/null 2>&1' "lint rejects DROP CONSTRAINT"
-ok 'python3 "$SUB/migration_lint.py" "$REPO/src/runtime/ledger/migrations/0006_skill_pk.sql" >/dev/null 2>&1' "lint clean on the real 0006 (DROP-in-a-string) — no false positive"
+ok 'python3 "$SUB/migration_lint.py" "$REPO/src/runtime/ledger/migrations/0013_dial_shadow_snapshot.sql" >/dev/null 2>&1' "lint clean on a real ADDITIVE migration (0013: CREATE TABLE/INDEX IF NOT EXISTS) — no false positive"
+ok '! python3 "$SUB/migration_lint.py" "$REPO/src/runtime/ledger/migrations/0006_skill_pk.sql" >/dev/null 2>&1' "lint REJECTS the real 0006 (DROP CONSTRAINT inside a DO/EXECUTE block) — dynamic DDL is fail-closed (r3 #1)"
 
 echo "== PR-1c review folds: M1 diff-filter, M2 quarantine, M3 old-pid, M4 disarm =="
 ok 'grep -q -- "--diff-filter=AMR" "$SUB/reconcile.sh"' "M1: reconcile lints ADDED+MODIFIED+RENAMED migrations (not added-only)"
 ok 'grep -q "QUARANTINED_SHA" "$SUB/reconcile.sh" && grep -q "QUARANTINED_SHA" "$SUB/bootstrap-fetch.sh"' "M2: quarantine-SHA written by reconcile + honored by bootstrap-fetch (no revert thrash)"
 ok 'grep -q "is QUARANTINED" "$SUB/bootstrap-fetch.sh"' "M2: bootstrap-fetch HOLDS when origin == quarantined SHA"
 ok 'grep -q "old_pid" "$SUB/reconcile.sh" && grep -q "pid\" != \"\$old_pid" "$SUB/reconcile.sh"' "M3: health_gate requires serve pid to CHANGE (no false-green on old serve)"
-ok 'grep -q "DISARMED — bootout" "$SUB/reconcile.sh" && ! grep -q "sleep 3; launchctl bootout" "$SUB/reconcile.sh"' "M4: disarmed poll bootout is SYNCHRONOUS final action (not a detached subshell)"
+ok 'grep -q "DISARMED (sentinel" "$SUB/reconcile.sh" && ! grep -q "sleep 3; launchctl bootout" "$SUB/reconcile.sh"' "M4: disarmed poll bootout is SYNCHRONOUS final action (not a detached subshell)"
 
 echo "== cross-family folds: health-only verify, disarmed-not-orphan, lint bypasses =="
 cat > "$TMP/ho.py" <<'PYEOF'
@@ -293,7 +294,7 @@ ok 'grep -q -- "check --health-only" "$SUB/reconcile.sh"' "health_gate uses mani
 printf 'ALTER TABLE t ALTER c TYPE text;\n' > "$TMP/ncol.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/ncol.sql" >/dev/null 2>&1' "lint catches ALTER c TYPE (optional COLUMN kw)"
 printf 'ALTER TABLE t DROP age;\n' > "$TMP/ndrop.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/ndrop.sql" >/dev/null 2>&1' "lint catches DROP age (optional COLUMN kw)"
 printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0);\n' > "$TMP/addc.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/addc.sql" >/dev/null 2>&1' "lint catches ADD CONSTRAINT (tightening)"
-printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0) NOT VALID;\n' > "$TMP/addcnv.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/addcnv.sql" >/dev/null 2>&1' "lint passes ADD CONSTRAINT ... NOT VALID (additive)"
+printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0) NOT VALID;\n' > "$TMP/addcnv.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/addcnv.sql" >/dev/null 2>&1' "lint REJECTS ADD CONSTRAINT ... NOT VALID — PG enforces it on new writes; not an additive escape (r3 #2)"
 printf 'ALTER TABLE t ADD COLUMN a INT NOT NULL, ADD COLUMN b INT DEFAULT 0;\n' > "$TMP/multi.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/multi.sql" >/dev/null 2>&1' "lint catches per-clause: NOT NULL col spoofed by a DEFAULT on another col"
 
 echo "== PR-1c cross-family r2 folds: paren-aware lint + revert/disarm robustness =="
@@ -312,8 +313,39 @@ print("ok")
 PYEOF
 ok 'python3 "$TMP/dl.py" "$SUB" >/dev/null 2>&1' "r2 CRIT#2: disarmed-but-loaded = drift (full) / ignored (--health-only)"
 ok 'grep -q "migration_head.txt not a plain identifier" "$SUB/reconcile.sh" && grep -A1 "migration_head.txt not a plain identifier" "$SUB/reconcile.sh" | grep -q "return 1"' "r2 CRIT#1: health_gate returns 1 (not die) on a bad migration_head"
-ok 'grep -B3 "reset --hard \"\$PREV_GOOD\"" "$SUB/reconcile.sh" | grep -q "la_bootout"' "r2 HIGH#3: mutating ticks quiesced before the auto-revert reset"
+ok 'grep -B12 "reset --hard \"\$PREV_GOOD\"" "$SUB/reconcile.sh" | grep -q "la_bootout"' "r2 HIGH#3: mutating ticks quiesced before the auto-revert reset"
 ok 'grep -q "quarantine NOT set" "$SUB/reconcile.sh"' "r2 HIGH#4: QUARANTINED_SHA write is fail-closed (die on failure)"
+
+echo "== PR-1c cross-family r3 folds: linter fail-closed + revert/disarm hardening =="
+# r3 #1 — dynamic DDL (DO/EXECUTE/CALL) is fail-closed (a DROP can hide in the stripped body).
+printf 'DO $$ BEGIN EXECUTE '\''ALTER TABLE job DROP COLUMN context'\''; END $$;\n' > "$TMP/r3do.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3do.sql" >/dev/null 2>&1' "r3 #1: DO/EXECUTE block hiding a DROP is rejected (dynamic DDL fail-closed)"
+printf 'CALL do_destructive();\n' > "$TMP/r3call.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3call.sql" >/dev/null 2>&1' "r3 #1: CALL <proc> is rejected (can run arbitrary DDL)"
+# r3 #5 — DROP DEFAULT breaks old INSERTs on a NOT NULL column after a revert.
+printf 'ALTER TABLE t ALTER COLUMN c DROP DEFAULT;\n' > "$TMP/r3dd.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3dd.sql" >/dev/null 2>&1' "r3 #5: DROP DEFAULT is rejected (old INSERTs omitting the col fail post-revert)"
+# r3 #6 — quoted identifier containing a SPACE no longer defeats the \\S+ identifier match.
+printf 'ALTER TABLE t RENAME COLUMN "my col" TO x;\n' > "$TMP/r3rn.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3rn.sql" >/dev/null 2>&1' "r3 #6: RENAME of a space-containing quoted column is caught (quoted-ident neutralized)"
+printf 'ALTER TABLE t ALTER COLUMN "my col" TYPE text;\n' > "$TMP/r3ty.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3ty.sql" >/dev/null 2>&1' "r3 #6: ALTER TYPE of a space-containing quoted column is caught"
+# r3 #7 — DIGIT-leading quoted identifier no longer bypasses the [A-Za-z_] anchor.
+printf 'ALTER TABLE t DROP COLUMN "1st_col";\n' > "$TMP/r3dg.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3dg.sql" >/dev/null 2>&1' "r3 #7: DROP COLUMN of a digit-leading quoted name is caught"
+# r3 #8 — a column literally named as an unreserved keyword (constraint) is a real column drop.
+printf 'ALTER TABLE t DROP COLUMN constraint;\n' > "$TMP/r3kw.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3kw.sql" >/dev/null 2>&1' "r3 #8: DROP COLUMN of a keyword-named column (constraint) is caught (was a lookahead bypass)"
+# r3 #9 — a double-quoted "DEFAULT" constraint name no longer spoofs the ADD COLUMN NOT NULL check.
+printf 'ALTER TABLE t ADD COLUMN age INT NOT NULL CONSTRAINT "DEFAULT" CHECK (age > 0);\n' > "$TMP/r3sp.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r3sp.sql" >/dev/null 2>&1' "r3 #9: quoted \"DEFAULT\" constraint name no longer spoofs a real DEFAULT"
+# no-false-positive: a legit ADDITIVE add of a digit-quoted column still passes.
+printf 'ALTER TABLE t ADD COLUMN "1st_col" INT;\n' > "$TMP/r3ok.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r3ok.sql" >/dev/null 2>&1' "r3: ADD COLUMN of a quoted-digit name still PASSES (neutralization doesn'\''t over-flag)"
+# r3 #3 — auto-revert quiesce is FAIL-CLOSED (SIGKILL-escalate then die) + abandoned-worker guard.
+ok 'grep -q "la_ensure_gone" "$SUB/lib.sh"' "r3 #3: lib.sh has the SIGKILL-escalation helper la_ensure_gone"
+ok 'grep -q "la_ensure_gone .* || die \"auto-revert:" "$SUB/reconcile.sh"' "r3 #3: auto-revert quiesce dies (not WARN) if a tick survives SIGKILL before the reset"
+ok 'grep -q "auto-revert: a worker is still running from the deploy clone" "$SUB/reconcile.sh"' "r3 #3: auto-revert refuses the reset if a play-* worker still runs from the deploy clone"
+# r3 #4 — disarm re-reads the sentinel ON DISK (not the stale ROLE_LABELS snapshot) + confirm-gone die.
+ok 'grep -q "! -e \"\$MYNDAIX_HOME/\$RECONCILE_SENTINEL\"" "$SUB/reconcile.sh"' "r3 #4: disarm decision re-reads RECONCILE_ARMED on disk (not the install_artifacts snapshot)"
+ok 'grep -q "DISARM FAILED" "$SUB/reconcile.sh"' "r3 #4: a bootout that leaves the poll loaded fails LOUD (die), not silent || true"
+# r3 #4c — the poll injects RECONCILE_POLL=1 and bootstrap HOLDS a disarmed poll-fire (manual runs proceed).
+ok 'grep -q "RECONCILE_POLL" "$SUB/plists/ai.myndaix.reconcile.json"' "r3 #4c: reconcile poll descriptor injects RECONCILE_POLL=1 (env_literal)"
+ok 'grep -q "RECONCILE_POLL:-0" "$SUB/bootstrap-fetch.sh" && grep -q "RECONCILE_ARMED" "$SUB/bootstrap-fetch.sh"' "r3 #4c: bootstrap-fetch holds a poll-fired invocation when disarmed (belt behind the bootout)"
+# sentinel-name SYNC: reconcile.sh RECONCILE_SENTINEL == descriptor requires_sentinel == bootstrap literal.
+SENT_DESC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["requires_sentinel"])' "$SUB/plists/ai.myndaix.reconcile.json")"
+ok '[[ "'"$SENT_DESC"'" == "RECONCILE_ARMED" ]] && grep -q "RECONCILE_SENTINEL=\"RECONCILE_ARMED\"" "$SUB/reconcile.sh" && grep -q "MYNDAIX_HOME/RECONCILE_ARMED" "$SUB/bootstrap-fetch.sh"' "r3 #4: the arm-sentinel name agrees across descriptor + reconcile.sh + bootstrap-fetch"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

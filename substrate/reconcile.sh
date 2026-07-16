@@ -48,6 +48,10 @@ fi
 # silently down. The restore uses only fixed labels + LA_DIR (no config), so it's valid this early.
 # Cleared after step 6 restarts the ticks. Must match bootstrap-fetch QUIESCE_LABELS (test.sh asserts).
 MUTATING_TICKS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
+# The arm-sentinel that gates the unattended reconcile poll. MUST equal the poll descriptor's
+# requires_sentinel (substrate/plists/ai.myndaix.reconcile.json) — asserted by test.sh. Re-read ON DISK
+# at the disarm site so a mid-converge disarm isn't missed by a stale ROLE_LABELS snapshot (r3 HIGH #4).
+RECONCILE_SENTINEL="RECONCILE_ARMED"
 LA_DIR="$HOME/Library/LaunchAgents"
 reconcile_restore_ticks() {
   local l
@@ -254,9 +258,21 @@ else
     log "AUTO-REVERT to last-good ${PREV_GOOD:0:8} (§2.8) — FACTORY must not stay on broken code"
     # QUIESCE the mutating ticks BEFORE the reset — health_gate may have already started them (step 6
     # runs before its verify), and a `reset --hard` rewrites their in-clone scripts in place. Prove
-    # them gone first, exactly like bootstrap-fetch (cross-family r2 HIGH #3).
+    # them gone first — FAIL CLOSED (SIGKILL-escalate then die), exactly like bootstrap-fetch's pre-reset
+    # quiesce. A `log WARN` that let the reset proceed against a live tick reopened the exact race the
+    # quiesce exists to close (cross-family r3 HIGH #3): a tick surviving SIGKILL is a human-needed
+    # anomaly, and dying here leaves FACTORY on the (bad) SHA with the restore trap re-arming the ticks —
+    # the same posture as an unrecoverable health gate, minus the tree-corruption risk.
     for _t in "${MUTATING_TICKS[@]}"; do la_bootout "$_t"; done
-    for _t in "${MUTATING_TICKS[@]}"; do la_wait_gone "$_t" 30 || log "WARN: $_t still up before revert reset"; done
+    for _t in "${MUTATING_TICKS[@]}"; do
+      la_ensure_gone "$_t" 30 10 || die "auto-revert: $_t survived SIGKILL — refusing reset (would rewrite a live tick mid-run); human needed"
+    done
+    # Abandoned-worker guard (mirror bootstrap-fetch H2): the controller detaches a play-* worker that
+    # can outlive its tick. If one is running FROM the deploy clone, `reset --hard` would rewrite its
+    # scripts mid-execution — refuse.
+    if pgrep -f "$DEPLOY_CLONE/orchestrator/play-" >/dev/null 2>&1; then
+      die "auto-revert: a worker is still running from the deploy clone — refusing reset; human needed"
+    fi
     git -C "$DEPLOY_CLONE" reset --hard "$PREV_GOOD" && git -C "$DEPLOY_CLONE" clean -ffd || die "auto-revert reset failed — human needed"
     install_artifacts
     if health_gate; then
@@ -325,10 +341,25 @@ fi
 # even if we ARE the poll process — the bootout's SIGTERM just ends an already-finished script. A
 # detached `( sleep; bootout ) &` did NOT work: it shares the launchd process group and gets killed
 # when the parent exits before the sleep elapses.
-poll_managed=0
-for l in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do [[ "$l" == "ai.myndaix.reconcile" ]] && poll_managed=1; done
-if [[ "$poll_managed" == 0 ]] && la_loaded ai.myndaix.reconcile; then
-  log "reconcile poll loaded but DISARMED — bootout + remove plist (final action)"
+# Decide from the sentinel ON DISK RIGHT NOW, not the install_artifacts ROLE_LABELS snapshot: if
+# RECONCILE_ARMED was removed AFTER install_artifacts ran, the snapshot still lists the poll as managed
+# and the bootout would be wrongly skipped, leaving a "disarmed" poll firing forever (cross-family r3
+# HIGH #4). Absent sentinel + loaded poll => bootout NOW.
+if [[ ! -e "$MYNDAIX_HOME/$RECONCILE_SENTINEL" ]] && la_loaded ai.myndaix.reconcile; then
+  log "reconcile poll loaded but DISARMED (sentinel '$RECONCILE_SENTINEL' absent) — bootout + remove plist (final action)"
   rm -f "$LA_DIR/ai.myndaix.reconcile.plist"
   launchctl bootout "$LA_DOMAIN/ai.myndaix.reconcile" 2>/dev/null || true
+  # CONFIRM it unloaded — a silently-failed bootout leaves a disarmed poll auto-deploying (r3 HIGH #4).
+  # If bootout SIGTERM'd us (we ARE the poll) we never reach here — that's a clean unload. If we survive
+  # AND it's still loaded, retry once, then fail LOUD (operator alarm + die) — never `|| true` silent.
+  if la_loaded ai.myndaix.reconcile; then
+    sleep 2; launchctl bootout "$LA_DOMAIN/ai.myndaix.reconcile" 2>/dev/null || true
+    if la_loaded ai.myndaix.reconcile; then
+      if [[ -n "${OPERATOR_INBOX:-}" && -d "$OPERATOR_INBOX" ]]; then
+        da="$OPERATOR_INBOX/reconcile-disarm-failed.md"
+        [[ -e "$da" ]] || { printf 'reconcile could NOT bootout the DISARMED poll (ai.myndaix.reconcile): it is still loaded and will keep firing every interval. A human must run: launchctl bootout %s/ai.myndaix.reconcile\n' "$LA_DOMAIN" > "$da.tmp" && mv -f "$da.tmp" "$da"; } || rm -f "$da.tmp"
+      fi
+      die "DISARM FAILED: reconcile poll still loaded after bootout — a human must bootout it"
+    fi
+  fi
 fi

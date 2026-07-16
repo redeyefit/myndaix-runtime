@@ -8,9 +8,16 @@ every migration is ADDITIVE (expand-contract) — the schema only ever GROWS, so
 against a compatible superset. A destructive change (drop/rename/retype/tighten a column or
 constraint) breaks the old code against the new schema and can't be undone by a code-revert.
 
-Matching is done on COMMENT- and STRING-stripped, whitespace-collapsed text split per statement, so a
-keyword split across a newline (`DROP\\n TABLE`) is caught and a string literal containing "DROP TABLE"
-is NOT a false positive.
+Matching is done on COMMENT-, STRING-, and DOUBLE-QUOTED-IDENTIFIER-neutralized, whitespace-collapsed
+text split per statement, so a keyword split across a newline (`DROP\\n TABLE`) is caught, a string
+literal containing "DROP TABLE" is NOT a false positive, and a quoted identifier cannot smuggle a keyword
+or hide a space/digit past a rule. It FAILS CLOSED on constructs it cannot reason about — a statement that
+begins with DO/EXECUTE/CALL (dynamic execution whose body is stripped) is rejected outright, and NOT VALID
+is NOT treated as an additive escape (Postgres still enforces the constraint on new writes). A blessed
+contraction is a deliberate, human-gated two-release change via RECONCILE_ALLOW_CONTRACTION=1.
+
+Regex is not a SQL parser: this is a conservative gate, not a proof. Its bias is fail-closed — an
+ambiguous construct is rejected (a false positive costs a human sign-off), never silently passed.
 
 reconcile lints only the migrations ADDED-OR-MODIFIED in a deploy (the prev_good..HEAD delta,
 --diff-filter=AMR), NOT the full history — historical migrations that already ran may contain
@@ -28,10 +35,14 @@ _ADD_COL_RE = re.compile(r"\bADD\s+COLUMN\b", re.IGNORECASE)
 _NOT_NULL_RE = re.compile(r"\bNOT\s+NULL\b", re.IGNORECASE)
 _DEFAULT_RE = re.compile(r"\bDEFAULT\b", re.IGNORECASE)
 _ALTER_TABLE_RE = re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE)
-_NOT_VALID_RE = re.compile(r"\bNOT\s+VALID\b", re.IGNORECASE)
 # ADD [CONSTRAINT <name>] (CHECK|UNIQUE|PRIMARY KEY|FOREIGN KEY|EXCLUDE) — named OR unnamed (r2 #5d).
 _ADD_TIGHTENING_RE = re.compile(
     r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE|PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b", re.IGNORECASE)
+# A statement that BEGINS with DO/EXECUTE/CALL runs code the linter cannot inspect: `_normalize` strips
+# the dollar/quoted body, so a `DO $$ ... EXECUTE 'ALTER TABLE t DROP COLUMN c' ... $$` reduces to `DO ''`
+# and no keyword rule can fire — yet `serve` executes the raw file and the DROP runs (cross-family r3 #1).
+# Fail closed: a migration cannot smuggle a contraction through dynamic execution.
+_DYNAMIC_DDL_RE = re.compile(r"^(?:DO|EXECUTE|CALL)\b", re.IGNORECASE)
 
 
 def _top_level_clauses(stmt: str) -> list[str]:
@@ -64,30 +75,51 @@ def _add_column_not_null_no_default(stmt: str) -> bool:
 
 
 def _drop_column(stmt: str) -> bool:
-    # ALTER TABLE ... DROP [COLUMN] [IF EXISTS] <ident> — COLUMN + IF EXISTS are optional in Postgres
-    # (r2 #5a). Exclude only the genuinely-additive DROP DEFAULT / DROP NOT NULL / DROP EXPRESSION /
-    # DROP IDENTITY and the separately-ruled DROP CONSTRAINT. (A column literally named e.g. `type` is
-    # still flagged — the earlier reserved-word exclusions were a bypass, r2 #5b.)
-    return bool(_ALTER_TABLE_RE.search(stmt) and re.search(
-        r"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?"
-        r"(?!CONSTRAINT\b|DEFAULT\b|NOT\s+NULL\b|EXPRESSION\b|IDENTITY\b)\"?[A-Za-z_]", stmt, re.IGNORECASE))
+    # ALTER TABLE column drop (old code reads a column that's gone). Two cases:
+    #   (a) the COLUMN keyword is present -> unambiguously a column drop, WHATEVER the column is named —
+    #       incl. a column named `constraint`/`default`/`type`; the old spelling-based exclusions were a
+    #       bypass (r2 #5b, r3 #8). `DROP COLUMN [IF EXISTS] <ident>`.
+    #   (b) no COLUMN keyword: `DROP [IF EXISTS] <ident>` is still a column drop UNLESS <ident> is one of
+    #       the sub-object drops — DROP CONSTRAINT (ruled separately), DROP DEFAULT (ruled by _drop_default,
+    #       r3 #5), or the genuinely-additive DROP NOT NULL / DROP EXPRESSION / DROP IDENTITY.
+    # Quoted identifiers are already neutralized to `qi` by _normalize, so a digit-leading or space-
+    # containing quoted column name can't slip past the anchor (r3 #6/#7).
+    if not _ALTER_TABLE_RE.search(stmt):
+        return False
+    if re.search(r"\bDROP\s+COLUMN\b", stmt, re.IGNORECASE):
+        return True
+    return bool(re.search(
+        r"\bDROP\s+(?:IF\s+EXISTS\s+)?"
+        r"(?!CONSTRAINT\b|DEFAULT\b|NOT\s+NULL\b|EXPRESSION\b|IDENTITY\b|COLUMN\b)[A-Za-z_]",
+        stmt, re.IGNORECASE))
+
+
+def _drop_default(stmt: str) -> bool:
+    # ALTER TABLE ... ALTER COLUMN ... DROP DEFAULT looks additive but a NOT NULL column with no default
+    # breaks old INSERTs that omitted it (relying on the default) after a revert (r3 #5). The linter can't
+    # know the column's nullability, so fail closed — a blessed drop uses RECONCILE_ALLOW_CONTRACTION.
+    return bool(_ALTER_TABLE_RE.search(stmt) and re.search(r"\bDROP\s+DEFAULT\b", stmt, re.IGNORECASE))
 
 
 def _add_constraint_tightening(stmt: str) -> bool:
     # ALTER TABLE ... ADD [CONSTRAINT] CHECK/UNIQUE/PK/FK/EXCLUDE tightens a guarantee old code doesn't
-    # honor after a revert. PER top-level clause + NOT VALID is the per-clause additive escape (r2 #5b).
+    # honor after a revert. NOT VALID is NOT an additive escape (r3 #2): Postgres skips validating
+    # EXISTING rows but still enforces the constraint on every new/updated row immediately, so reverted
+    # old writes can fail. PER top-level clause (paren-aware) so a later clause can't exempt an earlier one.
     if not _ALTER_TABLE_RE.search(stmt):
         return False
-    return any(_ADD_TIGHTENING_RE.search(c) and not _NOT_VALID_RE.search(c) for c in _top_level_clauses(stmt))
+    return any(_ADD_TIGHTENING_RE.search(c) for c in _top_level_clauses(stmt))
 
 
 # (checker, why). A checker is a compiled regex (matched with .search) or a callable(stmt)->bool.
 _RULES = [
+    (_DYNAMIC_DDL_RE,                                                "DO/EXECUTE/CALL — dynamic DDL the linter can't inspect (a contraction can hide in the body); fail-closed"),
     (re.compile(r"\bDROP\s+TABLE\b", re.I),                          "DROP TABLE — old code reads a table that's gone"),
     (re.compile(r"\bDROP\s+(MATERIALIZED\s+VIEW|VIEW)\b", re.I),     "DROP VIEW — old code reads a relation that's gone"),
     (re.compile(r"\bDROP\s+(SEQUENCE|SCHEMA|TYPE)\b", re.I),         "DROP SEQUENCE/SCHEMA/TYPE — old code depends on it"),
     (re.compile(r"\bDROP\s+CONSTRAINT\b", re.I),                     "DROP CONSTRAINT — relaxes/changes a guarantee old code assumes"),
     (_drop_column,                                                   "DROP COLUMN (optional COLUMN kw) — old code reads a column that's gone"),
+    (_drop_default,                                                  "DROP DEFAULT — a NOT NULL column with no default breaks old INSERTs that omit it after a revert"),
     (re.compile(r"\bRENAME\s+(?:COLUMN\s+|CONSTRAINT\s+)?\S+\s+TO\b", re.I), "RENAME COLUMN/CONSTRAINT — old code reads the old name"),
     (re.compile(r"\bRENAME\s+TO\b", re.I),                           "RENAME TABLE — old code reads the old name"),
     (re.compile(r"\bALTER\s+(?:COLUMN\s+)?\S+\s+(SET\s+DATA\s+)?TYPE\b", re.I), "column TYPE change (optional COLUMN kw) — old code mis-reads the type"),
@@ -104,6 +136,12 @@ def _normalize(sql: str) -> str:
     sql = re.sub(r"--[^\n]*", " ", sql)                            # line comments
     sql = re.sub(r"\$([A-Za-z_]*)\$.*?\$\1\$", " '' ", sql, flags=re.DOTALL)  # dollar-quoted bodies
     sql = re.sub(r"'(?:[^']|'')*'", " '' ", sql)                   # single-quoted (with '' escapes)
+    # Neutralize DOUBLE-quoted identifiers to a safe bareword. A "..." token is always a NAME, never a
+    # keyword, so replacing it with `qi` is semantics-preserving for a keyword-based lint — and it closes
+    # three cross-family r3 bypasses at once: a quoted name can no longer (a) smuggle a keyword like
+    # "DEFAULT" into a rule (#9), (b) hide a space that breaks a `\S+` identifier match (#6), or (c) start
+    # with a digit that defeats an identifier anchor (#7). ('' escapes handled: "a""b" is one identifier.)
+    sql = re.sub(r'"(?:[^"]|"")*"', " qi ", sql)                   # double-quoted identifiers -> safe name
     return re.sub(r"\s+", " ", sql)
 
 

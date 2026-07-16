@@ -44,6 +44,17 @@ DEPLOY_CLONE="$(read_key DEPLOY_CLONE)"
 # installed); a stray invocation on LAB must not reset a dev checkout.
 [[ "$MACHINE_ROLE" == "factory" ]] || die "bootstrap-fetch only runs on a factory machine (role=$MACHINE_ROLE)"
 
+# DISARM belt (cross-family r3 HIGH #4c): the reconcile POLL injects RECONCILE_POLL=1 (its plist's
+# env_literal). If a poll-fired invocation finds the arm-sentinel gone — a "disarmed" poll that a
+# failed bootout left LOADED — HOLD: do not fetch/reset/deploy. This is defence-in-depth behind
+# reconcile's disarm bootout; it must NOT gate MANUAL converges (a human running reconcile.sh has no
+# RECONCILE_POLL set), which are legitimate while the poll is disarmed. Keep the sentinel name in sync
+# with reconcile.sh RECONCILE_SENTINEL + the poll descriptor's requires_sentinel (test.sh asserts).
+if [[ "${RECONCILE_POLL:-0}" == "1" && ! -e "$MYNDAIX_HOME/RECONCILE_ARMED" ]]; then
+  log "poll fired while DISARMED (RECONCILE_ARMED absent) — holding, not deploying (a stale loaded poll?)"
+  exit 0
+fi
+
 # Hard-validate DEPLOY_CLONE before ANY reset — this is the path we `reset --hard`.
 case "$DEPLOY_CLONE" in
   /*) : ;;                                   # absolute
