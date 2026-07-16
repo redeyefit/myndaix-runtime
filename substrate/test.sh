@@ -504,11 +504,41 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r9addcolpk.sql" >/dev/null 2>&1' "r
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r9alterdomain.sql" >/dev/null 2>&1' "r9: ALTER DOMAIN ADD CONSTRAINT rejected"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r9replica.sql" >/dev/null 2>&1' "r9: REPLICA IDENTITY NOTHING rejected FREE (never enumerated — allowlist default catches it)"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r9selfn.sql" >/dev/null 2>&1' "r9: a bare SELECT f() (no FROM, an opaque call) rejected"
-ok 'python3 "$SUB/migration_lint.py" "$TMP/r9corview.sql" >/dev/null 2>&1' "r9: CREATE OR REPLACE VIEW PASSES (re-derivable from the migration; no data loss)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9corview.sql" >/dev/null 2>&1' "r10: CREATE OR REPLACE VIEW now REJECTS (a view narrow isn'\''t revertible — PG forbids it, serve bricks; live-PG confirmed)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r9uidxnew.sql" >/dev/null 2>&1' "r9: CREATE UNIQUE INDEX on a SAME-MIGRATION new table PASSES (old code doesn'\''t know the table)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r9backfill.sql" >/dev/null 2>&1' "r9: idempotent backfill (SELECT FOR UPDATE + UPDATE) PASSES (schema-neutral data DML)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r9setdef.sql" >/dev/null 2>&1' "r9: SET DEFAULT <value> PASSES (additive; only SET DEFAULT NULL is the contraction)"
 ok 'grep -q "_is_additive" "$SUB/migration_lint.py" && grep -q "ALLOWLIST" "$SUB/migration_lint.py"' "r9: the gate is an allowlist (_is_additive), not an unbounded denylist"
+
+echo "== PR-1c cross-family r10 + attack-fleet: allowlist HOLES (same-migration tracking, dblink, view) =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # r10 CRITICAL shape A: a LATER create must not retroactively bless an EARLIER destructive op
+    "r10rev": "ALTER TABLE job DROP COLUMN context;\nCREATE TABLE IF NOT EXISTS job (id uuid);\n",
+    # r10 CRITICAL shape B: CREATE TABLE IF NOT EXISTS is a no-op on an existing table -> can't launder a DROP
+    "r10ifne": "CREATE TABLE IF NOT EXISTS users (id int);\nALTER TABLE users DROP COLUMN password_hash;\n",
+    # r10 HIGH-1: a DDL-capable function via SELECT ... FROM (dblink_exec) must be rejected
+    "r10dblink": "SELECT dblink_exec('db', 'ALTER TABLE job DROP COLUMN context') FROM generate_series(1,1);\n",
+    # r10 fleet HIGH: CREATE OR REPLACE VIEW is not safely revertible
+    "r10corview": "CREATE OR REPLACE VIEW w AS SELECT a, b, c, d FROM tw;\n",
+    # PASS: an UNCONDITIONAL create genuinely proves newness -> a unique index / constraint on it is additive
+    "r10uncond": "CREATE TABLE fresh (a int);\nCREATE UNIQUE INDEX u ON fresh (a);\nALTER TABLE fresh ADD CONSTRAINT pk PRIMARY KEY (a);\n",
+    # PASS: a plain (new) CREATE VIEW is additive; a locking SELECT is the accepted migration use
+    "r10newview": "CREATE VIEW v AS SELECT 1;\n",
+    "r10lock": "SELECT id FROM t ORDER BY id FOR UPDATE;\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r10rev.sql" >/dev/null 2>&1' "r10 CRIT (both signals): a later CREATE TABLE can'\''t retroactively bless an earlier DROP COLUMN (order-aware created set)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r10ifne.sql" >/dev/null 2>&1' "r10 CRIT (live-PG): CREATE TABLE IF NOT EXISTS can'\''t launder a DROP COLUMN onto an existing table (unconditional-create only)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r10dblink.sql" >/dev/null 2>&1' "r10 HIGH-1: a SELECT invoking dblink_exec (DDL via function) is rejected (SELECT needs FOR UPDATE)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r10corview.sql" >/dev/null 2>&1' "r10 (fleet, live-PG): CREATE OR REPLACE VIEW rejected (a view narrow isn'\''t revertible)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r10uncond.sql" >/dev/null 2>&1' "r10: an UNCONDITIONAL new table + its UNIQUE INDEX/CONSTRAINT PASSES (newness provable; a create fails if it existed)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r10newview.sql" >/dev/null 2>&1' "r10: a plain new CREATE VIEW still PASSES (additive)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r10lock.sql" >/dev/null 2>&1' "r10: a locking SELECT ... FOR UPDATE still PASSES (accepted migration use)"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

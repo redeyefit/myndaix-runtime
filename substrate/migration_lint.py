@@ -30,9 +30,16 @@ blessed routine/behavioral object (a trigger/util function) has a NARROWER escap
 alongside is a separate statement and still fails.
 
 This is a conservative gate, not a proof. Its bias is fail-closed — an unrecognized construct is rejected
-(a false positive costs a human sign-off), never silently passed. Documented residual (accepted): a plain
-INSERT is treated additive; UPDATE/DELETE/TRUNCATE are rejected (they can strand old code with mutated or
-destroyed data).
+(a false positive costs a human sign-off), never silently passed. A table counts as "born this migration"
+(so ops on it are additive) ONLY if created UNCONDITIONALLY (not `IF NOT EXISTS`, which is a no-op on an
+existing table) and only for LATER statements (order-aware) — else a create could launder a DROP onto an
+existing table (cross-family r10 CRITICAL). Accepted fail-closed cost: an idempotent migration that uses
+`CREATE TABLE IF NOT EXISTS t` then adds a UNIQUE INDEX / CREATE OR REPLACE VIEW to `t` can't be proven
+additive from its text alone and needs RECONCILE_ALLOW_CONTRACTION (the repo's own 0008/0009/0011/0012 are
+such — they are safe in practice but unprovable). FOLLOW-UP (PR-1d): pass reconcile the set of objects that
+existed in prev_good so "new THIS DEPLOY vs pre-existing" is decidable and these pass without an escape.
+Other residuals: plain INSERT / a LOCKING SELECT ... FOR UPDATE / UPDATE are treated additive (schema-
+neutral); UPDATE-vs-a-destructive-function and a DDL function in a locked SELECT are out of scope.
 
 reconcile lints only the migrations ADDED-OR-MODIFIED in a deploy (the prev_good..HEAD delta,
 --diff-filter=AMR), NOT the full history — historical migrations that already ran may contain
@@ -327,22 +334,15 @@ def _additive_alter_table_clause(c: str) -> bool:
     return False
 
 
+# A table is provably born THIS migration ONLY if created UNCONDITIONALLY — an `IF NOT EXISTS` create is a
+# runtime NO-OP against an existing table, so it can't prove newness (cross-family r10 CRITICAL: it let a
+# DROP COLUMN / UNIQUE INDEX launder onto an EXISTING table). The negative lookahead rejects IF NOT EXISTS.
+# `qi` (a quoted name) is also excluded: neutralization collapses every quoted name to `qi`, so a `qi`
+# match can't identify a specific table. The set is built INCREMENTALLY in lint_file (a CREATE only blesses
+# LATER statements), so a create can't retroactively bless an EARLIER op (r10 order-reversal shape).
 _CREATE_TABLE_NAME_RE = re.compile(
-    r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+    r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*TABLE\s+(?!IF\s+NOT\s+EXISTS\b)([^\s(]+)",
     re.IGNORECASE)
-
-
-def _created_table_names(statements: list[str]) -> frozenset[str]:
-    # Names of tables CREATEd in THIS migration file. Any op on such a table is additive — old code has no
-    # knowledge of a table born this migration (r9: a UNIQUE INDEX on a same-migration table is additive).
-    # `qi` (a quoted name) is EXCLUDED: neutralization collapses every quoted name to `qi`, so trusting a
-    # `qi` match would let an op on an EXISTING quoted table masquerade as same-migration (fail-closed).
-    names = set()
-    for s in statements:
-        m = _CREATE_TABLE_NAME_RE.match(s.strip())
-        if m and m.group(1) != "qi":
-            names.add(m.group(1))
-    return frozenset(names)
 
 
 def _target_after_on(s: str) -> str | None:
@@ -363,10 +363,12 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
         return True
     if re.match(r"^CREATE\b", s, re.IGNORECASE):
         if re.match(r"^CREATE\s+OR\s+REPLACE\b", s, re.IGNORECASE):
-            # Only a VIEW / MATERIALIZED VIEW is re-derivable + data-lossless: its definition lives in the
-            # migration, so a code-revert re-runs prev_good's migration and restores the old view. CREATE OR
-            # REPLACE FUNCTION stays rejected (opaque body can run DDL) — escapable via --allow-routine.
-            return bool(re.match(r"^CREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+)?VIEW\b", s, re.IGNORECASE))
+            # Rejected fail-closed: a CREATE OR REPLACE VIEW that changes the column set is NOT safely
+            # revertible — Postgres forbids narrowing/retyping a view via CREATE OR REPLACE, so re-applying
+            # prev_good's older definition ERRORS and serve bricks, defeating auto-revert (cross-family r10,
+            # live-PG confirmed). A genuinely-new view uses a plain CREATE VIEW (additive); a re-definition
+            # needs RECONCILE_ALLOW_CONTRACTION.
+            return False
         if re.search(r"^CREATE\s+(?:\w+\s+)*?UNIQUE\s+INDEX\b", s, re.IGNORECASE):
             tgt = _target_after_on(s)                      # additive ONLY on a table born this migration
             return tgt is not None and tgt != "qi" and tgt in created
@@ -389,10 +391,11 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
     if re.match(r"^(?:INSERT\s+INTO|UPDATE)\b", s, re.IGNORECASE):
         return True
     if re.match(r"^SELECT\b", s, re.IGNORECASE):
-        # A read query (has FROM) is schema-neutral. A bare `SELECT f()` (no FROM) is a function INVOCATION
-        # that could run DDL (the r4 opaque-call vector) -> reject fail-closed; real migrations lock via
-        # SELECT ... FROM ... FOR UPDATE. Residual: a DDL-running function in a FROM-query's target list.
-        return bool(re.search(r"\bFROM\b", s, re.IGNORECASE))
+        # Only a LOCKING select (FOR UPDATE/SHARE) is an accepted migration use — the lock-ordering guard
+        # real idempotent backfills need. A bare or function-call SELECT (even with FROM) could invoke a
+        # DDL-capable function like dblink_exec('...ALTER TABLE...DROP COLUMN...') (cross-family r10 HIGH),
+        # so require the row-lock clause and reject the rest fail-closed.
+        return bool(re.search(r"\bFOR\s+(?:UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b", s, re.IGNORECASE))
     return False                                           # fail-closed: unrecognized => not provably additive
 
 
@@ -414,13 +417,18 @@ def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
     # ALLOWLIST gate: reject any statement that is not provably additive (fail-closed). allow_routine
     # (operator-gated via RECONCILE_ALLOW_ROUTINE) additionally blesses a routine/behavioral CREATE/DROP —
     # narrow: a DROP TABLE alongside is its own statement and still fails (r5 FP-7).
-    statements = [s.strip() for s in _normalize(path.read_text()).split(";")]
-    created = _created_table_names(statements)   # tables born THIS migration -> any op on them is additive
     out: list[str] = []
-    for stmt in statements:
-        if not stmt or _is_additive(stmt, allow_routine, created):
+    created: set[str] = set()   # tables UNCONDITIONALLY created in a PRECEDING statement (order-aware, r10)
+    for stmt in (s.strip() for s in _normalize(path.read_text()).split(";")):
+        if not stmt:
             continue
-        out.append(f"{path.name}: NON-ADDITIVE — {_reject_reason(stmt, allow_routine)}\n    {stmt[:140]}")
+        if not _is_additive(stmt, allow_routine, frozenset(created)):
+            out.append(f"{path.name}: NON-ADDITIVE — {_reject_reason(stmt, allow_routine)}\n    {stmt[:140]}")
+        # Register an unconditional CREATE TABLE AFTER checking this statement, so it can only bless LATER
+        # ops on the genuinely-new table — never retroactively an earlier op (r10 order-reversal).
+        m = _CREATE_TABLE_NAME_RE.match(stmt)
+        if m and m.group(1) != "qi":
+            created.add(m.group(1))
     return out
 
 
