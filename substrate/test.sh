@@ -685,7 +685,22 @@ printf 'CREATE OR REPLACE VIEW public . existing_v AS SELECT 1;\n' > "$TMP/d_wsv
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_trunc.sql" >/dev/null 2>&1' "PR-1d HIGH: a 64-byte name PG truncates to a pre-existing 63-byte relation REJECTS (NAMEDATALEN truncation)"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_wsalter.sql" >/dev/null 2>&1' "PR-1d: whitespace-around-dot ALTER (public . job) REJECTS (r14 dot-collapse; not a denylist bypass)"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_wsview.sql" >/dev/null 2>&1' "PR-1d: whitespace-around-dot CREATE OR REPLACE VIEW (public . existing_v) REJECTS"
-ok 'grep -q "relkind IN ('\''r'\'','\''v'\'','\''m'\'','\''p'\'','\''f'\'')" "$SUB/reconcile.sh"' "PR-1d MED: pg_catalog query includes foreign tables (relkind f) so a pre-existing foreign table isn'\''t seen as new"
+ok 'relk="$(grep -oE "relkind IN \(([^)]*)\)" "$SUB/reconcile.sh")"; for k in r i I S v m c f p; do echo "$relk" | grep -q "'\''$k'\''" || exit 1; done' "PR-1d r2 HIGH: pg_catalog query covers ALL user relkinds (r/i/I/S/v/m/c/f/p) so no pre-existing object (sequence, index, composite) is seen as new"
+# PR-1d r2 folds: identifier folding parity (ASCII-only downcase + 63-byte truncate on BOTH sides).
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+n63 = "a" * 61 + "İ"     # 61 'a' + İ (U+0130, 2 bytes) = exactly 63 bytes; Python .lower() would expand it
+prev = ["job", "job_id_seq", n63, "a" * 61 + "K"]   # + Kelvin-K name
+open(os.path.join(d, "prev_r2.txt"), "w", encoding="utf-8").write("\n".join(prev) + "\n")
+open(os.path.join(d, "d_seqrename.sql"), "w", encoding="utf-8").write("ALTER TABLE job_id_seq RENAME TO job_id_seq_old;\n")
+open(os.path.join(d, "d_unifold.sql"), "w", encoding="utf-8").write(f"ALTER TABLE {n63} DROP COLUMN x;\n")
+open(os.path.join(d, "d_kelvin.sql"), "w", encoding="utf-8").write(f"ALTER TABLE {'a'*61}K DROP COLUMN x;\n")
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_seqrename.sql" >/dev/null 2>&1' "PR-1d r2: ALTER TABLE <pre-existing sequence> RENAME REJECTS (sequence now in the pg_catalog set)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_unifold.sql" >/dev/null 2>&1' "PR-1d r2: a 63-byte non-ASCII (İ) pre-existing name REJECTS — ASCII-fold parity, no Unicode-.lower() truncation miss"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev_r2.txt" "$TMP/d_kelvin.sql" >/dev/null 2>&1' "PR-1d r2: a Kelvin-sign (U+212A) pre-existing name REJECTS (ASCII-fold doesn'\''t shrink it like Python .lower())"
+ok 'grep -q "_pg_fold" "$SUB/migration_lint.py" && grep -q "ident.translate" "$SUB/migration_lint.py"' "PR-1d r2: identifier folding mirrors Postgres (ASCII downcase + 63-byte truncate) on both sides via _pg_fold"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

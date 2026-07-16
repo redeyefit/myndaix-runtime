@@ -66,6 +66,7 @@ Usage:  migration_lint.py <file.sql|dir> ...
 from __future__ import annotations
 
 import re
+import string
 import sys
 from pathlib import Path
 
@@ -429,6 +430,17 @@ def _resolvable_table(name: str) -> bool:
     return name != "qi" and "qi" not in name.split(".")
 
 
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _pg_fold(ident: str) -> str:
+    # Fold an UNQUOTED identifier the way Postgres stores it, so a migration's bare name compares equal to
+    # the pg_catalog relname reconcile passed in. Postgres downcases ASCII A-Z ONLY (NOT Python's Unicode
+    # str.lower(), which diverges on e.g. İ -> i̇, changing byte length), then truncates to NAMEDATALEN-1
+    # (63) BYTES. Applied IDENTICALLY to both sides (prev_objects load + the target name) — cross-family PR-1d.
+    return ident.translate(_ASCII_LOWER).encode("utf-8")[:63].decode("utf-8", "ignore")
+
+
 def _new_this_deploy(name: str, created: frozenset[str], prev_objects: "frozenset[str] | None") -> bool:
     # Is <name> a relation BORN in this deploy (so any op on it — a UNIQUE INDEX, a CREATE OR REPLACE VIEW,
     # even a DROP — is additive, since old code has never referenced it)? PR-1d:
@@ -443,11 +455,10 @@ def _new_this_deploy(name: str, created: frozenset[str], prev_objects: "frozense
     if not _resolvable_table(name):
         return False
     if prev_objects is not None:
-        # bare, case-folded, and TRUNCATED to NAMEDATALEN-1 (63) BYTES — Postgres silently truncates a
-        # longer identifier to the stored relname, so a 64-byte spelling of a pre-existing 63-byte relation
-        # must still match it (else it would read as "new" and a DROP on it would pass — cross-family r-pr1d).
-        bare = name.split(".")[-1].lower().encode("utf-8")[:63].decode("utf-8", "ignore")
-        return bare not in prev_objects
+        # Compare the bare last component, folded EXACTLY as Postgres stores it (ASCII downcase + 63-byte
+        # truncate — _pg_fold) so a 64-byte spelling of a pre-existing 63-byte relation, or a non-ASCII
+        # name, still matches the pg_catalog set (cross-family PR-1d r1/r2).
+        return _pg_fold(name.split(".")[-1]) not in prev_objects
     return name in created
 
 
@@ -579,7 +590,7 @@ def main(argv: list[str]) -> int:
         expath = args[idx + 1]
         del args[idx:idx + 2]
         try:
-            prev_objects = frozenset(n.strip().lower() for n in Path(expath).read_text().split() if n.strip())
+            prev_objects = frozenset(_pg_fold(n) for n in Path(expath).read_text().split() if n.strip())
         except OSError as e:
             sys.stderr.write(f"migration_lint: cannot read --existing {expath}: {e}\n")
             return 2
