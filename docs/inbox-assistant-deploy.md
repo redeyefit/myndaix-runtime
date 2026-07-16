@@ -18,13 +18,16 @@ send; no send method is invoked anywhere). Everything reversible; per-account fa
    old screenshots/tutorials showing "OAuth consent screen" under APIs & Services lie
    (verified 2026-07, Google docs). Configure:
    - User type: **External**.
-   - Scopes (Data Access page) — add exactly these four:
+   - Scopes (Data Access page) — add exactly these three:
      ```
-     https://www.googleapis.com/auth/gmail.readonly
-     https://www.googleapis.com/auth/gmail.labels
+     https://www.googleapis.com/auth/gmail.modify
      https://www.googleapis.com/auth/gmail.compose
      https://www.googleapis.com/auth/drive.file
      ```
+     Why `gmail.modify`: label APPLICATION requires it (`gmail.labels` alone cannot
+     `messages.batchModify`, and it supersedes `gmail.readonly` too); its extra powers
+     (trash/archive/mark-read) are banned by code contract with a source-scan test, exactly
+     like drafts-only bans send.
    - **'Publish app'** → confirm past the "will require verification" warning. Status must read
      **'In production'**.
    - **NEVER leave it in Testing** — Testing-status refresh tokens expire after 7 days, which
@@ -56,7 +59,8 @@ service account, or you re-create the SA (verified 2026-07, 1Password docs).
 2. **Create the items** (the vault contract the code reads via `op read`):
    - `gmail-oauth-client` — fields `client_id`, `client_secret` (from step 1.4).
    - `gmail-rt-<email>` — ONE item per account, item name is literally `gmail-rt-` + the full
-     email address; field `refresh_token` (filled in step 4).
+     email address; field `refresh_token` (written — or the whole item created — by the mint
+     script in step 4).
    - `notion-inbox-assistant` — field `token` (filled in step 6; only if the Notion mirror is on).
 3. **THEN create the service account**, read-only on that one vault:
    ```
@@ -65,17 +69,36 @@ service account, or you re-create the SA (verified 2026-07, 1Password docs).
 4. **The SA token is shown once.** Store a copy in 1Password AND install it on the Mini's login
    Keychain (the tick script exports it as `OP_SERVICE_ACCOUNT_TOKEN` from there):
    ```
-   security add-generic-password -a "$USER" -s 'op.inbox-assistant.token' -w '<token>'
+   security add-generic-password -a "$USER" -s 'op.inbox-assistant.token' -T /usr/bin/security -U -w
    ```
+   - bare `-w` (no value): `security` prompts for the token interactively — it never lands in
+     argv, `ps`, or shell history.
+   - `-T /usr/bin/security`: pre-authorizes reads by the `security` binary itself, so the
+     headless 06:30 launchd run cannot hang on a keychain ACL confirmation prompt.
+   - `-U`: update-in-place if the item already exists — the command is safe to re-run.
+
    **Caveat:** after an unattended reboot without auto-login the login keychain is locked and the
    tick fails (`op` errors) until someone logs in. Known trade-off; the brief just skips days.
 
 ## 4. Mint the refresh tokens (MacBook — a browser is required)
 
 Run `scripts/mint_gmail_refresh_token.py` once per account (3x), logged into that account in the
-browser. The consumer account hits "Google hasn't verified this app" → **Advanced → Go to app
-(unsafe)** — expected, click through. The redeyefit accounts skip the interstitial if step 2 was
-done. Paste each refresh token into its `gmail-rt-<email>` vault item.
+browser:
+
+```
+python3 scripts/mint_gmail_refresh_token.py --client-id <id> --op-vault Automation \
+    --account <email> --check
+```
+
+With `--op-vault` the script stores the token STRAIGHT into the `gmail-rt-<email>` vault item
+(creating the item if it doesn't exist yet) and prints only the secret reference
+(`op://Automation/gmail-rt-<email>/refresh_token`) — the raw token never hits stdout, terminal
+scrollback, or the clipboard. (It does transit the local `op` process argv briefly — operator's
+own machine, subprocess arg list, no shell.) Printing the raw token requires an explicit
+`--print` (vault-less runs only) and warns on stderr.
+
+The consumer account hits "Google hasn't verified this app" → **Advanced → Go to app (unsafe)**
+— expected, click through. The redeyefit accounts skip the interstitial if step 2 was done.
 
 **Scopes are frozen at mint** — the token carries exactly the scopes consented at mint time.
 `drive.file` is in the list NOW deliberately, even before the Drive mirror is armed: adding a

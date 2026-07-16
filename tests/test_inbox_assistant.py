@@ -73,15 +73,12 @@ class FakeLedger:
         return {"account_id": account_id, "history_id": hid, "fallback_since": None,
                 "state": "active", "attempts": 0, "updated_at": None}
 
-    async def inbox_upsert_cursor(self, account_id, history_id):
-        self.calls.append(("upsert", account_id, history_id))
-        if account_id in self.cursors:
-            return False
-        self.cursors[account_id] = history_id
-        return True
-
     async def inbox_advance_cursor(self, account_id, history_id):
+        # mirrors the real UPSERT-CAS: True on fresh insert or changed value, False when
+        # already current. There is NO seed verb — this is the only row-creating write.
         self.calls.append(("advance", account_id, history_id))
+        if self.cursors.get(account_id) == history_id:
+            return False
         self.cursors[account_id] = history_id
         return True
 
@@ -392,6 +389,26 @@ def test_reply_without_parent_message_id_omits_threading_headers():
 
 
 # =====================================================================================
+# incremental pull — history.list filtered to messageAdded (own label writes don't echo)
+# =====================================================================================
+def test_pull_since_history_filters_to_message_added():
+    client = GmailClient("a@gmail.com", "cid", "csec", "rt")
+    svc = MagicMock()
+    hist = svc.users.return_value.history.return_value.list
+    hist.return_value.execute.return_value = {"historyId": "42"}   # quiet mailbox, one page
+    client._gmail_svc = svc
+    result = client.pull_since_history("41")
+    kwargs = hist.call_args.kwargs
+    ok(kwargs["historyTypes"] == ["messageAdded"],
+       "history.list filters to messageAdded — the tick's own IA/* label writes must not "
+       "echo into the next tick's pull")
+    ok(kwargs["startHistoryId"] == "41" and kwargs["userId"] == "me",
+       "cursor + user params intact")
+    ok(result.threads == [] and result.new_history_id == "42",
+       "quiet mailbox: no threads, cursor moves to the response historyId")
+
+
+# =====================================================================================
 # redaction — the brief carries subject + sender, NEVER snippet/body text
 # =====================================================================================
 def test_brief_redaction_no_snippet_ever():
@@ -408,6 +425,23 @@ def test_brief_redaction_no_snippet_ever():
     ok(marker not in summary and "Interview loop" not in summary and "corp.com" not in summary,
        "iMessage summary is counts-only (no subject, no sender, no snippet)")
     ok("1 need-you" in summary, "summary counts the needs-you thread")
+
+
+def test_board_dedup_drafted_items_only_in_drafts_waiting():
+    t1 = th("a@gmail.com", "t1", subject="Offer call")
+    t2 = th("a@gmail.com", "t2", subject="Board deck")
+    run = IA.AccountRun(account="a@gmail.com", ok=True, threads=[t1, t2], new_history_id="9")
+    items = [IA.Item(thread=t1, category="job-reply", reason="offer details", draft_id="d-1"),
+             IA.Item(thread=t2, category="needs-you", reason="decision needed")]
+    board = IA.assemble_brief("2026-07-15", [run], items, True)
+    ok(board.count("Offer call") == 1, "a drafted thread appears exactly ONCE on the board")
+    ok("## JOB REPLIES" not in board,
+       "its category section is empty -> omitted (DRAFTS WAITING subsumes the row)")
+    drafts = board.split("## DRAFTS WAITING")[1].split("##")[0]
+    ok("Offer call" in drafts and "d-1" in drafts, "the drafted thread rides DRAFTS WAITING")
+    needs = board.split("## NEEDS YOU")[1].split("##")[0]
+    ok("Board deck" in needs and "Offer call" not in needs,
+       "undrafted needs-you still under NEEDS YOU; the drafted item is excluded")
 
 
 def test_brief_redaction_end_to_end_through_the_jefe_drop():
@@ -475,13 +509,36 @@ def test_cursor_expired_falls_back_to_bounded_backfill():
        "cursor re-established at the backfill's checkpoint historyId")
 
 
-def test_first_run_seeds_cursor_from_backfill_checkpoint():
+def test_first_run_cursor_created_only_by_final_advance():
     plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "backfill_hid": "500"}}
     rc, led, inst, _brief, _out = run_tick(plan)   # no cursor -> first run
     ok(rc == 0, "first run completes")
     ok(inst["a@gmail.com"].backfill_days == [IA.BACKFILL_DAYS], "first run is the bounded backfill")
-    ok(("upsert", "a@gmail.com", "500") in led.calls,
-       "cursor seeded at the backfill checkpoint (getProfile-first historyId)")
+    ok(led.calls == [("advance", "a@gmail.com", "500")],
+       "the ONLY cursor write is the end-of-tick advance (no eager seed exists)")
+    ok(led.cursors.get("a@gmail.com") == "500",
+       "the final advance CREATES the row at the backfill checkpoint historyId")
+
+
+def test_first_run_failure_post_pull_leaves_no_cursor_row():
+    # THE data-loss bug the eager seed caused: a first-run account whose tick fails AFTER
+    # the pull must leave NO cursor row, so the next tick re-backfills the whole window
+    # instead of resuming past mail it never processed.
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "backfill_hid": "500",
+                            "label_exc": RuntimeError("label api down")}}
+    fake, _ = make_claude(categories={"t1": "needs-you"})
+    rc, led, _inst, _brief, _out = run_tick(plan, claude=fake)   # no cursor -> first run
+    ok(rc == 0, "the failed first run still exits 0 (brief delivered)")
+    ok(not [c for c in led.calls if c[0] == "advance"],
+       "post-pull action failure on a first-run account: NO advance")
+    ok("a@gmail.com" not in led.cursors,
+       "NO cursor row left behind — next tick re-backfills (the eager seed would have "
+       "stranded the backfill window)")
+    # same for an undelivered brief on a first run
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "backfill_hid": "500"}}
+    _rc, led2, _inst2, _brief2, _out2 = run_tick(plan, brief_fail=True)
+    ok("a@gmail.com" not in led2.cursors and not led2.calls,
+       "undelivered brief on a first run: zero cursor writes, no row")
 
 
 def test_undelivered_brief_holds_every_cursor():
@@ -598,11 +655,17 @@ def test_main_rejects_bad_verb():
 # drafts-only contract — no outbound-mail call EXISTS in the source, and the 5/run budget
 # =====================================================================================
 def test_drafts_only_no_send_invocation_in_source():
+    # gmail.modify also permits trash/untrash/archive/mark-read and delete — the code
+    # contract bans those calls exactly like send; this scan is the enforcement.
     src = Path(gmail_client.__file__).read_text() + Path(IA.__file__).read_text()
     ok("drafts().create" in src, "positive control: the real source was scanned")
     forbidden = [r"\.send\s*\(", r"\.send_message\s*\(", r"messages\(\)\s*\.\s*send",
                  r"drafts\(\)\s*\.\s*send", r"users\.messages\.send", r"messages/send",
-                 r"\bsmtplib\b", r"\bsendmail\b"]
+                 r"\bsmtplib\b", r"\bsendmail\b",
+                 # gmail.modify's destructive surface — never called (module contract)
+                 r"\.trash\s*\(", r"\.untrash\s*\(",
+                 r"messages\(\)\s*\.\s*delete", r"threads\(\)\s*\.\s*delete",
+                 r"\bbatchDelete\b"]
     for pat in forbidden:
         hit = re.search(pat, src, re.IGNORECASE)
         ok(hit is None, f"forbidden send pattern {pat!r} found: {hit.group(0) if hit else ''}")
@@ -646,7 +709,7 @@ def test_dry_run_writes_nothing():
     rc, led, inst, brief, out = run_tick(plan, cursors={"b@corp.com": "2"},
                                          claude=fake, dry_run=True)
     ok(rc == 0, "dry-run always exits 0")
-    ok(led.calls == [], "NO cursor writes (no seed, no advance, no mark — even for auth failure)")
+    ok(led.calls == [], "NO cursor writes (no advance, no mark — even for auth failure)")
     ok(inst["a@gmail.com"].labels == [], "no labels applied")
     ok(inst["a@gmail.com"].drafts == [], "no drafts created")
     ok(calls["draft"] == [], "no compose calls either (classify only)")
@@ -656,7 +719,7 @@ def test_dry_run_writes_nothing():
 
 
 # =====================================================================================
-# live ledger verbs (optional) — the four inbox_* verbs against a real Postgres, gated
+# live ledger verbs (optional) — the three inbox_* verbs against a real Postgres, gated
 # on LEDGER_TEST_DSN like the other *_verbs tests. Namespaced rows, no schema drop.
 # =====================================================================================
 async def live_inbox_cursor_verbs(dsn):
@@ -669,24 +732,27 @@ async def live_inbox_cursor_verbs(dsn):
             await con.execute(mig)   # idempotent CREATE IF NOT EXISTS
             await con.execute("DELETE FROM inbox_cursor WHERE account_id LIKE 'ia-selftest-%'")
         ok(await led.inbox_get_cursor(acct) is None, "unseen account -> None")
-        ok(await led.inbox_upsert_cursor(acct, "100") is True, "first seed -> True")
-        ok(await led.inbox_upsert_cursor(acct, "999") is False,
-           "second seed -> False (ON CONFLICT DO NOTHING never clobbers)")
+        ok(await led.inbox_advance_cursor(acct, "100") is True,
+           "first advance on a rowless account INSERTS the row -> True (UPSERT: the "
+           "end-of-tick advance is the only row-creating write)")
         cur = await led.inbox_get_cursor(acct)
         ok(cur["history_id"] == "100" and cur["state"] == "active" and cur["attempts"] == 0
-           and cur["fallback_since"] is None, "seeded row shape (fallback_since always None)")
+           and cur["fallback_since"] is None, "fresh row shape (fallback_since always None)")
         ok(await led.inbox_mark_cursor_error(acct, "error") is True, "mark error -> True")
         ok(await led.inbox_mark_cursor_error(acct, "stale") is True, "mark stale -> True")
         cur = await led.inbox_get_cursor(acct)
         ok(cur["state"] == "stale" and cur["attempts"] == 2, "marks increment attempts")
         ok(await led.inbox_advance_cursor(acct, "100") is False,
-           "advance to the SAME historyId -> False (CAS: IS DISTINCT FROM)")
+           "advance to the SAME historyId -> False (CAS: IS DISTINCT FROM, even via UPSERT)")
+        cur = await led.inbox_get_cursor(acct)
+        ok(cur["state"] == "stale" and cur["attempts"] == 2,
+           "a same-value advance changes NOTHING (state/attempts untouched)")
         ok(await led.inbox_advance_cursor(acct, "200") is True, "advance to a new historyId")
         cur = await led.inbox_get_cursor(acct)
         ok(cur["history_id"] == "200" and cur["state"] == "active" and cur["attempts"] == 0,
            "advance heals state to 'active' and resets attempts")
         ok(await led.inbox_mark_cursor_error("ia-selftest-missing", "error") is False,
-           "mark on a missing row -> False")
+           "mark on a missing row -> False (rowless first-run: correct, next tick re-backfills)")
         try:
             await led.inbox_mark_cursor_error(acct, "bogus")
             ok(False, "bad state must raise ValueError")

@@ -1084,7 +1084,8 @@ class PostgresLedger:
     # CAS discipline as the review cursor above.
     async def inbox_get_cursor(self, account_id: str) -> Optional[dict]:
         """The account's cursor row as a plain dict, or None if unseen (first run —
-        the tick then runs the bounded backfill and seeds via inbox_upsert_cursor).
+        the tick then runs the bounded backfill; the row is created by the end-of-tick
+        inbox_advance_cursor after FULL success, never eagerly).
         `fallback_since` is part of the tick's pinned shape but not persisted in v1
         (the backfill window is INBOX_BACKFILL_DAYS config, not state) — always None.
         `updated_at` is left as a datetime for staleness comparisons."""
@@ -1097,33 +1098,24 @@ class PostgresLedger:
             return None
         return {**dict(row), "fallback_since": None}
 
-    async def inbox_upsert_cursor(self, account_id: str, history_id: str) -> bool:
-        """Seed the cursor at first sight (checkpoint-before-scan: the tick records
-        getProfile's historyId BEFORE the backfill scan, so mail landing mid-scan is
-        caught by the NEXT incremental pull, never dropped). INSERT ... ON CONFLICT
-        DO NOTHING, so it only ever seeds an ABSENT cursor; returns True iff seeded."""
-        async with self._pool.acquire() as con:
-            row = await con.fetchrow(
-                """INSERT INTO inbox_cursor (account_id, history_id, state, attempts)
-                   VALUES ($1, $2, 'active', 0)
-                   ON CONFLICT (account_id) DO NOTHING
-                   RETURNING account_id""",
-                account_id, history_id)
-        return row is not None
-
     async def inbox_advance_cursor(self, account_id: str, history_id: str) -> bool:
         """Advance the cursor once the account's slice fully PROCESSED (labels +
         drafts + brief delivered) — never on pull alone, so a crash mid-run re-pulls
-        rather than drops threads (design §3.9). Guarded on the historyId actually
-        moving; also heals an 'error'/'stale' row back to 'active' (the post-404
-        backfill re-establish lands here). Returns True iff advanced."""
+        rather than drops threads (design §3.9). UPSERT: a first-run account has no
+        row until THIS verb creates it (state is written only in the end-of-tick
+        advance phase — no eager seed exists), preserving the CAS bool: True on a
+        fresh insert or a changed historyId, False when the value is already
+        current. Also heals an 'error'/'stale' row back to 'active' (the post-404
+        backfill re-establish lands here)."""
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
-                """UPDATE inbox_cursor
-                      SET history_id = $2, state = 'active', attempts = 0,
-                          updated_at = now()
-                    WHERE account_id = $1 AND history_id IS DISTINCT FROM $2
-                    RETURNING account_id""",
+                """INSERT INTO inbox_cursor (account_id, history_id)
+                   VALUES ($1, $2)
+                   ON CONFLICT (account_id) DO UPDATE
+                       SET history_id = EXCLUDED.history_id, state = 'active',
+                           attempts = 0, updated_at = now()
+                     WHERE inbox_cursor.history_id IS DISTINCT FROM EXCLUDED.history_id
+                   RETURNING account_id""",
                 account_id, history_id)
         return row is not None
 

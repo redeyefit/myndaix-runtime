@@ -1,7 +1,7 @@
 # Inbox Assistant — DESIGN.md
 
-_v0.2 · 2026-07-15 (Mack + Jefe, Remote Control session) · Status: **Oracle-reviewed —
-APPROVE-WITH-FIXES, all fixes applied.** Ready to build once the §7 open questions are answered.
+_v0.3 · 2026-07-15 (Mack + Jefe, Remote Control session) · Status: **built on this branch;
+code reviewed (KilaBz + Oracle), all approved fixes applied. §5 scopes amended in review.**
 Implements the `personal`/email surface of [[agent-orchestrator-north-star]] (rungs 1→4).
 Nothing here is built._
 
@@ -88,10 +88,13 @@ Edit/act, with **send gated** per the charter.
   + Secret** (needed to mint access tokens) *and* the refresh tokens live in the **vault** —
   never hardcoded, never in git/logs/prompts. A leak of either = full mailbox control, so the
   vault rule is load-bearing, not ceremonial.
-- **Scopes = strictly minimal:** `gmail.readonly` (read) + `gmail.labels` (organize) +
-  `gmail.compose` (create draft + send). **Drop `gmail.modify`** — it also permits trash/archive/
-  mark-read, which we never need. **Not** `https://mail.google.com/` (full delete). Read-only
-  scopes first if we stage the rollout.
+- **Scopes = strictly minimal that WORKS:** `gmail.modify` + `gmail.compose` + `drive.file`.
+  _(v0.3 amendment, review round 2026-07-15: the original "drop `gmail.modify`" plan was
+  incompatible with armed labeling — `gmail.labels` only manages label definitions; applying a
+  label to a message requires `gmail.modify`, per `users.messages.batchModify` docs. Both
+  reviewers caught it. `gmail.modify` also supersedes `gmail.readonly`, so the consent list
+  shrank. Its extra powers — trash/untrash/archive/mark-read — are banned the same way send is:
+  code contract + source-scan test.)_ **Not** `https://mail.google.com/` (full delete).
 - **Injected → nothing from email content reaches a shell or an auto-send.** Deterministic gate
   between "classify/draft" and "send."
 

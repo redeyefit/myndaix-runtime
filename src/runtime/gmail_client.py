@@ -9,6 +9,9 @@ DRAFTS-ONLY CONTRACT (v1, load-bearing): the gmail.compose scope technically per
 sending, but no sending method is invoked or referenced anywhere in this module — grep it.
 Sending is earned later, tap-approve first, per the design's autonomy ladder. Reviewers: any
 diff introducing an outbound-mail call here is a contract violation, not a feature.
+Same contract shape for gmail.modify: the scope also permits trash/untrash/archive/mark-read
+— this codebase NEVER calls them (labels are the only mutation), enforced by the same
+source-scan test as the send ban (tests/test_inbox_assistant.py).
 
 Error taxonomy the tick depends on (keep these paths distinct):
   * google.auth RefreshError -> GmailAuthError  — token revoked/expired (the password-change
@@ -40,11 +43,12 @@ __all__ = [
     "GmailAuthError", "CursorExpiredError", "ThreadSummary", "PullResult", "GmailClient",
 ]
 
-# Strictly minimal scopes (design §5): readonly + labels + compose + drive.file. NOT
-# gmail.modify (permits trash/archive/mark-read) and NOT mail.google.com (full delete).
+# Minimal WORKING scopes: gmail.modify supersedes both gmail.readonly and gmail.labels —
+# it grants read + label APPLICATION, which gmail.labels alone does not (per Google docs,
+# users.messages.batchModify requires gmail.modify). NOT mail.google.com (full delete).
+# Must stay identical to scripts/mint_gmail_refresh_token.py SCOPES (frozen at mint).
 _SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.labels",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/drive.file",
 ]
@@ -165,8 +169,11 @@ class GmailClient:
         new_history_id = str(start_history_id)
         page_token = None
         while True:
+            # historyTypes=messageAdded: our own IA/* label writes are labelAdded events —
+            # without the filter every tick's labels echo into the NEXT tick's pull.
             req = self._gmail.users().history().list(
-                userId="me", startHistoryId=start_history_id, pageToken=page_token)
+                userId="me", startHistoryId=start_history_id,
+                historyTypes=["messageAdded"], pageToken=page_token)
             try:
                 resp = self._execute(req)
             except HttpError as e:

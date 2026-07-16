@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # inbox-assistant-tick.sh — launchd entrypoint for the Inbox Assistant morning brief.
 # Runs ONE bounded tick (pull -> classify -> label/draft -> deliver), then exits (NOT a daemon).
-# OFF unless INBOX_ACCOUNTS is set in the environment (the module exits 0 when it's empty).
+# OFF unless INBOX_ACCOUNTS is set in the environment — the wrapper exits 0 BEFORE the
+# secrets/keychain gates (and the module double-checks, exiting 0 on an empty list too).
 #
 # Safe first run (classify + print the brief to stdout, touch NOTHING — no labels, no drafts,
 # no deliveries, no cursor writes):
@@ -13,6 +14,14 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 # portable across machines without a hardcoded path.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
+
+# Component-off short-circuit BEFORE the .secrets sourcing and the Keychain gate: on a
+# factory between merge and runbook execution INBOX_ACCOUNTS is unset and the keychain
+# item doesn't exist — that must be ONE quiet line and exit 0, not a daily FATAL.
+if [[ -z "${INBOX_ACCOUNTS:-}" ]]; then
+  echo "[inbox-assistant] not configured (INBOX_ACCOUNTS empty) — exiting"
+  exit 0
+fi
 
 # ~/.myndaix/.secrets provides CLAUDE_CODE_OAUTH_TOKEN for the classify subprocess
 # (`claude -p`). The set -a bracket exports everything the file defines; close it so
