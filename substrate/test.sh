@@ -446,7 +446,7 @@ cases = {
     "r8uidx": "CREATE UNIQUE INDEX u ON t(c);\n",
     "r8seq": "ALTER SEQUENCE job_id_seq RESTART WITH 1;\n",
     "r8addval": "ALTER TYPE status ADD VALUE 'archived';\n",                        # additive enum add -> PASS
-    "r8attach": "ALTER TABLE parent ATTACH PARTITION p FOR VALUES IN (1);\n",       # additive -> PASS
+    "r8attach": "CREATE TABLE parent (id int) PARTITION BY RANGE (id);\nCREATE TABLE p (id int);\nALTER TABLE parent ATTACH PARTITION p FOR VALUES FROM (1) TO (2);\n",  # both new -> additive -> PASS (r6)
     "r8cidx": "CREATE INDEX idx ON t(c);\n",                                        # non-unique index -> PASS
     "r8dollar": "INSERT INTO cfg(k,v) VALUES('h', $§$ has DROP TABLE text $§$);\n", # high-bit dollar tag -> PASS
     "r8trig": "CREATE TRIGGER t AFTER INSERT ON job EXECUTE FUNCTION f();\n",
@@ -465,7 +465,7 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r8gen.sql" >/dev/null 2>&1' "r8: SE
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r8uidx.sql" >/dev/null 2>&1' "r8: CREATE UNIQUE INDEX rejected (uniqueness tightening)"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/r8seq.sql" >/dev/null 2>&1' "r8: ALTER SEQUENCE RESTART rejected (ID reissue -> PK collision)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8addval.sql" >/dev/null 2>&1' "r8: ALTER TYPE ADD VALUE PASSES (additive enum add, not over-flagged)"
-ok 'python3 "$SUB/migration_lint.py" "$TMP/r8attach.sql" >/dev/null 2>&1' "r8: ATTACH PARTITION PASSES (additive)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r8attach.sql" >/dev/null 2>&1' "r8/r6: ATTACH PARTITION of a NEW child into a NEW parent PASSES (additive — no old code touches either)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8cidx.sql" >/dev/null 2>&1' "r8: non-unique CREATE INDEX PASSES (performance-only)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8dollar.sql" >/dev/null 2>&1' "r8 FP (fleet): a high-bit dollar tag is recognized as a string (no false positive)"
 ok 'python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r8trig.sql" >/dev/null 2>&1' "r8: --allow-routine permits a blessed CREATE TRIGGER"
@@ -769,6 +769,33 @@ ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pbspl
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x001.sql" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2: cross-file linkage (001 ATTACH) + tightening (002 DROP/UNIQUE) REJECTS (deploy-global linked)"
 ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2 control: 002 ALONE (no linkage file) PASSES — proving the deploy-global carry is what closes it"
 ok 'grep -q "deploy_linked" "$SUB/migration_lint.py" && grep -q "PARTITION\\\\s+OF" "$SUB/migration_lint.py"' "PR-1d r5: linkage guard is deploy-global (deploy_linked) and includes PARTITION OF"
+
+# PR-1d r6 fold: ATTACH PARTITION tightens on BOTH sides — a pre-existing PARENT re-routes its inserts into
+# the attached partition (its CHECK/NOT NULL/UNIQUE can reject rows the parent used to accept), and a
+# pre-existing CHILD gains the implicit partition-bound CHECK. Additive ONLY when parent AND child are both
+# new this deploy. (kilabz found the parent side; the child side is the same class, closed together.)
+printf 'events\nexisting_child\n' > "$TMP/prevat.txt"    # events + existing_child pre-exist
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # parent-side (kilabz r6): a NEW constrained child attached to a PRE-EXISTING parent -> REJECT
+    "d_atpar":  "CREATE TABLE events_us (region text, amount integer, CONSTRAINT ck CHECK (amount > 0));\nALTER TABLE events ATTACH PARTITION events_us FOR VALUES IN ('US');\n",
+    # parent-side, bare new child, still a PRE-EXISTING parent -> REJECT fail-closed (both-new rule)
+    "d_atparb": "CREATE TABLE events_us (region text, amount integer);\nALTER TABLE events ATTACH PARTITION events_us FOR VALUES IN ('US');\n",
+    # child-side: a PRE-EXISTING child attached to a NEW parent -> the child gains a partition bound -> REJECT
+    "d_atchild": "CREATE TABLE p (id int) PARTITION BY RANGE (id);\nALTER TABLE p ATTACH PARTITION existing_child FOR VALUES FROM (1) TO (100);\n",
+    # both new (even a constrained child) -> PASS (no old code touches either relation)
+    "d_atboth":  "CREATE TABLE p (region text, amount integer) PARTITION BY LIST (region);\nCREATE TABLE p_us (region text, amount integer, CONSTRAINT ck CHECK (amount > 0));\nALTER TABLE p ATTACH PARTITION p_us FOR VALUES IN ('US');\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atpar.sql" >/dev/null 2>&1' "PR-1d r6: constrained partition ATTACHed to a PRE-EXISTING parent REJECTS (partition-local CHECK tightens routed parent inserts)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atparb.sql" >/dev/null 2>&1' "PR-1d r6: ATTACH to a PRE-EXISTING parent REJECTS fail-closed (both parent and child must be new)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atchild.sql" >/dev/null 2>&1' "PR-1d r6: ATTACH a PRE-EXISTING child to a new parent REJECTS (child gains the partition-bound CHECK)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevat.txt" "$TMP/d_atboth.sql" >/dev/null 2>&1' "PR-1d r6: ATTACH where parent AND child are both new PASSES (no old code touches either)"
+ok '! grep -q "ATTACH..s.PARTITION..b., c" "$SUB/migration_lint.py"' "PR-1d r6: _additive_alter_table_clause no longer unconditionally blesses an ATTACH clause"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

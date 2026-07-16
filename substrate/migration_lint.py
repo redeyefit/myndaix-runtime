@@ -17,8 +17,9 @@ TWO layers:
    string/comment/quoted-ident is never mis-acted-upon, and a quoted name can't smuggle a keyword.
 
 2. An ALLOWLIST (`_is_additive`) is the gate: a statement passes ONLY if it matches a provably-additive
-   shape (CREATE a brand-new object; ALTER TABLE whose every clause is ADD COLUMN / ATTACH PARTITION /
-   INHERIT; ALTER TYPE ADD VALUE|ATTRIBUTE; COMMENT; INSERT). EVERYTHING ELSE is rejected fail-closed. The
+   shape (CREATE a brand-new object; ALTER TABLE whose every clause is ADD COLUMN / INHERIT — plus ATTACH
+   PARTITION only when both parent and attached child are new this deploy; ALTER TYPE ADD VALUE|ATTRIBUTE;
+   COMMENT; INSERT). EVERYTHING ELSE is rejected fail-closed. The
    earlier DENYLIST ("reject known-bad DDL") was fail-OPEN by default and could not converge — Postgres's
    non-additive surface is large and grows every release, so each review round found one more un-rejected
    contraction. For a gate protecting an autonomous factory a false-NEGATIVE (a hidden contraction) is far
@@ -381,8 +382,10 @@ _DBLINK_RE = re.compile(r"\bdblink", re.IGNORECASE)
 
 def _additive_alter_table_clause(c: str) -> bool:
     # An ALTER TABLE is additive only if EVERY top-level clause is: ADD COLUMN (nullable-or-defaulted, no
-    # inline tightening constraint), ATTACH PARTITION, or INHERIT. Anything else (DROP/ALTER/RENAME/SET/
-    # ENABLE/DISABLE/OWNER/DETACH/NO INHERIT/VALIDATE/…) makes the statement non-additive.
+    # inline tightening constraint), INHERIT, or SET DEFAULT <non-null>. Anything else (DROP/ALTER/RENAME/SET
+    # NOT NULL/ENABLE/DISABLE/OWNER/DETACH/NO INHERIT/VALIDATE/…) makes the statement non-additive. ATTACH
+    # PARTITION is NOT here — it re-routes/bounds a possibly-PRE-EXISTING relation and is gated separately at
+    # the statement level in _is_additive (both parent and child must be new this deploy — r6).
     c = c.strip()
     if re.match(r"^ADD\s+COLUMN\b", c, re.IGNORECASE):
         # inline PRIMARY KEY/UNIQUE/CHECK/REFERENCES on the new column tightens writes old code still does
@@ -395,9 +398,11 @@ def _additive_alter_table_clause(c: str) -> bool:
            and (not _DEFAULT_RE.search(c) or _NULL_DEFAULT_RE.search(c)):
             return False
         return True
-    if re.match(r"^ATTACH\s+PARTITION\b", c, re.IGNORECASE):
-        return True
     if re.match(r"^INHERIT\b", c, re.IGNORECASE):   # NOT "NO INHERIT" (that clause starts with NO)
+        # Old-style inheritance does NOT route the parent's inserts to the child and does NOT impose a bound
+        # on the child (PG requires the child to already satisfy the parent's constraints), so — unlike ATTACH
+        # PARTITION — the INHERIT clause itself never tightens either relation. A later recursing op on the
+        # parent is still caught by the file/deploy `linked` flag (r4).
         return True
     # SET DEFAULT <non-null value> is additive: old INSERTs that omit the column now get the value instead
     # of erroring; a code-revert keeps the default (harmless). SET DEFAULT NULL / CAST(NULL) is the
@@ -519,6 +524,19 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
         m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(*]+)\s*\*?\s+", s, re.IGNORECASE)
         if not m:
             return False
+        rest = s[m.end():]
+        # ATTACH PARTITION tightens on BOTH sides unless BOTH relations are born this deploy (cross-family
+        # PR-1d r6): a PRE-EXISTING PARENT re-routes its inserts into the attached partition, whose own
+        # CHECK / NOT NULL / UNIQUE can reject rows the parent used to accept (kilabz r6); and a PRE-EXISTING
+        # CHILD gains the implicit partition-bound CHECK, so its own direct inserts that used to succeed now
+        # fail. Additive ONLY when the parent AND the attached child are both new this deploy (no old code
+        # touches either). Handled at statement level — ATTACH is never comma-combined with another action —
+        # so it never reaches the clause loop (which no longer blesses ATTACH). Fail-closed: an unresolvable
+        # (quoted) name is not provably new, so it rejects.
+        am = re.match(r"^ATTACH\s+PARTITION\s+([^\s(*]+)", rest, re.IGNORECASE)
+        if am:
+            return (_new_this_deploy(m.group(1), created, prev_objects)
+                    and _new_this_deploy(am.group(1), created, prev_objects))
         # Any op on a table born this deploy is additive — old code has never referenced it. BUT an ALTER
         # TABLE without ONLY RECURSES to descendants, so if the migration linked a PRE-EXISTING descendant
         # (INHERIT / ATTACH, `linked`), an op on a "new" parent could hit that pre-existing table (r4). When
@@ -526,7 +544,7 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
         # DROP/RENAME/ADD CONSTRAINT/tighten reject.
         if not linked and _new_this_deploy(m.group(1), created, prev_objects):
             return True
-        return all(_additive_alter_table_clause(c) for c in _top_level_clauses(s[m.end():]))
+        return all(_additive_alter_table_clause(c) for c in _top_level_clauses(rest))
     if re.match(r"^ALTER\s+TYPE\b", s, re.IGNORECASE):     # enum ADD VALUE / composite ADD ATTRIBUTE only
         m = re.match(r"^ALTER\s+TYPE\s+(?:IF\s+EXISTS\s+)?\S+\s+", s, re.IGNORECASE)
         if not m:
@@ -564,8 +582,9 @@ def _reject_reason(stmt: str, allow_routine: bool = False) -> str:
         if hit:
             return why
     return ("not a provably-additive statement (allowlist gate, fail-closed): only CREATE-of-a-new-object, "
-            "CREATE OR REPLACE VIEW, ALTER TABLE ADD COLUMN / ATTACH PARTITION / INHERIT, ALTER TYPE ADD "
-            "VALUE|ATTRIBUTE, COMMENT, and INSERT/UPDATE/SELECT data-DML auto-pass; else needs "
+            "CREATE OR REPLACE VIEW, ALTER TABLE ADD COLUMN / INHERIT (ATTACH PARTITION only when both "
+            "parent and child are new this deploy), ALTER TYPE ADD VALUE|ATTRIBUTE, COMMENT, and "
+            "INSERT/UPDATE/SELECT data-DML auto-pass; else needs "
             "RECONCILE_ALLOW_CONTRACTION (or --allow-routine for a blessed function/trigger)")
 
 
