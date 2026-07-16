@@ -39,7 +39,19 @@ additive from its text alone and needs RECONCILE_ALLOW_CONTRACTION (the repo's o
 such — they are safe in practice but unprovable). FOLLOW-UP (PR-1d): pass reconcile the set of objects that
 existed in prev_good so "new THIS DEPLOY vs pre-existing" is decidable and these pass without an escape.
 Other residuals: plain INSERT / a LOCKING SELECT ... FOR UPDATE / UPDATE are treated additive (schema-
-neutral); UPDATE-vs-a-destructive-function and a DDL function in a locked SELECT are out of scope.
+neutral).
+
+FUNDAMENTAL CEILING (by design, not an unclosed hole): a static text lint CANNOT evaluate SQL
+EXPRESSIONS — it can't tell that a `DEFAULT coalesce(NULL,NULL)` evaluates to null, or that a
+pre-existing function called from an allowed INSERT/UPDATE runs DDL. This gate catches the STRUCTURAL
+contractions (drop/rename/retype/tighten), the KNOWN dynamic-execution mechanisms (DO/EXECUTE/CALL,
+CREATE FUNCTION/RULE/TRIGGER, dblink), and the OBVIOUS accidental forms (NOT NULL DEFAULT NULL, SET
+DEFAULT CAST(NULL...)). A semantically-null default expression or a DDL-capable PRE-EXISTING function
+invoked from DML is beyond static analysis — out of scope, backstopped by RECONCILE_ALLOW_CONTRACTION and,
+for a *malicious* author (who could also just push bad code), by the AUTHOR_ALLOWLIST + code review, which
+are the real security boundary. The lint's job is to stop ACCIDENTAL and KNOWN-MECHANISM non-additive
+migrations from auto-deploying, fail-closed — not to be a complete additivity proof, which is impossible
+from text alone.
 
 reconcile lints only the migrations ADDED-OR-MODIFIED in a deploy (the prev_good..HEAD delta,
 --diff-filter=AMR), NOT the full history — historical migrations that already ran may contain
@@ -306,6 +318,15 @@ _ADDITIVE_CREATE_RE = re.compile(
     r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*"
     r"(?:TABLE|SEQUENCE|SCHEMA|VIEW|MATERIALIZED\s+VIEW|EXTENSION|DOMAIN|TYPE|COLLATION|STATISTICS|INDEX)\b",
     re.IGNORECASE)
+# A DEFAULT that evaluates to NULL doesn't satisfy a NOT NULL column for an old omitted-column INSERT — the
+# obvious/accidental forms `DEFAULT NULL`, `DEFAULT (NULL)`, `DEFAULT CAST(NULL AS t)` (cross-family r11).
+# A semantically-null expression (`DEFAULT coalesce(null,null)`) is beyond a static lint — see the ceiling
+# note in the module docstring.
+_NULL_DEFAULT_RE = re.compile(r"\bDEFAULT\s+(?:CAST\s*\(\s*)?\(?\s*NULL\b", re.IGNORECASE)
+# dblink is Postgres's built-in mechanism to run DDL from a DML/SELECT expression (dblink_exec('…',
+# 'ALTER TABLE … DROP COLUMN …')). Reject ANY reference to it outright — it defeats the allowlist by
+# smuggling a contraction into an otherwise-additive INSERT/UPDATE/RETURNING/locked-SELECT (r11).
+_DBLINK_RE = re.compile(r"\bdblink", re.IGNORECASE)
 
 
 def _additive_alter_table_clause(c: str) -> bool:
@@ -318,8 +339,10 @@ def _additive_alter_table_clause(c: str) -> bool:
         # (a PK/UNIQUE the old omitted-column INSERT violates; a CHECK it can't satisfy) — cross-family r9 HIGH-2.
         if re.search(r"\b(PRIMARY\s+KEY|UNIQUE|CHECK|REFERENCES)\b", c, re.IGNORECASE):
             return False
-        # NOT NULL without a DEFAULT breaks old INSERTs; a GENERATED column supplies its own value (r5 FP-6).
-        if _NOT_NULL_RE.search(c) and not _DEFAULT_RE.search(c) and not _GENERATED_RE.search(c):
+        # NOT NULL needs a NON-NULL default (else an old omitted-column INSERT fails). Reject both no-default
+        # and a DEFAULT that is (obviously) NULL (r11). A GENERATED column supplies its own value (r5 FP-6).
+        if _NOT_NULL_RE.search(c) and not _GENERATED_RE.search(c) \
+           and (not _DEFAULT_RE.search(c) or _NULL_DEFAULT_RE.search(c)):
             return False
         return True
     if re.match(r"^ATTACH\s+PARTITION\b", c, re.IGNORECASE):
@@ -327,9 +350,9 @@ def _additive_alter_table_clause(c: str) -> bool:
     if re.match(r"^INHERIT\b", c, re.IGNORECASE):   # NOT "NO INHERIT" (that clause starts with NO)
         return True
     # SET DEFAULT <non-null value> is additive: old INSERTs that omit the column now get the value instead
-    # of erroring; a code-revert keeps the default (harmless). SET DEFAULT NULL is the contraction (a NOT
-    # NULL column loses its effective default) and is NOT allowed here.
-    if re.search(r"\bSET\s+DEFAULT\b", c, re.IGNORECASE) and not re.search(r"\bSET\s+DEFAULT\s+\(?\s*NULL\b", c, re.IGNORECASE):
+    # of erroring; a code-revert keeps the default (harmless). SET DEFAULT NULL / CAST(NULL) is the
+    # contraction (a NOT NULL column loses its effective default) and is NOT allowed here.
+    if re.search(r"\bSET\s+DEFAULT\b", c, re.IGNORECASE) and not _NULL_DEFAULT_RE.search(c):
         return True
     return False
 
@@ -355,6 +378,11 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
     s = stmt.strip()
     if not s:
         return True
+    # dblink can run DDL from a DML/SELECT expression — a hard reject anywhere, even under --allow-routine
+    # (cross-family r11: it smuggled `dblink_exec('…ALTER TABLE…DROP COLUMN…')` through an INSERT RETURNING
+    # and a locked SELECT).
+    if _DBLINK_RE.search(s):
+        return False
     # Operator-blessed routine/behavioral object (RECONCILE_ALLOW_ROUTINE): a CREATE/DROP of a
     # function/procedure/rule/trigger the operator vouched for. Still NARROW — a DROP TABLE alongside is a
     # separate statement and is judged on its own (not additive), so the file still fails.
@@ -389,13 +417,17 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
     # code still runs). Real idempotent backfills use INSERT ... ON CONFLICT, UPDATE, and SELECT ... FOR
     # UPDATE. TRUNCATE and DELETE (bulk row destruction that strands old code) are NOT allowed.
     if re.match(r"^(?:INSERT\s+INTO|UPDATE)\b", s, re.IGNORECASE):
-        return True
+        # a RETURNING clause is an executable-expression injection point (RETURNING <func-that-runs-DDL>);
+        # migrations don't need it, so reject fail-closed (cross-family r11).
+        return not re.search(r"\bRETURNING\b", s, re.IGNORECASE)
     if re.match(r"^SELECT\b", s, re.IGNORECASE):
         # Only a LOCKING select (FOR UPDATE/SHARE) is an accepted migration use — the lock-ordering guard
-        # real idempotent backfills need. A bare or function-call SELECT (even with FROM) could invoke a
-        # DDL-capable function like dblink_exec('...ALTER TABLE...DROP COLUMN...') (cross-family r10 HIGH),
-        # so require the row-lock clause and reject the rest fail-closed.
-        return bool(re.search(r"\bFOR\s+(?:UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b", s, re.IGNORECASE))
+        # real idempotent backfills need. Additionally the select-list (before FROM) must be plain column
+        # refs / * : a `(` signals a function call that could run DDL even under a row lock (cross-family
+        # r11: `SELECT dblink_exec(...) FROM t FOR UPDATE`). dblink itself is already hard-rejected above.
+        if not re.search(r"\bFOR\s+(?:UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b", s, re.IGNORECASE):
+            return False
+        return "(" not in re.split(r"\bFROM\b", s, maxsplit=1, flags=re.IGNORECASE)[0]
     return False                                           # fail-closed: unrecognized => not provably additive
 
 

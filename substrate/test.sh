@@ -540,6 +540,34 @@ ok 'python3 "$SUB/migration_lint.py" "$TMP/r10uncond.sql" >/dev/null 2>&1' "r10:
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r10newview.sql" >/dev/null 2>&1' "r10: a plain new CREATE VIEW still PASSES (additive)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r10lock.sql" >/dev/null 2>&1' "r10: a locking SELECT ... FOR UPDATE still PASSES (accepted migration use)"
 
+echo "== PR-1c cross-family r11: expression-injection (dblink DDL-via-DML, NULL default) =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "r11ret": "INSERT INTO rc(id,active) VALUES ('x',0) ON CONFLICT (id) DO UPDATE SET active=rc.active RETURNING dblink_exec('db','ALTER TABLE job DROP COLUMN body');\n",
+    "r11sel": "SELECT dblink_exec('db','ALTER TABLE job DROP COLUMN body') FROM rc WHERE id='x' FOR UPDATE;\n",
+    "r11ext": "CREATE EXTENSION IF NOT EXISTS dblink;\n",
+    "r11nn": "ALTER TABLE users ADD COLUMN age INT NOT NULL DEFAULT NULL;\n",
+    "r11cast": "ALTER TABLE users ALTER COLUMN age SET DEFAULT CAST(NULL AS int);\n",
+    "r11nncast": "ALTER TABLE users ADD COLUMN age INT NOT NULL DEFAULT CAST(NULL AS int);\n",
+    "r11okdef": "ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT 0;\n",           # non-null default -> PASS
+    "r11oklock": "SELECT repo_id FROM repo_concurrency ORDER BY repo_id FOR UPDATE;\n",  # 0002 lock -> PASS
+    "r11okins": "INSERT INTO rc(id,active) SELECT r, count(*) FROM t GROUP BY r ON CONFLICT (id) DO UPDATE SET active=EXCLUDED.active;\n",  # 0002 backfill -> PASS
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r11ret.sql" >/dev/null 2>&1' "r11 HIGH: dblink_exec via INSERT ... RETURNING rejected (dblink hard-rejected + RETURNING rejected)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r11sel.sql" >/dev/null 2>&1' "r11 HIGH: dblink_exec via a locking SELECT rejected (dblink + function in select-list)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r11ext.sql" >/dev/null 2>&1' "r11: CREATE EXTENSION dblink rejected (the DDL-from-DML mechanism)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r11nn.sql" >/dev/null 2>&1' "r11 HIGH: ADD COLUMN NOT NULL DEFAULT NULL rejected (default evaluates to null)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r11cast.sql" >/dev/null 2>&1' "r11: SET DEFAULT CAST(NULL AS int) rejected (NULL-default variant)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r11nncast.sql" >/dev/null 2>&1' "r11: ADD COLUMN NOT NULL DEFAULT CAST(NULL...) rejected"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r11okdef.sql" >/dev/null 2>&1' "r11: ADD COLUMN NOT NULL DEFAULT <non-null> still PASSES"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r11oklock.sql" >/dev/null 2>&1' "r11: 0002's locking SELECT (plain column list) still PASSES"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r11okins.sql" >/dev/null 2>&1' "r11: 0002's INSERT ... SELECT count(*) backfill still PASSES (function in INSERT-SELECT is fine)"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys
