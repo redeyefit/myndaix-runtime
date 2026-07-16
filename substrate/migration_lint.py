@@ -465,9 +465,10 @@ def _new_this_deploy(name: str, created: frozenset[str], prev_objects: "frozense
 def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str] = frozenset(),
                  prev_objects: "frozenset[str] | None" = None, linked: bool = False) -> bool:
     """True iff `stmt` (already _normalize'd) is a provably-additive migration statement — the allowlist.
-    linked: the file contains an INHERIT / ATTACH PARTITION, so a "new" table may have gained a PRE-EXISTING
-    descendant/partition — a recursing ALTER TABLE or a UNIQUE INDEX on it could then hit that pre-existing
-    relation, so the new-this-deploy shortcuts are disabled and everything clause-checks (cross-family PR-1d r4)."""
+    linked: the DEPLOY contains an INHERIT / ATTACH PARTITION / PARTITION OF (any delta file), so a "new"
+    table may share rows/routing with a PRE-EXISTING relation — a recursing ALTER TABLE or a UNIQUE INDEX on
+    it could then hit that pre-existing relation, so the new-this-deploy shortcuts are disabled and everything
+    clause-checks (cross-family PR-1d r4/r5)."""
     s = stmt.strip()
     if not s:
         return True
@@ -499,6 +500,17 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
             # would be tightened; conservative file-level guard, r4).
             tgt = _target_after_on(s)
             return tgt is not None and not linked and _new_this_deploy(tgt, created, prev_objects)
+        # A CREATE TABLE ... PARTITION OF <parent> that carries its own ( column/constraint list ) can TIGHTEN
+        # the PRE-EXISTING parent: Postgres routes the parent's inserts into the new partition, where a
+        # partition-local CHECK / NOT NULL / UNIQUE rejects rows the parent used to accept (via its DEFAULT
+        # partition, or as a widening) — a contraction old code hits after a revert (cross-family PR-1d r5,
+        # BLOCKER 1 Path A). A BARE partition (no `( ... )` before FOR VALUES / DEFAULT — e.g. a time-series
+        # roll `PARTITION OF events FOR VALUES ...`) stays additive; so does a partition of a table BORN this
+        # deploy (no old code depends on it). Fail-closed: a constrained partition of a not-provably-new parent
+        # is rejected. (INHERITS is NOT here — its child-local constraints never route the parent's inserts.)
+        pm = re.search(r"\bPARTITION\s+OF\s+([^\s(*]+)\s*\(", s, re.IGNORECASE)
+        if pm and not _new_this_deploy(pm.group(1), created, prev_objects):
+            return False
         return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
     if re.match(r"^ALTER\s+TABLE\b", s, re.IGNORECASE):
         # `([^\s(*]+)\*?` — exclude the inheritance wildcard from the NAME and consume it separately:
@@ -557,8 +569,20 @@ def _reject_reason(stmt: str, allow_routine: bool = False) -> str:
             "RECONCILE_ALLOW_CONTRACTION (or --allow-routine for a blessed function/trigger)")
 
 
+# A descendant/partition LINK ties a "new" table to a PRE-EXISTING relation, so an op on the "new" side can
+# recurse/route to the pre-existing side and the new-this-deploy shortcuts become unsafe:
+#   ATTACH PARTITION / INHERIT (ALTER) — the new PARENT gains a pre-existing partition/child; a recursing
+#     ALTER TABLE or a UNIQUE INDEX on the "new" parent then hits the pre-existing relation (r4).
+#   PARTITION OF (CREATE) — the new partition catches the pre-existing parent's routed inserts; a later
+#     ALTER/UNIQUE INDEX on that partition tightens what the parent accepts (r5 BLOCKER 1 Path B).
+# NOT `\bINHERITS\b`: `CREATE TABLE c INHERITS (parent)` makes the NEW table a child; PostgreSQL inheritance
+# recurses DOWNWARD only, so the child's constraints never affect the pre-existing parent's writes (r5, both
+# reviewers agree). `\bINHERIT\b`'s word boundary already excludes the trailing-S `INHERITS`.
+_LINK_RE = re.compile(r"\bATTACH\s+PARTITION\b|\bINHERIT\b|\bPARTITION\s+OF\b", re.IGNORECASE)
+
+
 def lint_file(path: Path, allow_routine: bool = False,
-              prev_objects: "frozenset[str] | None" = None) -> list[str]:
+              prev_objects: "frozenset[str] | None" = None, deploy_linked: bool = False) -> list[str]:
     # ALLOWLIST gate: reject any statement that is not provably additive (fail-closed). allow_routine
     # (operator-gated via RECONCILE_ALLOW_ROUTINE) additionally blesses a routine/behavioral CREATE/DROP —
     # narrow: a DROP TABLE alongside is its own statement and still fails (r5 FP-7). prev_objects (PR-1d,
@@ -574,10 +598,13 @@ def lint_file(path: Path, allow_routine: bool = False,
         return [f"{path.name}: NON-ADDITIVE — references dblink (runs DDL from a DML/SELECT expression); "
                 "not additive — set RECONCILE_ALLOW_CONTRACTION=1 for a blessed one"]
     norm = _normalize(raw)
-    # File-level: does the migration create a descendant/partition LINK (INHERIT / ATTACH PARTITION)? If so a
-    # "new" table may have gained a PRE-EXISTING descendant, so a recursing ALTER TABLE or a UNIQUE INDEX on
-    # it can't be blessed as new-only (r4). Conservative — any such link disables the new-this-deploy shortcuts.
-    linked = bool(re.search(r"\bATTACH\s+PARTITION\b|\bINHERIT\b", norm, re.IGNORECASE))
+    # Does the migration create a descendant/partition LINK (INHERIT / ATTACH PARTITION / PARTITION OF)? If so
+    # a "new" table shares rows/routing with a PRE-EXISTING relation, so a recursing ALTER TABLE or a UNIQUE
+    # INDEX on it can't be blessed as new-only (r4/r5). `deploy_linked` carries this DEPLOY-wide: the linkage
+    # and a later tightening can live in DIFFERENT files, and prev_objects is deploy-global, so a per-file
+    # `linked` alone would miss the cross-file split (r5 BLOCKER 2). Conservative — any such link disables the
+    # new-this-deploy shortcuts for the whole deploy.
+    linked = deploy_linked or bool(_LINK_RE.search(norm))
     out: list[str] = []
     created: set[str] = set()   # tables UNCONDITIONALLY created in a PRECEDING statement (order-aware, r10)
     for stmt in (s.strip() for s in norm.split(";")):
@@ -623,10 +650,25 @@ def main(argv: list[str]) -> int:
             files.extend(sorted(p.glob("*.sql")))
         elif p.suffix == ".sql":
             files.append(p)
+    # Cross-file linkage pre-pass (PR-1d r5 BLOCKER 2): the `linked` guard must be DEPLOY-global. A migration
+    # can create+link a parent in one file and tighten it in another; prev_objects is deploy-global but the
+    # linkage keyword lives only in the first file, so a per-file `linked` would read the second file as clean
+    # and let a recursing DROP / UNIQUE INDEX through. If ANY delta file links, every file clause-checks.
+    # (No current runtime migration partitions/inherits, so this only bites future ones — fail-closed,
+    # escapable via RECONCILE_ALLOW_CONTRACTION.)
+    deploy_linked = False
+    for sql in files:
+        try:
+            if _LINK_RE.search(_normalize(sql.read_text())):
+                deploy_linked = True
+                break
+        except OSError:
+            pass   # the lint loop below reports the read error and exits 2
     violations: list[str] = []
     for sql in files:
         try:
-            violations.extend(lint_file(sql, allow_routine=allow_routine, prev_objects=prev_objects))
+            violations.extend(lint_file(sql, allow_routine=allow_routine,
+                                        prev_objects=prev_objects, deploy_linked=deploy_linked))
         except OSError as e:
             sys.stderr.write(f"migration_lint: cannot read {sql}: {e}\n")
             return 2

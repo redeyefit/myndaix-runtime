@@ -736,6 +736,40 @@ ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_partu
 ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_newfull.sql" >/dev/null 2>&1' "PR-1d r4: a genuinely-new table (no INHERIT/ATTACH) + UNIQUE INDEX + ADD CONSTRAINT PK still PASSES"
 ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhadd.sql" >/dev/null 2>&1' "PR-1d r4: ADD COLUMN on a new INHERIT-parent still PASSES (additive even when recursed to the child)"
 
+# PR-1d r5 fold: PARTITION OF is a linkage too (a new partition catches the pre-existing parent's routed
+# inserts), and the linkage guard must be DEPLOY-global (linkage in file N, tightening in file N+1).
+printf 'events\njob\n' > "$TMP/prevp.txt"          # events + job pre-exist
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # Path A: a CONSTRAINED partition of a PRE-EXISTING parent tightens the parent's routed inserts -> REJECT
+    "d_paconstr": "CREATE TABLE events_us PARTITION OF events (CONSTRAINT ck CHECK (amount > 0)) FOR VALUES IN ('US');\n",
+    "d_padefck":  "CREATE TABLE events_def PARTITION OF events (CHECK (amount > 0)) DEFAULT;\n",
+    # Path A safe forms: BARE partition of pre-existing (time-series roll), + constrained partition of a NEW parent
+    "d_pabare":   "CREATE TABLE events_us PARTITION OF events FOR VALUES IN ('US');\n",
+    "d_panew":    "CREATE TABLE ev (region text, amount int) PARTITION BY LIST (region);\nCREATE TABLE ev_us PARTITION OF ev (CONSTRAINT ck CHECK (amount > 0)) FOR VALUES IN ('US');\n",
+    # Path B: split-form partition tightening in ONE file -> REJECT (PARTITION OF now sets `linked`)
+    "d_pbsplit":  "CREATE TABLE events_us PARTITION OF events FOR VALUES IN ('US');\nALTER TABLE events_us ADD CONSTRAINT ck CHECK (amount > 0);\nCREATE UNIQUE INDEX uq ON events_us (email);\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+# BLOCKER 2 cross-file: linkage in 001, tightening in 002 (deploy-global `linked`)
+open(os.path.join(d, "d_x001.sql"), "w", encoding="utf-8").write(
+    "CREATE TABLE new_parent (id int) PARTITION BY RANGE (id);\nALTER TABLE new_parent ATTACH PARTITION pre_existing FOR VALUES FROM (1) TO (100);\n")
+open(os.path.join(d, "d_x002.sql"), "w", encoding="utf-8").write(
+    "CREATE UNIQUE INDEX u ON new_parent (id);\nALTER TABLE new_parent DROP COLUMN context;\n")
+PYEOF
+printf 'pre_existing\n' > "$TMP/prevx.txt"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_paconstr.sql" >/dev/null 2>&1' "PR-1d r5: constrained PARTITION OF a pre-existing parent REJECTS (partition-local CHECK tightens routed parent inserts)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_padefck.sql" >/dev/null 2>&1' "PR-1d r5: constrained DEFAULT partition of a pre-existing parent REJECTS"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pabare.sql" >/dev/null 2>&1' "PR-1d r5: BARE partition of a pre-existing parent PASSES (time-series roll is additive)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_panew.sql" >/dev/null 2>&1' "PR-1d r5: constrained partition of a NEW parent (same deploy) PASSES (no old code depends on it)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pbsplit.sql" >/dev/null 2>&1' "PR-1d r5: split-form ADD CONSTRAINT / UNIQUE INDEX on a partition of a pre-existing parent REJECTS (PARTITION OF sets linked)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x001.sql" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2: cross-file linkage (001 ATTACH) + tightening (002 DROP/UNIQUE) REJECTS (deploy-global linked)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2 control: 002 ALONE (no linkage file) PASSES — proving the deploy-global carry is what closes it"
+ok 'grep -q "deploy_linked" "$SUB/migration_lint.py" && grep -q "PARTITION\\\\s+OF" "$SUB/migration_lint.py"' "PR-1d r5: linkage guard is deploy-global (deploy_linked) and includes PARTITION OF"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys
