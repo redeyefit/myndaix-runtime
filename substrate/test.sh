@@ -746,8 +746,10 @@ cases = {
     # Path A: a CONSTRAINED partition of a PRE-EXISTING parent tightens the parent's routed inserts -> REJECT
     "d_paconstr": "CREATE TABLE events_us PARTITION OF events (CONSTRAINT ck CHECK (amount > 0)) FOR VALUES IN ('US');\n",
     "d_padefck":  "CREATE TABLE events_def PARTITION OF events (CHECK (amount > 0)) DEFAULT;\n",
-    # Path A safe forms: BARE partition of pre-existing (time-series roll), + constrained partition of a NEW parent
+    # r7: a BARE partition of a PRE-EXISTING parent also tightens (shrinks a pre-existing DEFAULT partition's
+    # implicit bound), so it REJECTS too; a partition (bare or constrained) of a NEW parent still PASSES.
     "d_pabare":   "CREATE TABLE events_us PARTITION OF events FOR VALUES IN ('US');\n",
+    "d_pabarenew": "CREATE TABLE ev0 (region text) PARTITION BY LIST (region);\nCREATE TABLE ev0_us PARTITION OF ev0 FOR VALUES IN ('US');\n",
     "d_panew":    "CREATE TABLE ev (region text, amount int) PARTITION BY LIST (region);\nCREATE TABLE ev_us PARTITION OF ev (CONSTRAINT ck CHECK (amount > 0)) FOR VALUES IN ('US');\n",
     # Path B: split-form partition tightening in ONE file -> REJECT (PARTITION OF now sets `linked`)
     "d_pbsplit":  "CREATE TABLE events_us PARTITION OF events FOR VALUES IN ('US');\nALTER TABLE events_us ADD CONSTRAINT ck CHECK (amount > 0);\nCREATE UNIQUE INDEX uq ON events_us (email);\n",
@@ -763,7 +765,8 @@ PYEOF
 printf 'pre_existing\n' > "$TMP/prevx.txt"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_paconstr.sql" >/dev/null 2>&1' "PR-1d r5: constrained PARTITION OF a pre-existing parent REJECTS (partition-local CHECK tightens routed parent inserts)"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_padefck.sql" >/dev/null 2>&1' "PR-1d r5: constrained DEFAULT partition of a pre-existing parent REJECTS"
-ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pabare.sql" >/dev/null 2>&1' "PR-1d r5: BARE partition of a pre-existing parent PASSES (time-series roll is additive)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pabare.sql" >/dev/null 2>&1' "PR-1d r7: BARE partition of a PRE-EXISTING parent REJECTS (shrinks a pre-existing DEFAULT partition'\''s implicit bound — fail-closed)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pabarenew.sql" >/dev/null 2>&1' "PR-1d r7: BARE partition of a NEW parent (same deploy) PASSES (no old code touches it)"
 ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_panew.sql" >/dev/null 2>&1' "PR-1d r5: constrained partition of a NEW parent (same deploy) PASSES (no old code depends on it)"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevp.txt" "$TMP/d_pbsplit.sql" >/dev/null 2>&1' "PR-1d r5: split-form ADD CONSTRAINT / UNIQUE INDEX on a partition of a pre-existing parent REJECTS (PARTITION OF sets linked)"
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevx.txt" "$TMP/d_x001.sql" "$TMP/d_x002.sql" >/dev/null 2>&1' "PR-1d r5 BLOCKER 2: cross-file linkage (001 ATTACH) + tightening (002 DROP/UNIQUE) REJECTS (deploy-global linked)"

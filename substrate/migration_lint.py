@@ -505,15 +505,18 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
             # would be tightened; conservative file-level guard, r4).
             tgt = _target_after_on(s)
             return tgt is not None and not linked and _new_this_deploy(tgt, created, prev_objects)
-        # A CREATE TABLE ... PARTITION OF <parent> that carries its own ( column/constraint list ) can TIGHTEN
-        # the PRE-EXISTING parent: Postgres routes the parent's inserts into the new partition, where a
-        # partition-local CHECK / NOT NULL / UNIQUE rejects rows the parent used to accept (via its DEFAULT
-        # partition, or as a widening) — a contraction old code hits after a revert (cross-family PR-1d r5,
-        # BLOCKER 1 Path A). A BARE partition (no `( ... )` before FOR VALUES / DEFAULT — e.g. a time-series
-        # roll `PARTITION OF events FOR VALUES ...`) stays additive; so does a partition of a table BORN this
-        # deploy (no old code depends on it). Fail-closed: a constrained partition of a not-provably-new parent
-        # is rejected. (INHERITS is NOT here — its child-local constraints never route the parent's inserts.)
-        pm = re.search(r"\bPARTITION\s+OF\s+([^\s(*]+)\s*\(", s, re.IGNORECASE)
+        # A CREATE TABLE ... PARTITION OF <parent> is additive ONLY when <parent> is born this deploy. Adding
+        # ANY partition to a PRE-EXISTING partitioned parent tightens a pre-existing relation — even a BARE
+        # partition with no extra constraints (cross-family PR-1d r5+r7):
+        #   (a) a partition-local CHECK / NOT NULL / UNIQUE rejects rows the parent routes to it (r5); AND
+        #   (b) even bare, the new partition claims values that a pre-existing DEFAULT partition used to hold,
+        #       so an old DIRECT insert into that default partition for the newly-claimed values now fails —
+        #       the same child-side tightening class r6 closed for ATTACH, via CREATE TABLE this time (r7).
+        # The linter can't see whether the pre-existing parent has a DEFAULT partition, so fail-closed: reject
+        # any PARTITION OF a not-provably-new parent. A partition of a table BORN this deploy passes (no old
+        # code touches it). (INHERITS is NOT here — old-style inheritance neither routes the parent's inserts
+        # nor bounds the child.)
+        pm = re.search(r"\bPARTITION\s+OF\s+([^\s(*]+)", s, re.IGNORECASE)
         if pm and not _new_this_deploy(pm.group(1), created, prev_objects):
             return False
         return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
