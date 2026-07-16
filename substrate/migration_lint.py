@@ -108,8 +108,11 @@ def _drop_column(stmt: str) -> bool:
         return False
     if re.search(r"\bDROP\s+COLUMN\b", stmt, re.IGNORECASE):
         return True
+    # `\S` (any non-whitespace token start), NOT `[A-Za-z_]`: an UNQUOTED Unicode column name (`DROP é`)
+    # is a valid destructive drop that an ASCII-only anchor missed (cross-family r7 CRIT). Quoted names are
+    # already neutralized to `qi` upstream; the NOT NULL lookahead still exempts the additive relaxation.
     return bool(re.search(
-        r"\bDROP\s+(?:IF\s+EXISTS\s+)?(?!NOT\s+NULL\b)[A-Za-z_]", stmt, re.IGNORECASE))
+        r"\bDROP\s+(?:IF\s+EXISTS\s+)?(?!NOT\s+NULL\b)\S", stmt, re.IGNORECASE))
 
 
 def _drop_default(stmt: str) -> bool:
@@ -167,12 +170,18 @@ _RULES = [
 # safe direction on any doubt is to UNDER-consume (expose text to the rules → at worst a false positive),
 # never OVER-consume (which could swallow a real DROP). A tag/prefix the scanner doesn't recognize is left
 # as ordinary text, so its contents stay visible to the rules.
-_DOLLAR_OPEN = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|)\$")   # $tag$ open; tag = ASCII identifier or empty
+# $tag$ open; tag = a PG identifier or empty. `\w` is Unicode-aware in Python 3; `[^\W\d]` is "a word
+# char that is not a digit" = a letter/underscore (ASCII or Unicode), matching PG's tag rules — an
+# ASCII-only class wrongly rejected a legit `$café$` string (cross-family r7 HIGH FP).
+_DOLLAR_OPEN = re.compile(r"\$([^\W\d]\w*|)\$")
 
 
 def _ident_char(c: str) -> bool:
-    # Postgres identifier character (Unicode-aware via str.isalnum) or the SQL identifier '_' / '$'.
-    return c.isalnum() or c == "_" or c == "$"
+    # Postgres ident_cont is [A-Za-z\200-\377_0-9$] (scan.l) — ASCII alnum/_/$ OR ANY non-ASCII byte
+    # (every high-bit char: Unicode letters AND combining marks). str.isalnum() is NARROWER — it is False
+    # for a combining mark like U+0301 — which let a fake dollar-quote open mid-identifier and hide a DROP
+    # (cross-family r7 CRIT). Mirror PG's byte rule directly: any non-ASCII char is an identifier char.
+    return (not c.isascii()) or c.isalnum() or c == "_" or c == "$"
 
 
 def _scan_quoted(sql: str, j: int, n: int, escape: bool) -> int:

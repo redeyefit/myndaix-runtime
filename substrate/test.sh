@@ -410,6 +410,26 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r6d.sql" >/dev/null 2>&1' "r6 HIGH:
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r6ok.sql" >/dev/null 2>&1' "r6: a legit E'' string default still PASSES (scanner regression)"
 ok 'grep -q "_scan_quoted" "$SUB/migration_lint.py" && ! grep -q "_TOKEN_RE" "$SUB/migration_lint.py"' "r6: _normalize is the hand-written lexer scanner (regex _TOKEN_RE retired)"
 
+echo "== PR-1c cross-family r7 folds: Postgres Unicode identifier rules (ident_cont = high-bit bytes) =="
+# UTF-8 / combining-mark fixtures written via python for exact bytes.
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # combining acute (e + U+0301) before $tag$ must NOT open a fake dollar-quote that hides the DROP
+    "r7a":  "CREATE TABLE IF NOT EXISTS é$tag$(id int);\nDROP TABLE IF EXISTS victims;\nSELECT $tag$ok$tag$;\n",
+    "r7b":  "ALTER TABLE users DROP é;\n",                                  # unquoted Unicode column drop
+    "r7c":  "ALTER TABLE t ADD COLUMN c text DEFAULT $café$ DROP TABLE is text $café$;\n",  # $café$ -> PASS
+    "r7ok": "ALTER TABLE t ADD COLUMN é int;\n",                            # additive unicode col -> PASS
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r7a.sql" >/dev/null 2>&1' "r7 CRIT: a combining-mark identifier char before \$tag\$ doesn'\''t open a fake dollar-quote (PG high-bit ident_cont)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r7b.sql" >/dev/null 2>&1' "r7 CRIT: an UNQUOTED Unicode column name drop is caught (\\\\S anchor, not ASCII-only)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r7c.sql" >/dev/null 2>&1' "r7 HIGH-FP: a \$café\$ Unicode dollar tag is recognized as a string (no false positive)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r7ok.sql" >/dev/null 2>&1' "r7: ADD COLUMN with a Unicode name still PASSES (additive, not over-flagged)"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys
