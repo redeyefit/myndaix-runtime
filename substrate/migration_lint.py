@@ -8,16 +8,22 @@ every migration is ADDITIVE (expand-contract) — the schema only ever GROWS, so
 against a compatible superset. A destructive change (drop/rename/retype/tighten a column or
 constraint) breaks the old code against the new schema and can't be undone by a code-revert.
 
-Matching is done on COMMENT-, STRING-, and DOUBLE-QUOTED-IDENTIFIER-neutralized, whitespace-collapsed
-text split per statement, so a keyword split across a newline (`DROP\\n TABLE`) is caught, a string
-literal containing "DROP TABLE" is NOT a false positive, and a quoted identifier cannot smuggle a keyword
-or hide a space/digit past a rule. It FAILS CLOSED on constructs it cannot reason about — a statement that
-begins with DO/EXECUTE/CALL (dynamic execution whose body is stripped) is rejected outright, and NOT VALID
-is NOT treated as an additive escape (Postgres still enforces the constraint on new writes). A blessed
-contraction is a deliberate, human-gated two-release change via RECONCILE_ALLOW_CONTRACTION=1.
+Matching runs on text whose comments, string/dollar-quoted bodies, and double-quoted identifiers are
+neutralized in ONE interleaving-aware pass (a comment delimiter inside a string, or a quote inside a
+quoted identifier, can no longer swallow real DDL — the sequential-regex bug cross-family review found),
+then whitespace-collapsed and split per statement. So a keyword split across a newline (`DROP\\n TABLE`)
+is caught, a string literal containing "DROP TABLE" is NOT a false positive, and a quoted identifier
+cannot smuggle a keyword or hide a space/digit past a rule. It FAILS CLOSED on constructs it cannot
+reason about: DO/EXECUTE/CALL and CREATE FUNCTION/PROCEDURE (dynamic/opaque bodies the linter can't
+inspect) are rejected outright, and NOT VALID is NOT an additive escape (Postgres still enforces the
+constraint on new writes). A blessed contraction is a deliberate, human-gated two-release change via
+RECONCILE_ALLOW_CONTRACTION=1.
 
 Regex is not a SQL parser: this is a conservative gate, not a proof. Its bias is fail-closed — an
 ambiguous construct is rejected (a false positive costs a human sign-off), never silently passed.
+Documented residuals (accepted): a migration that CALLs a PRE-EXISTING opaque function via a bare
+`SELECT f()` (the function is not defined in this migration, so nothing to inspect), and `DROP NOT NULL`
+treated as additive (a null written by new code during the pre-revert window could surface to old code).
 
 reconcile lints only the migrations ADDED-OR-MODIFIED in a deploy (the prev_good..HEAD delta,
 --diff-filter=AMR), NOT the full history — historical migrations that already ran may contain
@@ -38,11 +44,13 @@ _ALTER_TABLE_RE = re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE)
 # ADD [CONSTRAINT <name>] (CHECK|UNIQUE|PRIMARY KEY|FOREIGN KEY|EXCLUDE) — named OR unnamed (r2 #5d).
 _ADD_TIGHTENING_RE = re.compile(
     r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:CHECK|UNIQUE|PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b", re.IGNORECASE)
-# A statement that BEGINS with DO/EXECUTE/CALL runs code the linter cannot inspect: `_normalize` strips
-# the dollar/quoted body, so a `DO $$ ... EXECUTE 'ALTER TABLE t DROP COLUMN c' ... $$` reduces to `DO ''`
-# and no keyword rule can fire — yet `serve` executes the raw file and the DROP runs (cross-family r3 #1).
-# Fail closed: a migration cannot smuggle a contraction through dynamic execution.
+# Code the linter cannot inspect is fail-closed. A statement that BEGINS with DO/EXECUTE/CALL runs a body
+# `_normalize` strips (r3 #1). But that anchor alone was bypassable: a `CREATE FUNCTION f() AS $$ DROP
+# TABLE x $$` (body stripped) invoked by a later `SELECT f()` starts with CREATE/SELECT, not DO/CALL
+# (r4 CRIT-2). So ALSO reject CREATE FUNCTION/PROCEDURE outright — its body is opaque and can run DDL
+# when invoked — and treat DROP FUNCTION/PROCEDURE as a contraction (old code may depend on it).
 _DYNAMIC_DDL_RE = re.compile(r"^(?:DO|EXECUTE|CALL)\b", re.IGNORECASE)
+_CREATE_ROUTINE_RE = re.compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b", re.IGNORECASE)
 
 
 def _top_level_clauses(stmt: str) -> list[str]:
@@ -79,9 +87,13 @@ def _drop_column(stmt: str) -> bool:
     #   (a) the COLUMN keyword is present -> unambiguously a column drop, WHATEVER the column is named —
     #       incl. a column named `constraint`/`default`/`type`; the old spelling-based exclusions were a
     #       bypass (r2 #5b, r3 #8). `DROP COLUMN [IF EXISTS] <ident>`.
-    #   (b) no COLUMN keyword: `DROP [IF EXISTS] <ident>` is still a column drop UNLESS <ident> is one of
-    #       the sub-object drops — DROP CONSTRAINT (ruled separately), DROP DEFAULT (ruled by _drop_default,
-    #       r3 #5), or the genuinely-additive DROP NOT NULL / DROP EXPRESSION / DROP IDENTITY.
+    #   (b) no COLUMN keyword: `DROP [IF EXISTS] <ident>` is still a column drop. Only DROP NOT NULL is
+    #       excluded — it is the one genuinely-additive property drop (relaxes nullability). Everything
+    #       else is caught: DROP CONSTRAINT / DROP DEFAULT are contractions ruled elsewhere too (a double
+    #       flag is harmless), and a column literally NAMED constraint/default/expression/identity is a
+    #       real drop that the old per-keyword exclusions silently let through (r3 #8, r4 HIGH-3). The
+    #       rare genuinely-additive DROP EXPRESSION/IDENTITY now flags — a deliberate fail-closed tradeoff
+    #       (use RECONCILE_ALLOW_CONTRACTION for a blessed generated-column cleanup).
     # Quoted identifiers are already neutralized to `qi` by _normalize, so a digit-leading or space-
     # containing quoted column name can't slip past the anchor (r3 #6/#7).
     if not _ALTER_TABLE_RE.search(stmt):
@@ -89,9 +101,7 @@ def _drop_column(stmt: str) -> bool:
     if re.search(r"\bDROP\s+COLUMN\b", stmt, re.IGNORECASE):
         return True
     return bool(re.search(
-        r"\bDROP\s+(?:IF\s+EXISTS\s+)?"
-        r"(?!CONSTRAINT\b|DEFAULT\b|NOT\s+NULL\b|EXPRESSION\b|IDENTITY\b|COLUMN\b)[A-Za-z_]",
-        stmt, re.IGNORECASE))
+        r"\bDROP\s+(?:IF\s+EXISTS\s+)?(?!NOT\s+NULL\b)[A-Za-z_]", stmt, re.IGNORECASE))
 
 
 def _drop_default(stmt: str) -> bool:
@@ -114,12 +124,15 @@ def _add_constraint_tightening(stmt: str) -> bool:
 # (checker, why). A checker is a compiled regex (matched with .search) or a callable(stmt)->bool.
 _RULES = [
     (_DYNAMIC_DDL_RE,                                                "DO/EXECUTE/CALL — dynamic DDL the linter can't inspect (a contraction can hide in the body); fail-closed"),
+    (_CREATE_ROUTINE_RE,                                             "CREATE FUNCTION/PROCEDURE — opaque body can run DDL when invoked (a stripped body defeats inspection); fail-closed"),
+    (re.compile(r"\bDROP\s+(FUNCTION|PROCEDURE)\b", re.I),           "DROP FUNCTION/PROCEDURE — old code may depend on it"),
     (re.compile(r"\bDROP\s+TABLE\b", re.I),                          "DROP TABLE — old code reads a table that's gone"),
     (re.compile(r"\bDROP\s+(MATERIALIZED\s+VIEW|VIEW)\b", re.I),     "DROP VIEW — old code reads a relation that's gone"),
     (re.compile(r"\bDROP\s+(SEQUENCE|SCHEMA|TYPE)\b", re.I),         "DROP SEQUENCE/SCHEMA/TYPE — old code depends on it"),
     (re.compile(r"\bDROP\s+CONSTRAINT\b", re.I),                     "DROP CONSTRAINT — relaxes/changes a guarantee old code assumes"),
     (_drop_column,                                                   "DROP COLUMN (optional COLUMN kw) — old code reads a column that's gone"),
     (_drop_default,                                                  "DROP DEFAULT — a NOT NULL column with no default breaks old INSERTs that omit it after a revert"),
+    (re.compile(r"\bSET\s+DEFAULT\s+NULL\b", re.I),                  "SET DEFAULT NULL — removes a column's effective default (like DROP DEFAULT); breaks old INSERTs on a NOT NULL column after a revert"),
     (re.compile(r"\bRENAME\s+(?:COLUMN\s+|CONSTRAINT\s+)?\S+\s+TO\b", re.I), "RENAME COLUMN/CONSTRAINT — old code reads the old name"),
     (re.compile(r"\bRENAME\s+TO\b", re.I),                           "RENAME TABLE — old code reads the old name"),
     (re.compile(r"\bALTER\s+(?:COLUMN\s+)?\S+\s+(SET\s+DATA\s+)?TYPE\b", re.I), "column TYPE change (optional COLUMN kw) — old code mis-reads the type"),
@@ -129,20 +142,40 @@ _RULES = [
 ]
 
 
+# SINGLE interleaving-aware token scan (cross-family r4 CRIT-1/-3). SEQUENTIAL re.subs mis-parse
+# overlapping boundaries: a `/*` or `--` INSIDE a '...' string opened a comment match that swallowed
+# real DDL between it and a later delimiter; a `'` inside a "..." identifier unbalanced the single-quote
+# pass the same way. One left-to-right alternation consumes each lexical token WHOLE, so a delimiter that
+# lives inside an already-open token is never re-interpreted. Order matters only for a tie at the SAME
+# position; these openers can't tie (each starts with a distinct char), so any order is safe here.
+_TOKEN_RE = re.compile(
+    r"""
+      (?P<block>/\*.*?\*/)                                  # /* block comment */  (non-greedy)
+    | (?P<line>--[^\n]*)                                    # -- line comment (to EOL)
+    | (?P<dollar>\$(?P<tag>[A-Za-z_]*)\$.*?\$(?P=tag)\$)    # $tag$ dollar-quoted body $tag$
+    | (?P<sq>'(?:[^']|'')*')                                # 'single-quoted' string ('' escapes)
+    | (?P<dq>"(?:[^"]|"")*")                                # "double-quoted" identifier ("" escapes)
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
+def _neutralize_token(m: "re.Match[str]") -> str:
+    # A "..." token is always a NAME, never a keyword -> a safe bareword `qi` (keeps identifier shape so
+    # rules still see "a column here", but a quoted name can't smuggle a keyword or hide a space/digit).
+    if m.group("dq") is not None:
+        return " qi "
+    # Comments vanish (whitespace); strings and dollar-quoted bodies collapse to an empty-string literal.
+    if m.group("block") is not None or m.group("line") is not None:
+        return " "
+    return " '' "
+
+
 def _normalize(sql: str) -> str:
-    """Strip comments + string/dollar-quoted bodies, collapse whitespace — so a keyword split across a
-    newline is caught and a string literal is never a false positive."""
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)          # block comments
-    sql = re.sub(r"--[^\n]*", " ", sql)                            # line comments
-    sql = re.sub(r"\$([A-Za-z_]*)\$.*?\$\1\$", " '' ", sql, flags=re.DOTALL)  # dollar-quoted bodies
-    sql = re.sub(r"'(?:[^']|'')*'", " '' ", sql)                   # single-quoted (with '' escapes)
-    # Neutralize DOUBLE-quoted identifiers to a safe bareword. A "..." token is always a NAME, never a
-    # keyword, so replacing it with `qi` is semantics-preserving for a keyword-based lint — and it closes
-    # three cross-family r3 bypasses at once: a quoted name can no longer (a) smuggle a keyword like
-    # "DEFAULT" into a rule (#9), (b) hide a space that breaks a `\S+` identifier match (#6), or (c) start
-    # with a digit that defeats an identifier anchor (#7). ('' escapes handled: "a""b" is one identifier.)
-    sql = re.sub(r'"(?:[^"]|"")*"', " qi ", sql)                   # double-quoted identifiers -> safe name
-    return re.sub(r"\s+", " ", sql)
+    """Neutralize comments, string/dollar-quoted bodies, and double-quoted identifiers in ONE pass, then
+    collapse whitespace — so a keyword split across a newline is caught, a delimiter hidden inside a
+    string/quoted-ident is never mis-acted-upon (r4), and a quoted name can't smuggle a keyword."""
+    return re.sub(r"\s+", " ", _TOKEN_RE.sub(_neutralize_token, sql))
 
 
 def lint_file(path: Path) -> list[str]:

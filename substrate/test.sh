@@ -347,6 +347,25 @@ ok 'grep -q "RECONCILE_POLL:-0" "$SUB/bootstrap-fetch.sh" && grep -q "RECONCILE_
 SENT_DESC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["requires_sentinel"])' "$SUB/plists/ai.myndaix.reconcile.json")"
 ok '[[ "'"$SENT_DESC"'" == "RECONCILE_ARMED" ]] && grep -q "RECONCILE_SENTINEL=\"RECONCILE_ARMED\"" "$SUB/reconcile.sh" && grep -q "MYNDAIX_HOME/RECONCILE_ARMED" "$SUB/bootstrap-fetch.sh"' "r3 #4: the arm-sentinel name agrees across descriptor + reconcile.sh + bootstrap-fetch"
 
+echo "== PR-1c cross-family r4 folds: single-pass lexer + routine/SET-DEFAULT-NULL + poll env reload =="
+# r4 CRIT-1 — a comment delimiter INSIDE a string no longer swallows the DDL between it and a later quote.
+printf "SELECT '/*';\nALTER TABLE job DROP COLUMN context;\nSELECT '*/';\n" > "$TMP/r4c1a.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4c1a.sql" >/dev/null 2>&1' "r4 CRIT-1: block-comment tokens inside strings don'\''t swallow a DROP COLUMN"
+printf "ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'http://u/--/p';\nDROP TABLE victims;\nSELECT 'x';\n" > "$TMP/r4c1b.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4c1b.sql" >/dev/null 2>&1' "r4 CRIT-1: a -- inside a string doesn'\''t swallow a following DROP TABLE"
+# r4 CRIT-2 — dynamic DDL in a CREATE FUNCTION body invoked by SELECT is caught (routine rejected).
+printf 'CREATE OR REPLACE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $x$ BEGIN EXECUTE '\''ALTER TABLE job DROP COLUMN context'\''; END $x$;\nSELECT f();\n' > "$TMP/r4c2.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4c2.sql" >/dev/null 2>&1' "r4 CRIT-2: CREATE FUNCTION with a DDL body (+SELECT invoke) is rejected (opaque body fail-closed)"
+printf 'DROP FUNCTION old_fn();\n' > "$TMP/r4df.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4df.sql" >/dev/null 2>&1' "r4 CRIT-2: DROP FUNCTION is rejected (old code may depend on it)"
+# r4 CRIT-3 — a single-quote inside a double-quoted identifier no longer unbalances the string pass.
+printf 'SELECT "dummy_'\''x"; DROP TABLE victims; SELECT '\''z'\'';\n' > "$TMP/r4c3.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4c3.sql" >/dev/null 2>&1' "r4 CRIT-3: a quoted-ident containing a '\'' doesn'\''t swallow a DROP TABLE (single-pass lexer)"
+# r4 HIGH-1 — SET DEFAULT NULL is the DROP DEFAULT contraction in disguise; SET DEFAULT <val> is additive.
+printf 'ALTER TABLE t ALTER COLUMN c SET DEFAULT NULL;\n' > "$TMP/r4h1.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4h1.sql" >/dev/null 2>&1' "r4 HIGH-1: SET DEFAULT NULL rejected (functional DROP DEFAULT)"
+printf 'ALTER TABLE t ALTER COLUMN c SET DEFAULT 5;\n' > "$TMP/r4h1b.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r4h1b.sql" >/dev/null 2>&1' "r4 HIGH-1: SET DEFAULT <value> still PASSES (only NULL is the contraction)"
+# r4 HIGH-3 — a column literally named expression/identity dropped bare is a real column drop.
+printf 'ALTER TABLE t DROP expression;\n' > "$TMP/r4h3.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4h3.sql" >/dev/null 2>&1' "r4 HIGH-3: DROP expression (bare, keyword-named column) is caught"
+# no-false-positive: DROP NOT NULL relaxation still PASSES (the one genuinely-additive property drop).
+printf 'ALTER TABLE t ALTER COLUMN c DROP NOT NULL;\n' > "$TMP/r4nn.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r4nn.sql" >/dev/null 2>&1' "r4: DROP NOT NULL still PASSES (additive relaxation, not over-flagged)"
+# r4 HIGH-2 — a manual converge reloads an already-loaded poll so a new plist/env (RECONCILE_POLL) lands.
+ok 'grep -q "RECONCILE_POLL:-0.* != .1." "$SUB/reconcile.sh" && grep -B2 "la_loaded \"\$label\" || la_bootstrap" "$SUB/reconcile.sh" | grep -q "la_bootout \"\$label\""' "r4 HIGH-2: a manual converge (RECONCILE_POLL unset) bootout+reloads the poll so a changed env takes effect"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys

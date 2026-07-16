@@ -229,7 +229,16 @@ health_gate() {
   # 6. start the ticks (never bootout the reconcile-poll self label)
   for label in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do
     [[ "$label" == "ai.myndaix.runtime" ]] && continue
-    if [[ "$label" == "ai.myndaix.reconcile" ]]; then la_loaded "$label" || la_bootstrap "$LA_DIR/$label.plist"; continue; fi
+    if [[ "$label" == "ai.myndaix.reconcile" ]]; then
+      # Reload so a CHANGED plist/env (e.g. the RECONCILE_POLL marker added by an upgrade) takes effect
+      # on an ALREADY-loaded poll (cross-family r4 HIGH-2). Only a MANUAL converge (RECONCILE_POLL unset)
+      # can safely bootout+re-bootstrap the poll — a poll-TRIGGERED run is the poll's own launchd process
+      # and would SIGKILL itself mid-reload, so it merely ensures the job is loaded (its env is current by
+      # definition, being what launched it). Arming is a manual converge, so the fresh env lands on arm.
+      if [[ "${RECONCILE_POLL:-0}" != "1" ]]; then la_bootout "$label"; la_wait_gone "$label" 10 || true; fi
+      la_loaded "$label" || la_bootstrap "$LA_DIR/$label.plist" || { log "could not bootstrap $label"; return 1; }
+      continue
+    fi
     la_bootout "$label"; la_wait_gone "$label" 10 || true
     la_bootstrap "$LA_DIR/$label.plist" || { sleep 2; la_bootstrap "$LA_DIR/$label.plist"; } || { log "could not bootstrap $label"; return 1; }
     log "started tick: $label"
