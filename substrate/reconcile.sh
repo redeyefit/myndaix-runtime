@@ -132,7 +132,7 @@ if prev_recoverable; then
       # lib.sh PGCONNECT_TIMEOUT + statement_timeout; the pre-existing set never WEAKENS the gate).
       existing_rel="$STATE_DIR/existing_relations.txt"
       if PGOPTIONS='-c statement_timeout=10s' psql "$MYNDAIX_DSN" -v ON_ERROR_STOP=1 -tAqc \
-           "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','p') AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')" \
+           "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','p','f') AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')" \
            > "$existing_rel.tmp" 2>/dev/null; then
         mv -f "$existing_rel.tmp" "$existing_rel"
         lint_flags+=(--existing "$existing_rel")

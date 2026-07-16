@@ -443,7 +443,11 @@ def _new_this_deploy(name: str, created: frozenset[str], prev_objects: "frozense
     if not _resolvable_table(name):
         return False
     if prev_objects is not None:
-        return name.split(".")[-1].lower() not in prev_objects   # bare, case-folded (unquoted idents fold)
+        # bare, case-folded, and TRUNCATED to NAMEDATALEN-1 (63) BYTES — Postgres silently truncates a
+        # longer identifier to the stored relname, so a 64-byte spelling of a pre-existing 63-byte relation
+        # must still match it (else it would read as "new" and a DROP on it would pass — cross-family r-pr1d).
+        bare = name.split(".")[-1].lower().encode("utf-8")[:63].decode("utf-8", "ignore")
+        return bare not in prev_objects
     return name in created
 
 

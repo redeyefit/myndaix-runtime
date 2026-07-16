@@ -676,6 +676,16 @@ for m in 0008 0009 0011 0012; do
   ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev_empty.txt" "'"$f"'" >/dev/null 2>&1' "PR-1d: real $m PASSES when its objects are new (empty pg_catalog) — the idempotent create+index/view false-positive is fixed"
 done
 ok 'grep -q "pg_catalog for pre-existing" "$SUB/reconcile.sh" && grep -q -- "--existing" "$SUB/reconcile.sh"' "PR-1d: reconcile queries pg_catalog (fail-closed) and passes --existing to the lint"
+# PR-1d review folds (r-pr1d): identifier truncation + foreign tables; + codify the whitespace-dot non-hole.
+L63="aaaaaaaaaa_bbbbbbbbbb_cccccccccc_dddddddddd_eeeeeeeeee_ffffffff"   # exactly 63 bytes
+printf 'job\nexisting_v\n%s\n' "$L63" > "$TMP/prevd.txt"
+printf 'ALTER TABLE %sg DROP COLUMN context;\n' "$L63" > "$TMP/d_trunc.sql"          # 64-byte -> PG 63-byte existing
+printf 'ALTER TABLE public . job DROP COLUMN x;\n' > "$TMP/d_wsalter.sql"            # whitespace-around-dot
+printf 'CREATE OR REPLACE VIEW public . existing_v AS SELECT 1;\n' > "$TMP/d_wsview.sql"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_trunc.sql" >/dev/null 2>&1' "PR-1d HIGH: a 64-byte name PG truncates to a pre-existing 63-byte relation REJECTS (NAMEDATALEN truncation)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_wsalter.sql" >/dev/null 2>&1' "PR-1d: whitespace-around-dot ALTER (public . job) REJECTS (r14 dot-collapse; not a denylist bypass)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevd.txt" "$TMP/d_wsview.sql" >/dev/null 2>&1' "PR-1d: whitespace-around-dot CREATE OR REPLACE VIEW (public . existing_v) REJECTS"
+ok 'grep -q "relkind IN ('\''r'\'','\''v'\'','\''m'\'','\''p'\'','\''f'\'')" "$SUB/reconcile.sh"' "PR-1d MED: pg_catalog query includes foreign tables (relkind f) so a pre-existing foreign table isn'\''t seen as new"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
