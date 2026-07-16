@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,7 +72,9 @@ NOTION_DB = (os.environ.get("INBOX_NOTION_DB") or "").strip()           # empty 
 IMESSAGE_TO = (os.environ.get("INBOX_IMESSAGE_TO") or "").strip()       # empty = ping off
 DRY_RUN = os.environ.get("MYNDAIX_INBOX_DRY_RUN") == "1"
 
-MAX_CLASSIFY = 200      # threads per batched classify call; overflow ships 'unclassified', LOGGED
+MAX_CLASSIFY = 200        # threads per classify CHUNK (one `claude -p` call each)
+MAX_CLASSIFY_CALLS = 3    # chunks per tick — 600 threads covers any realistic backfill; beyond
+                          # that is the bounded-loss valve (ships 'unclassified' ONCE, loudly)
 SNIPPET_CAP = 500       # chars of snippet per fenced thread (Gmail snippets are ~200 anyway)
 MAX_DRAFTS = 5          # draft ATTEMPTS per run (bounds both LLM spend and Gmail writes)
 CLAUDE_TIMEOUT = 300    # seconds per `claude -p` subprocess
@@ -83,6 +86,16 @@ _DRAFT_CATEGORIES = ("job-reply", "needs-you")   # only these ever earn a reply 
 # skillselect._C0_DEL reproduced: delete C0 (0x00-08,0B,0C,0E-1F) + DEL, keep \t \n \r —
 # fence bodies contain newlines we add ourselves; everything else is stripped at the boundary.
 _C0_DEL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Fence-marker detector (Oracle 2026-07-16): an attacker doesn't need the run nonce to break
+# out — a bare "===END UNTRUSTED nonce=FAKE===" line in an email body reads as a closed fence
+# to the model. ANY fence marker inside content is a breakout attempt; the nonce check alone
+# only catches the (impossible) case of a sender guessing the live nonce.
+_FENCE_MARKER_RE = re.compile(r"===\s*(?:BEGIN|END)\s+UNTRUSTED", re.IGNORECASE)
+
+
+def _fence_breakout(*fields: str) -> bool:
+    return any(_FENCE_MARKER_RE.search(f) for f in fields if f)
 
 # [work]/[personal] tagging (design §3 step 6: work visually separated, never bleeding into
 # personal). Heuristic: consumer-Gmail domains are personal, custom domains are work — the
@@ -186,15 +199,34 @@ Output ONLY the reply body text — no subject line, no JSON, no markdown, no co
 """
 
 
+# Sandbox for the `claude -p` subprocess (KilaBz 2026-07-16): the prompt embeds hostile email
+# content and `claude` is an AGENTIC CLI — the fence is a mitigation, not a security boundary.
+# (1) allowlist-scrubbed env: the tick's environment carries OP_SERVICE_ACCOUNT_TOKEN (the key
+# to the whole vault), the DSN and component config — a steered CLI must never see them; only
+# what the CLI needs to run and authenticate survives.
+# (2) every filesystem/shell/network tool disallowed (belt — flags may drift across CLI
+# versions; the env scrub is the load-bearing layer).
+# (3) cwd = throwaway temp dir, so even a read-only escape starts nowhere.
+_CLAUDE_ENV_KEEP = ("PATH", "HOME", "CLAUDE_CODE_OAUTH_TOKEN", "TERM", "LANG", "LC_ALL")
+_CLAUDE_DENY_TOOLS = ("Bash", "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
+                      "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite")
+
+
 def _claude(prompt: str) -> Optional[str]:
-    """One `claude -p` call, prompt on STDIN (argv stays content-free). None on any failure —
-    the caller degrades (unclassified board / skipped draft); a flaky LLM never sinks the tick."""
-    try:
-        r = subprocess.run(["claude", "-p", "--output-format", "text"], input=prompt,
-                           capture_output=True, text=True, timeout=CLAUDE_TIMEOUT, check=False)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        log(f"claude call failed ({type(e).__name__})")
-        return None
+    """One `claude -p` call, prompt on STDIN (argv stays content-free), sandboxed per the
+    block comment above. None on any failure — the caller degrades (unclassified board /
+    skipped draft); a flaky LLM never sinks the tick."""
+    env = {k: v for k, v in os.environ.items() if k in _CLAUDE_ENV_KEEP}
+    with tempfile.TemporaryDirectory(prefix="inbox-claude-") as scratch:
+        try:
+            r = subprocess.run(
+                ["claude", "-p", "--output-format", "text",
+                 "--disallowedTools", *_CLAUDE_DENY_TOOLS],
+                input=prompt, capture_output=True, text=True,
+                timeout=CLAUDE_TIMEOUT, check=False, env=env, cwd=scratch)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"claude call failed ({type(e).__name__})")
+            return None
     if r.returncode != 0:
         log(f"claude call rc={r.returncode}")
         return None
@@ -230,13 +262,21 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
     entry dies here — and the category must be a known member. The echoed 'account' field is
     ignored: we already know each thread's account and never trust the echo. Returns
     thread_id -> row, or None when the payload is unusable (caller ships 'unclassified')."""
-    start, end = raw.find("["), raw.rfind("]")
-    if start < 0 or end <= start:
+    end = raw.rfind("]")
+    if end < 0:
         return None
-    try:
-        data = json.loads(raw[start:end + 1])
-    except (json.JSONDecodeError, ValueError):
-        return None
+    # anchor-scan (Oracle 2026-07-16): the FIRST '[' may sit in model prose ("here are the
+    # results [1/2]:") and poison the slice; try each '[' until one parses, bounded so
+    # pathological output can't spin the loop.
+    data = None
+    for tries, m in enumerate(re.finditer(r"\[", raw[:end + 1])):
+        if tries >= 20:
+            break
+        try:
+            data = json.loads(raw[m.start():end + 1])
+            break
+        except (json.JSONDecodeError, ValueError):
+            continue
     if not isinstance(data, list):
         return None
     rows: dict[str, dict] = {}
@@ -258,45 +298,58 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
 
 
 def classify(threads: list[ThreadSummary], nonce: str) -> tuple[list[Item], bool]:
-    """Batch-classify every pulled thread. Returns (items — exactly one per thread —,
-    classify_ok). classify_ok=False (subprocess/JSON failure) ships everything
-    'unclassified' — the advisory board must still go out — and the caller HOLDS every
-    cursor so the same threads are re-pulled and re-classified next tick."""
+    """Classify every pulled thread in <=MAX_CLASSIFY-thread chunks (up to MAX_CLASSIFY_CALLS
+    `claude -p` calls — 600 threads covers any realistic 3-inbox backfill). Returns (items —
+    exactly one per thread —, classify_ok). classify_ok=False (any chunk's subprocess/JSON
+    failure) ships the rest 'unclassified' — the advisory board must still go out — and the
+    caller HOLDS every cursor so the same threads are re-pulled and re-classified next tick.
+    BOUNDED-LOSS VALVE (deliberate, Oracle 2026-07-16 reviewed): threads beyond the chunk
+    budget ship 'unclassified' ONCE, loudly, on the board — and the cursor still advances.
+    Holding the cursor instead would re-pull the identical over-budget slice every tick and
+    wedge the account forever; surfacing them once for Jefe to act on beats an infinite loop."""
     items: list[Item] = []
     candidates: list[ThreadSummary] = []
     for t in threads:
-        # the sender cannot know the per-run nonce, so the nonce inside content means the
-        # fence would lie: drop from classification, flag on the board (still under NEEDS YOU).
-        if any(nonce in f for f in (t.snippet, t.subject, t.sender, t.date)):
-            log(f"{t.account}: thread {t.thread_id} contains the run nonce — SUSPICIOUS, "
-                "dropped from classification")
+        # Two breakout signals, either one flags the thread on the board (under NEEDS YOU):
+        # the live nonce inside content (fence would lie) or ANY fence marker (an attacker
+        # doesn't need the real nonce — a fake ===END UNTRUSTED=== line reads as a closed
+        # fence to the model).
+        fields = (t.snippet, t.subject, t.sender, t.date)
+        if any(nonce in f for f in fields) or _fence_breakout(*fields):
+            log(f"{t.account}: thread {t.thread_id} contains a fence marker/nonce — "
+                "SUSPICIOUS, dropped from classification")
             items.append(Item(thread=t, category="suspicious",
-                              reason="SUSPICIOUS: run nonce inside content (fence-breakout "
+                              reason="SUSPICIOUS: fence marker inside content (breakout "
                                      "attempt) — open with care"))
             continue
         candidates.append(t)
-    if len(candidates) > MAX_CLASSIFY:               # bounded batch — never silent truncation
-        log(f"classify CAPPED at {MAX_CLASSIFY} of {len(candidates)} threads — "
-            f"{len(candidates) - MAX_CLASSIFY} ship unclassified")
-        for t in candidates[MAX_CLASSIFY:]:
-            items.append(Item(thread=t, category="unclassified", reason="over per-run classify cap"))
-        candidates = candidates[:MAX_CLASSIFY]
-    if not candidates:
-        return items, True
-    raw = _claude(_build_classify_prompt(candidates, nonce))
-    rows = parse_classification(raw, {t.thread_id for t in candidates}) if raw is not None else None
-    if rows is None:
-        log("classification unusable — every thread ships 'unclassified' (board still goes out)")
-        items.extend(Item(thread=t, category="unclassified") for t in candidates)
-        return items, False
-    for t in candidates:
-        row = rows.get(t.thread_id)
-        if row is None:                              # model skipped it — advisory, not fatal
-            items.append(Item(thread=t, category="unclassified"))
-        else:
-            items.append(Item(thread=t, category=row["category"], reason=row["reason"],
-                              draft_worthy=row["draft_worthy"], draft_hint=row["draft_hint"]))
-    return items, True
+    budget = MAX_CLASSIFY * MAX_CLASSIFY_CALLS
+    if len(candidates) > budget:
+        log(f"classify budget EXCEEDED: {len(candidates) - budget} of {len(candidates)} "
+            f"threads ship unclassified (bounded-loss valve — they will NOT be retried)")
+        for t in candidates[budget:]:
+            items.append(Item(thread=t, category="unclassified",
+                              reason="over per-run classify budget — act from this list"))
+        candidates = candidates[:budget]
+    ok = True
+    for i in range(0, len(candidates), MAX_CLASSIFY):
+        chunk = candidates[i:i + MAX_CLASSIFY]
+        raw = _claude(_build_classify_prompt(chunk, nonce))
+        rows = parse_classification(raw, {t.thread_id for t in chunk}) if raw is not None else None
+        if rows is None:
+            log(f"classification unusable for chunk {i // MAX_CLASSIFY + 1} — its threads "
+                "ship 'unclassified'; cursors held (board still goes out)")
+            items.extend(Item(thread=t, category="unclassified") for t in chunk)
+            ok = False
+            continue
+        for t in chunk:
+            row = rows.get(t.thread_id)
+            if row is None:                          # model skipped it — advisory, not fatal
+                items.append(Item(thread=t, category="unclassified"))
+            else:
+                items.append(Item(thread=t, category=row["category"], reason=row["reason"],
+                                  draft_worthy=row["draft_worthy"], draft_hint=row["draft_hint"]))
+    return items, ok
 
 
 # =====================================================================================
@@ -312,6 +365,7 @@ class AccountRun:
     ok: bool = False
     threads: list[ThreadSummary] = field(default_factory=list)
     new_history_id: str = ""
+    prev_history_id: Optional[str] = None   # cursor value READ at pull time — the CAS expectation
     client: Optional[GmailClient] = None
     action_failed: bool = False
 
@@ -342,6 +396,12 @@ def _compose_draft(item: Item) -> Optional[str]:
     subject + snippet + the classifier's draft_hint only (design §4 snippet-first). The
     draft_hint is model output derived from hostile content, so it rides INSIDE the fence."""
     t = item.thread
+    # belt: classify() already drops fence-marker threads, but draft_hint is MODEL output —
+    # if a marker leaked through into any fenced field, skip the draft rather than hand the
+    # composer a fake fence boundary.
+    if _fence_breakout(t.sender, t.subject, t.date, t.snippet, item.draft_hint):
+        log(f"{t.account}: fence marker in compose fields for thread {t.thread_id} — draft skipped")
+        return None
     nonce = uuid.uuid4().hex   # fresh per compose: minted after the content exists, so the
     body = (f"from: {t.sender}\nsubject: {t.subject}\ndate: {t.date}\n"      # fenced text
             f"snippet: {t.snippet[:SNIPPET_CAP]}\n"                          # cannot contain
@@ -373,6 +433,20 @@ def _create_drafts(runs: list[AccountRun], items: list[Item]) -> None:
         if budget <= 0:
             log(f"draft budget ({MAX_DRAFTS}/run) exhausted — remaining draft-worthy threads skipped")
             break
+        # IDEMPOTENCY GATE (KilaBz 2026-07-16): cursors are deliberately held on later
+        # failures (at-least-once), so a crash between draft-create and cursor-advance
+        # re-pulls this thread next tick — without this check that means a duplicate draft.
+        # Checked BEFORE the budget spend (a Gmail read, not an LLM call).
+        try:
+            if run.client.has_draft_for_thread(item.thread.thread_id):
+                log(f"{item.thread.account}: draft already exists on thread "
+                    f"{item.thread.thread_id} — skipped (idempotent re-run)")
+                continue
+        except Exception as e:
+            log(f"{item.thread.account}: draft-exists check failed ({type(e).__name__}) "
+                "— cursor held")
+            run.action_failed = True
+            continue
         budget -= 1
         body = _compose_draft(item)
         if body is None:
@@ -554,7 +628,19 @@ async def _pull_account(led: PostgresLedger, account: str,
     try:
         token = _op_read(f"op://{OP_VAULT}/gmail-rt-{account}/refresh_token")
         client = GmailClient(account, client_id, client_secret, token)
+        # IDENTITY GATE (KilaBz 2026-07-16): the vault item name is convention, not proof —
+        # a wrong browser account at mint time or a swapped item would silently read/label/
+        # draft the WRONG mailbox under this account's label. Verify before any other call.
+        mailbox = client.profile_email()
+        if mailbox != account.strip().lower():
+            run.status = "token/mailbox mismatch — re-mint for this account"
+            log(f"{account}: getProfile returned a different address — account skipped, "
+                "re-mint the refresh token")
+            if not DRY_RUN:
+                await led.inbox_mark_cursor_error(account, "error")
+            return run
         cursor = await led.inbox_get_cursor(account)
+        run.prev_history_id = cursor["history_id"] if cursor else None   # CAS expectation
         if cursor is None:
             log(f"{account}: no cursor — bounded backfill ({BACKFILL_DAYS}d)")
             # NO eager seed here: cursor state is written ONLY in the end-of-tick advance
@@ -649,14 +735,23 @@ async def tick() -> int:
         if brief_written and classify_ok:
             for run in runs:
                 if run.ok and not run.action_failed and run.new_history_id:
-                    moved = await led.inbox_advance_cursor(run.account, run.new_history_id)
-                    log(f"{run.account}: cursor {'advanced' if moved else 'already current'} "
+                    # TRUE CAS: expected = the value read at pull time. A miss means another
+                    # tick advanced it under us — never rewind; hold and re-pull next time.
+                    moved = await led.inbox_advance_cursor(
+                        run.account, run.new_history_id, run.prev_history_id)
+                    log(f"{run.account}: cursor "
+                        f"{'advanced' if moved else 'CAS miss (moved under us) — held'} "
                         f"@ {run.new_history_id}")
         else:
             log("cursors held (brief undelivered or classify failed) — next tick re-pulls")
 
-        if not any(r.ok for r in runs) and not brief_written:
-            log("TOTAL FAILURE — no account pulled and no brief written")
+        # exit-code contract (KilaBz 2026-07-16): the jefe drop is "primary durable or bust" —
+        # an undelivered brief is a FAILED tick to launchd/reconcile, not a quiet log line.
+        if not brief_written:
+            log("PRIMARY DELIVERY FAILED — brief not durably written (cursors held)")
+            return 1
+        if not any(r.ok for r in runs):
+            log("TOTAL FAILURE — no account pulled (brief delivered with failure lines)")
             return 1
         log(f"tick complete — {sum(1 for r in runs if r.ok)}/{len(runs)} account(s) ok, "
             f"{sum(1 for i in items if i.draft_id)} draft(s), brief_written={brief_written}")

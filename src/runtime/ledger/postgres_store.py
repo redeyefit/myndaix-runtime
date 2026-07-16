@@ -1098,15 +1098,19 @@ class PostgresLedger:
             return None
         return {**dict(row), "fallback_since": None}
 
-    async def inbox_advance_cursor(self, account_id: str, history_id: str) -> bool:
+    async def inbox_advance_cursor(self, account_id: str, history_id: str,
+                                   expected_history_id: Optional[str]) -> bool:
         """Advance the cursor once the account's slice fully PROCESSED (labels +
         drafts + brief delivered) — never on pull alone, so a crash mid-run re-pulls
-        rather than drops threads (design §3.9). UPSERT: a first-run account has no
-        row until THIS verb creates it (state is written only in the end-of-tick
-        advance phase — no eager seed exists), preserving the CAS bool: True on a
-        fresh insert or a changed historyId, False when the value is already
-        current. Also heals an 'error'/'stale' row back to 'active' (the post-404
-        backfill re-establish lands here)."""
+        rather than drops threads (design §3.9). TRUE CAS: `expected_history_id` is
+        the value read at pull time (None on a rowless first run); the update fires
+        ONLY when the row still holds it, so a slower older tick can never rewind a
+        newer tick's cursor, and a concurrent first-run insert makes the loser's
+        upsert a no-op (False -> that tick's slice re-pulls next time). A CAS-matched
+        advance ALWAYS heals: state='active', attempts=0 — including the same-value
+        case (quiet mailbox after an 'error'/'stale' tick), which the previous
+        history_id-changed-only guard skipped, leaving error rows sticky forever.
+        Returns True iff this call owned the advance (insert or CAS-matched update)."""
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
                 """INSERT INTO inbox_cursor (account_id, history_id)
@@ -1114,9 +1118,9 @@ class PostgresLedger:
                    ON CONFLICT (account_id) DO UPDATE
                        SET history_id = EXCLUDED.history_id, state = 'active',
                            attempts = 0, updated_at = now()
-                     WHERE inbox_cursor.history_id IS DISTINCT FROM EXCLUDED.history_id
+                     WHERE inbox_cursor.history_id IS NOT DISTINCT FROM $3
                    RETURNING account_id""",
-                account_id, history_id)
+                account_id, history_id, expected_history_id)
         return row is not None
 
     async def inbox_mark_cursor_error(self, account_id: str, state: str) -> bool:

@@ -162,17 +162,25 @@ class GmailClient:
     # ---- pull ------------------------------------------------------------------------------------
 
     def pull_since_history(self, start_history_id: str) -> PullResult:
-        """Incremental pull: every thread changed since `start_history_id`. new_history_id is
-        the historyId from the LAST history.list page (an empty response with no 'history' key
-        is normal — quiet mailbox — and still carries historyId)."""
+        """Incremental pull: every INBOX thread changed since `start_history_id`.
+        CHECKPOINT-FROM-FIRST-PAGE: new_history_id comes from the FIRST history.list page
+        only (an empty response with no 'history' key is normal — quiet mailbox — and still
+        carries historyId). A later page's historyId reflects the mailbox at THAT request's
+        moment: mail landing mid-pagination advances it past events this query never
+        returned, silently dropping them. Same invariant as pull_bounded_backfill's
+        checkpoint-before-scan — overlap re-pulls harmlessly; the reverse order loses mail.
+        labelId=INBOX scopes the pull: without it sent/archived mail and our OWN just-created
+        drafts (messageAdded fires for drafts too) echo into the next tick — the self-echo
+        path to duplicate/recursive drafts."""
         thread_ids: dict[str, None] = {}   # insertion-ordered dedupe within the run
         new_history_id = str(start_history_id)
         page_token = None
+        first_page = True
         while True:
             # historyTypes=messageAdded: our own IA/* label writes are labelAdded events —
             # without the filter every tick's labels echo into the NEXT tick's pull.
             req = self._gmail.users().history().list(
-                userId="me", startHistoryId=start_history_id,
+                userId="me", startHistoryId=start_history_id, labelId="INBOX",
                 historyTypes=["messageAdded"], pageToken=page_token)
             try:
                 resp = self._execute(req)
@@ -180,7 +188,9 @@ class GmailClient:
                 if _status(e) == 404:   # cursor aged out — the tick backfills to re-establish
                     raise CursorExpiredError(self.account) from e
                 raise                   # 400 = malformed startHistoryId = code bug, never expiry
-            new_history_id = str(resp.get("historyId", new_history_id))
+            if first_page:
+                new_history_id = str(resp.get("historyId", new_history_id))
+                first_page = False
             for record in resp.get("history") or []:
                 for msg in record.get("messages") or []:
                     if msg.get("threadId"):
@@ -202,8 +212,11 @@ class GmailClient:
         thread_ids: dict[str, None] = {}
         page_token = None
         while True:
+            # labelIds=INBOX: same scoping as the incremental pull — a backfill must not
+            # sweep sent/archived/draft mail into classification.
             resp = self._execute(self._gmail.users().messages().list(
-                userId="me", q=f"after:{since}", maxResults=500, pageToken=page_token))
+                userId="me", q=f"after:{since}", labelIds=["INBOX"],
+                maxResults=500, pageToken=page_token))
             for msg in resp.get("messages") or []:
                 if msg.get("threadId"):
                     thread_ids.setdefault(msg["threadId"], None)
@@ -255,17 +268,48 @@ class GmailClient:
                                    "addLabelIds": [label_id]}))
 
     def _label_id(self, name: str) -> str:
+        """Get-or-create, PARENTS FIRST for nested names: Gmail 400s a create of 'IA/x'
+        when 'IA' doesn't exist (the API never auto-creates ancestors), and on a fresh
+        account that failure would wedge every tick (action_failed -> cursor held)."""
         if self._labels is None:   # one labels.list per client instance
             resp = self._execute(self._gmail.users().labels().list(userId="me"))
             self._labels = {lb["name"].lower(): lb["id"] for lb in resp.get("labels") or []}
-        key = name.lower()         # Gmail rejects creates that differ only by case — match likewise
-        if key not in self._labels:
-            created = self._execute(self._gmail.users().labels().create(
-                userId="me", body={"name": name,
-                                   "labelListVisibility": "labelShow",
-                                   "messageListVisibility": "show"}))
-            self._labels[key] = created["id"]
-        return self._labels[key]
+        parts = name.split("/")
+        for depth in range(1, len(parts) + 1):   # 'IA', then 'IA/x' — each level get-or-create
+            ancestor = "/".join(parts[:depth])
+            key = ancestor.lower()   # Gmail rejects creates differing only by case — match likewise
+            if key not in self._labels:
+                created = self._execute(self._gmail.users().labels().create(
+                    userId="me", body={"name": ancestor,
+                                       "labelListVisibility": "labelShow",
+                                       "messageListVisibility": "show"}))
+                self._labels[key] = created["id"]
+        return self._labels[name.lower()]
+
+    def profile_email(self) -> str:
+        """The authenticated mailbox's address (getProfile). The tick compares this against
+        the CONFIGURED account before any read/label/draft: a wrong browser account at mint
+        time or a swapped vault item must fail that account loudly, not silently operate on
+        the wrong mailbox under the wrong label."""
+        profile = self._execute(self._gmail.users().getProfile(userId="me"))
+        return str(profile.get("emailAddress") or "").strip().lower()
+
+    def has_draft_for_thread(self, thread_id: str) -> bool:
+        """True if ANY existing draft already sits on the thread — the idempotency gate
+        before create_reply_draft. Cursors are deliberately held on later failures
+        (at-least-once), so a crash after draft-create but before cursor-advance re-pulls
+        the same thread next tick; without this check that means a duplicate draft.
+        drafts.list is paginated defensively; the count is expected to be tiny."""
+        page_token = None
+        while True:
+            resp = self._execute(self._gmail.users().drafts().list(
+                userId="me", maxResults=100, pageToken=page_token))
+            for d in resp.get("drafts") or []:
+                if (d.get("message") or {}).get("threadId") == thread_id:
+                    return True
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return False
 
     def create_reply_draft(self, parent_message_id: str, body_text: str) -> str:
         """Create a correctly-THREADED reply draft; returns the draft id. Threading needs all

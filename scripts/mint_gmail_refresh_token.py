@@ -148,11 +148,22 @@ def main() -> int:
             return 2
         try:
             gmail = build("gmail", "v1", credentials=creds)
+            # IDENTITY FIRST (KilaBz 2026-07-16): labels.list proves the token WORKS, not
+            # that it belongs to --account. The browser account picker is exactly where the
+            # wrong mailbox slips in — verify getProfile's address before storing anything.
+            profile = gmail.users().getProfile(userId="me").execute()
+            minted_for = str(profile.get("emailAddress") or "").strip().lower()
+            if minted_for != args.account.strip().lower():
+                print(f"CHECK FAIL: token was minted for {minted_for!r}, not "
+                      f"--account {args.account!r} — wrong account in the browser picker; "
+                      "NOT stored, re-run and pick the right account", file=sys.stderr)
+                return 1
             labels = gmail.users().labels().list(userId="me").execute().get("labels", [])
         except Exception as exc:  # HttpError et al — message is safe, credentials are not in it
-            print(f"CHECK FAIL: labels.list — {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"CHECK FAIL: profile/labels — {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
-        print(f"CHECK OK: token lists {len(labels)} labels for {args.account}", file=sys.stderr)
+        print(f"CHECK OK: token is for {args.account} and lists {len(labels)} labels",
+              file=sys.stderr)
 
     if args.op_vault:
         if not _store_in_vault(args.op_vault, args.account, creds.refresh_token):

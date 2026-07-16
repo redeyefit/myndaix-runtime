@@ -23,6 +23,30 @@ if [[ -z "${INBOX_ACCOUNTS:-}" ]]; then
   exit 0
 fi
 
+# SINGLE-FLIGHT LOCK (KilaBz 2026-07-16): launchd is single-instance per label, but a manual
+# run overlapping the scheduled tick would pull the same slice, race the cursor CAS, and
+# double-draft. Atomic mkdir (the house pattern); a crashed run's stale lock clears after
+# 900s. Held for the WHOLE tick — released by the EXIT trap (which is why the python call
+# below must NOT be `exec`: exec replaces the shell and the trap never fires).
+LOCK="$HOME/.myndaix/inbox-assistant.tick.lock"
+mkdir -p "$HOME/.myndaix"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || echo 0) ))
+  if [[ "$lock_age" -lt 900 ]]; then
+    echo "[inbox-assistant] another tick holds the lock (age ${lock_age}s) — exiting"
+    exit 0
+  fi
+  echo "[inbox-assistant] clearing stale lock (age ${lock_age}s)"
+  rm -f "$LOCK/pid" 2>/dev/null || true
+  rmdir "$LOCK" 2>/dev/null || true
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "FATAL: could not acquire tick lock after stale clear — aborting" >&2
+    exit 1
+  fi
+fi
+echo "$$" > "$LOCK/pid"
+trap 'rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
 # ~/.myndaix/.secrets provides CLAUDE_CODE_OAUTH_TOKEN for the classify subprocess
 # (`claude -p`). The set -a bracket exports everything the file defines; close it so
 # nothing sourced later leaks into auto-export. Values are secrets — never echoed,
@@ -52,4 +76,6 @@ export OP_SERVICE_ACCOUNT_TOKEN
 # MacBook). Matches the automerge + serve + mxr pin (session 2026-07-12).
 export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://127.0.0.1/runtime}"
 export PYTHONPATH="src"
-exec "$REPO/.venv/bin/python" -m runtime.inbox_assistant tick
+# NOT exec — the EXIT trap must fire to release the single-flight lock. Under set -e a
+# nonzero python rc still exits the script with that rc (trap runs first).
+"$REPO/.venv/bin/python" -m runtime.inbox_assistant tick
