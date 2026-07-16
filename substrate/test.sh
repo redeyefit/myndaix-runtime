@@ -860,6 +860,19 @@ run_canary "$LIVE_URL" 1
 ok '[[ "$(ls "$TMP/canhome/inbox"/drift-alert-*.md 2>/dev/null | wc -l)" -eq 1 ]]' "drift latch still holds"
 run_canary "$LIVE_URL" 0
 ok '[[ ! -e "$TMP/canhome/state/drift-streak" && ! -e "$TMP/canhome/state/drift-alerted" ]]' "clean dry-run clears drift streak + latch"
+# single-instance lock (review r1): fresh lock held -> skip tick untouched; stale lock -> reclaimed
+mkdir "$TMP/canhome/state/canary.lock"
+ok 'run_canary "$DEAD_URL"' "held lock: tick exits 0"
+ok '[[ ! -e "$TMP/canhome/state/net-streak" ]]' "held lock: tick skipped (no streak bump)"
+touch -t 202001010000 "$TMP/canhome/state/canary.lock"
+run_canary "$DEAD_URL"
+ok '[[ "$(cat "$TMP/canhome/state/net-streak" 2>/dev/null)" == "1" ]]' "stale lock reclaimed: tick ran"
+ok '[[ ! -e "$TMP/canhome/state/canary.lock" ]]' "lock released on exit"
+run_canary "$LIVE_URL"
+# fail-closed streak read (review r1 #5): unreadable streak file dies, does not reset to 0
+mkdir "$TMP/canhome/state/net-streak"
+ok '! run_canary "$DEAD_URL"' "dir-at-streak-path: canary dies (no silent reset)"
+rmdir "$TMP/canhome/state/net-streak"
 
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
