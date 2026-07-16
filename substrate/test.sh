@@ -712,6 +712,29 @@ ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w2.sq
 ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w3.sql" >/dev/null 2>&1' "PR-1d r3: spaced wildcard 'job *' DROP REJECTS"
 ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prevw.txt" "$TMP/d_w4.sql" >/dev/null 2>&1' "PR-1d r3: newt* ADD COLUMN on a genuinely-new table still PASSES (wildcard doesn'\''t block additive)"
 ok '! grep -qE "\(\[\^..s\(\]\+\)" "$SUB/migration_lint.py"' "PR-1d r3: no name-capture regex uses the *-including class ([^\\s(]+) — all exclude the inheritance wildcard"
+# PR-1d r4 fold: inheritance/partition target-set expansion — a recursing op on a "new" parent that gained
+# a PRE-EXISTING descendant must not skip the clause checks.
+printf 'child\nexisting_part\n' > "$TMP/previ.txt"
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "d_inhren":  "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent* RENAME COLUMN c TO d;\n",
+    "d_inhdrop": "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent DROP COLUMN c;\n",
+    "d_inhck":   "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent ADD CONSTRAINT ck CHECK (c>0);\n",
+    "d_partui":  "CREATE TABLE p (id int) PARTITION BY RANGE (id);\nALTER TABLE p ATTACH PARTITION existing_part FOR VALUES FROM (1) TO (100);\nCREATE UNIQUE INDEX u ON p (id);\n",
+    "d_newfull": "CREATE TABLE fresh (a int);\nCREATE UNIQUE INDEX u ON fresh (a);\nALTER TABLE fresh ADD CONSTRAINT pk PRIMARY KEY (a);\n",
+    "d_inhadd":  "CREATE TABLE parent (c int);\nALTER TABLE child INHERIT parent;\nALTER TABLE parent ADD COLUMN e int;\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhren.sql" >/dev/null 2>&1' "PR-1d r4: RENAME on a new parent that INHERITs a pre-existing child REJECTS (recurses to the pre-existing child)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhdrop.sql" >/dev/null 2>&1' "PR-1d r4: DROP COLUMN on a new INHERIT-parent REJECTS (recurses)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhck.sql" >/dev/null 2>&1' "PR-1d r4: ADD CONSTRAINT CHECK on a new INHERIT-parent REJECTS (CHECK recurses to the pre-existing child)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_partui.sql" >/dev/null 2>&1' "PR-1d r4: UNIQUE INDEX on a new partitioned table with a PRE-EXISTING attached partition REJECTS"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_newfull.sql" >/dev/null 2>&1' "PR-1d r4: a genuinely-new table (no INHERIT/ATTACH) + UNIQUE INDEX + ADD CONSTRAINT PK still PASSES"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/previ.txt" "$TMP/d_inhadd.sql" >/dev/null 2>&1' "PR-1d r4: ADD COLUMN on a new INHERIT-parent still PASSES (additive even when recursed to the child)"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

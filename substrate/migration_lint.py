@@ -463,8 +463,11 @@ def _new_this_deploy(name: str, created: frozenset[str], prev_objects: "frozense
 
 
 def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str] = frozenset(),
-                 prev_objects: "frozenset[str] | None" = None) -> bool:
-    """True iff `stmt` (already _normalize'd) is a provably-additive migration statement — the allowlist."""
+                 prev_objects: "frozenset[str] | None" = None, linked: bool = False) -> bool:
+    """True iff `stmt` (already _normalize'd) is a provably-additive migration statement — the allowlist.
+    linked: the file contains an INHERIT / ATTACH PARTITION, so a "new" table may have gained a PRE-EXISTING
+    descendant/partition — a recursing ALTER TABLE or a UNIQUE INDEX on it could then hit that pre-existing
+    relation, so the new-this-deploy shortcuts are disabled and everything clause-checks (cross-family PR-1d r4)."""
     s = stmt.strip()
     if not s:
         return True
@@ -491,8 +494,11 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
                           s, re.IGNORECASE)
             return bool(vm) and _new_this_deploy(vm.group(1), created, prev_objects)
         if re.search(r"^CREATE\s+(?:\w+\s+)*?UNIQUE\s+INDEX\b", s, re.IGNORECASE):
-            tgt = _target_after_on(s)                      # additive ONLY on a table born this deploy
-            return tgt is not None and _new_this_deploy(tgt, created, prev_objects)
+            # additive ONLY on a table born this deploy AND when the migration created no descendant/partition
+            # link (a unique index on a partitioned parent propagates to its partitions — a pre-existing one
+            # would be tightened; conservative file-level guard, r4).
+            tgt = _target_after_on(s)
+            return tgt is not None and not linked and _new_this_deploy(tgt, created, prev_objects)
         return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
     if re.match(r"^ALTER\s+TABLE\b", s, re.IGNORECASE):
         # `([^\s(*]+)\*?` — exclude the inheritance wildcard from the NAME and consume it separately:
@@ -501,8 +507,13 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
         m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(*]+)\s*\*?\s+", s, re.IGNORECASE)
         if not m:
             return False
-        if _new_this_deploy(m.group(1), created, prev_objects):
-            return True                                    # any op on a table born this deploy is additive
+        # Any op on a table born this deploy is additive — old code has never referenced it. BUT an ALTER
+        # TABLE without ONLY RECURSES to descendants, so if the migration linked a PRE-EXISTING descendant
+        # (INHERIT / ATTACH, `linked`), an op on a "new" parent could hit that pre-existing table (r4). When
+        # linked, DON'T short-circuit — clause-check so ADD COLUMN (additive even recursed) passes while
+        # DROP/RENAME/ADD CONSTRAINT/tighten reject.
+        if not linked and _new_this_deploy(m.group(1), created, prev_objects):
+            return True
         return all(_additive_alter_table_clause(c) for c in _top_level_clauses(s[m.end():]))
     if re.match(r"^ALTER\s+TYPE\b", s, re.IGNORECASE):     # enum ADD VALUE / composite ADD ATTRIBUTE only
         m = re.match(r"^ALTER\s+TYPE\s+(?:IF\s+EXISTS\s+)?\S+\s+", s, re.IGNORECASE)
@@ -562,12 +573,17 @@ def lint_file(path: Path, allow_routine: bool = False,
     if _DBLINK_RE.search(_normalize(raw, keep_quoted=True)):
         return [f"{path.name}: NON-ADDITIVE — references dblink (runs DDL from a DML/SELECT expression); "
                 "not additive — set RECONCILE_ALLOW_CONTRACTION=1 for a blessed one"]
+    norm = _normalize(raw)
+    # File-level: does the migration create a descendant/partition LINK (INHERIT / ATTACH PARTITION)? If so a
+    # "new" table may have gained a PRE-EXISTING descendant, so a recursing ALTER TABLE or a UNIQUE INDEX on
+    # it can't be blessed as new-only (r4). Conservative — any such link disables the new-this-deploy shortcuts.
+    linked = bool(re.search(r"\bATTACH\s+PARTITION\b|\bINHERIT\b", norm, re.IGNORECASE))
     out: list[str] = []
     created: set[str] = set()   # tables UNCONDITIONALLY created in a PRECEDING statement (order-aware, r10)
-    for stmt in (s.strip() for s in _normalize(raw).split(";")):
+    for stmt in (s.strip() for s in norm.split(";")):
         if not stmt:
             continue
-        if not _is_additive(stmt, allow_routine, frozenset(created), prev_objects):
+        if not _is_additive(stmt, allow_routine, frozenset(created), prev_objects, linked):
             out.append(f"{path.name}: NON-ADDITIVE — {_reject_reason(stmt, allow_routine)}\n    {stmt[:140]}")
         # Register an unconditional CREATE TABLE AFTER checking this statement, so it can only bless LATER
         # ops on the genuinely-new table — never retroactively an earlier op (r10 order-reversal).
