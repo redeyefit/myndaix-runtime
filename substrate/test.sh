@@ -258,6 +258,23 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/badC.sql" >/dev/null 2>&1' "lint re
 ok 'python3 "$SUB/migration_lint.py" "$TMP/goodM.sql" >/dev/null 2>&1' "lint passes additive (ADD COLUMN NOT NULL DEFAULT / CREATE IF NOT EXISTS / CREATE+DROP INDEX)"
 printf -- '-- DROP TABLE old;\n/* DROP COLUMN x */\n' > "$TMP/cmt.sql"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/cmt.sql" >/dev/null 2>&1' "lint ignores commented-out contractions"
+# adversarial review M1 hardening: newline-split keyword, string-literal false-positive, ADD-COLUMN-NN, DROP CONSTRAINT
+printf 'DROP\n  TABLE foo;\n' > "$TMP/split.sql"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/split.sql" >/dev/null 2>&1' "lint catches a keyword split across a newline (DROP\\n TABLE)"
+printf "INSERT INTO x(sql) VALUES('please DROP TABLE nothing');\n" > "$TMP/strlit.sql"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/strlit.sql" >/dev/null 2>&1' "lint does NOT false-positive on DROP inside a string literal"
+printf 'ALTER TABLE t ADD COLUMN c int NOT NULL;\n' > "$TMP/nndef.sql"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/nndef.sql" >/dev/null 2>&1' "lint rejects ADD COLUMN NOT NULL without DEFAULT"
+printf 'ALTER TABLE t DROP CONSTRAINT t_pk;\n' > "$TMP/dcon.sql"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/dcon.sql" >/dev/null 2>&1' "lint rejects DROP CONSTRAINT"
+ok 'python3 "$SUB/migration_lint.py" "$REPO/src/runtime/ledger/migrations/0006_skill_pk.sql" >/dev/null 2>&1' "lint clean on the real 0006 (DROP-in-a-string) — no false positive"
+
+echo "== PR-1c review folds: M1 diff-filter, M2 quarantine, M3 old-pid, M4 disarm =="
+ok 'grep -q -- "--diff-filter=AMR" "$SUB/reconcile.sh"' "M1: reconcile lints ADDED+MODIFIED+RENAMED migrations (not added-only)"
+ok 'grep -q "QUARANTINED_SHA" "$SUB/reconcile.sh" && grep -q "QUARANTINED_SHA" "$SUB/bootstrap-fetch.sh"' "M2: quarantine-SHA written by reconcile + honored by bootstrap-fetch (no revert thrash)"
+ok 'grep -q "is QUARANTINED" "$SUB/bootstrap-fetch.sh"' "M2: bootstrap-fetch HOLDS when origin == quarantined SHA"
+ok 'grep -q "old_pid" "$SUB/reconcile.sh" && grep -q "pid\" != \"\$old_pid" "$SUB/reconcile.sh"' "M3: health_gate requires serve pid to CHANGE (no false-green on old serve)"
+ok 'grep -q "detached bootout" "$SUB/reconcile.sh"' "M4: disarmed-but-loaded reconcile poll is detached-bootout'\''d"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

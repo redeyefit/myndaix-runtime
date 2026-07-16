@@ -102,12 +102,21 @@ prev_recoverable() { [[ "$PREV_GOOD" != none ]] && git -C "$DEPLOY_CLONE" cat-fi
 # so refuse to auto-deploy it (a contraction is a deliberate human-gated two-release change). Only
 # the delta is linted — historical migrations may contain legitimate one-time contractions.
 if prev_recoverable; then
+  # --diff-filter=AMR: catch ADDED, MODIFIED, and RENAMED migrations (adversarial review M1) — serve
+  # re-runs the CURRENT on-disk content of every migration on boot, so an in-place EDIT to a shipped
+  # migration also executes and must be linted. Capture into a var + check exit (a process-sub failure
+  # would fail-OPEN and silently skip the lint).
+  if ! delta="$(git -C "$DEPLOY_CLONE" diff --name-only --diff-filter=AMR "${PREV_GOOD}..HEAD" -- 'src/runtime/ledger/migrations/*.sql')"; then
+    die "could not compute migration delta ${PREV_GOOD:0:8}..HEAD (git diff failed) — refusing to converge"
+  fi
   new_migs=()
-  while IFS= read -r m; do [[ -n "$m" ]] && new_migs+=("$m"); done \
-    < <(git -C "$DEPLOY_CLONE" diff --name-only --diff-filter=A "${PREV_GOOD}..HEAD" -- 'src/runtime/ledger/migrations/*.sql')
+  while IFS= read -r m; do [[ -n "$m" ]] && new_migs+=("$m"); done <<< "$delta"
   if [[ ${#new_migs[@]} -gt 0 ]]; then
-    ( cd "$DEPLOY_CLONE" && python3 "$SUBSTRATE_DIR/migration_lint.py" "${new_migs[@]}" ) \
-      || die "NON-ADDITIVE migration in ${PREV_GOOD:0:8}..HEAD — refusing unattended auto-deploy (§2.8)"
+    if [[ "${RECONCILE_ALLOW_CONTRACTION:-0}" == "1" ]]; then
+      log "WARN: RECONCILE_ALLOW_CONTRACTION=1 — skipping the additive-migration lint (blessed contraction)"
+    elif ! ( cd "$DEPLOY_CLONE" && python3 "$SUBSTRATE_DIR/migration_lint.py" "${new_migs[@]}" ); then
+      die "NON-ADDITIVE migration in ${PREV_GOOD:0:8}..HEAD — refusing unattended auto-deploy (§2.8; RECONCILE_ALLOW_CONTRACTION=1 to override a blessed one)"
+    fi
   fi
 fi
 
@@ -169,7 +178,7 @@ install_artifacts() {
     while IFS= read -r prev; do
       [[ -n "$prev" ]] || continue
       [[ "$prev" == "ai.myndaix.runtime" ]] && continue
-      still=0; for l in "${ROLE_LABELS[@]}"; do [[ "$l" == "$prev" ]] && { still=1; break; }; done
+      still=0; for l in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do [[ "$l" == "$prev" ]] && { still=1; break; }; done
       if [[ "$still" == 0 ]]; then
         log "orphan prune: $prev no longer managed — bootout + remove plist"
         # never bootout the poll label we may be running under; just remove its file if disarmed
@@ -184,26 +193,31 @@ install_artifacts() {
 # so the caller can auto-revert. Reads migration_head.txt from the CURRENT tree each call (so after a
 # revert it checks the reverted SHA's head object). psql CONNECT is bounded by PGCONNECT_TIMEOUT (lib.sh)
 # so a flaky loopback fails-fast and the deadline logic actually fires (found live on the Mini cutover).
+serve_pid() { launchctl print "$LA_DOMAIN/ai.myndaix.runtime" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid =/{gsub(/[^0-9]/,"",$2); print $2; exit}'; }
 health_gate() {
-  local HEAD_OBJ deadline prev_pid pid head_ok label vrc verify porcelain
+  local HEAD_OBJ deadline old_pid prev_pid pid head_ok label vrc verify porcelain
   HEAD_OBJ="$(cat "$SUBSTRATE_DIR/migration_head.txt")"
   [[ "$HEAD_OBJ" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "migration_head.txt not a plain identifier: '$HEAD_OBJ'"
-  # 4. restart serve (sole migration owner; hand-managed plist — kickstart the existing label)
+  # 4. restart serve (sole migration owner; hand-managed plist — kickstart the existing label).
+  #    Capture the OLD pid FIRST: kickstart -k does NOT block on the old process exiting (serve does a
+  #    graceful multi-worker drain), so without requiring the pid to CHANGE the WAIT could false-green
+  #    on the still-draining OLD serve — a broken new SHA reads healthy and gets cemented (review M3).
   la_loaded ai.myndaix.runtime || { log "serve (ai.myndaix.runtime) not loaded"; return 1; }
-  log "kickstarting serve to apply migrations"; la_kickstart ai.myndaix.runtime || { log "serve kickstart failed"; return 1; }
-  # 5. WAIT for a STABLE serve pid AND the migration head object (pid-stability rules out a crash-loop).
+  old_pid="$(serve_pid)"
+  log "kickstarting serve (old pid ${old_pid:-none}) to apply migrations"; la_kickstart ai.myndaix.runtime || { log "serve kickstart failed"; return 1; }
+  # 5. WAIT for serve to be RESTARTED (pid != old) AND STABLE (pid unchanged across a poll) AND migrated.
   deadline=$(( $(date +%s) + 150 )); prev_pid=""
   while :; do
-    pid="$(launchctl print "$LA_DOMAIN/ai.myndaix.runtime" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid =/{gsub(/[^0-9]/,"",$2); print $2; exit}')"
+    pid="$(serve_pid)"
     head_ok="$(PGOPTIONS='-c statement_timeout=10s' psql "$MYNDAIX_DSN" -v ON_ERROR_STOP=1 -tAc "SELECT to_regclass('public.$HEAD_OBJ') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')"
-    [[ -n "$pid" && "$pid" == "$prev_pid" && "$head_ok" == "t" ]] && break
+    [[ -n "$pid" && "$pid" != "$old_pid" && "$pid" == "$prev_pid" && "$head_ok" == "t" ]] && break
     prev_pid="$pid"
-    [[ $(date +%s) -ge $deadline ]] && { log "health WAIT timeout: serve not stable / head '$HEAD_OBJ' absent (150s)"; return 1; }
+    [[ $(date +%s) -ge $deadline ]] && { log "health WAIT timeout: serve not restarted+stable / head '$HEAD_OBJ' absent (150s)"; return 1; }
     sleep 3
   done
-  log "serve healthy (pid $pid stable); migration head '$HEAD_OBJ' present"
+  log "serve healthy (restarted pid $pid stable, was ${old_pid:-none}); migration head '$HEAD_OBJ' present"
   # 6. start the ticks (never bootout the reconcile-poll self label)
-  for label in "${ROLE_LABELS[@]}"; do
+  for label in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do
     [[ "$label" == "ai.myndaix.runtime" ]] && continue
     if [[ "$label" == "ai.myndaix.reconcile" ]]; then la_loaded "$label" || la_bootstrap "$LA_DIR/$label.plist"; continue; fi
     la_bootout "$label"; la_wait_gone "$label" 10 || true
@@ -242,10 +256,20 @@ else
 fi
 trap - EXIT   # converged (possibly reverted) — clear the autonomy-halt restore trap
 
+# QUARANTINE (review M2): if we auto-reverted, remember the BAD SHA so the NEXT poll doesn't reset to
+# it and thrash forever (origin/main is still the bad SHA until a human pushes a fix). bootstrap-fetch
+# HOLDS while origin == QUARANTINED_SHA. A clean (non-reverted) converge clears any stale quarantine.
+if [[ "$reverted" == 1 ]]; then
+  { printf '%s\n' "$HEAD_SHA" > "$STATE_DIR/QUARANTINED_SHA.tmp" && mv -f "$STATE_DIR/QUARANTINED_SHA.tmp" "$STATE_DIR/QUARANTINED_SHA"; } || rm -f "$STATE_DIR/QUARANTINED_SHA.tmp"
+else
+  rm -f "$STATE_DIR/QUARANTINED_SHA"
+fi
+
 # 8. COMMIT POINT — manifest receipt FIRST, then managed_labels, then RUNNING_SHA LAST (the last-good
-#    marker). Each write is an explicit fail-closed if-block (a `printf > tmp && mv` &&-chain is exempt
-#    from set -e on the non-final link — the #89 class).
-if ! { printf '%s\n' "${ROLE_LABELS[@]}" > "$STATE_DIR/managed_labels.tmp" && mv -f "$STATE_DIR/managed_labels.tmp" "$STATE_DIR/managed_labels"; }; then
+#    marker). Explicit fail-closed if-blocks (a `printf > tmp && mv` &&-chain is exempt from set -e on
+#    the non-final link — the #89 class). The `${arr[@]+...}` idiom is bash-3.2 + set -u safe on an
+#    empty array (review MED — /bin/bash is 3.2 on macOS).
+if ! { printf '%s\n' ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"} > "$STATE_DIR/managed_labels.tmp" && mv -f "$STATE_DIR/managed_labels.tmp" "$STATE_DIR/managed_labels"; }; then
   die "failed to write managed_labels (converge incomplete, retry next poll)"
 fi
 if ! { python3 "$SUBSTRATE_DIR/manifest.py" build "$CONFIG_FILE" > "$STATE_DIR/manifest.json.tmp" && mv -f "$STATE_DIR/manifest.json.tmp" "$STATE_DIR/manifest.json"; }; then
@@ -256,12 +280,23 @@ if ! { printf '%s\n' "$converged_sha" > "$STATE_DIR/RUNNING_SHA.tmp" && mv -f "$
 fi
 log "CONVERGED at ${converged_sha:0:8} — receipt written"
 
-# Loud ALARM on an auto-revert: FACTORY is back on known-good code, but the bad SHA needs a human.
+# DISARM enforcement (review M4): `rm RECONCILE_ARMED` deletes the poll's plist file but the LOADED
+# StartInterval job keeps firing → keeps auto-deploying. If the poll is loaded but NOT managed this run
+# (disarmed), bootout it — DETACHED so we don't self-suicide if we ARE the poll process (finish this
+# converge, THEN unload).
+poll_managed=0
+for l in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do [[ "$l" == "ai.myndaix.reconcile" ]] && poll_managed=1; done
+if [[ "$poll_managed" == 0 ]] && la_loaded ai.myndaix.reconcile; then
+  log "reconcile poll loaded but disarmed — detached bootout after this converge exits"
+  ( sleep 3; launchctl bootout "$LA_DOMAIN/ai.myndaix.reconcile" 2>/dev/null ) >/dev/null 2>&1 &
+fi
+
+# Loud ALARM on an auto-revert (dedup: filename keyed on the BAD SHA so repeated polls can't flood).
 if [[ "$reverted" == 1 ]]; then
   log "ALARM: AUTO-REVERTED ${HEAD_SHA:0:8} -> ${converged_sha:0:8} (bad SHA failed the health gate) — investigate"
   if [[ -n "${OPERATOR_INBOX:-}" && -d "$OPERATOR_INBOX" ]]; then
-    alert="$OPERATOR_INBOX/reconcile-revert-$(date '+%Y%m%d%H%M%S').md"
-    { printf 'reconcile AUTO-REVERTED FACTORY from %s to %s: the new SHA failed the post-restart health gate.\nFACTORY is back on known-good code. Investigate the bad SHA before re-deploying.\n' "$HEAD_SHA" "$converged_sha" > "$alert.tmp" && mv -f "$alert.tmp" "$alert"; } || rm -f "$alert.tmp"
+    alert="$OPERATOR_INBOX/reconcile-revert-${HEAD_SHA:0:12}.md"
+    [[ -e "$alert" ]] || { printf 'reconcile AUTO-REVERTED FACTORY from %s to %s: the new SHA failed the post-restart health gate.\nFACTORY is back on known-good code. Investigate the bad SHA before re-deploying.\n' "$HEAD_SHA" "$converged_sha" > "$alert.tmp" && mv -f "$alert.tmp" "$alert"; } || rm -f "$alert.tmp"
   fi
 fi
 

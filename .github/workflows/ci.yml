@@ -59,3 +59,16 @@ jobs:
         # Fixture-only; portable (plistlib not macOS plutil; shellcheck skipped if absent). Catches
         # a stale migration_head.txt pin, config-parser/denylist regressions, quiesce-list drift.
         run: bash substrate/test.sh
+
+      - name: Migration additivity lint (changed migrations vs main)
+        # Belt-and-suspenders enforcement of §2.8 at PR time (reconcile enforces at deploy). Lints
+        # only the migrations ADDED/MODIFIED/RENAMED vs the merge-base — a contraction fails CI.
+        run: |
+          git fetch --no-tags --depth=200 origin main || true
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          if [ -z "$base" ]; then echo "no merge-base with origin/main — skipping (reconcile enforces at deploy)"; exit 0; fi
+          changed="$(git diff --diff-filter=AMR --name-only "$base"..HEAD -- 'src/runtime/ledger/migrations/*.sql' || true)"
+          if [ -z "$changed" ]; then echo "no migration changes vs main"; exit 0; fi
+          echo "linting changed migrations:"; echo "$changed"
+          # shellcheck disable=SC2086
+          python substrate/migration_lint.py $changed
