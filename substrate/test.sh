@@ -647,6 +647,36 @@ ok '! python3 "$SUB/migration_lint.py" "$TMP/r14luidx.sql" >/dev/null 2>&1' "r14
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r14fp.sql" >/dev/null 2>&1' "r14: a legit ADD COLUMN on a schema-qualified quoted table PASSES (false-positive fixed)"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r14unq.sql" >/dev/null 2>&1' "r14: unquoted schema-qualified same-migration (CREATE public.orders + UNIQUE INDEX) still PASSES"
 
+echo "== PR-1d: pg_catalog pre-existing-relation context (--existing) =="
+printf 'job\nusers\nfinding_current\nexisting_v\n' > "$TMP/prev.txt"   # the live-DB relation set (prev_good schema)
+printf '' > "$TMP/prev_empty.txt"                                      # DB with no relations (every object new)
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    "d_newuidx": "CREATE TABLE IF NOT EXISTS finding_outcome (id int);\nCREATE UNIQUE INDEX u ON finding_outcome(id);\n",
+    "d_newview": "CREATE OR REPLACE VIEW v AS SELECT 1;\n",
+    "d_launder": "CREATE TABLE IF NOT EXISTS users (id int);\nALTER TABLE users DROP COLUMN pw;\n",
+    "d_replexist": "CREATE OR REPLACE VIEW existing_v AS SELECT a, b FROM t;\n",
+    "d_uidxexist": "CREATE UNIQUE INDEX u ON job (x);\n",
+    "d_dropexist": "ALTER TABLE public.\"job\" DROP COLUMN context;\n",
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_newuidx.sql" >/dev/null 2>&1' "PR-1d: with --existing, a NEW table + its UNIQUE INDEX PASSES (finding_outcome not in pg_catalog = born this deploy)"
+ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_newview.sql" >/dev/null 2>&1' "PR-1d: a NEW view (CREATE OR REPLACE VIEW, not in pg_catalog) PASSES"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_launder.sql" >/dev/null 2>&1' "PR-1d: launder STILL closed — DROP COLUMN on a pre-existing table (users in pg_catalog) REJECTS even with --existing"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_replexist.sql" >/dev/null 2>&1' "PR-1d: CREATE OR REPLACE of a PRE-EXISTING view (existing_v in pg_catalog) REJECTS (a redef could narrow un-revertibly)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_uidxexist.sql" >/dev/null 2>&1' "PR-1d: UNIQUE INDEX on a PRE-EXISTING table (job) REJECTS (tightening)"
+ok '! python3 "$SUB/migration_lint.py" --existing "$TMP/prev.txt" "$TMP/d_dropexist.sql" >/dev/null 2>&1' "PR-1d: schema-qualified DROP on a pre-existing table (public.\"job\", bare job in pg_catalog) REJECTS"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/d_newuidx.sql" >/dev/null 2>&1' "PR-1d fallback: WITHOUT --existing the new-table UNIQUE INDEX stays conservative-REJECT (current behavior preserved)"
+for m in 0008 0009 0011 0012; do
+  f=$(ls "$REPO"/src/runtime/ledger/migrations/${m}_*.sql)
+  ok 'python3 "$SUB/migration_lint.py" --existing "$TMP/prev_empty.txt" "'"$f"'" >/dev/null 2>&1' "PR-1d: real $m PASSES when its objects are new (empty pg_catalog) — the idempotent create+index/view false-positive is fixed"
+done
+ok 'grep -q "pg_catalog for pre-existing" "$SUB/reconcile.sh" && grep -q -- "--existing" "$SUB/reconcile.sh"' "PR-1d: reconcile queries pg_catalog (fail-closed) and passes --existing to the lint"
+
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
 import sys

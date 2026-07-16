@@ -35,9 +35,13 @@ This is a conservative gate, not a proof. Its bias is fail-closed — an unrecog
 existing table) and only for LATER statements (order-aware) — else a create could launder a DROP onto an
 existing table (cross-family r10 CRITICAL). Accepted fail-closed cost: an idempotent migration that uses
 `CREATE TABLE IF NOT EXISTS t` then adds a UNIQUE INDEX / CREATE OR REPLACE VIEW to `t` can't be proven
-additive from its text alone and needs RECONCILE_ALLOW_CONTRACTION (the repo's own 0008/0009/0011/0012 are
-such — they are safe in practice but unprovable). FOLLOW-UP (PR-1d): pass reconcile the set of objects that
-existed in prev_good so "new THIS DEPLOY vs pre-existing" is decidable and these pass without an escape.
+additive from its text alone. PR-1d closes most of this: reconcile passes `--existing` = the live pg_catalog
+relation set (which at lint time still reflects prev_good, since the new migrations haven't applied), so an
+op on a relation BORN this deploy (a new table's UNIQUE INDEX, a NEW view) is additive without an escape,
+while a DROP/tighten on a PRE-EXISTING relation stays rejected. A CREATE OR REPLACE VIEW that RE-DEFINES a
+pre-existing view still needs RECONCILE_ALLOW_CONTRACTION (its column set could narrow un-revertibly — the
+lint can't prove otherwise). `--existing` never WEAKENS the gate; absent it (DB unreadable), the lint runs
+the conservative same-migration fallback.
 Other residuals: plain INSERT / a LOCKING SELECT ... FOR UPDATE / UPDATE are treated additive (schema-
 neutral).
 
@@ -425,7 +429,26 @@ def _resolvable_table(name: str) -> bool:
     return name != "qi" and "qi" not in name.split(".")
 
 
-def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str] = frozenset()) -> bool:
+def _new_this_deploy(name: str, created: frozenset[str], prev_objects: "frozenset[str] | None") -> bool:
+    # Is <name> a relation BORN in this deploy (so any op on it — a UNIQUE INDEX, a CREATE OR REPLACE VIEW,
+    # even a DROP — is additive, since old code has never referenced it)? PR-1d:
+    #   - AUTHORITATIVE (prev_objects given = reconcile read the LIVE pg_catalog, which at lint time reflects
+    #     prev_good's schema since the new migrations haven't applied): new IFF the bare name is NOT already
+    #     a relation in the DB. This closes the idempotent-migration false positive (a CREATE TABLE IF NOT
+    #     EXISTS of a genuinely-new table + its UNIQUE INDEX / OR REPLACE VIEW) WITHOUT reopening the r10
+    #     launder (a DROP on a pre-existing table: its bare name IS in prev_objects -> not new -> rejected).
+    #   - FALLBACK (prev_objects is None: DB unreadable / first converge): the conservative same-migration
+    #     rule — new only if UNCONDITIONALLY created in a preceding statement THIS file (r10).
+    # An unresolvable (quoted) name is never trusted as new (fail-closed).
+    if not _resolvable_table(name):
+        return False
+    if prev_objects is not None:
+        return name.split(".")[-1].lower() not in prev_objects   # bare, case-folded (unquoted idents fold)
+    return name in created
+
+
+def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str] = frozenset(),
+                 prev_objects: "frozenset[str] | None" = None) -> bool:
     """True iff `stmt` (already _normalize'd) is a provably-additive migration statement — the allowlist."""
     s = stmt.strip()
     if not s:
@@ -443,22 +466,25 @@ def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str]
         return True
     if re.match(r"^CREATE\b", s, re.IGNORECASE):
         if re.match(r"^CREATE\s+OR\s+REPLACE\b", s, re.IGNORECASE):
-            # Rejected fail-closed: a CREATE OR REPLACE VIEW that changes the column set is NOT safely
-            # revertible — Postgres forbids narrowing/retyping a view via CREATE OR REPLACE, so re-applying
-            # prev_good's older definition ERRORS and serve bricks, defeating auto-revert (cross-family r10,
-            # live-PG confirmed). A genuinely-new view uses a plain CREATE VIEW (additive); a re-definition
-            # needs RECONCILE_ALLOW_CONTRACTION.
-            return False
+            # A CREATE OR REPLACE VIEW that changes an EXISTING view's column set is NOT safely revertible —
+            # Postgres forbids narrowing/retyping a view via OR REPLACE, so re-applying prev_good's older
+            # definition ERRORS and serve bricks (cross-family r10, live-PG confirmed). Additive ONLY when
+            # the view is NEW this deploy (PR-1d: not already a relation in prev_good). CREATE OR REPLACE
+            # FUNCTION etc. stays rejected (opaque). Absent prev_objects -> reject (a view is never in the
+            # table-only `created` fallback set).
+            vm = re.match(r"^CREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+                          s, re.IGNORECASE)
+            return bool(vm) and _new_this_deploy(vm.group(1), created, prev_objects)
         if re.search(r"^CREATE\s+(?:\w+\s+)*?UNIQUE\s+INDEX\b", s, re.IGNORECASE):
-            tgt = _target_after_on(s)                      # additive ONLY on a table born this migration
-            return tgt is not None and _resolvable_table(tgt) and tgt in created
+            tgt = _target_after_on(s)                      # additive ONLY on a table born this deploy
+            return tgt is not None and _new_this_deploy(tgt, created, prev_objects)
         return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
     if re.match(r"^ALTER\s+TABLE\b", s, re.IGNORECASE):
         m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(]+)\s+", s, re.IGNORECASE)
         if not m:
             return False
-        if _resolvable_table(m.group(1)) and m.group(1) in created:
-            return True                                    # any op on a same-migration new table is additive
+        if _new_this_deploy(m.group(1), created, prev_objects):
+            return True                                    # any op on a table born this deploy is additive
         return all(_additive_alter_table_clause(c) for c in _top_level_clauses(s[m.end():]))
     if re.match(r"^ALTER\s+TYPE\b", s, re.IGNORECASE):     # enum ADD VALUE / composite ADD ATTRIBUTE only
         m = re.match(r"^ALTER\s+TYPE\s+(?:IF\s+EXISTS\s+)?\S+\s+", s, re.IGNORECASE)
@@ -502,10 +528,13 @@ def _reject_reason(stmt: str, allow_routine: bool = False) -> str:
             "RECONCILE_ALLOW_CONTRACTION (or --allow-routine for a blessed function/trigger)")
 
 
-def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
+def lint_file(path: Path, allow_routine: bool = False,
+              prev_objects: "frozenset[str] | None" = None) -> list[str]:
     # ALLOWLIST gate: reject any statement that is not provably additive (fail-closed). allow_routine
     # (operator-gated via RECONCILE_ALLOW_ROUTINE) additionally blesses a routine/behavioral CREATE/DROP —
-    # narrow: a DROP TABLE alongside is its own statement and still fails (r5 FP-7).
+    # narrow: a DROP TABLE alongside is its own statement and still fails (r5 FP-7). prev_objects (PR-1d,
+    # reconcile's --existing = the live pg_catalog relation set = prev_good's schema) lets an op on a
+    # relation BORN this deploy pass without the escape; None keeps the conservative same-file behavior.
     raw = path.read_text()
     # FILE-LEVEL dblink guard on the DE-IDENTIFIED text (quoted-ident content preserved, comments/strings
     # stripped): the per-statement check runs on _normalize output where `"dblink_exec"` became `qi`, so a
@@ -520,7 +549,7 @@ def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
     for stmt in (s.strip() for s in _normalize(raw).split(";")):
         if not stmt:
             continue
-        if not _is_additive(stmt, allow_routine, frozenset(created)):
+        if not _is_additive(stmt, allow_routine, frozenset(created), prev_objects):
             out.append(f"{path.name}: NON-ADDITIVE — {_reject_reason(stmt, allow_routine)}\n    {stmt[:140]}")
         # Register an unconditional CREATE TABLE AFTER checking this statement, so it can only bless LATER
         # ops on the genuinely-new table — never retroactively an earlier op (r10 order-reversal).
@@ -534,8 +563,24 @@ def main(argv: list[str]) -> int:
     args = argv[1:]
     allow_routine = "--allow-routine" in args
     args = [a for a in args if a != "--allow-routine"]
+    # --existing <file>: newline-separated relation names that EXIST before this deploy (reconcile passes the
+    # live pg_catalog set). PR-1d: an op on a relation NOT in this set is on an object born this deploy ->
+    # additive. Names are compared bare + case-folded (unquoted PG identifiers fold to lowercase).
+    prev_objects: "frozenset[str] | None" = None
+    if "--existing" in args:
+        idx = args.index("--existing")
+        if idx + 1 >= len(args):
+            sys.stderr.write("migration_lint: --existing needs a file argument\n")
+            return 2
+        expath = args[idx + 1]
+        del args[idx:idx + 2]
+        try:
+            prev_objects = frozenset(n.strip().lower() for n in Path(expath).read_text().split() if n.strip())
+        except OSError as e:
+            sys.stderr.write(f"migration_lint: cannot read --existing {expath}: {e}\n")
+            return 2
     if not args:
-        sys.stderr.write("usage: migration_lint.py [--allow-routine] <file.sql|dir> ...\n")
+        sys.stderr.write("usage: migration_lint.py [--allow-routine] [--existing <file>] <file.sql|dir> ...\n")
         return 2
     files: list[Path] = []
     for a in args:
@@ -547,7 +592,7 @@ def main(argv: list[str]) -> int:
     violations: list[str] = []
     for sql in files:
         try:
-            violations.extend(lint_file(sql, allow_routine=allow_routine))
+            violations.extend(lint_file(sql, allow_routine=allow_routine, prev_objects=prev_objects))
         except OSError as e:
             sys.stderr.write(f"migration_lint: cannot read {sql}: {e}\n")
             return 2

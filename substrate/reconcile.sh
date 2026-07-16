@@ -123,8 +123,26 @@ if prev_recoverable; then
     [[ "${RECONCILE_ALLOW_ROUTINE:-0}" == "1" ]] && lint_flags+=(--allow-routine)
     if [[ "${RECONCILE_ALLOW_CONTRACTION:-0}" == "1" ]]; then
       log "WARN: RECONCILE_ALLOW_CONTRACTION=1 — skipping the additive-migration lint (blessed contraction)"
-    elif ! ( cd "$DEPLOY_CLONE" && python3 "$SUBSTRATE_DIR/migration_lint.py" ${lint_flags[@]+"${lint_flags[@]}"} "${new_migs[@]}" ); then
-      die "NON-ADDITIVE migration in ${PREV_GOOD:0:8}..HEAD — refusing unattended auto-deploy (§2.8; RECONCILE_ALLOW_CONTRACTION=1 to override a blessed one, or RECONCILE_ALLOW_ROUTINE=1 for a blessed function)"
+    else
+      # PR-1d: give the lint the relations that ALREADY EXIST. The new migrations have NOT applied yet (the
+      # lint is a PRE-converge precondition), so the live pg_catalog reflects prev_good's schema. An op on a
+      # relation BORN this deploy (a new table's UNIQUE INDEX, a new view) is then additive without an escape,
+      # while a DROP/tighten on a pre-existing relation is still rejected. FAIL-CLOSED: a psql failure just
+      # skips --existing and the lint falls back to its conservative same-migration rule (bounded connect via
+      # lib.sh PGCONNECT_TIMEOUT + statement_timeout; the pre-existing set never WEAKENS the gate).
+      existing_rel="$STATE_DIR/existing_relations.txt"
+      if PGOPTIONS='-c statement_timeout=10s' psql "$MYNDAIX_DSN" -v ON_ERROR_STOP=1 -tAqc \
+           "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','v','m','p') AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')" \
+           > "$existing_rel.tmp" 2>/dev/null; then
+        mv -f "$existing_rel.tmp" "$existing_rel"
+        lint_flags+=(--existing "$existing_rel")
+      else
+        rm -f "$existing_rel.tmp"
+        log "WARN: could not read pg_catalog for pre-existing relations — additivity lint runs conservative (an idempotent create+index migration may need RECONCILE_ALLOW_CONTRACTION)"
+      fi
+      if ! ( cd "$DEPLOY_CLONE" && python3 "$SUBSTRATE_DIR/migration_lint.py" ${lint_flags[@]+"${lint_flags[@]}"} "${new_migs[@]}" ); then
+        die "NON-ADDITIVE migration in ${PREV_GOOD:0:8}..HEAD — refusing unattended auto-deploy (§2.8; RECONCILE_ALLOW_CONTRACTION=1 to override a blessed one, or RECONCILE_ALLOW_ROUTINE=1 for a blessed function)"
+      fi
     fi
   fi
 fi
