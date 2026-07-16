@@ -274,7 +274,27 @@ ok 'grep -q -- "--diff-filter=AMR" "$SUB/reconcile.sh"' "M1: reconcile lints ADD
 ok 'grep -q "QUARANTINED_SHA" "$SUB/reconcile.sh" && grep -q "QUARANTINED_SHA" "$SUB/bootstrap-fetch.sh"' "M2: quarantine-SHA written by reconcile + honored by bootstrap-fetch (no revert thrash)"
 ok 'grep -q "is QUARANTINED" "$SUB/bootstrap-fetch.sh"' "M2: bootstrap-fetch HOLDS when origin == quarantined SHA"
 ok 'grep -q "old_pid" "$SUB/reconcile.sh" && grep -q "pid\" != \"\$old_pid" "$SUB/reconcile.sh"' "M3: health_gate requires serve pid to CHANGE (no false-green on old serve)"
-ok 'grep -q "detached bootout" "$SUB/reconcile.sh"' "M4: disarmed-but-loaded reconcile poll is detached-bootout'\''d"
+ok 'grep -q "DISARMED — bootout" "$SUB/reconcile.sh" && ! grep -q "sleep 3; launchctl bootout" "$SUB/reconcile.sh"' "M4: disarmed poll bootout is SYNCHRONOUS final action (not a detached subshell)"
+
+echo "== cross-family folds: health-only verify, disarmed-not-orphan, lint bypasses =="
+cat > "$TMP/ho.py" <<'PYEOF'
+import sys; sys.path.insert(0, sys.argv[1]); import manifest
+m = {"deploy_sha":"a"*40,"origin_sha":"b"*40,"plists_expected":{},"plists_installed":{},"labels_loaded":{},"orphans":{}}
+assert manifest.drift_list(m), "full check: deploy!=origin must be drift"
+assert not manifest.drift_list(m, health_only=True), "health_only: deploy!=origin must NOT be drift (auto-revert)"
+# a disarmed sentinel-gated label is NOT an orphan
+m2 = dict(m, origin_sha="a"*40, disarmed=["ai.myndaix.reconcile"], orphans={})
+assert not manifest.drift_list(m2), "disarmed label excluded from orphans"
+print("ok")
+PYEOF
+ok 'python3 "$TMP/ho.py" "$SUB" >/dev/null 2>&1' "CRIT#1 health_gate verify skips deploy-vs-origin (revert converges); CRIT#2 disarmed != orphan"
+ok 'grep -q -- "check --health-only" "$SUB/reconcile.sh"' "health_gate uses manifest check --health-only"
+# lint bypasses the cross-family review found (optional COLUMN kw, ADD CONSTRAINT, multi-clause DEFAULT)
+printf 'ALTER TABLE t ALTER c TYPE text;\n' > "$TMP/ncol.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/ncol.sql" >/dev/null 2>&1' "lint catches ALTER c TYPE (optional COLUMN kw)"
+printf 'ALTER TABLE t DROP age;\n' > "$TMP/ndrop.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/ndrop.sql" >/dev/null 2>&1' "lint catches DROP age (optional COLUMN kw)"
+printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0);\n' > "$TMP/addc.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/addc.sql" >/dev/null 2>&1' "lint catches ADD CONSTRAINT (tightening)"
+printf 'ALTER TABLE t ADD CONSTRAINT ck CHECK (x>0) NOT VALID;\n' > "$TMP/addcnv.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/addcnv.sql" >/dev/null 2>&1' "lint passes ADD CONSTRAINT ... NOT VALID (additive)"
+printf 'ALTER TABLE t ADD COLUMN a INT NOT NULL, ADD COLUMN b INT DEFAULT 0;\n' > "$TMP/multi.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/multi.sql" >/dev/null 2>&1' "lint catches per-clause: NOT NULL col spoofed by a DEFAULT on another col"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'

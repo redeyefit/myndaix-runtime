@@ -180,9 +180,12 @@ install_artifacts() {
       [[ "$prev" == "ai.myndaix.runtime" ]] && continue
       still=0; for l in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do [[ "$l" == "$prev" ]] && { still=1; break; }; done
       if [[ "$still" == 0 ]]; then
+        # The reconcile poll is handled at the END of the script (synchronous bootout — it may be the
+        # job we're running under, so it can't self-suicide mid-converge, and manifest --health-only
+        # already excludes it as transitionally-disarmed). Everything else: bootout + remove now.
+        [[ "$prev" == "ai.myndaix.reconcile" ]] && continue
         log "orphan prune: $prev no longer managed — bootout + remove plist"
-        # never bootout the poll label we may be running under; just remove its file if disarmed
-        [[ "$prev" == "ai.myndaix.reconcile" ]] || la_bootout "$prev"
+        la_bootout "$prev"
         rm -f "$LA_DIR/$prev.plist"
       fi
     done < "$MANAGED_REC"
@@ -225,7 +228,10 @@ health_gate() {
     log "started tick: $label"
   done
   # 7. verify manifest + tree clean
-  set +e; verify="$(python3 "$SUBSTRATE_DIR/manifest.py" check "$CONFIG_FILE" 2>&1)"; vrc=$?; set -e
+  # --health-only: post-converge health (plists/labels/orphans/venv/tree), NOT deploy-vs-origin SHA
+  # currency — an AUTO-REVERT intentionally leaves deploy=last-good while origin=bad, and that must
+  # not read as a failed converge (cross-family review CRITICAL #1).
+  set +e; verify="$(python3 "$SUBSTRATE_DIR/manifest.py" check --health-only "$CONFIG_FILE" 2>&1)"; vrc=$?; set -e
   if ! porcelain="$(git -C "$DEPLOY_CLONE" status --porcelain)"; then log "verify: git status failed"; return 1; fi
   if [[ "$vrc" -ne 0 || -n "$porcelain" ]]; then
     printf '%s\n' "$verify"; [[ -n "$porcelain" ]] && printf 'tree dirty:\n%s\n' "$porcelain"
@@ -280,17 +286,6 @@ if ! { printf '%s\n' "$converged_sha" > "$STATE_DIR/RUNNING_SHA.tmp" && mv -f "$
 fi
 log "CONVERGED at ${converged_sha:0:8} — receipt written"
 
-# DISARM enforcement (review M4): `rm RECONCILE_ARMED` deletes the poll's plist file but the LOADED
-# StartInterval job keeps firing → keeps auto-deploying. If the poll is loaded but NOT managed this run
-# (disarmed), bootout it — DETACHED so we don't self-suicide if we ARE the poll process (finish this
-# converge, THEN unload).
-poll_managed=0
-for l in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do [[ "$l" == "ai.myndaix.reconcile" ]] && poll_managed=1; done
-if [[ "$poll_managed" == 0 ]] && la_loaded ai.myndaix.reconcile; then
-  log "reconcile poll loaded but disarmed — detached bootout after this converge exits"
-  ( sleep 3; launchctl bootout "$LA_DOMAIN/ai.myndaix.reconcile" 2>/dev/null ) >/dev/null 2>&1 &
-fi
-
 # Loud ALARM on an auto-revert (dedup: filename keyed on the BAD SHA so repeated polls can't flood).
 if [[ "$reverted" == 1 ]]; then
   log "ALARM: AUTO-REVERTED ${HEAD_SHA:0:8} -> ${converged_sha:0:8} (bad SHA failed the health gate) — investigate"
@@ -308,4 +303,19 @@ if command -v mxr >/dev/null 2>&1; then
   else
     log "WARN: canary did not confirm (pool busy / quota) — schema+health already verified"
   fi
+fi
+
+# DISARM enforcement (review M4 + cross-family CRITICAL #2) — the ABSOLUTE LAST action. `rm
+# RECONCILE_ARMED` deletes the poll's plist file, but the LOADED StartInterval job keeps firing and
+# auto-deploying until it's booted out. If the poll is loaded but NOT managed this run (disarmed),
+# bootout it SYNCHRONOUSLY here: everything (receipt, alerts, canary) is already done, so it is safe
+# even if we ARE the poll process — the bootout's SIGTERM just ends an already-finished script. A
+# detached `( sleep; bootout ) &` did NOT work: it shares the launchd process group and gets killed
+# when the parent exits before the sleep elapses.
+poll_managed=0
+for l in ${ROLE_LABELS[@]+"${ROLE_LABELS[@]}"}; do [[ "$l" == "ai.myndaix.reconcile" ]] && poll_managed=1; done
+if [[ "$poll_managed" == 0 ]] && la_loaded ai.myndaix.reconcile; then
+  log "reconcile poll loaded but DISARMED — bootout + remove plist (final action)"
+  rm -f "$LA_DIR/ai.myndaix.reconcile.plist"
+  launchctl bootout "$LA_DOMAIN/ai.myndaix.reconcile" 2>/dev/null || true
 fi
