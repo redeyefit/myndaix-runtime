@@ -8,29 +8,31 @@ every migration is ADDITIVE (expand-contract) — the schema only ever GROWS, so
 against a compatible superset. A destructive change (drop/rename/retype/tighten a column or
 constraint) breaks the old code against the new schema and can't be undone by a code-revert.
 
-Matching runs on text whose comments, string/dollar-quoted bodies, and double-quoted identifiers are
-neutralized by a hand-written character SCANNER that models Postgres's lexer (NOT a regex — a regex can't
-count nested block-comment depth, and it kept diverging from the engine's scanner on E'' escapes, Unicode
-identifiers, and CR line-endings across several review rounds), then whitespace-collapsed and split per
-statement. So a keyword split across a newline (`DROP\\n TABLE`) is caught, a delimiter hidden inside a
-string/comment/quoted-ident is never mis-acted-upon, a string literal containing "DROP TABLE" is NOT a
-false positive, and a quoted identifier cannot smuggle a keyword or hide a space/digit past a rule. It FAILS CLOSED on constructs it cannot
-reason about: DO/EXECUTE/CALL and CREATE FUNCTION/PROCEDURE (dynamic/opaque bodies the linter can't
-inspect) are rejected outright, and NOT VALID is NOT an additive escape (Postgres still enforces the
-constraint on new writes). A blessed contraction is a deliberate, human-gated two-release change via
-RECONCILE_ALLOW_CONTRACTION=1; a blessed additive ROUTINE (a trigger/util function the opaque-body rule
-would otherwise block) has a NARROWER escape, RECONCILE_ALLOW_ROUTINE=1 (`--allow-routine`), which drops
-ONLY the CREATE/DROP-routine rules and keeps every other contraction check active.
+TWO layers:
 
-Regex is not a SQL parser: this is a conservative gate, not a proof. Its bias is fail-closed — an
-ambiguous construct is rejected (a false positive costs a human sign-off), never silently passed.
-Documented residuals (accepted, deliberate): a migration that CALLs a PRE-EXISTING opaque function via a
-bare `SELECT f()` (nothing to inspect); `DROP NOT NULL` treated as additive (a null written by new code
-in the pre-revert window could surface to old code); a bare `DROP INDEX` treated as additive — it is a
-performance-only change for the COMMON case, and dropping a UNIQUE index cannot be distinguished from it
-in the DDL text, so flagging every index drop would over-flag safe migrations (uniqueness is normally
-enforced via a CONSTRAINT, which IS caught); and `ALTER TABLE ... SET UNLOGGED` — a durability downgrade,
-not a schema-compatibility change, so it is OUT OF SCOPE for the code-revert additivity gate.
+1. A hand-written character SCANNER (`_normalize`) neutralizes comments, string/dollar-quoted bodies, and
+   double-quoted identifiers by modeling Postgres's lexer exactly (NOT a regex — a regex can't count
+   nested block-comment depth, and kept diverging on E'' escapes, Unicode identifiers, and CR line-endings
+   across review rounds). So a keyword split across a newline is caught, a delimiter hidden inside a
+   string/comment/quoted-ident is never mis-acted-upon, and a quoted name can't smuggle a keyword.
+
+2. An ALLOWLIST (`_is_additive`) is the gate: a statement passes ONLY if it matches a provably-additive
+   shape (CREATE a brand-new object; ALTER TABLE whose every clause is ADD COLUMN / ATTACH PARTITION /
+   INHERIT; ALTER TYPE ADD VALUE|ATTRIBUTE; COMMENT; INSERT). EVERYTHING ELSE is rejected fail-closed. The
+   earlier DENYLIST ("reject known-bad DDL") was fail-OPEN by default and could not converge — Postgres's
+   non-additive surface is large and grows every release, so each review round found one more un-rejected
+   contraction. For a gate protecting an autonomous factory a false-NEGATIVE (a hidden contraction) is far
+   worse than a false-POSITIVE (a human sign-off), so the default is "not proven additive => reject".
+
+A blessed contraction is a deliberate, human-gated two-release change via RECONCILE_ALLOW_CONTRACTION=1; a
+blessed routine/behavioral object (a trigger/util function) has a NARROWER escape RECONCILE_ALLOW_ROUTINE=1
+(`--allow-routine`) that only blesses CREATE/DROP of a function/procedure/rule/trigger — a DROP TABLE
+alongside is a separate statement and still fails.
+
+This is a conservative gate, not a proof. Its bias is fail-closed — an unrecognized construct is rejected
+(a false positive costs a human sign-off), never silently passed. Documented residual (accepted): a plain
+INSERT is treated additive; UPDATE/DELETE/TRUNCATE are rejected (they can strand old code with mutated or
+destroyed data).
 
 reconcile lints only the migrations ADDED-OR-MODIFIED in a deploy (the prev_good..HEAD delta,
 --diff-filter=AMR), NOT the full history — historical migrations that already ran may contain
@@ -278,20 +280,147 @@ def _normalize(sql: str) -> str:
     return re.sub(r"\s+", " ", "".join(out))
 
 
-def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
-    # allow_routine (operator-gated via RECONCILE_ALLOW_ROUTINE) drops ONLY the CREATE/DROP-routine rules
-    # — a narrow escape for a genuinely-additive trigger/util function, without the blanket
-    # RECONCILE_ALLOW_CONTRACTION that suppresses EVERY contraction check (r5 FP-7).
-    rules = [(c, w) for (c, w) in _RULES if not (allow_routine and c in _ROUTINE_CHECKERS)]
-    out: list[str] = []
-    for stmt in _normalize(path.read_text()).split(";"):
-        stmt = stmt.strip()
-        if not stmt:
+# =====================================================================================================
+# ALLOWLIST — the actual gate (design §2.8; cross-family review r9). A DENYLIST ("reject known-bad DDL")
+# is fail-OPEN by default and cannot converge: Postgres's non-additive DDL surface is large and grows
+# every release, so each review round found "one more" un-rejected contraction (SET SCHEMA, RLS, DROP
+# EXTENSION/DOMAIN/POLICY/OWNED, REPLICA IDENTITY, ADD GENERATED ALWAYS, inline column constraints, …).
+# For a gate protecting an autonomous factory a false-NEGATIVE (a hidden contraction slips through) is far
+# worse than a false-POSITIVE (an extra human sign-off), so INVERT it: a statement passes ONLY if it
+# matches a provably-ADDITIVE shape; everything else is rejected fail-closed. New/obscure non-additive DDL
+# now needs NO new rule — it simply isn't additive. The _RULES denylist below is kept ONLY to annotate a
+# rejection with a specific reason (else a generic one).
+
+# CREATE of a brand-NEW standalone object is additive: old code never referenced it. Excludes `OR REPLACE`
+# (mutates an existing object — a VIEW replace can drop a column), `UNIQUE INDEX` (tightens an existing
+# table), and every opaque/behavioral CREATE (FUNCTION/PROCEDURE/RULE/TRIGGER/POLICY) by listing only the
+# safe new-object kinds. `CREATE TABLE ... PARTITION OF` / `... AS SELECT` are still new tables (additive).
+_ADDITIVE_CREATE_RE = re.compile(
+    r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*"
+    r"(?:TABLE|SEQUENCE|SCHEMA|VIEW|MATERIALIZED\s+VIEW|EXTENSION|DOMAIN|TYPE|COLLATION|STATISTICS|INDEX)\b",
+    re.IGNORECASE)
+
+
+def _additive_alter_table_clause(c: str) -> bool:
+    # An ALTER TABLE is additive only if EVERY top-level clause is: ADD COLUMN (nullable-or-defaulted, no
+    # inline tightening constraint), ATTACH PARTITION, or INHERIT. Anything else (DROP/ALTER/RENAME/SET/
+    # ENABLE/DISABLE/OWNER/DETACH/NO INHERIT/VALIDATE/…) makes the statement non-additive.
+    c = c.strip()
+    if re.match(r"^ADD\s+COLUMN\b", c, re.IGNORECASE):
+        # inline PRIMARY KEY/UNIQUE/CHECK/REFERENCES on the new column tightens writes old code still does
+        # (a PK/UNIQUE the old omitted-column INSERT violates; a CHECK it can't satisfy) — cross-family r9 HIGH-2.
+        if re.search(r"\b(PRIMARY\s+KEY|UNIQUE|CHECK|REFERENCES)\b", c, re.IGNORECASE):
+            return False
+        # NOT NULL without a DEFAULT breaks old INSERTs; a GENERATED column supplies its own value (r5 FP-6).
+        if _NOT_NULL_RE.search(c) and not _DEFAULT_RE.search(c) and not _GENERATED_RE.search(c):
+            return False
+        return True
+    if re.match(r"^ATTACH\s+PARTITION\b", c, re.IGNORECASE):
+        return True
+    if re.match(r"^INHERIT\b", c, re.IGNORECASE):   # NOT "NO INHERIT" (that clause starts with NO)
+        return True
+    # SET DEFAULT <non-null value> is additive: old INSERTs that omit the column now get the value instead
+    # of erroring; a code-revert keeps the default (harmless). SET DEFAULT NULL is the contraction (a NOT
+    # NULL column loses its effective default) and is NOT allowed here.
+    if re.search(r"\bSET\s+DEFAULT\b", c, re.IGNORECASE) and not re.search(r"\bSET\s+DEFAULT\s+\(?\s*NULL\b", c, re.IGNORECASE):
+        return True
+    return False
+
+
+_CREATE_TABLE_NAME_RE = re.compile(
+    r"^CREATE\s+(?:GLOBAL\s+|LOCAL\s+|TEMP(?:ORARY)?\s+|UNLOGGED\s+)*TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+    re.IGNORECASE)
+
+
+def _created_table_names(statements: list[str]) -> frozenset[str]:
+    # Names of tables CREATEd in THIS migration file. Any op on such a table is additive — old code has no
+    # knowledge of a table born this migration (r9: a UNIQUE INDEX on a same-migration table is additive).
+    # `qi` (a quoted name) is EXCLUDED: neutralization collapses every quoted name to `qi`, so trusting a
+    # `qi` match would let an op on an EXISTING quoted table masquerade as same-migration (fail-closed).
+    names = set()
+    for s in statements:
+        m = _CREATE_TABLE_NAME_RE.match(s.strip())
+        if m and m.group(1) != "qi":
+            names.add(m.group(1))
+    return frozenset(names)
+
+
+def _target_after_on(s: str) -> str | None:
+    m = re.search(r"\bON\s+(?:ONLY\s+)?([^\s(]+)", s, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _is_additive(stmt: str, allow_routine: bool = False, created: frozenset[str] = frozenset()) -> bool:
+    """True iff `stmt` (already _normalize'd) is a provably-additive migration statement — the allowlist."""
+    s = stmt.strip()
+    if not s:
+        return True
+    # Operator-blessed routine/behavioral object (RECONCILE_ALLOW_ROUTINE): a CREATE/DROP of a
+    # function/procedure/rule/trigger the operator vouched for. Still NARROW — a DROP TABLE alongside is a
+    # separate statement and is judged on its own (not additive), so the file still fails.
+    if allow_routine and (_CREATE_ROUTINE_RE.search(s) or _CREATE_BEHAVIORAL_RE.search(s)
+                          or _DROP_ROUTINE_RE.search(s)):
+        return True
+    if re.match(r"^CREATE\b", s, re.IGNORECASE):
+        if re.match(r"^CREATE\s+OR\s+REPLACE\b", s, re.IGNORECASE):
+            # Only a VIEW / MATERIALIZED VIEW is re-derivable + data-lossless: its definition lives in the
+            # migration, so a code-revert re-runs prev_good's migration and restores the old view. CREATE OR
+            # REPLACE FUNCTION stays rejected (opaque body can run DDL) — escapable via --allow-routine.
+            return bool(re.match(r"^CREATE\s+OR\s+REPLACE\s+(?:MATERIALIZED\s+)?VIEW\b", s, re.IGNORECASE))
+        if re.search(r"^CREATE\s+(?:\w+\s+)*?UNIQUE\s+INDEX\b", s, re.IGNORECASE):
+            tgt = _target_after_on(s)                      # additive ONLY on a table born this migration
+            return tgt is not None and tgt != "qi" and tgt in created
+        return bool(_ADDITIVE_CREATE_RE.match(s))          # the safe brand-new object kinds
+    if re.match(r"^ALTER\s+TABLE\b", s, re.IGNORECASE):
+        m = re.match(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([^\s(]+)\s+", s, re.IGNORECASE)
+        if not m:
+            return False
+        if m.group(1) != "qi" and m.group(1) in created:
+            return True                                    # any op on a same-migration new table is additive
+        return all(_additive_alter_table_clause(c) for c in _top_level_clauses(s[m.end():]))
+    if re.match(r"^ALTER\s+TYPE\b", s, re.IGNORECASE):     # enum ADD VALUE / composite ADD ATTRIBUTE only
+        m = re.match(r"^ALTER\s+TYPE\s+(?:IF\s+EXISTS\s+)?\S+\s+", s, re.IGNORECASE)
+        return bool(m and re.match(r"^ADD\s+(?:VALUE|ATTRIBUTE)\b", s[m.end():], re.IGNORECASE))
+    if re.match(r"^COMMENT\s+ON\b", s, re.IGNORECASE):     # metadata only
+        return True
+    # Schema-NEUTRAL data DML is out of scope for a SCHEMA-additivity gate (the schema is unchanged, so old
+    # code still runs). Real idempotent backfills use INSERT ... ON CONFLICT, UPDATE, and SELECT ... FOR
+    # UPDATE. TRUNCATE and DELETE (bulk row destruction that strands old code) are NOT allowed.
+    if re.match(r"^(?:INSERT\s+INTO|UPDATE)\b", s, re.IGNORECASE):
+        return True
+    if re.match(r"^SELECT\b", s, re.IGNORECASE):
+        # A read query (has FROM) is schema-neutral. A bare `SELECT f()` (no FROM) is a function INVOCATION
+        # that could run DDL (the r4 opaque-call vector) -> reject fail-closed; real migrations lock via
+        # SELECT ... FROM ... FOR UPDATE. Residual: a DDL-running function in a FROM-query's target list.
+        return bool(re.search(r"\bFROM\b", s, re.IGNORECASE))
+    return False                                           # fail-closed: unrecognized => not provably additive
+
+
+def _reject_reason(stmt: str, allow_routine: bool = False) -> str:
+    # A rejected statement gets a SPECIFIC message if the denylist recognizes the contraction, else generic.
+    for checker, why in _RULES:
+        if allow_routine and checker in _ROUTINE_CHECKERS:
             continue
-        for checker, why in rules:
-            hit = checker.search(stmt) if isinstance(checker, re.Pattern) else checker(stmt)
-            if hit:
-                out.append(f"{path.name}: NON-ADDITIVE — {why}\n    {stmt[:140]}")
+        hit = checker.search(stmt) if isinstance(checker, re.Pattern) else checker(stmt)
+        if hit:
+            return why
+    return ("not a provably-additive statement (allowlist gate, fail-closed): only CREATE-of-a-new-object, "
+            "CREATE OR REPLACE VIEW, ALTER TABLE ADD COLUMN / ATTACH PARTITION / INHERIT, ALTER TYPE ADD "
+            "VALUE|ATTRIBUTE, COMMENT, and INSERT/UPDATE/SELECT data-DML auto-pass; else needs "
+            "RECONCILE_ALLOW_CONTRACTION (or --allow-routine for a blessed function/trigger)")
+
+
+def lint_file(path: Path, allow_routine: bool = False) -> list[str]:
+    # ALLOWLIST gate: reject any statement that is not provably additive (fail-closed). allow_routine
+    # (operator-gated via RECONCILE_ALLOW_ROUTINE) additionally blesses a routine/behavioral CREATE/DROP —
+    # narrow: a DROP TABLE alongside is its own statement and still fails (r5 FP-7).
+    statements = [s.strip() for s in _normalize(path.read_text()).split(";")]
+    created = _created_table_names(statements)   # tables born THIS migration -> any op on them is additive
+    out: list[str] = []
+    for stmt in statements:
+        if not stmt or _is_additive(stmt, allow_routine, created):
+            continue
+        out.append(f"{path.name}: NON-ADDITIVE — {_reject_reason(stmt, allow_routine)}\n    {stmt[:140]}")
     return out
 
 

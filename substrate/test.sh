@@ -251,11 +251,12 @@ echo "== PR-1c: migration lint (additive-only) =="
 printf 'ALTER TABLE t DROP COLUMN c;\n' > "$TMP/badA.sql"
 printf 'ALTER TABLE t ALTER COLUMN c SET NOT NULL;\n' > "$TMP/badB.sql"
 printf 'ALTER TABLE t RENAME COLUMN a TO b;\n' > "$TMP/badC.sql"
-printf 'CREATE TABLE IF NOT EXISTS t (id int);\nALTER TABLE t ADD COLUMN IF NOT EXISTS c int NOT NULL DEFAULT 0;\nCREATE INDEX IF NOT EXISTS t_i ON t(id);\nDROP INDEX IF EXISTS old_i;\n' > "$TMP/goodM.sql"
+printf 'CREATE TABLE IF NOT EXISTS t (id int);\nALTER TABLE t ADD COLUMN IF NOT EXISTS c int NOT NULL DEFAULT 0;\nCREATE INDEX IF NOT EXISTS t_i ON t(id);\n' > "$TMP/goodM.sql"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/badA.sql" >/dev/null 2>&1' "lint rejects DROP COLUMN"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/badB.sql" >/dev/null 2>&1' "lint rejects SET NOT NULL"
 ok '! python3 "$SUB/migration_lint.py" "$TMP/badC.sql" >/dev/null 2>&1' "lint rejects RENAME COLUMN"
-ok 'python3 "$SUB/migration_lint.py" "$TMP/goodM.sql" >/dev/null 2>&1' "lint passes additive (ADD COLUMN NOT NULL DEFAULT / CREATE IF NOT EXISTS / CREATE+DROP INDEX)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/goodM.sql" >/dev/null 2>&1' "lint passes additive (ADD COLUMN NOT NULL DEFAULT / CREATE TABLE+INDEX IF NOT EXISTS)"
+printf 'DROP INDEX IF EXISTS old_i;\n' > "$TMP/dropidx.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/dropidx.sql" >/dev/null 2>&1' "allowlist: a bare DROP INDEX now REJECTS fail-closed (a unique-backing index drop can't be told from a perf-index drop)"
 printf -- '-- DROP TABLE old;\n/* DROP COLUMN x */\n' > "$TMP/cmt.sql"
 ok 'python3 "$SUB/migration_lint.py" "$TMP/cmt.sql" >/dev/null 2>&1' "lint ignores commented-out contractions"
 # adversarial review M1 hardening: newline-split keyword, string-literal false-positive, ADD-COLUMN-NN, DROP CONSTRAINT
@@ -362,7 +363,7 @@ printf 'ALTER TABLE t ALTER COLUMN c SET DEFAULT 5;\n' > "$TMP/r4h1b.sql"; ok 'p
 # r4 HIGH-3 — a column literally named expression/identity dropped bare is a real column drop.
 printf 'ALTER TABLE t DROP expression;\n' > "$TMP/r4h3.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4h3.sql" >/dev/null 2>&1' "r4 HIGH-3: DROP expression (bare, keyword-named column) is caught"
 # no-false-positive: DROP NOT NULL relaxation still PASSES (the one genuinely-additive property drop).
-printf 'ALTER TABLE t ALTER COLUMN c DROP NOT NULL;\n' > "$TMP/r4nn.sql"; ok 'python3 "$SUB/migration_lint.py" "$TMP/r4nn.sql" >/dev/null 2>&1' "r4: DROP NOT NULL still PASSES (additive relaxation, not over-flagged)"
+printf 'ALTER TABLE t ALTER COLUMN c DROP NOT NULL;\n' > "$TMP/r4nn.sql"; ok '! python3 "$SUB/migration_lint.py" "$TMP/r4nn.sql" >/dev/null 2>&1' "allowlist: DROP NOT NULL now REJECTS fail-closed (a null written pre-revert could surface to old code)"
 # r4 HIGH-2 — a manual converge reloads an already-loaded poll so a new plist/env (RECONCILE_POLL) lands.
 ok 'grep -q "RECONCILE_POLL:-0.* != .1." "$SUB/reconcile.sh"' "r4 HIGH-2: a manual converge (RECONCILE_POLL unset) reloads the poll so a changed env takes effect"
 
@@ -469,6 +470,45 @@ ok 'python3 "$SUB/migration_lint.py" "$TMP/r8cidx.sql" >/dev/null 2>&1' "r8: non
 ok 'python3 "$SUB/migration_lint.py" "$TMP/r8dollar.sql" >/dev/null 2>&1' "r8 FP (fleet): a high-bit dollar tag is recognized as a string (no false positive)"
 ok 'python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r8trig.sql" >/dev/null 2>&1' "r8: --allow-routine permits a blessed CREATE TRIGGER"
 ok '! python3 "$SUB/migration_lint.py" --allow-routine "$TMP/r8trigdrop.sql" >/dev/null 2>&1' "r8: --allow-routine stays NARROW — a DROP TABLE alongside a trigger still REJECTS"
+
+echo "== PR-1c cross-family r9: ALLOWLIST inversion (fail-closed by default; no unbounded denylist) =="
+python3 - "$TMP" <<'PYEOF'
+import os, sys
+d = sys.argv[1]
+cases = {
+    # r9 gaps a denylist missed — now rejected by DEFAULT (not on the allowlist), no new rule needed
+    "r9setschema": "ALTER TABLE job SET SCHEMA archive;\n",
+    "r9rls": "ALTER TABLE job FORCE ROW LEVEL SECURITY;\n",
+    "r9dropext": "DROP EXTENSION pgcrypto CASCADE;\n",
+    "r9droppolicy": "DROP POLICY p ON job;\n",
+    "r9addgen": "ALTER TABLE t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;\n",
+    "r9addcolpk": "ALTER TABLE audit_log ADD COLUMN g int PRIMARY KEY;\n",
+    "r9alterdomain": "ALTER DOMAIN d ADD CONSTRAINT ck CHECK (VALUE > 0);\n",
+    "r9replica": "ALTER TABLE t REPLICA IDENTITY NOTHING;\n",   # never enumerated — allowlist rejects it FREE
+    "r9selfn": "SELECT drop_it();\n",                            # bare function call (no FROM) -> reject
+    # corrected-additive shapes the allowlist must PASS
+    "r9corview": "CREATE OR REPLACE VIEW v AS SELECT 1;\n",      # re-derivable view -> additive
+    "r9uidxnew": "CREATE TABLE fresh (a int);\nCREATE UNIQUE INDEX u ON fresh(a);\n",  # unique idx on same-migration table
+    "r9backfill": "SELECT id FROM t ORDER BY id FOR UPDATE;\nUPDATE t SET x=0 WHERE x<>0;\n",  # idempotent backfill DML
+    "r9setdef": "ALTER TABLE t ALTER COLUMN c SET DEFAULT 5;\n",  # SET DEFAULT non-null -> additive
+}
+for k, v in cases.items():
+    open(os.path.join(d, k + ".sql"), "w", encoding="utf-8").write(v)
+PYEOF
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9setschema.sql" >/dev/null 2>&1' "r9: ALTER TABLE SET SCHEMA rejected (not on allowlist)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9rls.sql" >/dev/null 2>&1' "r9: FORCE ROW LEVEL SECURITY rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9dropext.sql" >/dev/null 2>&1' "r9: DROP EXTENSION rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9droppolicy.sql" >/dev/null 2>&1' "r9: DROP POLICY rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9addgen.sql" >/dev/null 2>&1' "r9: ALTER COLUMN ADD GENERATED ALWAYS rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9addcolpk.sql" >/dev/null 2>&1' "r9 HIGH-2: ADD COLUMN ... PRIMARY KEY (inline tightening) rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9alterdomain.sql" >/dev/null 2>&1' "r9: ALTER DOMAIN ADD CONSTRAINT rejected"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9replica.sql" >/dev/null 2>&1' "r9: REPLICA IDENTITY NOTHING rejected FREE (never enumerated — allowlist default catches it)"
+ok '! python3 "$SUB/migration_lint.py" "$TMP/r9selfn.sql" >/dev/null 2>&1' "r9: a bare SELECT f() (no FROM, an opaque call) rejected"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r9corview.sql" >/dev/null 2>&1' "r9: CREATE OR REPLACE VIEW PASSES (re-derivable from the migration; no data loss)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r9uidxnew.sql" >/dev/null 2>&1' "r9: CREATE UNIQUE INDEX on a SAME-MIGRATION new table PASSES (old code doesn'\''t know the table)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r9backfill.sql" >/dev/null 2>&1' "r9: idempotent backfill (SELECT FOR UPDATE + UPDATE) PASSES (schema-neutral data DML)"
+ok 'python3 "$SUB/migration_lint.py" "$TMP/r9setdef.sql" >/dev/null 2>&1' "r9: SET DEFAULT <value> PASSES (additive; only SET DEFAULT NULL is the contraction)"
+ok 'grep -q "_is_additive" "$SUB/migration_lint.py" && grep -q "ALLOWLIST" "$SUB/migration_lint.py"' "r9: the gate is an allowlist (_is_additive), not an unbounded denylist"
 
 echo "== PR-1c: manifest sentinel-gate (reconcile poll expected ONLY when RECONCILE_ARMED) =="
 cat > "$TMP/sg.py" <<'PYEOF'
