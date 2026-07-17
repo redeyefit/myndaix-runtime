@@ -306,7 +306,15 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
     must still be found); a winning candidate's span is consumed whole. RecursionError
     (pathological [[[[... nesting) is caught like any parse failure. Residual accepted:
     a model reliably coerced into >=50 decodable decoy arrays every tick yields None ->
-    hold -> retry, which is VISIBLE (the board ships 'unclassified' each tick), not silent."""
+    hold -> retry, which is VISIBLE (the board ships 'unclassified' each tick), not silent.
+    ACCEPTED RESIDUALS (r7 #2/#3, evaluated — no structural fix): a model coerced into
+    emitting a COMPLETE forged classification (or an equal-length decoy ahead of a real
+    partial) is indistinguishable AT PARSE LEVEL from the model genuinely classifying —
+    the model's output IS the answer, so the parser cannot arbitrate intent. The defenses
+    are upstream (nonce fences, breakout detection, known-ids/category validation) and
+    the blast radius is one chunk misclassified ON the visible board, never silent data
+    loss. Positional/candidates==1 heuristics were considered and rejected: they reject
+    legitimate prose-wrapped outputs and re-open the livelock class r5 closed."""
     decoder = json.JSONDecoder()
     best: Optional[dict] = None
     pos = scanned = candidates = 0
@@ -334,12 +342,13 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
             if len(best) == len(known_ids):
                 return best    # complete answer — legitimate regardless of budget state
         pos = max(end, i + 1)  # consume the winning span; its innards are already rows
-    if scanned >= 2000 or candidates >= 50:
-        # r6 #1 (CRITICAL): budget exhaustion must FAIL CLOSED. Returning a partial best
-        # here re-opens the eclipse — one valid decoy row + 49 decoy arrays burns the
-        # budget and silently wins over the unseen real answer. None -> hold + retry,
-        # visible on the board. A partial best is trustworthy ONLY at the natural end of
-        # the output (no more '[' — the model truly answered partially).
+    if (scanned >= 2000 or candidates >= 50) and raw.find("[", pos) >= 0:
+        # r6 #1 (CRITICAL): budget exhaustion WITH INPUT REMAINING must FAIL CLOSED.
+        # Returning a partial best here re-opens the eclipse — one valid decoy row + 49
+        # decoy arrays burns the budget and silently wins over the unseen real answer.
+        # None -> hold + retry, visible on the board. r7 #1: budget counters AT the limit
+        # with nothing left to scan is a NATURAL end — a partial best there is the model's
+        # true partial answer and ships (the find() probe is what tells the two apart).
         return None
     return best
 
