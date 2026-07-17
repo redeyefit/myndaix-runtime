@@ -531,7 +531,8 @@ def _create_drafts(runs: list[AccountRun], items: list[Item]) -> None:
 # only — never bodies, never snippets (the board travels to Notion/Drive/iMessage too).
 # =====================================================================================
 def assemble_brief(date_str: str, runs: list[AccountRun], items: list[Item],
-                   classify_ok: bool) -> str:
+                   classify_ok: bool, valve_accounts: Optional[set] = None) -> str:
+    valve_accounts = valve_accounts or set()
     lines = [f"# Inbox brief — {date_str}", ""]
     for run in runs:
         if run.ok:
@@ -542,8 +543,19 @@ def assemble_brief(date_str: str, runs: list[AccountRun], items: list[Item],
             status = run.status
         lines.append(f"- {run.account} [{_account_tag(run.account)}]: {status}")
     if not classify_ok:
-        lines += ["", "Classifier unavailable this run — threads listed unclassified; "
-                      "cursors held for a clean retry."]
+        # r10 #1: the durable brief must state the TRUE cursor outcome — the bounded-loss
+        # valve (computed from the same attempts read, before delivery) may ADVANCE some
+        # accounts past this slice; promising "held for retry" there would be a lie in
+        # the one artifact Jefe keeps.
+        if valve_accounts:
+            advancing = ", ".join(sorted(valve_accounts))
+            lines += ["", "Classifier unavailable this run — threads listed unclassified. "
+                          f"BOUNDED-LOSS LIMIT reached for: {advancing} — their cursors "
+                          "advance past this slice (these threads will NOT reappear; act on "
+                          "them from this brief). Any other account still retries."]
+        else:
+            lines += ["", "Classifier unavailable this run — threads listed unclassified; "
+                          "cursors held for a clean retry."]
 
     def item_line(item: Item) -> str:
         t = item.thread
@@ -709,11 +721,12 @@ async def _pull_account(led: PostgresLedger, account: str,
             return run
         cursor = await led.inbox_get_cursor(account)
         run.prev_history_id = cursor["history_id"] if cursor else None   # CAS expectation
-        if cursor is None:
+        if cursor is None or cursor["history_id"] is None:
+            # No row, OR an error-SEEDED row (history_id NULL — r10 #2: a first-run tick
+            # failed after pull; the seed exists only to accumulate valve attempts and
+            # is treated EXACTLY like no-cursor here, so it can't corrupt incremental
+            # pulls). No eager real-cursor write ever happens outside the advance phase.
             log(f"{account}: no cursor — bounded backfill ({BACKFILL_DAYS}d)")
-            # NO eager seed here: cursor state is written ONLY in the end-of-tick advance
-            # phase after FULL per-account success — a first-run failure post-pull must
-            # leave no row, so the next tick re-backfills instead of dropping the window.
             pull = client.pull_bounded_backfill(BACKFILL_DAYS)
         else:
             try:
@@ -781,8 +794,20 @@ async def tick() -> int:
             _apply_labels(runs, items)
             _create_drafts(runs, items)
 
+        # r10 #1: the brief must state the TRUE per-account cursor outcome, and the valve
+        # decision must act on the SAME attempts values the brief reported (read once here,
+        # act on them below — no read-between gap). valve_accounts = accounts whose cursor
+        # will ADVANCE past this slice if classify failed (bounded-loss limit reached).
+        valve_attempts: dict[str, int] = {}
+        if not classify_ok and not DRY_RUN:
+            for run in runs:
+                if run.ok and not run.action_failed and run.new_history_id:
+                    cur = await led.inbox_get_cursor(run.account)
+                    valve_attempts[run.account] = int((cur or {}).get("attempts") or 0)
+        valve_accounts = {a for a, n in valve_attempts.items() if n + 1 >= CLASSIFY_HOLD_MAX}
+
         date_str = _dt.date.today().isoformat()
-        board = assemble_brief(date_str, runs, items, classify_ok)
+        board = assemble_brief(date_str, runs, items, classify_ok, valve_accounts)
 
         if DRY_RUN:
             log("DRY-RUN brief follows on stdout")
@@ -818,18 +843,26 @@ async def tick() -> int:
             # escape, same shape as classify()'s BOUNDED-LOSS VALVE: each failed tick marks
             # the cursor (attempts++, visible in the ledger; advance resets it); at
             # CLASSIFY_HOLD_MAX the slice has surfaced on the board and the cursor advances
-            # LOUDLY rather than wedge. NOTE: attempts also counts pull-failed ticks (the
-            # column is 'consecutive failed ticks') — the valve may fire with fewer than MAX
-            # unclassified surfacings, but never without at least THIS delivered one.
-            # RESIDUAL: a FIRST-RUN account (no cursor row until its first advance) cannot
-            # accumulate attempts — it re-backfills each tick until classify succeeds once,
-            # visibly on every board. Eager row creation would corrupt the incremental-pull
-            # path, so accepted.
+            # LOUDLY rather than wedge. The attempts values were read ONCE above (r10 #1)
+            # so the delivered brief and this decision agree; the marks/advances below are
+            # CAS-bound to the history_id this tick read, so a slow stale tick can neither
+            # advance nor pollute a row a newer tick already moved (r10 #3). First-run
+            # accounts (no row yet) get an error-SEEDED row with NULL history_id so their
+            # attempts accumulate too (r10 #2) — the pull path treats NULL as no-cursor.
+            # NOTE: attempts also counts pull-failed ticks (the column is 'consecutive
+            # failed ticks') — the valve may fire with fewer than MAX unclassified
+            # surfacings, but never without at least THIS delivered one.
+            # ADJUDICATED (r10 #4, oracle): crash-induced classify failures COUNT toward
+            # the valve, deliberately. The same adversary can induce parse-None failures
+            # (accepted residual — >=50 decoys), which count; excluding the crash subtype
+            # closes nothing and reintroduces the infinite wedge for exactly those
+            # payloads — the wedge both reviewers required us to eliminate (r9 FIX-3).
+            # The valve's outcome is bounded + visible (unclassified on a delivered
+            # board), never a silent classification bypass.
             for run in runs:
                 if run.ok and not run.action_failed and run.new_history_id:
-                    cur = await led.inbox_get_cursor(run.account)
-                    attempts = int((cur or {}).get("attempts") or 0)
-                    if attempts + 1 >= CLASSIFY_HOLD_MAX:
+                    attempts = valve_attempts.get(run.account, 0)
+                    if run.account in valve_accounts:
                         moved = await led.inbox_advance_cursor(
                             run.account, run.new_history_id, run.prev_history_id)
                         log(f"{run.account}: BOUNDED-LOSS VALVE — classify failed on "
@@ -837,9 +870,11 @@ async def tick() -> int:
                             f"{'ADVANCED past the held slice' if moved else 'CAS miss — held'} "
                             f"@ {run.new_history_id} (slice surfaced unclassified on the board)")
                     else:
-                        await led.inbox_mark_cursor_error(run.account, "error")
+                        marked = await led.inbox_mark_cursor_error(
+                            run.account, "error", expected_history_id=run.prev_history_id)
                         log(f"{run.account}: classify failed — cursor held "
-                            f"(attempt {attempts + 1}/{CLASSIFY_HOLD_MAX})")
+                            f"(attempt {attempts + 1}/{CLASSIFY_HOLD_MAX}"
+                            f"{'' if marked else '; mark skipped — cursor moved under us'})")
         else:
             log("cursors held (brief undelivered) — next tick re-pulls")
 

@@ -18,15 +18,26 @@
 --
 --   account_id — the full Gmail address (one row per INBOX_ACCOUNTS entry).
 --   history_id — last historyId whose slice fully PROCESSED; next pull starts here.
+--                NULL = an error-SEEDED row (r10 #2): a first-run account whose classify
+--                failed before its first advance. The pull path treats NULL exactly like
+--                no-row (bounded backfill), so a seed can never corrupt incremental
+--                pulls — it exists ONLY so `attempts` accumulates and the bounded-loss
+--                valve reaches first-run accounts too. The first successful advance sets
+--                a real history_id (its CAS expectation NULL matches the seeded row).
 --   state      — 'active' (healthy) | 'error' (pull/process failed) | 'stale'
 --                (cursor expired, awaiting backfill re-establish). Advance resets
 --                to 'active'.
 --   attempts   — consecutive failed ticks for this account; reset to 0 on advance.
 CREATE TABLE IF NOT EXISTS inbox_cursor (
     account_id text NOT NULL PRIMARY KEY,
-    history_id text NOT NULL,
+    history_id text,
     state      text NOT NULL DEFAULT 'active'
         CHECK (state IN ('active','error','stale')),
     attempts   int  NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+-- NOTE: 0014 never shipped to main, so the nullable history_id above IS the canonical
+-- shape. If a dev DB ran this migration's brief interim NOT NULL form (pre-merge PR-95
+-- branch only), fix it manually — the substrate migration lint deliberately fail-closes
+-- ALTER contractions, so no automated ALTER lives here:
+--   ALTER TABLE inbox_cursor ALTER COLUMN history_id DROP NOT NULL;

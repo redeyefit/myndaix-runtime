@@ -70,11 +70,14 @@ class FakeLedger:
         self.attempts = dict(attempts or {})   # mirrors inbox_cursor.attempts (r9 valve)
         self.calls = []
 
+    _UNBOUND = object()   # mirrors postgres_store._UNBOUND (no-CAS-expectation sentinel)
+
     async def inbox_get_cursor(self, account_id):
-        hid = self.cursors.get(account_id)
-        if hid is None:
+        if account_id not in self.cursors:
             return None
-        return {"account_id": account_id, "history_id": hid, "fallback_since": None,
+        # a present entry with hid None = an error-SEEDED row (r10 #2)
+        return {"account_id": account_id, "history_id": self.cursors[account_id],
+                "fallback_since": None,
                 "state": "active", "attempts": self.attempts.get(account_id, 0),
                 "updated_at": None}
 
@@ -90,9 +93,22 @@ class FakeLedger:
         self.attempts[account_id] = 0
         return True
 
-    async def inbox_mark_cursor_error(self, account_id, state):
+    async def inbox_mark_cursor_error(self, account_id, state, expected_history_id=_UNBOUND):
+        # mirrors the real verb's three modes (r10 #2/#3): unbound legacy update,
+        # None = seed-or-bump the NULL-history first-run row, str = CAS-bound increment.
         self.calls.append(("mark", account_id, state))
-        if account_id in self.cursors:
+        if expected_history_id is FakeLedger._UNBOUND:
+            if account_id in self.cursors:
+                self.attempts[account_id] = self.attempts.get(account_id, 0) + 1
+                return True
+            return False
+        if expected_history_id is None:
+            if account_id not in self.cursors or self.cursors[account_id] is None:
+                self.cursors[account_id] = None
+                self.attempts[account_id] = self.attempts.get(account_id, 0) + 1
+                return True
+            return False
+        if account_id in self.cursors and self.cursors[account_id] == expected_history_id:
             self.attempts[account_id] = self.attempts.get(account_id, 0) + 1
             return True
         return False
@@ -589,9 +605,11 @@ def test_classify_fail_valve_holds_then_advances_bounded():
     led = FakeLedger({"a@gmail.com": "1"})
     for i in range(1, IA.CLASSIFY_HOLD_MAX):
         plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
-        rc, led, _inst, _brief, _out = run_tick(plan, claude=fake, led=led)
+        rc, led, _inst, brief, _out = run_tick(plan, claude=fake, led=led)
         ok(rc == 0 and not [c for c in led.calls if c[0] == "advance"],
            f"valve tick {i}: classify failed -> held (no advance), marked attempt {i}")
+        ok(brief is not None and "cursors held for a clean retry" in brief,
+           f"valve tick {i}: brief truthfully promises the retry (r10 #1)")
     ok(led.attempts.get("a@gmail.com") == IA.CLASSIFY_HOLD_MAX - 1,
        "attempts accumulated across held ticks")
     plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
@@ -599,6 +617,9 @@ def test_classify_fail_valve_holds_then_advances_bounded():
     ok(("advance", "a@gmail.com", "9") in led.calls,
        "valve tick MAX: cursor ADVANCED past the held slice (bounded loss, not a wedge)")
     ok("BOUNDED-LOSS VALVE" in out, "the valve advance is LOUD in the log")
+    ok(brief is not None and "BOUNDED-LOSS LIMIT reached for: a@gmail.com" in brief
+       and "cursors held for a clean retry" not in brief,
+       "valve tick MAX: the DELIVERED brief states the advance, not a false retry promise (r10 #1)")
     ok(led.attempts.get("a@gmail.com") == 0, "advance reset attempts")
     # an undelivered brief NEVER feeds the valve — that branch holds unconditionally
     led2 = FakeLedger({"a@gmail.com": "1"}, attempts={"a@gmail.com": 99})
@@ -606,6 +627,28 @@ def test_classify_fail_valve_holds_then_advances_bounded():
     rc, led2, _inst, _brief, _out = run_tick(plan, claude=fake, brief_fail=True, led=led2)
     ok(not [c for c in led2.calls if c[0] == "advance"],
        "undelivered brief holds even at high attempts (valve requires a delivered board)")
+
+
+def test_classify_fail_valve_reaches_first_run_accounts():
+    # r10 #2 (both reviewers): a FIRST-RUN account (no cursor row) must also reach the
+    # valve — the classify-fail mark SEEDS a NULL-history row so attempts accumulate;
+    # the pull path treats the seed as no-cursor (backfill), so pulls stay uncorrupted.
+    fake, _ = make_claude(fail_classify=True)
+    led = FakeLedger()   # rowless — brand-new account
+    for i in range(1, IA.CLASSIFY_HOLD_MAX):
+        plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+        rc, led, _inst, _brief, out = run_tick(plan, claude=fake, led=led)
+        ok(rc == 0 and led.cursors.get("a@gmail.com", "MISSING") is None,
+           f"first-run valve tick {i}: error row SEEDED (history None), no advance")
+        ok("bounded backfill" in out, f"first-run valve tick {i}: pull used backfill (seed inert)")
+    ok(led.attempts.get("a@gmail.com") == IA.CLASSIFY_HOLD_MAX - 1,
+       "first-run attempts accumulated on the seeded row")
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+    rc, led, _inst, _brief, out = run_tick(plan, claude=fake, led=led)
+    ok(led.cursors.get("a@gmail.com") is not None
+       and any(c[0] == "advance" and c[1] == "a@gmail.com" for c in led.calls),
+       "first-run valve tick MAX: CAS(None) advance replaced the seed with a real cursor")
+    ok("BOUNDED-LOSS VALVE" in out, "first-run valve advance is loud")
 
 
 def test_label_failure_holds_that_cursor_but_run_continues():
@@ -1065,6 +1108,34 @@ async def live_inbox_cursor_verbs(dsn):
            "advance heals state to 'active' and resets attempts")
         ok(await led.inbox_mark_cursor_error("ia-selftest-missing", "error") is False,
            "mark on a missing row -> False (rowless first-run: correct, next tick re-backfills)")
+        # r10 #3 — CAS-BOUND mark: a stale tick (cursor moved under it) must not increment
+        ok(await led.inbox_mark_cursor_error(acct, "error", expected_history_id="999") is False,
+           "bound mark with a STALE expectation -> False, no write (r10 #3 TOCTOU)")
+        cur = await led.inbox_get_cursor(acct)
+        ok(cur["attempts"] == 0, "stale-bound mark left attempts untouched")
+        ok(await led.inbox_mark_cursor_error(acct, "error", expected_history_id="200") is True,
+           "bound mark matching the stored history_id -> increments")
+        cur = await led.inbox_get_cursor(acct)
+        ok(cur["attempts"] == 1 and cur["state"] == "error", "bound mark incremented once")
+        # r10 #2 — SEED mode (expected None): first-run rows accumulate attempts via a
+        # NULL-history row; advance CAS(None) later replaces it with a real cursor.
+        seed = "ia-selftest-b@x.com"
+        ok(await led.inbox_mark_cursor_error(seed, "error", expected_history_id=None) is True,
+           "seed mark on a rowless account CREATES the NULL-history row")
+        cur = await led.inbox_get_cursor(seed)
+        ok(cur is not None and cur["history_id"] is None and cur["attempts"] == 1,
+           "seeded row: history_id NULL (pull treats as no-cursor), attempts=1")
+        ok(await led.inbox_mark_cursor_error(seed, "error", expected_history_id=None) is True,
+           "second seed mark bumps the same NULL row")
+        cur = await led.inbox_get_cursor(seed)
+        ok(cur["attempts"] == 2, "seeded attempts accumulate")
+        ok(await led.inbox_advance_cursor(seed, "300", None) is True,
+           "CAS(None) advance replaces the seed with a real cursor")
+        cur = await led.inbox_get_cursor(seed)
+        ok(cur["history_id"] == "300" and cur["attempts"] == 0 and cur["state"] == "active",
+           "post-seed advance: real history_id, attempts reset, active")
+        ok(await led.inbox_mark_cursor_error(seed, "error", expected_history_id=None) is False,
+           "seed mark against a REAL cursor row -> False (bound to still-NULL only)")
         try:
             await led.inbox_mark_cursor_error(acct, "bogus")
             ok(False, "bad state must raise ValueError")

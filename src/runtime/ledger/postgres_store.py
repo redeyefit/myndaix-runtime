@@ -48,6 +48,10 @@ from runtime.contracts import (
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+
+# Distinguishes "caller passed no CAS expectation" from "caller expects NO row / a NULL
+# history_id" in inbox_mark_cursor_error (None is a meaningful expectation there — r10 #2/#3).
+_UNBOUND = object()
 # Fixed advisory-lock key so concurrent serve boots serialize their migrate() and
 # don't race the same DDL. Arbitrary stable bigint ("mxrMIG").
 _MIGRATE_LOCK_KEY = 0x6D7872_4D4947
@@ -1123,22 +1127,54 @@ class PostgresLedger:
                 account_id, history_id, expected_history_id)
         return row is not None
 
-    async def inbox_mark_cursor_error(self, account_id: str, state: str) -> bool:
+    async def inbox_mark_cursor_error(self, account_id: str, state: str,
+                                      expected_history_id: object = _UNBOUND) -> bool:
         """Record a failed tick for the account: 'error' (pull/process failed) or
         'stale' (users.history.list 404 — cursor expired, awaiting the bounded
         backfill re-establish, design §4). Increments attempts so a persistently
         failing account is visible; the next advance resets both. `state` is
-        validated here fail-closed (the DB CHECK is the backstop). Returns True iff
-        the row exists."""
+        validated here fail-closed (the DB CHECK is the backstop).
+
+        `expected_history_id` (r10 #2 + #3):
+        - omitted (_UNBOUND) — legacy unbound mark: UPDATE by account only; no-op False
+          on a missing row. Used by pre-pull failure paths that never read the cursor.
+        - a str — CAS-BOUND mark: increments ONLY if the row still holds the history_id
+          this tick read at pull time. A slow failed tick that lost the race to a newer
+          advance must not pollute the new cursor's attempts (the valve would fire
+          against a legitimately in-flight slice).
+        - None — the tick read NO row (first run): SEED an error row with NULL
+          history_id so attempts can accumulate; the pull path treats NULL as no-cursor
+          (bounded backfill), so the seed cannot corrupt incremental pulls. On conflict
+          the increment stays bound to a still-NULL row (same CAS discipline).
+        Returns True iff a row was written."""
         if state not in ("error", "stale"):
             raise ValueError(f"inbox_mark_cursor_error: bad state {state!r} (expected error|stale)")
         async with self._pool.acquire() as con:
-            row = await con.fetchrow(
-                """UPDATE inbox_cursor
-                      SET state = $2, attempts = attempts + 1, updated_at = now()
-                    WHERE account_id = $1
-                    RETURNING account_id""",
-                account_id, state)
+            if expected_history_id is _UNBOUND:
+                row = await con.fetchrow(
+                    """UPDATE inbox_cursor
+                          SET state = $2, attempts = attempts + 1, updated_at = now()
+                        WHERE account_id = $1
+                        RETURNING account_id""",
+                    account_id, state)
+            elif expected_history_id is None:
+                row = await con.fetchrow(
+                    """INSERT INTO inbox_cursor (account_id, history_id, state, attempts)
+                            VALUES ($1, NULL, $2, 1)
+                       ON CONFLICT (account_id) DO UPDATE
+                            SET state = $2, attempts = inbox_cursor.attempts + 1,
+                                updated_at = now()
+                          WHERE inbox_cursor.history_id IS NULL
+                        RETURNING account_id""",
+                    account_id, state)
+            else:
+                row = await con.fetchrow(
+                    """UPDATE inbox_cursor
+                          SET state = $2, attempts = attempts + 1, updated_at = now()
+                        WHERE account_id = $1
+                          AND history_id IS NOT DISTINCT FROM $3
+                        RETURNING account_id""",
+                    account_id, state, expected_history_id)
         return row is not None
 
     # ---- review skills ("+learning" rung) — DESIGN v0.3 governing sections --------------
