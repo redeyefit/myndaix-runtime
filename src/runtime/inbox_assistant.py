@@ -329,10 +329,18 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
             pos = i + 1        # scan inside it: [[...]]-wrapped real rows must still be found
             continue
         if best is None or len(rows) > len(best):
+            # ties keep the FIRST candidate seen (deterministic; r6 #2 advisory — documented)
             best = rows
             if len(best) == len(known_ids):
-                break          # complete answer — cannot do better
+                return best    # complete answer — legitimate regardless of budget state
         pos = max(end, i + 1)  # consume the winning span; its innards are already rows
+    if scanned >= 2000 or candidates >= 50:
+        # r6 #1 (CRITICAL): budget exhaustion must FAIL CLOSED. Returning a partial best
+        # here re-opens the eclipse — one valid decoy row + 49 decoy arrays burns the
+        # budget and silently wins over the unseen real answer. None -> hold + retry,
+        # visible on the board. A partial best is trustworthy ONLY at the natural end of
+        # the output (no more '[' — the model truly answered partially).
+        return None
     return best
 
 

@@ -836,6 +836,27 @@ def test_parse_r5_recursion_bomb_caught():
     ok(rows is None, "r5: recursion bomb with trailing prose -> None, no crash")
 
 
+def test_parse_r6_budget_exhaustion_fails_closed():
+    # r6 FIX-1 (CRITICAL, both reviewers): a partial best must NOT survive budget
+    # exhaustion — 1 valid decoy row + enough decoy arrays to burn the candidate budget
+    # must yield None (hold + retry), never the decoy eclipsing the unseen real answer.
+    known = {"t1", "t2", "t3"}
+    decoy = f'[{_row("t1")}]'
+    spam = "[] " * 60                                       # 60 decodable decoy arrays
+    real = f'[{_row("t1")}, {_row("t2")}, {_row("t3")}]'
+    ok(IA.parse_classification(f'{decoy}\n{spam}\n{real}', known) is None,
+       "r6: budget exhausted with only a partial best -> None (fail closed)")
+    # A PARTIAL answer at the NATURAL end of output is still shipped (r5 FIX-1 semantics —
+    # the model truly answered partially; missing threads surface as unclassified).
+    rows = IA.parse_classification(decoy, known)
+    ok(rows is not None and set(rows.keys()) == {"t1"},
+       "r6: partial best at natural end of output still ships")
+    # A COMPLETE answer is legitimate even when it lands on the budget boundary.
+    rows = IA.parse_classification(("[] " * 49) + real, known)
+    ok(rows is not None and set(rows.keys()) == known,
+       "r6: complete answer on the 50th candidate is returned, not discarded")
+
+
 def test_parse_r5_double_wrapped_answer_still_found():
     # r5 guard on the fix itself: skipping past a decoded-but-invalid candidate would lose a
     # [[...]]-wrapped real answer (a model double-wrap artifact) — we scan INSIDE instead.
