@@ -25,11 +25,14 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 
 # ---- config (env-overridable; sane defaults) --------------------------------------------------
 TS_CLI="${TS_RELOGIN_CLI:-$(command -v tailscale || echo /opt/homebrew/bin/tailscale)}"
-SECRETS_FILE="${TS_RELOGIN_SECRETS:-$HOME/.myndaix/.secrets}"
-KEY_VAR="${TS_RELOGIN_KEY_VAR:-TAILSCALE_AUTHKEY}"     # var name to read from .secrets
-TAGS_VAR="${TS_RELOGIN_TAGS_VAR:-TAILSCALE_TAGS}"      # optional tags var; REQUIRED for an OAuth
-                                                       # client secret (its keys are always tagged),
-                                                       # unused for a plain reusable auth key
+# Secrets: the house convention is ~/.myndaix/.secrets/load.sh -> load_secret <name> sources
+# env/<name>.env AFTER validating 700/600/owner (fail-closed). We inherit that validation.
+SECRETS_LOAD="${TS_RELOGIN_SECRETS_LOAD:-$HOME/.myndaix/.secrets/load.sh}"
+SECRET_NAME="${TS_RELOGIN_SECRET_NAME:-tailscale}"    # loads env/tailscale.env
+KEY_VAR="${TS_RELOGIN_KEY_VAR:-TAILSCALE_AUTHKEY}"    # var the env file defines for the key
+TAGS_VAR="${TS_RELOGIN_TAGS_VAR:-TAILSCALE_TAGS}"     # optional tags var; REQUIRED for an OAuth
+                                                      # client secret (its keys are always tagged),
+                                                      # unused for a plain reusable auth key
 STATE_DIR="${TS_RELOGIN_STATE_DIR:-$HOME/.myndaix/state}"
 OPERATOR_INBOX="${TS_RELOGIN_OPERATOR_INBOX:-$HOME/.myndaix/bridge/inbox/jefe}"
 THRESHOLD="$(( 10#${TS_RELOGIN_THRESHOLD:-2} ))"      # consecutive logged-out checks before acting
@@ -129,26 +132,30 @@ if [[ "$last" -gt 0 && "$elapsed" -lt "$COOLDOWN_S" ]]; then
   exit 0
 fi
 
-# read the auth key + optional tags (fail-closed + loud; key NEVER logged). A missing secrets
-# FILE or an empty key VAR are the same operator-actionable condition: logged out, no key.
+# read the auth key + optional tags via the house loader (fail-closed + loud; key NEVER logged).
+# The load runs in a SUBSHELL so the secret never lands in this daemon's own environment — we
+# capture only the two values it prints. A missing loader, a load_secret failure (bad perms /
+# missing env/<name>.env), or an empty key are the same operator-actionable condition: logged
+# out with no usable key.
 AUTHKEY=""; TAGS=""
-if [[ -f "$SECRETS_FILE" ]]; then
-  # one source, both values printed on separate lines (the key is not logged — only assigned)
+if [[ -f "$SECRETS_LOAD" ]]; then
   { IFS= read -r AUTHKEY; IFS= read -r TAGS; } < <(
     set +u
-    # shellcheck disable=SC1090  # runtime-path secrets file; not statically resolvable
-    source "$SECRETS_FILE" >/dev/null 2>&1 || true
+    # shellcheck disable=SC1090  # runtime-path loader; not statically resolvable
+    source "$SECRETS_LOAD" >/dev/null 2>&1 || true
+    if declare -F load_secret >/dev/null 2>&1; then load_secret "$SECRET_NAME" >/dev/null 2>&1 || true; fi
     set -u
     printf '%s\n%s\n' "${!KEY_VAR:-}" "${!TAGS_VAR:-}"
   )
 fi
 if [[ -z "$AUTHKEY" ]]; then
   drop_alert "ts-nokey-alert" \
-    "tailscale-relogin: node is logged out but NO usable $KEY_VAR is available in $SECRETS_FILE
-(file missing or var empty) — cannot self-recover. Add a reusable/OAuth auth key (tag:factory
-recommended) to re-enable auto-relogin." \
+    "tailscale-relogin: node is logged out but NO usable $KEY_VAR could be loaded
+(load_secret $SECRET_NAME via $SECRETS_LOAD — loader missing, perms wrong, env/$SECRET_NAME.env
+absent, or var empty) — cannot self-recover. Add the OAuth/reusable key to
+~/.myndaix/.secrets/env/$SECRET_NAME.env (mode 600) to re-enable auto-relogin." \
     "$STATE_DIR/ts-relogin-nokey-alerted"
-  die "no usable $KEY_VAR in $SECRETS_FILE — logged out and cannot relogin (alerted)"
+  die "no usable $KEY_VAR (load_secret $SECRET_NAME) — logged out and cannot relogin (alerted)"
 fi
 rm -f "$STATE_DIR/ts-relogin-nokey-alerted"
 

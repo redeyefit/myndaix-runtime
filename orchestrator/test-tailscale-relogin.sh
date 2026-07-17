@@ -25,6 +25,24 @@ exit 0
 FEOF
 chmod +x "$FAKE"
 
+# ---- fake house secrets loader: mirrors ~/.myndaix/.secrets/load.sh's load_secret interface
+# (sources env/<name>.env from $HOME). Perm checks omitted — the daemon only relies on the
+# load_secret contract, and the real loader's validation is its own concern.
+LOADER="$TMP/load.sh"
+cat > "$LOADER" <<'LEOF'
+load_secret() {
+  local name="$1"
+  local f="$HOME/.myndaix/.secrets/env/${name}.env"
+  [ -f "$f" ] || return 1
+  # shellcheck disable=SC1090
+  source "$f"
+}
+LEOF
+# mk_secret HOME KEY [TAGS] — write env/tailscale.env for that home
+mk_secret(){ local h="$1" key="$2" tags="${3:-}"; mkdir -p "$h/.myndaix/.secrets/env"
+  { printf 'TAILSCALE_AUTHKEY=%s\n' "$key"; [ -n "$tags" ] && printf 'TAILSCALE_TAGS=%s\n' "$tags"; } \
+    > "$h/.myndaix/.secrets/env/tailscale.env"; chmod 600 "$h/.myndaix/.secrets/env/tailscale.env"; }
+
 # a run helper: fresh home per scenario unless $KEEP given; returns the daemon's exit code
 HOME_N=0
 run(){ # run STATE [extra env assignments...]
@@ -34,7 +52,7 @@ run(){ # run STATE [extra env assignments...]
   LAST_HOME="$h"
   env FAKE_STATE="$state" "$@" \
     TS_RELOGIN_CLI="$FAKE" \
-    TS_RELOGIN_SECRETS="$h/.secrets" \
+    TS_RELOGIN_SECRETS_LOAD="$LOADER" \
     TS_RELOGIN_STATE_DIR="$h/.myndaix/state" \
     TS_RELOGIN_OPERATOR_INBOX="$h/.myndaix/bridge/inbox/jefe" \
     HOME="$h" \
@@ -50,8 +68,8 @@ ok '[[ ! -e "$LAST_HOME/.myndaix/state/ts-relogin-last-attempt" ]]' "Running -> 
 
 echo "== logged out below threshold: streak bumps, no up =="
 H="$TMP/persist"; mkdir -p "$H/.myndaix/state" "$H/.myndaix/orchestrator" "$H/.myndaix/bridge/inbox/jefe"
-printf 'TAILSCALE_AUTHKEY=tskey-fake-123\nTAILSCALE_TAGS=tag:factory\n' > "$H/.secrets"
-common=(TS_RELOGIN_CLI="$FAKE" TS_RELOGIN_SECRETS="$H/.secrets" TS_RELOGIN_STATE_DIR="$H/.myndaix/state" TS_RELOGIN_OPERATOR_INBOX="$H/.myndaix/bridge/inbox/jefe" TS_RELOGIN_DRY_RUN=1 HOME="$H")
+mk_secret "$H" "tskey-fake-123" "tag:factory"
+common=(TS_RELOGIN_CLI="$FAKE" TS_RELOGIN_SECRETS_LOAD="$LOADER" TS_RELOGIN_STATE_DIR="$H/.myndaix/state" TS_RELOGIN_OPERATOR_INBOX="$H/.myndaix/bridge/inbox/jefe" TS_RELOGIN_DRY_RUN=1 HOME="$H")
 env FAKE_STATE=NeedsLogin "${common[@]}" /bin/bash "$DAEMON" > "$H/r1.out" 2>&1
 ok '[[ "$(cat "$H/.myndaix/state/ts-relogin-streak")" == "1" ]]' "logged-out tick1 -> streak=1"
 ok '[[ ! -e "$H/.myndaix/state/ts-relogin-last-attempt" ]]' "tick1 below threshold(2) -> no up attempt"

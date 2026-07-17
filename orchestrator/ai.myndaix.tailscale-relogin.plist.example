@@ -3,7 +3,8 @@
   LaunchAgent for tailscale-relogin.sh — keeps the FACTORY on the tailnet non-interactively.
   Install (see docs/tailscale-relogin.md for the full prerequisites):
     1. Swap to STANDALONE tailscaled + `tailscale set --operator=jefe` + add TAILSCALE_AUTHKEY
-       to ~/.myndaix/.secrets (chmod 600) + disable node key expiry in the admin console.
+       to ~/.myndaix/.secrets/env/tailscale.env (mode 600, loaded via load_secret) + disable
+       node key expiry in the admin console.
     2. Replace {HOME} below with the real home (or keep if installing as jefe on the Mini).
     3. cp orchestrator/ai.myndaix.tailscale-relogin.plist.example \
          ~/Library/LaunchAgents/ai.myndaix.tailscale-relogin.plist

@@ -39,8 +39,9 @@ Every 5 min: `tailscale status --json` → `BackendState` →
 
 ## Security surface
 
-- The auth key is read from `~/.myndaix/.secrets` (`chmod 600`) into a variable and passed to
-  `tailscale up --auth-key=…`. It is **never logged** (the command logs `<redacted>`); a test
+- The auth key is loaded via the house `load_secret tailscale` (which validates 700/600/owner
+  and fail-closes) in a **subshell**, so it never lands in the daemon's own environment; only
+  the two values are captured. It is **never logged** (the command logs `<redacted>`); a test
   asserts the key value appears in no log.
 - Fail-closed + loud on a missing/empty key: drops a `ts-nokey-alert` and exits non-zero rather
   than silently doing nothing.
@@ -60,27 +61,31 @@ Every 5 min: `tailscale status --json` → `BackendState` →
    ```
    sudo tailscale set --operator=$(whoami)
    ```
-3. **Add a credential** to `~/.myndaix/.secrets` (`chmod 600`). Two options:
+3. **Add a credential** via the house secrets store (`~/.myndaix/.secrets/env/<name>.env`,
+   loaded by `load_secret`). The daemon calls `load_secret tailscale`, so the file is
+   `env/tailscale.env` (mode 600). Save it WITHOUT the secret hitting shell history — use an
+   editor, not an `echo`/`printf` on the command line:
+   ```
+   umask 077 && nano ~/.myndaix/.secrets/env/tailscale.env
+   ```
+   Contents — two options:
 
    **(a) OAuth client — recommended (no expiry).** OAuth-minted keys are ALWAYS tagged, so the
-   tag must exist in the ACL first and be passed to `--advertise-tags`:
-   - In **Access Controls**, define the tag owner:
-     ```json
-     "tagOwners": { "tag:factory": ["autogroup:admin"] }
-     ```
-   - **Settings → OAuth clients → Generate**, scope **Auth Keys → Write**, tag **tag:factory**.
-   - Store BOTH the client secret and the tag — the daemon reads `TAILSCALE_TAGS` and passes it
-     as `--advertise-tags` (required, or the OAuth `up` fails):
-     ```
-     TAILSCALE_AUTHKEY=tskey-client-...
-     TAILSCALE_TAGS=tag:factory
-     ```
+   tag must exist in the ACL first (**Access Controls → tagOwners** `"tag:factory":
+   ["autogroup:admin"]`), and the OAuth client (**Trust credentials / OAuth clients → Generate**)
+   needs scope **Auth Keys → Write** attached to **tag:factory**. The daemon reads `TAILSCALE_TAGS`
+   and passes it as `--advertise-tags` (required, or the OAuth `up` fails):
+   ```
+   TAILSCALE_AUTHKEY=tskey-client-...
+   TAILSCALE_TAGS=tag:factory
+   ```
 
    **(b) Reusable auth key — simpler, but expires (≤90d).** Non-ephemeral, reusable; no tag
-   needed. Set a reminder to rotate before expiry:
+   line needed. Set a reminder to rotate before expiry:
    ```
    TAILSCALE_AUTHKEY=tskey-...
    ```
+   Then `chmod 600 ~/.myndaix/.secrets/env/tailscale.env`.
 
    Manual `up` (Phase 2) mirrors this — the OAuth path needs the tag flag:
    ```
