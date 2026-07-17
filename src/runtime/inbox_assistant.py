@@ -262,34 +262,12 @@ def _build_classify_prompt(threads: list[ThreadSummary], nonce: str) -> str:
     return _CLASSIFY_OBJECTIVE + "\n" + "".join(fences)
 
 
-def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
-    """STRICT parse of the classifier's JSON array (pure — unit-testable). Slices to the
-    first '['..last ']' (models wrap JSON in prose), then validates EVERY row: the thread_id
-    must be one WE sent — the model cannot mint rows, so an injected email asking for a fake
-    entry dies here — and the category must be a known member. The echoed 'account' field is
-    ignored: we already know each thread's account and never trust the echo. Returns
-    thread_id -> row, or None when the payload is unusable (caller ships 'unclassified')."""
-    # anchor-scan (Oracle round-1 + KilaBz round-2): prose brackets can precede AND follow
-    # the array ("results [1 of 2]: [...] Done [ok]"), so there is NO end anchor —
-    # raw_decode parses one complete JSON value from each candidate '[' and ignores
-    # whatever trails it. A candidate wins only if it is a list holding at least one dict:
-    # prose that happens to parse ("[1, 2]") must not steal the slot and silently
-    # unclassify the batch WITH a cursor advance. No qualifying candidate -> None
-    # (caller ships 'unclassified' AND holds cursors — safe retry, never data loss).
-    decoder = json.JSONDecoder()
-    data = None
-    for tries, m in enumerate(re.finditer(r"\[", raw)):
-        if tries >= 20:   # bounded — pathological output must not spin the loop
-            break
-        try:
-            cand, _ = decoder.raw_decode(raw, m.start())
-        except ValueError:
-            continue
-        if isinstance(cand, list) and any(isinstance(r, dict) for r in cand):
-            data = cand
-            break
-    if data is None:
-        return None
+def _validate_rows(data: list, known_ids: set) -> dict:
+    """Row validation for one candidate array: the thread_id must be one WE sent — the
+    model cannot mint rows, so an injected email asking for a fake entry dies here — and
+    the category must be a known member. The echoed 'account' field is ignored: we already
+    know each thread's account and never trust the echo. Returns thread_id -> row (empty
+    when nothing validates — the CANDIDATE is then rejected, see parse_classification)."""
     rows: dict[str, dict] = {}
     for row in data:
         if not isinstance(row, dict):
@@ -306,6 +284,33 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
             "draft_hint": _one_line(str(row.get("draft_hint") or ""))[:200],
         }
     return rows
+
+
+def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
+    """STRICT parse of the classifier's JSON array (pure — unit-testable). Returns
+    thread_id -> row, or None when the payload is unusable (caller ships 'unclassified'
+    AND holds cursors — safe retry, never data loss).
+    Anchor-scan (Oracle round-1, KilaBz rounds 2+3): prose brackets can precede AND follow
+    the array ("results [1 of 2]: [...] Done [ok]"), so there is NO end anchor —
+    raw_decode parses one complete JSON value from each candidate '[' and ignores whatever
+    trails it. A candidate wins only by yielding AT LEAST ONE VALID row against known_ids:
+    dict-less prose ("[1, 2]") and dict-SHAPED prose ('[{"thread_id": "bogus"}]') alike
+    must not steal the slot — either would return empty rows as "usable" and advance the
+    cursor past a batch the model never actually answered."""
+    decoder = json.JSONDecoder()
+    for tries, m in enumerate(re.finditer(r"\[", raw)):
+        if tries >= 20:   # bounded — pathological output must not spin the loop
+            break
+        try:
+            cand, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        if not isinstance(cand, list):
+            continue
+        rows = _validate_rows(cand, known_ids)
+        if rows:
+            return rows
+    return None
 
 
 def classify(threads: list[ThreadSummary], nonce: str) -> tuple[list[Item], bool]:

@@ -792,6 +792,14 @@ def test_parse_survives_trailing_prose_and_json_prose_steal():
     rows = IA.parse_classification(f'count [1, 2]\n[{row}]\ntail [x]', {"t1"})
     ok(rows is not None and rows["t1"]["category"] == "fyi",
        "dict-less JSON prose rejected — the real row array wins")
+    # ...and dict-SHAPED prose whose rows don't validate against known_ids must not steal
+    # it either (KilaBz round-3: same data-loss shape, dict-shaped instead of dict-less).
+    rows = IA.parse_classification(
+        'note [{"thread_id": "bogus", "category": "fyi"}]\n' + f'[{row}]', {"t1"})
+    ok(rows is not None and rows["t1"]["category"] == "fyi",
+       "dict-shaped bogus prose rejected — a candidate wins only with a VALID row")
+    ok(IA.parse_classification('[{"thread_id": "bogus", "category": "fyi"}]', {"t1"}) is None,
+       "an array with ZERO valid rows is unusable -> None (hold), never empty-rows-advance")
 
 
 def test_board_defangs_fence_markers_in_hostile_fields():
