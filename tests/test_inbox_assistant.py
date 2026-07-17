@@ -855,13 +855,13 @@ def test_parse_r6_budget_exhaustion_fails_closed():
     rows = IA.parse_classification(("[] " * 49) + real, known)
     ok(rows is not None and set(rows.keys()) == known,
        "r6: complete answer on the 50th candidate is returned, not discarded")
-    # r7 #1: a PARTIAL best on the exact budget boundary with input truly ENDED is a
-    # natural end — it ships. Only budget-with-input-REMAINING fails closed.
-    rows = IA.parse_classification(("[] " * 49) + decoy, known)
-    ok(rows is not None and set(rows.keys()) == {"t1"},
-       "r7: partial answer exactly on the 50th candidate at EOF still ships")
+    # r8 P0 (supersedes r7 #1): budget exhaustion fails closed UNCONDITIONALLY — a
+    # max_tokens-padding attacker controls whether input "remains", so a boundary-exact
+    # partial must hold (one tick, fresh re-classify) rather than risk shipping a forgery.
+    ok(IA.parse_classification(("[] " * 49) + decoy, known) is None,
+       "r8: partial on the 50th candidate at EOF -> None (truncation-eclipse closed)")
     ok(IA.parse_classification(("[] " * 49) + decoy + "\n[more", known) is None,
-       "r7: partial on the boundary WITH input remaining -> None (eclipse risk)")
+       "r8: partial on the boundary with input remaining -> None")
 
 
 def test_parse_r5_double_wrapped_answer_still_found():

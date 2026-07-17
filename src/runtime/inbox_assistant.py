@@ -342,13 +342,17 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
             if len(best) == len(known_ids):
                 return best    # complete answer — legitimate regardless of budget state
         pos = max(end, i + 1)  # consume the winning span; its innards are already rows
-    if (scanned >= 2000 or candidates >= 50) and raw.find("[", pos) >= 0:
-        # r6 #1 (CRITICAL): budget exhaustion WITH INPUT REMAINING must FAIL CLOSED.
-        # Returning a partial best here re-opens the eclipse — one valid decoy row + 49
-        # decoy arrays burns the budget and silently wins over the unseen real answer.
-        # None -> hold + retry, visible on the board. r7 #1: budget counters AT the limit
-        # with nothing left to scan is a NATURAL end — a partial best there is the model's
-        # true partial answer and ships (the find() probe is what tells the two apart).
+    if scanned >= 2000 or candidates >= 50:
+        # r8 P0 (supersedes the r7 #1 find-probe — the two rounds conflict, resolved
+        # FAIL-CLOSED): budget exhaustion returns None UNCONDITIONALLY. The r7 probe
+        # ("does a '[' remain?") tried to ship a boundary-exact natural-end partial, but
+        # an attacker who pads the model into max_tokens truncation controls whether any
+        # '[' remains — turning the natural-end branch into an eclipse ship-path for a
+        # forged partial. Cost of unconditional None: a legitimate partial that lands
+        # EXACTLY on the budget boundary holds one tick and re-classifies on a FRESH
+        # model call next tick (non-deterministic — converges; not the deterministic
+        # livelock class r5 killed). Benefit: both truncation routes fail closed and
+        # VISIBLY (board ships 'unclassified', cursor holds).
         return None
     return best
 
