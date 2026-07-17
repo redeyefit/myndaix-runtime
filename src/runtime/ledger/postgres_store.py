@@ -1158,15 +1158,28 @@ class PostgresLedger:
                         RETURNING account_id""",
                     account_id, state)
             elif expected_history_id is None:
-                row = await con.fetchrow(
-                    """INSERT INTO inbox_cursor (account_id, history_id, state, attempts)
-                            VALUES ($1, NULL, $2, 1)
-                       ON CONFLICT (account_id) DO UPDATE
-                            SET state = $2, attempts = inbox_cursor.attempts + 1,
-                                updated_at = now()
-                          WHERE inbox_cursor.history_id IS NULL
-                        RETURNING account_id""",
-                    account_id, state)
+                try:
+                    row = await con.fetchrow(
+                        """INSERT INTO inbox_cursor (account_id, history_id, state, attempts)
+                                VALUES ($1, NULL, $2, 1)
+                           ON CONFLICT (account_id) DO UPDATE
+                                SET state = $2, attempts = inbox_cursor.attempts + 1,
+                                    updated_at = now()
+                              WHERE inbox_cursor.history_id IS NULL
+                            RETURNING account_id""",
+                        account_id, state)
+                except asyncpg.NotNullViolationError:
+                    # r-review #1: the canonical 0014 shape has history_id NULLABLE, but a DB
+                    # that ran this migration's brief interim NOT NULL form (PR-95 pre-merge
+                    # branch only — 0014 never shipped to main, and main's migration-additivity
+                    # lint FORBIDS an ALTER ... DROP NOT NULL here, so it can't be auto-fixed in
+                    # the migration) rejects the NULL seed. DEGRADE, don't crash: the first-run
+                    # valve simply won't accrue on that legacy dev DB (the account re-backfills
+                    # each tick, visibly). Fix such a DB by dropping/recreating inbox_cursor.
+                    _log_line = (f"inbox_mark_cursor_error: NULL seed rejected for {account_id} "
+                                 "— legacy NOT NULL inbox_cursor; recreate the table (dev DB only)")
+                    print(_log_line, flush=True)
+                    return False
             else:
                 row = await con.fetchrow(
                     """UPDATE inbox_cursor

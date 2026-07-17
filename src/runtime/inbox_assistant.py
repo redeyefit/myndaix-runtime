@@ -577,11 +577,13 @@ def assemble_brief(date_str: str, runs: list[AccountRun], items: list[Item],
         if run.ok:
             status = f"ok — {len(run.threads)} thread(s)"
             if run.action_failed:
-                # r10 #1 truthfulness extended to the action valve: if this account hit the
-                # bounded-loss limit its cursor ADVANCES now — say so, don't promise a hold.
+                # r10 #1 truthfulness extended to the action valve; r-review #3: the CAS
+                # advance runs AFTER this brief is delivered (advance-after-delivery is the
+                # no-data-loss invariant) and can rarely miss, so state INTENT — "act from
+                # this brief" is safe advice whether or not the advance lands.
                 if run.account in valve_accounts:
-                    status += (" — actions incomplete; BOUNDED-LOSS LIMIT reached, cursor "
-                               "ADVANCED (labels/drafts NOT applied — act from this brief)")
+                    status += (" — actions incomplete; BOUNDED-LOSS LIMIT reached, advancing "
+                               "past this slice (labels/drafts NOT applied — ACT FROM THIS BRIEF)")
                 else:
                     status += " — actions incomplete (cursor held)"
         else:
@@ -595,9 +597,10 @@ def assemble_brief(date_str: str, runs: list[AccountRun], items: list[Item],
         if valve_accounts:
             advancing = ", ".join(sorted(valve_accounts))
             lines += ["", "Classifier unavailable this run — threads listed unclassified. "
-                          f"BOUNDED-LOSS LIMIT reached for: {advancing} — their cursors "
-                          "advance past this slice (these threads will NOT reappear; act on "
-                          "them from this brief). Any other account still retries."]
+                          f"BOUNDED-LOSS LIMIT reached for: {advancing} — the assistant is "
+                          "advancing past this slice, so ACT ON THESE FROM THIS BRIEF. (If the "
+                          "advance is contended they may resurface next run — don't count on "
+                          "it.) Any other account still retries."]
         else:
             lines += ["", "Classifier unavailable this run — threads listed unclassified; "
                           "cursors held for a clean retry."]
@@ -750,6 +753,7 @@ async def _pull_account(led: PostgresLedger, account: str,
     """One account's pull, independently fail-closed (design §4: a dead account surfaces on
     the board while the others keep working — never silent-skip)."""
     run = AccountRun(account=account)
+    cursor_read = False   # True once we've read the cursor — gates SLICE-BOUND error marks (r-review #4)
     try:
         token = _op_read(f"op://{OP_VAULT}/gmail-rt-{account}/refresh_token")
         client = GmailClient(account, client_id, client_secret, token)
@@ -766,6 +770,7 @@ async def _pull_account(led: PostgresLedger, account: str,
             return run
         cursor = await led.inbox_get_cursor(account)
         run.prev_history_id = cursor["history_id"] if cursor else None   # CAS expectation
+        cursor_read = True   # from here, an error mark can be bound to THIS slice
         if cursor is None or cursor["history_id"] is None:
             # No row, OR an error-SEEDED row (history_id NULL — r10 #2: a first-run tick
             # failed after pull; the seed exists only to accumulate valve attempts and
@@ -786,16 +791,28 @@ async def _pull_account(led: PostgresLedger, account: str,
         run.status = "needs re-auth (token revoked — usually a password change)"
         log(f"{account}: {run.status}")
         if not DRY_RUN:
-            # on a rowless first-run account this updates nothing and returns False —
-            # correct: no row means the next tick re-backfills anyway.
-            await led.inbox_mark_cursor_error(account, "error")
+            await _mark_pull_error(led, account, "error", cursor_read, run.prev_history_id)
     except Exception as e:
         run.status = f"pull failed: {type(e).__name__}"   # class ONLY — details may embed content
         log(f"{account}: {run.status}")
         if not DRY_RUN:
-            # rowless first-run: no-op False, correct (see the GmailAuthError branch above)
-            await led.inbox_mark_cursor_error(account, "stale")
+            await _mark_pull_error(led, account, "stale", cursor_read, run.prev_history_id)
     return run
+
+
+async def _mark_pull_error(led: PostgresLedger, account: str, state: str,
+                           cursor_read: bool, prev_history_id) -> None:
+    """Record a pull failure on the cursor, SLICE-BOUND when we know the slice (r-review #4).
+    A pull failure that fired AFTER the cursor read for an EXISTING cursor binds the mark to
+    that history_id, so a concurrent tick that advanced the row in the gap is not mis-marked
+    (its attempts belong to a different, in-flight slice). Pre-read failures (token/identity
+    gate) and rowless first-runs stay UNBOUND: they must NOT seed a row — a pull failure has
+    no board surfacing, so it must never feed a bounded-loss ADVANCE; the unbound mark on a
+    missing row is a correct no-op that re-backfills next tick."""
+    if cursor_read and prev_history_id is not None:
+        await led.inbox_mark_cursor_error(account, state, expected_history_id=prev_history_id)
+    else:
+        await led.inbox_mark_cursor_error(account, state)
 
 
 async def tick() -> int:
@@ -847,12 +864,18 @@ async def tick() -> int:
         def _is_held(r: AccountRun) -> bool:
             return bool(r.ok and r.new_history_id and ((not classify_ok) or r.action_failed))
 
+        # Read attempts ONCE per held run, and ONLY when the ledger row still OWNS the slice
+        # this tick pulled (history_id == prev_history_id; both None for the seed/first-run
+        # case). A concurrent tick that advanced the cursor reset attempts to ITS slice —
+        # counting those would fire the valve against the wrong slice and lie in the brief
+        # (r-review #2). Read even under DRY_RUN so the preview brief reflects the true
+        # would-be valve (#5); only the WRITES below are gated on not DRY_RUN.
         valve_attempts: dict[str, int] = {}
-        if not DRY_RUN:
-            for run in runs:
-                if _is_held(run):
-                    cur = await led.inbox_get_cursor(run.account)
-                    valve_attempts[run.account] = int((cur or {}).get("attempts") or 0)
+        for run in runs:
+            if _is_held(run):
+                cur = await led.inbox_get_cursor(run.account)
+                if cur is not None and cur.get("history_id") == run.prev_history_id:
+                    valve_attempts[run.account] = int(cur.get("attempts") or 0)
         valve_accounts = {a for a, n in valve_attempts.items() if n + 1 >= CLASSIFY_HOLD_MAX}
 
         date_str = _dt.date.today().isoformat()

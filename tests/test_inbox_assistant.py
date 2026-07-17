@@ -1317,8 +1317,81 @@ def test_action_failure_valve_bounds_the_hold(_HOLD=None):
     ok(("advance", "a@gmail.com", "9") in led.calls,
        "action-fail valve: cursor ADVANCED past the persistently-failing slice (bounded loss)")
     ok("BOUNDED-LOSS VALVE" in out and "actions failed" in out, "the action valve advance is loud")
-    ok(brief is not None and "BOUNDED-LOSS LIMIT reached, cursor ADVANCED" in brief,
-       "the delivered brief states the action-valve advance truthfully (r10 #1 shape)")
+    ok(brief is not None and "BOUNDED-LOSS LIMIT reached, advancing past this slice" in brief
+       and "ACT FROM THIS BRIEF" in brief,
+       "the delivered brief states the action-valve advance as INTENT, not a false guarantee "
+       "(r-review #3 — the CAS runs after delivery)")
+
+
+def test_valve_attempts_ignored_when_cursor_moved_under_us():
+    # r-review #2: a concurrent tick advanced the cursor (H1 -> H2, attempts now belong to
+    # H2). This tick still holds prev_history_id=H1; it must NOT read H2's attempts and fire
+    # the valve against its stale H1 slice. Simulate by seeding the ledger row at a DIFFERENT
+    # history_id than the tick will read at pull time.
+    fake, _ = make_claude(fail_classify=True)
+    # cursor row says H2 with high attempts, but the tick pulls from H1 (prev = "1")
+    led = FakeLedger({"a@gmail.com": "H2-moved"}, attempts={"a@gmail.com": 99})
+    # the tick reads cursor "H2-moved" as prev_history_id, pulls incrementally, hid "9".
+    # The valve read compares cur.history_id (H2-moved) to prev (H2-moved) -> matches, so
+    # this test instead checks the STALE case: force prev != stored via a mid-flight advance.
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+
+    # monkeypatch inbox_get_cursor so the SECOND read (the valve read) returns a moved cursor
+    reads = {"n": 0}
+    orig = led.inbox_get_cursor
+
+    async def _moving_get(acct):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return await orig(acct)                       # pull-time read: prev = "H2-moved"
+        return {"account_id": acct, "history_id": "H3-newer",  # valve read: moved under us
+                "fallback_since": None, "state": "active", "attempts": 99, "updated_at": None}
+    led.inbox_get_cursor = _moving_get
+    rc, led, _inst, brief, out = run_tick(plan, claude=fake, led=led)
+    ok(not [c for c in led.calls if c[0] == "advance"],
+       "valve did NOT fire against a slice the cursor no longer owns (attempts 99 ignored)")
+    ok(brief is not None and "BOUNDED-LOSS LIMIT reached" not in brief,
+       "the brief does not falsely claim a bounded-loss advance for the moved slice")
+
+
+def test_dry_run_brief_previews_the_valve():
+    # r-review #5: dry-run must reflect the would-be valve, not always "held". A classify
+    # failure with attempts already at the threshold should preview the advance banner.
+    fake, _ = make_claude(fail_classify=True)
+    led = FakeLedger({"a@gmail.com": "1"}, attempts={"a@gmail.com": IA.CLASSIFY_HOLD_MAX - 1})
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+    rc, led, _inst, _brief, out = run_tick(plan, claude=fake, led=led, dry_run=True)
+    ok(not led.calls, "dry-run writes NOTHING to the ledger (no mark, no advance)")
+    ok("BOUNDED-LOSS LIMIT reached" in out,
+       "dry-run brief PREVIEWS the bounded-loss advance (read happens even under DRY_RUN)")
+
+
+def test_pull_error_mark_is_slice_bound_after_read():
+    # r-review #4: a pull failure AFTER the cursor read on an EXISTING cursor binds the mark
+    # to that history_id, so a concurrent advance isn't mis-marked. A pre-read/first-run
+    # failure stays UNBOUND (no seed — a pull failure has no board surfacing, must not feed
+    # a bounded-loss advance).
+    import asyncio as _aio
+
+    async def _drive():
+        # existing cursor, pull fails AFTER read -> bound mark at "H1"
+        led = FakeLedger({"a@gmail.com": "H1"})
+        await IA._mark_pull_error(led, "a@gmail.com", "stale", cursor_read=True,
+                                  prev_history_id="H1")
+        ok(led.attempts.get("a@gmail.com") == 1, "post-read existing-cursor mark bound + incremented")
+        # a concurrent advance moved the row to H2 -> the bound mark must NO-OP
+        led2 = FakeLedger({"a@gmail.com": "H2"})
+        await IA._mark_pull_error(led2, "a@gmail.com", "stale", cursor_read=True,
+                                  prev_history_id="H1")
+        ok(led2.attempts.get("a@gmail.com", 0) == 0,
+           "stale post-read mark (prev H1, row now H2) NO-OPs — no mis-mark of the newer slice")
+        # pre-read failure on a rowless first-run -> unbound no-op, NO seed
+        led3 = FakeLedger()
+        await IA._mark_pull_error(led3, "a@gmail.com", "error", cursor_read=False,
+                                  prev_history_id=None)
+        ok("a@gmail.com" not in led3.cursors,
+           "pre-read failure leaves NO row (pull failure must not seed / feed the valve)")
+    _aio.run(_drive())
 
 
 def main():
