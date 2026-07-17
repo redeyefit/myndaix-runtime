@@ -1377,18 +1377,31 @@ def test_pull_error_mark_is_slice_bound_after_read():
         # existing cursor, pull fails AFTER read -> bound mark at "H1"
         led = FakeLedger({"a@gmail.com": "H1"})
         await IA._mark_pull_error(led, "a@gmail.com", "stale", cursor_read=True,
-                                  prev_history_id="H1")
+                                  row_existed=True, prev_history_id="H1")
         ok(led.attempts.get("a@gmail.com") == 1, "post-read existing-cursor mark bound + incremented")
         # a concurrent advance moved the row to H2 -> the bound mark must NO-OP
         led2 = FakeLedger({"a@gmail.com": "H2"})
         await IA._mark_pull_error(led2, "a@gmail.com", "stale", cursor_read=True,
-                                  prev_history_id="H1")
+                                  row_existed=True, prev_history_id="H1")
         ok(led2.attempts.get("a@gmail.com", 0) == 0,
            "stale post-read mark (prev H1, row now H2) NO-OPs — no mis-mark of the newer slice")
+        # r12 #2: an EXISTING NULL-seed row (prev_history_id None but row_existed True) must use
+        # the BOUND seed path, not the unbound UPDATE.
+        led_seed = FakeLedger({"a@gmail.com": None}, attempts={"a@gmail.com": 1})
+        await IA._mark_pull_error(led_seed, "a@gmail.com", "error", cursor_read=True,
+                                  row_existed=True, prev_history_id=None)
+        ok(led_seed.attempts.get("a@gmail.com") == 2,
+           "post-read NULL-seed row: bound seed path increments the still-NULL row")
+        # ...and if that seed row was advanced to a real cursor under us, the bound path NO-OPs
+        led_seed2 = FakeLedger({"a@gmail.com": "H9"})
+        await IA._mark_pull_error(led_seed2, "a@gmail.com", "error", cursor_read=True,
+                                  row_existed=True, prev_history_id=None)
+        ok(led_seed2.attempts.get("a@gmail.com", 0) == 0,
+           "NULL-seed mark against an advanced row NO-OPs (no mis-mark of the real slice)")
         # pre-read failure on a rowless first-run -> unbound no-op, NO seed
         led3 = FakeLedger()
         await IA._mark_pull_error(led3, "a@gmail.com", "error", cursor_read=False,
-                                  prev_history_id=None)
+                                  row_existed=False, prev_history_id=None)
         ok("a@gmail.com" not in led3.cursors,
            "pre-read failure leaves NO row (pull failure must not seed / feed the valve)")
     _aio.run(_drive())

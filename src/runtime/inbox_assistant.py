@@ -754,6 +754,7 @@ async def _pull_account(led: PostgresLedger, account: str,
     the board while the others keep working — never silent-skip)."""
     run = AccountRun(account=account)
     cursor_read = False   # True once we've read the cursor — gates SLICE-BOUND error marks (r-review #4)
+    row_existed = False   # True if a cursor ROW existed at read time (even a NULL-history seed)
     try:
         token = _op_read(f"op://{OP_VAULT}/gmail-rt-{account}/refresh_token")
         client = GmailClient(account, client_id, client_secret, token)
@@ -771,6 +772,7 @@ async def _pull_account(led: PostgresLedger, account: str,
         cursor = await led.inbox_get_cursor(account)
         run.prev_history_id = cursor["history_id"] if cursor else None   # CAS expectation
         cursor_read = True   # from here, an error mark can be bound to THIS slice
+        row_existed = cursor is not None   # distinguishes "no row" from "NULL-seed row" (r12 #2)
         if cursor is None or cursor["history_id"] is None:
             # No row, OR an error-SEEDED row (history_id NULL — r10 #2: a first-run tick
             # failed after pull; the seed exists only to accumulate valve attempts and
@@ -791,25 +793,28 @@ async def _pull_account(led: PostgresLedger, account: str,
         run.status = "needs re-auth (token revoked — usually a password change)"
         log(f"{account}: {run.status}")
         if not DRY_RUN:
-            await _mark_pull_error(led, account, "error", cursor_read, run.prev_history_id)
+            await _mark_pull_error(led, account, "error", cursor_read, row_existed,
+                                   run.prev_history_id)
     except Exception as e:
         run.status = f"pull failed: {type(e).__name__}"   # class ONLY — details may embed content
         log(f"{account}: {run.status}")
         if not DRY_RUN:
-            await _mark_pull_error(led, account, "stale", cursor_read, run.prev_history_id)
+            await _mark_pull_error(led, account, "stale", cursor_read, row_existed,
+                                   run.prev_history_id)
     return run
 
 
-async def _mark_pull_error(led: PostgresLedger, account: str, state: str,
-                           cursor_read: bool, prev_history_id) -> None:
-    """Record a pull failure on the cursor, SLICE-BOUND when we know the slice (r-review #4).
-    A pull failure that fired AFTER the cursor read for an EXISTING cursor binds the mark to
-    that history_id, so a concurrent tick that advanced the row in the gap is not mis-marked
-    (its attempts belong to a different, in-flight slice). Pre-read failures (token/identity
-    gate) and rowless first-runs stay UNBOUND: they must NOT seed a row — a pull failure has
-    no board surfacing, so it must never feed a bounded-loss ADVANCE; the unbound mark on a
-    missing row is a correct no-op that re-backfills next tick."""
-    if cursor_read and prev_history_id is not None:
+async def _mark_pull_error(led: PostgresLedger, account: str, state: str, cursor_read: bool,
+                           row_existed: bool, prev_history_id) -> None:
+    """Record a pull failure on the cursor, SLICE-BOUND whenever a ROW existed at read time
+    (r-review #4 + r12 #2). If a row existed we bind to prev_history_id — a real history_id
+    uses the CAS-bound UPDATE, and a NULL-seed row (prev_history_id is None) uses the
+    expected_history_id=None seed path (WHERE history_id IS NULL). BOTH reject a concurrent
+    advance that moved the row in the gap, so neither mis-marks a newer in-flight slice. Only
+    when NO row existed at all (or the failure fired pre-read) do we use the UNBOUND no-op:
+    a pull failure has no board surfacing and must never seed a row / feed a bounded-loss
+    ADVANCE, and an unbound mark on a missing row is a correct no-op that re-backfills."""
+    if cursor_read and row_existed:
         await led.inbox_mark_cursor_error(account, state, expected_history_id=prev_history_id)
     else:
         await led.inbox_mark_cursor_error(account, state)
