@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for tailscale-relogin.sh — keeps the FACTORY on the tailnet non-interactively.
+  Install (see docs/tailscale-relogin.md for the full prerequisites):
+    1. Swap to STANDALONE tailscaled + `tailscale set --operator=jefe` + add TAILSCALE_AUTHKEY
+       to ~/.myndaix/.secrets (chmod 600) + disable node key expiry in the admin console.
+    2. Replace {HOME} below with the real home (or keep if installing as jefe on the Mini).
+    3. cp orchestrator/ai.myndaix.tailscale-relogin.plist.example \
+         ~/Library/LaunchAgents/ai.myndaix.tailscale-relogin.plist
+    4. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.myndaix.tailscale-relogin.plist
+  Runs every 5 min; a logged-out node is re-joined only after it PERSISTS past the streak
+  threshold, and `up` is rate-limited between attempts (see the script's safety model).
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ai.myndaix.tailscale-relogin</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>{HOME}/code/active/myndaix-runtime/orchestrator/tailscale-relogin.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{HOME}/.myndaix/orchestrator/tailscale-relogin.out</string>
+    <key>StandardErrorPath</key>
+    <string>{HOME}/.myndaix/orchestrator/tailscale-relogin.out</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+  </dict>
+</plist>
