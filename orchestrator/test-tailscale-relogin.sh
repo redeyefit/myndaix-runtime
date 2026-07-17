@@ -50,7 +50,7 @@ ok '[[ ! -e "$LAST_HOME/.myndaix/state/ts-relogin-last-attempt" ]]' "Running -> 
 
 echo "== logged out below threshold: streak bumps, no up =="
 H="$TMP/persist"; mkdir -p "$H/.myndaix/state" "$H/.myndaix/orchestrator" "$H/.myndaix/bridge/inbox/jefe"
-printf 'TAILSCALE_AUTHKEY=tskey-fake-123\n' > "$H/.secrets"
+printf 'TAILSCALE_AUTHKEY=tskey-fake-123\nTAILSCALE_TAGS=tag:factory\n' > "$H/.secrets"
 common=(TS_RELOGIN_CLI="$FAKE" TS_RELOGIN_SECRETS="$H/.secrets" TS_RELOGIN_STATE_DIR="$H/.myndaix/state" TS_RELOGIN_OPERATOR_INBOX="$H/.myndaix/bridge/inbox/jefe" TS_RELOGIN_DRY_RUN=1 HOME="$H")
 env FAKE_STATE=NeedsLogin "${common[@]}" /bin/bash "$DAEMON" > "$H/r1.out" 2>&1
 ok '[[ "$(cat "$H/.myndaix/state/ts-relogin-streak")" == "1" ]]' "logged-out tick1 -> streak=1"
@@ -62,6 +62,8 @@ ok '[[ -e "$H/.myndaix/state/ts-relogin-last-attempt" ]]' "tick2 at threshold ->
 ok 'grep -q "redacted" "$H/r2.out"' "the up command is logged with the key REDACTED"
 ok '! grep -q "tskey-fake-123" "$H/r2.out" "$H/.myndaix/orchestrator/tailscale-relogin.log"' \
    "the auth key value NEVER appears in any log (security)"
+ok 'grep -q -- "--advertise-tags=tag:factory" "$H/r2.out"' \
+   "TAILSCALE_TAGS is passed as --advertise-tags (required for an OAuth-client secret)"
 
 echo "== cooldown: a third immediate tick does NOT re-attempt =="
 cp "$H/.myndaix/state/ts-relogin-last-attempt" "$H/last.bak"

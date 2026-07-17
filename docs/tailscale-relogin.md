@@ -60,13 +60,32 @@ Every 5 min: `tailscale status --json` → `BackendState` →
    ```
    sudo tailscale set --operator=$(whoami)
    ```
-3. **Add an auth key** to `~/.myndaix/.secrets`:
+3. **Add a credential** to `~/.myndaix/.secrets` (`chmod 600`). Two options:
+
+   **(a) OAuth client — recommended (no expiry).** OAuth-minted keys are ALWAYS tagged, so the
+   tag must exist in the ACL first and be passed to `--advertise-tags`:
+   - In **Access Controls**, define the tag owner:
+     ```json
+     "tagOwners": { "tag:factory": ["autogroup:admin"] }
+     ```
+   - **Settings → OAuth clients → Generate**, scope **Auth Keys → Write**, tag **tag:factory**.
+   - Store BOTH the client secret and the tag — the daemon reads `TAILSCALE_TAGS` and passes it
+     as `--advertise-tags` (required, or the OAuth `up` fails):
+     ```
+     TAILSCALE_AUTHKEY=tskey-client-...
+     TAILSCALE_TAGS=tag:factory
+     ```
+
+   **(b) Reusable auth key — simpler, but expires (≤90d).** Non-ephemeral, reusable; no tag
+   needed. Set a reminder to rotate before expiry:
    ```
-   TAILSCALE_AUTHKEY=tskey-...        # chmod 600 the file
+   TAILSCALE_AUTHKEY=tskey-...
    ```
-   Prefer a **no-expiry** key: a Tailscale **OAuth client** secret (`tskey-client-…`) with a
-   `tag:factory` ACL tag — reusable auth keys expire (≤90d) and would reintroduce the very expiry
-   problem. `tailscale up --auth-key=<oauth-secret>` mints ephemeral node auth automatically.
+
+   Manual `up` (Phase 2) mirrors this — the OAuth path needs the tag flag:
+   ```
+   sudo tailscale up --auth-key='<secret>' --advertise-tags=tag:factory --hostname=jefes-mac-mini
+   ```
 4. **Disable key expiry** on `jefes-mac-mini` in the admin console
    (login.tailscale.com → **Google acct stevenfernandez83**, NOT github/redeyefit — that's a dead
    tailnet) so the node key itself never times out. This daemon is the belt; expiry-disable is the

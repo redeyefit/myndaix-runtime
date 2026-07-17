@@ -27,6 +27,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 TS_CLI="${TS_RELOGIN_CLI:-$(command -v tailscale || echo /opt/homebrew/bin/tailscale)}"
 SECRETS_FILE="${TS_RELOGIN_SECRETS:-$HOME/.myndaix/.secrets}"
 KEY_VAR="${TS_RELOGIN_KEY_VAR:-TAILSCALE_AUTHKEY}"     # var name to read from .secrets
+TAGS_VAR="${TS_RELOGIN_TAGS_VAR:-TAILSCALE_TAGS}"      # optional tags var; REQUIRED for an OAuth
+                                                       # client secret (its keys are always tagged),
+                                                       # unused for a plain reusable auth key
 STATE_DIR="${TS_RELOGIN_STATE_DIR:-$HOME/.myndaix/state}"
 OPERATOR_INBOX="${TS_RELOGIN_OPERATOR_INBOX:-$HOME/.myndaix/bridge/inbox/jefe}"
 THRESHOLD="$(( 10#${TS_RELOGIN_THRESHOLD:-2} ))"      # consecutive logged-out checks before acting
@@ -126,17 +129,18 @@ if [[ "$last" -gt 0 && "$elapsed" -lt "$COOLDOWN_S" ]]; then
   exit 0
 fi
 
-# read the auth key (fail-closed + loud; NEVER logged). A missing secrets FILE or an empty
-# key VAR are the same operator-actionable condition: logged out and no key to recover with.
-AUTHKEY=""
+# read the auth key + optional tags (fail-closed + loud; key NEVER logged). A missing secrets
+# FILE or an empty key VAR are the same operator-actionable condition: logged out, no key.
+AUTHKEY=""; TAGS=""
 if [[ -f "$SECRETS_FILE" ]]; then
-  AUTHKEY="$(
+  # one source, both values printed on separate lines (the key is not logged — only assigned)
+  { IFS= read -r AUTHKEY; IFS= read -r TAGS; } < <(
     set +u
     # shellcheck disable=SC1090  # runtime-path secrets file; not statically resolvable
     source "$SECRETS_FILE" >/dev/null 2>&1 || true
     set -u
-    printf '%s' "${!KEY_VAR:-}"
-  )"
+    printf '%s\n%s\n' "${!KEY_VAR:-}" "${!TAGS_VAR:-}"
+  )
 fi
 if [[ -z "$AUTHKEY" ]]; then
   drop_alert "ts-nokey-alert" \
@@ -148,20 +152,25 @@ recommended) to re-enable auto-relogin." \
 fi
 rm -f "$STATE_DIR/ts-relogin-nokey-alerted"
 
+# build the `up` argv: --advertise-tags is REQUIRED for an OAuth-client secret (its keys are
+# always tagged) and harmless-to-omit for a plain reusable key. The key stays in a var, never
+# in a logged string.
+up_args=(up --auth-key="$AUTHKEY" --hostname="$(hostname -s)")
+[[ -n "$TAGS" ]] && up_args+=(--advertise-tags="$TAGS")
+
 atomic_write "$LAST_ATTEMPT_FILE" "$(now_s)"
 if [[ "$DRY" == "1" ]]; then
-  log "DRY-RUN: would run '$TS_CLI up --auth-key=<redacted> --hostname=$(hostname -s)'"
+  log "DRY-RUN: would run '$TS_CLI up --auth-key=<redacted> --hostname=$(hostname -s)${TAGS:+ --advertise-tags=$TAGS}'"
   exit 0
 fi
 
-log "attempting non-interactive relogin (tailscale up --auth-key=<redacted>)"
-if "$TS_CLI" up --auth-key="$AUTHKEY" --hostname="$(hostname -s)" >/dev/null 2>&1; then
+log "attempting non-interactive relogin (tailscale up --auth-key=<redacted>${TAGS:+ --advertise-tags=$TAGS})"
+if "$TS_CLI" "${up_args[@]}" >/dev/null 2>&1; then
   rm -f "$STREAK_FILE"
   drop_alert "ts-recovered-alert" \
     "tailscale-relogin: node was logged out and has been AUTO-REJOINED to the tailnet via the
 stored auth key. No action needed — informational." \
     "$STATE_DIR/ts-relogin-recovered-alerted"
-  rm -f "$STATE_DIR/ts-relogin-recovered-alerted"   # informational one-shot; don't latch across episodes
   log "relogin SUCCEEDED — node rejoined the tailnet"
 else
   log "relogin FAILED (tailscale up nonzero) — will retry after cooldown (${COOLDOWN_S}s)"
