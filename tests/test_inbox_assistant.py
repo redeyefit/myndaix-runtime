@@ -802,6 +802,48 @@ def test_parse_survives_trailing_prose_and_json_prose_steal():
        "an array with ZERO valid rows is unusable -> None (hold), never empty-rows-advance")
 
 
+def _row(tid: str) -> str:
+    return ('{"thread_id": "%s", "account": "a", "category": "fyi", "reason": "r", '
+            '"draft_worthy": false, "draft_hint": ""}' % tid)
+
+
+def test_parse_r5_best_candidate_wins_not_first():
+    # r5 FIX-1 (KilaBz+Oracle): a partial-but-valid decoy array (hostile email echoing its
+    # own fenced thread_id, or plain truncation artifact) must not eclipse the full answer.
+    known = {"t1", "t2", "t3"}
+    decoy = f'[{_row("t1")}]'                              # 1 valid row — previously WON
+    real = f'[{_row("t1")}, {_row("t2")}, {_row("t3")}]'   # the full answer, later
+    rows = IA.parse_classification(f'{decoy}\n{real}', known)
+    ok(rows is not None and set(rows.keys()) == known,
+       "r5: best candidate (3 rows) beats the earlier partial (1 row)")
+
+
+def test_parse_r5_prose_brackets_do_not_exhaust_budget():
+    # r5 FIX-2 (Oracle): 20+ literal '[' chars before the real array burned the whole try
+    # budget -> None -> cursor hold -> identical retry forever (livelock).
+    raw = ("bracket [ spam [ " * 15) + f'\n[{_row("t1")}]'   # 30 prose brackets, then the answer
+    rows = IA.parse_classification(raw, {"t1"})
+    ok(rows is not None and rows["t1"]["category"] == "fyi",
+       "r5: 30 prose brackets no longer exhaust the candidate budget")
+
+
+def test_parse_r5_recursion_bomb_caught():
+    # r5 FIX-3 (Oracle): deep [[[[... nesting blows json's recursive descent — RecursionError
+    # must be caught like any parse failure, never crash the worker.
+    bomb = "[" * 5000
+    ok(IA.parse_classification(bomb, {"t1"}) is None, "r5: recursion bomb -> None, no crash")
+    rows = IA.parse_classification(bomb + "\nignored", {"t1"})
+    ok(rows is None, "r5: recursion bomb with trailing prose -> None, no crash")
+
+
+def test_parse_r5_double_wrapped_answer_still_found():
+    # r5 guard on the fix itself: skipping past a decoded-but-invalid candidate would lose a
+    # [[...]]-wrapped real answer (a model double-wrap artifact) — we scan INSIDE instead.
+    rows = IA.parse_classification(f'[[{_row("t1")}]]', {"t1"})
+    ok(rows is not None and rows["t1"]["category"] == "fyi",
+       "r5: double-wrapped [[rows]] answer is still found (scan inside invalid candidates)")
+
+
 def test_board_defangs_fence_markers_in_hostile_fields():
     # KilaBz round-2: a subject spelling ===END UNTRUSTED=== is dropped from CLASSIFICATION
     # (suspicious), but it still rides the board — which is delivered inside the brief's own

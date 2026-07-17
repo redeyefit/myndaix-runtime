@@ -296,21 +296,44 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
     trails it. A candidate wins only by yielding AT LEAST ONE VALID row against known_ids:
     dict-less prose ("[1, 2]") and dict-SHAPED prose ('[{"thread_id": "bogus"}]') alike
     must not steal the slot — either would return empty rows as "usable" and advance the
-    cursor past a batch the model never actually answered."""
+    cursor past a batch the model never actually answered.
+    Round-5 (r5 FIX-1/2/3): the BEST candidate wins (most valid rows), not the first —
+    a partial array (a hostile email echoing its own fenced thread_id, or plain model
+    truncation) must not eclipse the full answer behind it. Prose '[' chars no longer
+    consume the candidate budget (20 stray brackets before the array meant None -> cursor
+    hold -> identical retry forever — livelock); the budgets below bound CPU instead.
+    A candidate with zero valid rows is scanned INSIDE (a double-wrapped [[...]] answer
+    must still be found); a winning candidate's span is consumed whole. RecursionError
+    (pathological [[[[... nesting) is caught like any parse failure. Residual accepted:
+    a model reliably coerced into >=50 decodable decoy arrays every tick yields None ->
+    hold -> retry, which is VISIBLE (the board ships 'unclassified' each tick), not silent."""
     decoder = json.JSONDecoder()
-    for tries, m in enumerate(re.finditer(r"\[", raw)):
-        if tries >= 20:   # bounded — pathological output must not spin the loop
+    best: Optional[dict] = None
+    pos = scanned = candidates = 0
+    while scanned < 2000 and candidates < 50:   # CPU bounds, not correctness anchors
+        i = raw.find("[", pos)
+        if i < 0:
             break
+        scanned += 1
         try:
-            cand, _ = decoder.raw_decode(raw, m.start())
-        except ValueError:
+            cand, end = decoder.raw_decode(raw, i)
+        except (ValueError, RecursionError):
+            pos = i + 1
             continue
         if not isinstance(cand, list):
+            pos = i + 1
             continue
+        candidates += 1
         rows = _validate_rows(cand, known_ids)
-        if rows:
-            return rows
-    return None
+        if not rows:
+            pos = i + 1        # scan inside it: [[...]]-wrapped real rows must still be found
+            continue
+        if best is None or len(rows) > len(best):
+            best = rows
+            if len(best) == len(known_ids):
+                break          # complete answer — cannot do better
+        pos = max(end, i + 1)  # consume the winning span; its innards are already rows
+    return best
 
 
 def classify(threads: list[ThreadSummary], nonce: str) -> tuple[list[Item], bool]:
