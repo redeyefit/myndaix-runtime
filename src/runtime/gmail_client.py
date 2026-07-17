@@ -9,9 +9,12 @@ DRAFTS-ONLY CONTRACT (v1, load-bearing): the gmail.compose scope technically per
 sending, but no sending method is invoked or referenced anywhere in this module — grep it.
 Sending is earned later, tap-approve first, per the design's autonomy ladder. Reviewers: any
 diff introducing an outbound-mail call here is a contract violation, not a feature.
-Same contract shape for gmail.modify: the scope also permits trash/untrash/archive/mark-read
-— this codebase NEVER calls them (labels are the only mutation), enforced by the same
-source-scan test as the send ban (tests/test_inbox_assistant.py).
+Same contract shape for gmail.modify: the scope also permits trash/untrash, archive & mark-read
+(which are label REMOVAL on INBOX/UNREAD), draft rewrite, and label deletion — this codebase
+NEVER calls them (label APPLICATION via batchModify addLabelIds is the only mutation), enforced
+by the source-scan test in tests/test_inbox_assistant.py, whose forbidden list covers those
+verbs plus every send form. (This comment states the verbs in prose, not as their literal API
+tokens, so the scan does not flag its own documentation.)
 
 Error taxonomy the tick depends on (keep these paths distinct):
   * google.auth RefreshError -> GmailAuthError  — token revoked/expired (the password-change
@@ -20,8 +23,10 @@ Error taxonomy the tick depends on (keep these paths distinct):
   * HTTP 404 from users.history.list ONLY -> CursorExpiredError — Google aged out the
     historyId; the tick falls back to pull_bounded_backfill. A 400 is NEVER this: that is a
     malformed request (a code bug) and must surface loudly, not silently trigger a rescan.
-  * HTTP 429 -> exponential-backoff retry here (google-api-python-client does NOT retry rate
-    limits for you), then raise.
+  * Retryable-with-backoff (google-api-python-client does NOT retry for you): HTTP 429, 403
+    with a rate-limit reason (rateLimitExceeded/userRateLimitExceeded), and 500/502/503 per
+    Google's error guide — exponential backoff here, then raise. A plain 403 (permissions) is
+    NOT retryable.
 
 Synchronous by design: the tick is a once-daily sequential batch; async buys nothing here.
 """
@@ -30,6 +35,7 @@ from __future__ import annotations
 import base64
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from email.message import EmailMessage
 
@@ -93,7 +99,13 @@ class PullResult:
 
 
 def _clean(text: str | None) -> str:
-    return _CTRL_RE.sub("", text or "")
+    # C0/DEL, then NFKC-normalize + drop Unicode format chars (category Cf: zero-width spaces,
+    # BOM, soft hyphen, word joiner). Defense-in-depth belt for the fence-marker evasion the
+    # inbox-assistant ingest also strips — a ZWSP-spliced "===END<zwsp>UNTRUSTED===" must never
+    # reach the classifier prompt or the brief looking like a real fence close.
+    stripped = _CTRL_RE.sub("", text or "")
+    norm = unicodedata.normalize("NFKC", stripped)
+    return "".join(ch for ch in norm if unicodedata.category(ch) != "Cf")
 
 
 def _header_map(message: dict) -> dict[str, str]:
@@ -105,6 +117,39 @@ def _header_map(message: dict) -> dict[str, str]:
 
 def _status(err: HttpError) -> int:
     return getattr(err.resp, "status", 0) or 0
+
+
+# Retryable-with-backoff classes per Google's Gmail error-handling guide (independent review
+# 2026-07-16): not just 429. 403 with a rate-limit REASON (rateLimitExceeded /
+# userRateLimitExceeded) and 500/503 backendError/unavailable are documented "use exponential
+# backoff to retry". A plain 403 (insufficientPermissions, forbidden) is NOT retryable — so we
+# gate 403 on the reason string, never the bare status.
+_RETRYABLE_403_REASONS = ("ratelimitexceeded", "userratelimitexceeded")
+
+
+def _error_reasons(err: HttpError) -> str:
+    """Lowercased blob of the error's reason fields — best-effort (HttpError shape varies
+    across client versions). Used only to distinguish a retryable 403-rate from a hard 403."""
+    try:
+        details = err.error_details  # newer googleapiclient: list of dicts
+        if details:
+            return str(details).lower()
+    except Exception:
+        pass
+    try:
+        return (err.content or b"").decode("utf-8", "replace").lower()
+    except Exception:
+        return ""
+
+
+def _retryable(err: HttpError) -> bool:
+    st = _status(err)
+    if st == 429 or st in (500, 502, 503):
+        return True
+    if st == 403:
+        reasons = _error_reasons(err)
+        return any(r in reasons for r in _RETRYABLE_403_REASONS)
+    return False
 
 
 class GmailClient:
@@ -145,7 +190,8 @@ class GmailClient:
 
     def _execute(self, request):
         """Run one API request under the module's error taxonomy: RefreshError ->
-        GmailAuthError; 429 -> exponential backoff then raise; everything else propagates."""
+        GmailAuthError; retryable classes (429, 403-rate, 5xx per Google's guide) ->
+        exponential backoff then raise; everything else propagates."""
         delay = 1.0
         for attempt in range(_MAX_TRIES):
             try:
@@ -153,7 +199,7 @@ class GmailClient:
             except RefreshError as e:
                 raise GmailAuthError(self.account) from e
             except HttpError as e:
-                if _status(e) == 429 and attempt < _MAX_TRIES - 1:
+                if _retryable(e) and attempt < _MAX_TRIES - 1:
                     time.sleep(delay)
                     delay *= 2
                     continue
@@ -177,11 +223,15 @@ class GmailClient:
         page_token = None
         first_page = True
         while True:
-            # historyTypes=messageAdded: our own IA/* label writes are labelAdded events —
-            # without the filter every tick's labels echo into the NEXT tick's pull.
+            # messageAdded catches NEW mail; labelAdded catches mail RE-ENTERING the inbox
+            # (snooze expiry, un-archive, manual move-to-inbox, another client's filter) —
+            # those fire labelAdded(INBOX), never messageAdded, so messageAdded alone silently
+            # loses them forever (independent review 2026-07-16). labelId=INBOX scopes BOTH
+            # types to the inbox, so our own IA/* label writes (which never touch INBOX) do not
+            # echo; the INBOX-added filter below is the belt that drops any non-INBOX labelAdded.
             req = self._gmail.users().history().list(
                 userId="me", startHistoryId=start_history_id, labelId="INBOX",
-                historyTypes=["messageAdded"], pageToken=page_token)
+                historyTypes=["messageAdded", "labelAdded"], pageToken=page_token)
             try:
                 resp = self._execute(req)
             except HttpError as e:
@@ -192,9 +242,18 @@ class GmailClient:
                 new_history_id = str(resp.get("historyId", new_history_id))
                 first_page = False
             for record in resp.get("history") or []:
+                # messageAdded records: every added message is inbound to INBOX.
                 for msg in record.get("messages") or []:
                     if msg.get("threadId"):
                         thread_ids.setdefault(msg["threadId"], None)
+                # labelAdded records: keep ONLY those where INBOX itself was the label added
+                # (re-entry). This excludes IA/* self-labels and any other label churn — the
+                # exact self-echo the historyTypes filter used to prevent by omission.
+                for la in record.get("labelsAdded") or []:
+                    if "INBOX" in (la.get("labelIds") or []):
+                        msg = la.get("message") or {}
+                        if msg.get("threadId"):
+                            thread_ids.setdefault(msg["threadId"], None)
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break

@@ -33,6 +33,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,8 +78,10 @@ MAX_CLASSIFY_CALLS = 3    # chunks per tick — 600 threads covers any realistic
                           # that is the bounded-loss valve (ships 'unclassified' ONCE, loudly)
 SNIPPET_CAP = 500       # chars of snippet per fenced thread (Gmail snippets are ~200 anyway)
 MAX_DRAFTS = 5          # draft ATTEMPTS per run (bounds both LLM spend and Gmail writes)
-CLASSIFY_HOLD_MAX = 3   # consecutive classify-failed ticks before the bounded-loss valve
-                        # advances a held cursor (r9 FIX-3 — a hold must not be forever)
+CLASSIFY_HOLD_MAX = 3   # consecutive HELD ticks (classify-fail OR action-fail) before the
+                        # bounded-loss valve advances a held cursor (r9 FIX-3 + independent
+                        # review 2026-07-16 — no hold class may wedge forever + re-spend paid
+                        # LLM calls every tick). attempts is shared across both hold kinds.
 CLAUDE_TIMEOUT = 300    # seconds per `claude -p` subprocess
 OP_TIMEOUT = 30         # seconds per `op read`
 
@@ -89,15 +92,36 @@ _DRAFT_CATEGORIES = ("job-reply", "needs-you")   # only these ever earn a reply 
 # fence bodies contain newlines we add ourselves; everything else is stripped at the boundary.
 _C0_DEL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# Unicode format/zero-width chars (Cf category) + BOM/soft-hyphen (independent review 2026-07-16,
+# HIGH): a ZERO-WIDTH SPACE spliced into "===END<ZWSP> UNTRUSTED===" renders VISUALLY IDENTICAL
+# to a real fence close but defeats _FENCE_MARKER_RE (\s+ won't match U+200B) — so the marker
+# evades BOTH the breakout flag AND the board defang, letting a hostile subject inject the agent
+# that reads the delivered brief. Kill the whole class at ingest: NFKC-normalize (collapses
+# compatibility forms) then drop every Cf char + U+FEFF/U+00AD. Applied in _clean so ALL fenced
+# content, board fields, and the whole-board defang inherit it.
+
+
+def _strip_invisibles(text: str) -> str:
+    # NFKC first so compatibility forms (fullwidth '=', ligatures) can't spell the marker in
+    # disguise; then drop every Unicode format char (category Cf) — U+200B/U+00AD/U+2060/U+FEFF
+    # (the reviewer's PoC set) and every other zero-width joiner/mark are all Cf, so this covers
+    # the class without an error-prone literal-codepoint regex.
+    norm = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in norm if unicodedata.category(ch) != "Cf")
+
+
 # Fence-marker detector (Oracle 2026-07-16): an attacker doesn't need the run nonce to break
 # out — a bare "===END UNTRUSTED nonce=FAKE===" line in an email body reads as a closed fence
 # to the model. ANY fence marker inside content is a breakout attempt; the nonce check alone
-# only catches the (impossible) case of a sender guessing the live nonce.
-_FENCE_MARKER_RE = re.compile(r"===\s*(?:BEGIN|END)\s+UNTRUSTED", re.IGNORECASE)
+# only catches the (impossible) case of a sender guessing the live nonce. \s* (not \s+) so a
+# marker with NO separator ("===ENDUNTRUSTED") is still caught after invisibles are stripped.
+_FENCE_MARKER_RE = re.compile(r"===\s*(?:BEGIN|END)\s*UNTRUSTED", re.IGNORECASE)
 
 
 def _fence_breakout(*fields: str) -> bool:
-    return any(_FENCE_MARKER_RE.search(f) for f in fields if f)
+    # normalize+de-invisible each field BEFORE matching (the raw fields haven't been _clean'd
+    # yet here) — else a zero-width-spliced fake marker slips past the breakout flag.
+    return any(_FENCE_MARKER_RE.search(_strip_invisibles(f)) for f in fields if f)
 
 # [work]/[personal] tagging (design §3 step 6: work visually separated, never bleeding into
 # personal). Heuristic: consumer-Gmail domains are personal, custom domains are work — the
@@ -111,7 +135,9 @@ def log(msg: str) -> None:
 
 
 def _clean(text: str) -> str:
-    return _C0_DEL.sub("", text or "")
+    # strip C0/DEL, then Unicode-normalize + drop invisibles (the fence-evasion belt) so no
+    # zero-width splice can survive into the fence markers, the model prompt, or the board.
+    return _strip_invisibles(_C0_DEL.sub("", text or ""))
 
 
 def _one_line(text: str) -> str:
@@ -204,15 +230,23 @@ Output ONLY the reply body text — no subject line, no JSON, no markdown, no co
 """
 
 
-# Sandbox for the `claude -p` subprocess (KilaBz 2026-07-16): the prompt embeds hostile email
-# content and `claude` is an AGENTIC CLI — the fence is a mitigation, not a security boundary.
+# Sandbox for the `claude -p` subprocess (KilaBz 2026-07-16; hardened by independent review
+# 2026-07-16): the prompt embeds hostile email content and `claude` is an AGENTIC CLI — the
+# fence is a mitigation, not a security boundary.
 # (1) allowlist-scrubbed env: the tick's environment carries OP_SERVICE_ACCOUNT_TOKEN (the key
 # to the whole vault), the DSN and component config — a steered CLI must never see them; only
-# what the CLI needs to run and authenticate survives.
-# (2) every filesystem/shell/network tool disallowed (belt — flags may drift across CLI
-# versions; the env scrub is the load-bearing layer).
-# (3) cwd = throwaway temp dir, so even a read-only escape starts nowhere.
-_CLAUDE_ENV_KEEP = ("PATH", "HOME", "CLAUDE_CODE_OAUTH_TOKEN", "TERM", "LANG", "LC_ALL")
+# what the CLI needs to run and authenticate survives. HOME is DELIBERATELY NOT kept — see (4).
+# (2) HOME = the scratch dir + `--strict-mcp-config` with an EMPTY config: the load-bearing
+# fix. The inherited real ~/.claude carries the Mini's whole MCP roster (Gmail/Notion/Drive/…)
+# AND PostToolUse hooks; the old `--disallowedTools` denylist named only BUILT-INS and reached
+# NEITHER — a steered model could call an MCP network sink or fire a hook. A scratch HOME
+# isolates ~/.claude entirely (no MCP servers, no hooks, no settings load); `--strict-mcp-config`
+# + an empty --mcp-config is the belt (use ONLY that file's servers = none). Auth survives
+# because `claude` reads CLAUDE_CODE_OAUTH_TOKEN from env, not HOME — so HOME is NOT kept.
+# (3) --disallowedTools stays as the BUILT-IN belt (Bash/Read/Write/WebFetch/…) — verified
+# working 2026-07-16; MCP is now handled by (2), not this list.
+# (4) cwd = throwaway temp dir, so even a read-only escape starts nowhere.
+_CLAUDE_ENV_KEEP = ("PATH", "CLAUDE_CODE_OAUTH_TOKEN", "TERM", "LANG", "LC_ALL")
 _CLAUDE_DENY_TOOLS = ("Bash", "Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
                       "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite")
 
@@ -223,14 +257,19 @@ def _claude(prompt: str) -> Optional[str]:
     skipped draft); a flaky LLM never sinks the tick."""
     env = {k: v for k, v in os.environ.items() if k in _CLAUDE_ENV_KEEP}
     with tempfile.TemporaryDirectory(prefix="inbox-claude-") as scratch:
+        # scratch is the CLI's HOME → inherits NO ~/.claude MCP servers, hooks, or settings.
+        env["HOME"] = scratch
+        # an empty MCP config + --strict-mcp-config = "use ONLY this file's servers" = none.
+        mcp_cfg = os.path.join(scratch, "empty-mcp.json")
+        with open(mcp_cfg, "w") as fh:
+            fh.write('{"mcpServers":{}}')
         try:
-            # one comma-joined value, NOT *-splatted: variadic flag parsing verified working
-            # (2026-07-16, stdin prompt survives) but is exactly the kind of CLI contract
-            # that drifts across versions — a single argv token cannot be re-read as a
-            # positional prompt by any parser.
+            # one comma-joined --disallowedTools value, NOT *-splatted: a single argv token
+            # cannot be re-read as a positional prompt by any parser across CLI versions.
             r = subprocess.run(
                 ["claude", "-p", "--output-format", "text",
-                 "--disallowedTools", ",".join(_CLAUDE_DENY_TOOLS)],
+                 "--disallowedTools", ",".join(_CLAUDE_DENY_TOOLS),
+                 "--strict-mcp-config", "--mcp-config", mcp_cfg],
                 input=prompt, capture_output=True, text=True,
                 timeout=CLAUDE_TIMEOUT, check=False, env=env, cwd=scratch)
         except (subprocess.TimeoutExpired, OSError) as e:
@@ -538,7 +577,13 @@ def assemble_brief(date_str: str, runs: list[AccountRun], items: list[Item],
         if run.ok:
             status = f"ok — {len(run.threads)} thread(s)"
             if run.action_failed:
-                status += " — actions incomplete (cursor held)"
+                # r10 #1 truthfulness extended to the action valve: if this account hit the
+                # bounded-loss limit its cursor ADVANCES now — say so, don't promise a hold.
+                if run.account in valve_accounts:
+                    status += (" — actions incomplete; BOUNDED-LOSS LIMIT reached, cursor "
+                               "ADVANCED (labels/drafts NOT applied — act from this brief)")
+                else:
+                    status += " — actions incomplete (cursor held)"
         else:
             status = run.status
         lines.append(f"- {run.account} [{_account_tag(run.account)}]: {status}")
@@ -794,14 +839,18 @@ async def tick() -> int:
             _apply_labels(runs, items)
             _create_drafts(runs, items)
 
-        # r10 #1: the brief must state the TRUE per-account cursor outcome, and the valve
-        # decision must act on the SAME attempts values the brief reported (read once here,
-        # act on them below — no read-between gap). valve_accounts = accounts whose cursor
-        # will ADVANCE past this slice if classify failed (bounded-loss limit reached).
+        # A run is HELD (not cleanly advanced) when classify failed (whole tick) OR its own
+        # labels/drafts failed (independent review 2026-07-16: an action-fail hold had NO
+        # valve and re-spent classify+compose every tick forever). Read attempts ONCE for
+        # every held run so the brief and the valve decision below use identical values
+        # (r10 #1). valve_accounts = held accounts at the bounded-loss limit (cursor advances).
+        def _is_held(r: AccountRun) -> bool:
+            return bool(r.ok and r.new_history_id and ((not classify_ok) or r.action_failed))
+
         valve_attempts: dict[str, int] = {}
-        if not classify_ok and not DRY_RUN:
+        if not DRY_RUN:
             for run in runs:
-                if run.ok and not run.action_failed and run.new_history_id:
+                if _is_held(run):
                     cur = await led.inbox_get_cursor(run.account)
                     valve_attempts[run.account] = int((cur or {}).get("attempts") or 0)
         valve_accounts = {a for a, n in valve_attempts.items() if n + 1 >= CLASSIFY_HOLD_MAX}
@@ -822,12 +871,30 @@ async def tick() -> int:
         if IMESSAGE_TO:
             deliver_imessage(_summary_line(date_str, runs, items))
 
-        # cursor advance LAST, ONLY for fully-processed accounts. An undelivered brief or a
-        # failed classify holds EVERY cursor (the threads would otherwise vanish from the
-        # board forever); a per-account pull/action failure holds that account's only.
-        if brief_written and classify_ok:
+        # cursor advance LAST. An undelivered brief holds EVERY cursor (threads would vanish
+        # from the board forever). Otherwise, per run: a CLEAN run advances; a HELD run
+        # (classify-fail or action-fail) goes through the BOUNDED-LOSS VALVE.
+        #
+        # The valve (r9 FIX-3 + independent review 2026-07-16): no hold class may wedge
+        # forever while re-spending paid classify/compose calls every tick. Each held tick
+        # marks the cursor (attempts++, CAS-bound to the history_id this tick read, so a slow
+        # stale tick can neither advance nor pollute a row a newer tick already moved — r10
+        # #3); at CLASSIFY_HOLD_MAX the slice has surfaced on the DELIVERED board (classify
+        # fail → 'unclassified'; action fail → the per-account 'actions incomplete' line) and
+        # the cursor advances LOUDLY rather than wedge. attempts was read ONCE above so the
+        # brief and this decision agree (r10 #1). First-run accounts (no row) get an error-
+        # SEEDED NULL-history row so their attempts accumulate too (r10 #2). NOTE attempts is
+        # shared across pull/classify/action failures ('consecutive failed ticks') — the valve
+        # may fire with fewer than MAX surfacings of one kind, but never without at least this
+        # delivered one. ADJUDICATED (r10 #4): crash-induced failures COUNT — excluding them
+        # reopens the exact wedge r9 FIX-3 closed; the outcome is bounded + visible, never a
+        # silent classification bypass.
+        if brief_written:
             for run in runs:
-                if run.ok and not run.action_failed and run.new_history_id:
+                if not (run.ok and run.new_history_id):
+                    continue
+                held = _is_held(run)
+                if not held:
                     # TRUE CAS: expected = the value read at pull time. A miss means another
                     # tick advanced it under us — never rewind; hold and re-pull next time.
                     moved = await led.inbox_advance_cursor(
@@ -835,46 +902,22 @@ async def tick() -> int:
                     log(f"{run.account}: cursor "
                         f"{'advanced' if moved else 'CAS miss (moved under us) — held'} "
                         f"@ {run.new_history_id}")
-        elif brief_written:
-            # classify failed but the board DELIVERED (this tick's threads shipped on it as
-            # 'unclassified'). r9 FIX-3 (both reviewers): a classify-hold must not be forever —
-            # nothing guarantees the next tick's model call converges (a consistently
-            # injected/oversized output would wedge every account indefinitely). Bounded
-            # escape, same shape as classify()'s BOUNDED-LOSS VALVE: each failed tick marks
-            # the cursor (attempts++, visible in the ledger; advance resets it); at
-            # CLASSIFY_HOLD_MAX the slice has surfaced on the board and the cursor advances
-            # LOUDLY rather than wedge. The attempts values were read ONCE above (r10 #1)
-            # so the delivered brief and this decision agree; the marks/advances below are
-            # CAS-bound to the history_id this tick read, so a slow stale tick can neither
-            # advance nor pollute a row a newer tick already moved (r10 #3). First-run
-            # accounts (no row yet) get an error-SEEDED row with NULL history_id so their
-            # attempts accumulate too (r10 #2) — the pull path treats NULL as no-cursor.
-            # NOTE: attempts also counts pull-failed ticks (the column is 'consecutive
-            # failed ticks') — the valve may fire with fewer than MAX unclassified
-            # surfacings, but never without at least THIS delivered one.
-            # ADJUDICATED (r10 #4, oracle): crash-induced classify failures COUNT toward
-            # the valve, deliberately. The same adversary can induce parse-None failures
-            # (accepted residual — >=50 decoys), which count; excluding the crash subtype
-            # closes nothing and reintroduces the infinite wedge for exactly those
-            # payloads — the wedge both reviewers required us to eliminate (r9 FIX-3).
-            # The valve's outcome is bounded + visible (unclassified on a delivered
-            # board), never a silent classification bypass.
-            for run in runs:
-                if run.ok and not run.action_failed and run.new_history_id:
-                    attempts = valve_attempts.get(run.account, 0)
-                    if run.account in valve_accounts:
-                        moved = await led.inbox_advance_cursor(
-                            run.account, run.new_history_id, run.prev_history_id)
-                        log(f"{run.account}: BOUNDED-LOSS VALVE — classify failed on "
-                            f"{attempts + 1} consecutive ticks; cursor "
-                            f"{'ADVANCED past the held slice' if moved else 'CAS miss — held'} "
-                            f"@ {run.new_history_id} (slice surfaced unclassified on the board)")
-                    else:
-                        marked = await led.inbox_mark_cursor_error(
-                            run.account, "error", expected_history_id=run.prev_history_id)
-                        log(f"{run.account}: classify failed — cursor held "
-                            f"(attempt {attempts + 1}/{CLASSIFY_HOLD_MAX}"
-                            f"{'' if marked else '; mark skipped — cursor moved under us'})")
+                    continue
+                why = "classify failed" if not classify_ok else "actions failed"
+                attempts = valve_attempts.get(run.account, 0)
+                if run.account in valve_accounts:
+                    moved = await led.inbox_advance_cursor(
+                        run.account, run.new_history_id, run.prev_history_id)
+                    log(f"{run.account}: BOUNDED-LOSS VALVE — {why} on {attempts + 1} "
+                        f"consecutive ticks; cursor "
+                        f"{'ADVANCED past the held slice' if moved else 'CAS miss — held'} "
+                        f"@ {run.new_history_id} (slice surfaced on the delivered board)")
+                else:
+                    marked = await led.inbox_mark_cursor_error(
+                        run.account, "error", expected_history_id=run.prev_history_id)
+                    log(f"{run.account}: {why} — cursor held "
+                        f"(attempt {attempts + 1}/{CLASSIFY_HOLD_MAX}"
+                        f"{'' if marked else '; mark skipped — cursor moved under us'})")
         else:
             log("cursors held (brief undelivered) — next tick re-pulls")
 

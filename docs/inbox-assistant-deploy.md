@@ -106,6 +106,14 @@ scope later means re-minting all three tokens. Do not trim the scope list to "wh
 
 ## 5. Mini config — `~/.myndaix/config.env`
 
+> **⚠️ ORDER: MERGE FIRST (step 7.1), THEN add these keys.** The `INBOX_*` keys exist only in
+> THIS PR's `config_parse.py` schema. The currently-deployed parser rejects unknown keys
+> fail-closed (exit 2), and `drift-canary.sh` runs `substrate_load_config` every 15 min on the
+> factory — so adding these keys before the merge lands makes the canary hard-ALARM every tick,
+> and any unrelated merge in that window wedges the reconcile converge until this PR lands or the
+> edit is reverted. Do the merge in step 7.1, confirm the new parser is live, and only then edit
+> `config.env`. (This is why step 7's arm is a plain merge — the config edit rides *after* it.)
+
 Add the `INBOX_*` keys (parsed, never sourced; strict `KEY=value`). Injected into the tick via
 the plist env:
 
@@ -140,12 +148,16 @@ token). `INBOX_NOTION_DB` = the database id from the database URL.
 
 ## 7. Arm
 
-1. Merge the PR to `main`. The Mini's reconcile poll converges within 15 min (no SSH deploy step).
-2. Verify the job landed:
+1. **Merge the PR to `main` FIRST** (before the step-5 config edit — see the step-5 warning). The
+   Mini's reconcile poll converges within 15 min (no SSH deploy step), installing the new parser
+   that understands the `INBOX_*` keys.
+2. **Now do step 5**: add the `INBOX_*` keys to `~/.myndaix/config.env`. With the new parser live,
+   the keys validate and the drift-canary stays quiet.
+3. Verify the job landed:
    ```
    launchctl print gui/$(id -u)/ai.myndaix.inbox-assistant
    ```
-3. After the first 06:30 run, read `{MYNDAIX_HOME}/orchestrator/inbox-assistant.out` and confirm
+4. After the first 06:30 run, read `{MYNDAIX_HOME}/orchestrator/inbox-assistant.out` and confirm
    the brief in `~/.myndaix/bridge/inbox/jefe/`. **The first run does a bounded backfill**
    (`INBOX_BACKFILL_DAYS`, default 90) — expect it to be slow and the first brief to be big;
    subsequent runs are incremental off the historyId cursor.
