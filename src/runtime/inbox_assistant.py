@@ -77,6 +77,8 @@ MAX_CLASSIFY_CALLS = 3    # chunks per tick — 600 threads covers any realistic
                           # that is the bounded-loss valve (ships 'unclassified' ONCE, loudly)
 SNIPPET_CAP = 500       # chars of snippet per fenced thread (Gmail snippets are ~200 anyway)
 MAX_DRAFTS = 5          # draft ATTEMPTS per run (bounds both LLM spend and Gmail writes)
+CLASSIFY_HOLD_MAX = 3   # consecutive classify-failed ticks before the bounded-loss valve
+                        # advances a held cursor (r9 FIX-3 — a hold must not be forever)
 CLAUDE_TIMEOUT = 300    # seconds per `claude -p` subprocess
 OP_TIMEOUT = 30         # seconds per `op read`
 
@@ -307,7 +309,9 @@ def parse_classification(raw: str, known_ids: set) -> Optional[dict]:
     (pathological [[[[... nesting) is caught like any parse failure. Residual accepted:
     a model reliably coerced into >=50 decodable decoy arrays every tick yields None ->
     hold -> retry, which is VISIBLE (the board ships 'unclassified' each tick), not silent.
-    ACCEPTED RESIDUALS (r7 #2/#3, evaluated — no structural fix): a model coerced into
+    ACCEPTED RESIDUALS (r7 #2/#3, evaluated; RESTATED as r9 FIX-1/FIX-2 — adjudication
+    unchanged, gating the complete-answer return on budget state adds no security since a
+    forged complete array ships at candidates=1 regardless): a model coerced into
     emitting a COMPLETE forged classification (or an equal-length decoy ahead of a real
     partial) is indistinguishable AT PARSE LEVEL from the model genuinely classifying —
     the model's output IS the answer, so the parser cannot arbitrate intent. The defenses
@@ -806,8 +810,38 @@ async def tick() -> int:
                     log(f"{run.account}: cursor "
                         f"{'advanced' if moved else 'CAS miss (moved under us) — held'} "
                         f"@ {run.new_history_id}")
+        elif brief_written:
+            # classify failed but the board DELIVERED (this tick's threads shipped on it as
+            # 'unclassified'). r9 FIX-3 (both reviewers): a classify-hold must not be forever —
+            # nothing guarantees the next tick's model call converges (a consistently
+            # injected/oversized output would wedge every account indefinitely). Bounded
+            # escape, same shape as classify()'s BOUNDED-LOSS VALVE: each failed tick marks
+            # the cursor (attempts++, visible in the ledger; advance resets it); at
+            # CLASSIFY_HOLD_MAX the slice has surfaced on the board and the cursor advances
+            # LOUDLY rather than wedge. NOTE: attempts also counts pull-failed ticks (the
+            # column is 'consecutive failed ticks') — the valve may fire with fewer than MAX
+            # unclassified surfacings, but never without at least THIS delivered one.
+            # RESIDUAL: a FIRST-RUN account (no cursor row until its first advance) cannot
+            # accumulate attempts — it re-backfills each tick until classify succeeds once,
+            # visibly on every board. Eager row creation would corrupt the incremental-pull
+            # path, so accepted.
+            for run in runs:
+                if run.ok and not run.action_failed and run.new_history_id:
+                    cur = await led.inbox_get_cursor(run.account)
+                    attempts = int((cur or {}).get("attempts") or 0)
+                    if attempts + 1 >= CLASSIFY_HOLD_MAX:
+                        moved = await led.inbox_advance_cursor(
+                            run.account, run.new_history_id, run.prev_history_id)
+                        log(f"{run.account}: BOUNDED-LOSS VALVE — classify failed on "
+                            f"{attempts + 1} consecutive ticks; cursor "
+                            f"{'ADVANCED past the held slice' if moved else 'CAS miss — held'} "
+                            f"@ {run.new_history_id} (slice surfaced unclassified on the board)")
+                    else:
+                        await led.inbox_mark_cursor_error(run.account, "error")
+                        log(f"{run.account}: classify failed — cursor held "
+                            f"(attempt {attempts + 1}/{CLASSIFY_HOLD_MAX})")
         else:
-            log("cursors held (brief undelivered or classify failed) — next tick re-pulls")
+            log("cursors held (brief undelivered) — next tick re-pulls")
 
         # exit-code contract (KilaBz 2026-07-16): the jefe drop is "primary durable or bust" —
         # an undelivered brief is a FAILED tick to launchd/reconcile, not a quiet log line.

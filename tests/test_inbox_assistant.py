@@ -65,8 +65,9 @@ class FakeLedger:
     """inbox_* verb recorder. `calls` logs WRITES only — the dry-run test asserts it
     stays empty while reads still happen."""
 
-    def __init__(self, cursors=None):
+    def __init__(self, cursors=None, attempts=None):
         self.cursors = dict(cursors or {})
+        self.attempts = dict(attempts or {})   # mirrors inbox_cursor.attempts (r9 valve)
         self.calls = []
 
     async def inbox_get_cursor(self, account_id):
@@ -74,22 +75,27 @@ class FakeLedger:
         if hid is None:
             return None
         return {"account_id": account_id, "history_id": hid, "fallback_since": None,
-                "state": "active", "attempts": 0, "updated_at": None}
+                "state": "active", "attempts": self.attempts.get(account_id, 0),
+                "updated_at": None}
 
     async def inbox_advance_cursor(self, account_id, history_id, expected_history_id):
         # mirrors the real TRUE-CAS UPSERT: the write fires only when the row still holds
         # the value read at pull time (None = rowless first run); a CAS match ALWAYS
         # advances + heals — including same-value. There is NO seed verb — this is the
-        # only row-creating write.
+        # only row-creating write. Advance resets attempts (mirrors the real UPDATE).
         self.calls.append(("advance", account_id, history_id))
         if self.cursors.get(account_id) != expected_history_id:
             return False
         self.cursors[account_id] = history_id
+        self.attempts[account_id] = 0
         return True
 
     async def inbox_mark_cursor_error(self, account_id, state):
         self.calls.append(("mark", account_id, state))
-        return account_id in self.cursors
+        if account_id in self.cursors:
+            self.attempts[account_id] = self.attempts.get(account_id, 0) + 1
+            return True
+        return False
 
     async def close(self):
         pass
@@ -200,12 +206,14 @@ _PATCHED = ("ACCOUNTS", "DRY_RUN", "JEFE_INBOX", "PostgresLedger", "GmailClient"
             "deliver_jefe_drop")
 
 
-def run_tick(plan, cursors=None, claude=None, dry_run=False, brief_fail=False):
+def run_tick(plan, cursors=None, claude=None, dry_run=False, brief_fail=False,
+             attempts=None, led=None):
     """One full tick() with every boundary stubbed and the jefe drop in a temp dir.
-    Returns (rc, ledger, gmail-instances-by-account, brief text or None, stdout)."""
+    Returns (rc, ledger, gmail-instances-by-account, brief text or None, stdout).
+    Pass `led` to carry ledger state ACROSS ticks (the r9 valve tests)."""
     root = Path(tempfile.mkdtemp(prefix="ia-test."))
     jefe = root / "drop"
-    led = FakeLedger(cursors)
+    led = led if led is not None else FakeLedger(cursors, attempts)
     FakeGmail.plan, FakeGmail.instances = dict(plan), {}
     saved = {k: getattr(IA, k) for k in _PATCHED}
     IA.ACCOUNTS = list(plan)
@@ -571,6 +579,33 @@ def test_undelivered_brief_holds_every_cursor():
     ok(rc == 1, "undelivered PRIMARY brief -> exit 1 (durable or bust — launchd must see it)")
     ok(not [c for c in led.calls if c[0] == "advance"],
        "an undelivered jefe brief holds EVERY cursor (threads must reappear next tick)")
+
+
+def test_classify_fail_valve_holds_then_advances_bounded():
+    # r9 FIX-3 (both reviewers): a classify failure holds cursors — but NOT forever.
+    # Ticks 1..N-1 mark the cursor (attempts++); at CLASSIFY_HOLD_MAX the bounded-loss
+    # valve advances past the (board-surfaced) slice instead of wedging indefinitely.
+    fake, _ = make_claude(fail_classify=True)
+    led = FakeLedger({"a@gmail.com": "1"})
+    for i in range(1, IA.CLASSIFY_HOLD_MAX):
+        plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+        rc, led, _inst, _brief, _out = run_tick(plan, claude=fake, led=led)
+        ok(rc == 0 and not [c for c in led.calls if c[0] == "advance"],
+           f"valve tick {i}: classify failed -> held (no advance), marked attempt {i}")
+    ok(led.attempts.get("a@gmail.com") == IA.CLASSIFY_HOLD_MAX - 1,
+       "attempts accumulated across held ticks")
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+    rc, led, _inst, brief, out = run_tick(plan, claude=fake, led=led)
+    ok(("advance", "a@gmail.com", "9") in led.calls,
+       "valve tick MAX: cursor ADVANCED past the held slice (bounded loss, not a wedge)")
+    ok("BOUNDED-LOSS VALVE" in out, "the valve advance is LOUD in the log")
+    ok(led.attempts.get("a@gmail.com") == 0, "advance reset attempts")
+    # an undelivered brief NEVER feeds the valve — that branch holds unconditionally
+    led2 = FakeLedger({"a@gmail.com": "1"}, attempts={"a@gmail.com": 99})
+    plan = {"a@gmail.com": {"threads": [th("a@gmail.com", "t1")], "hid": "9"}}
+    rc, led2, _inst, _brief, _out = run_tick(plan, claude=fake, brief_fail=True, led=led2)
+    ok(not [c for c in led2.calls if c[0] == "advance"],
+       "undelivered brief holds even at high attempts (valve requires a delivered board)")
 
 
 def test_label_failure_holds_that_cursor_but_run_continues():
