@@ -12,6 +12,10 @@ dependencies = [
     "psutil>=5.9",      # process-tree control
     "pexpect>=4.9",     # stubborn interactive CLIs
     "httpx>=0.27",      # api-reach agents (OpenAI-compatible chat) + the HTTP surface
+    "google-api-python-client>=2.100",  # inbox assistant: Gmail + Drive REST (gmail_client)
+    "google-auth>=2.23",                # refresh-token -> access-token mint (needs 2.x)
+    "google-auth-httplib2>=0.2",        # discovery client's authorized-http shim
+    "google-auth-oauthlib>=1.2",        # one-time per-account authorization flow
 ]
 
 [project.optional-dependencies]

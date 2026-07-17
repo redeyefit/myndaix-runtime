@@ -48,6 +48,10 @@ from runtime.contracts import (
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+
+# Distinguishes "caller passed no CAS expectation" from "caller expects NO row / a NULL
+# history_id" in inbox_mark_cursor_error (None is a meaningful expectation there — r10 #2/#3).
+_UNBOUND = object()
 # Fixed advisory-lock key so concurrent serve boots serialize their migrate() and
 # don't race the same DDL. Arbitrary stable bigint ("mxrMIG").
 _MIGRATE_LOCK_KEY = 0x6D7872_4D4947
@@ -1076,6 +1080,109 @@ class PostgresLedger:
                       AND attempts >= $4 AND state = 'dispatching'
                     RETURNING repo_id""",
                 repo_id, ref, head, max_attempts)
+        return row is not None
+
+    # ---- Inbox Assistant per-account Gmail cursor (docs/inbox-assistant-design.md §3.9) --
+    # The morning tick's only durable state: the last historyId whose slice fully
+    # PROCESSED, per account (state in the ledger, not files). Same WHERE-guarded
+    # CAS discipline as the review cursor above.
+    async def inbox_get_cursor(self, account_id: str) -> Optional[dict]:
+        """The account's cursor row as a plain dict, or None if unseen (first run —
+        the tick then runs the bounded backfill; the row is created by the end-of-tick
+        inbox_advance_cursor after FULL success, never eagerly).
+        `fallback_since` is part of the tick's pinned shape but not persisted in v1
+        (the backfill window is INBOX_BACKFILL_DAYS config, not state) — always None.
+        `updated_at` is left as a datetime for staleness comparisons."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """SELECT account_id, history_id, state, attempts, updated_at
+                     FROM inbox_cursor WHERE account_id = $1""",
+                account_id)
+        if row is None:
+            return None
+        return {**dict(row), "fallback_since": None}
+
+    async def inbox_advance_cursor(self, account_id: str, history_id: str,
+                                   expected_history_id: Optional[str]) -> bool:
+        """Advance the cursor once the account's slice fully PROCESSED (labels +
+        drafts + brief delivered) — never on pull alone, so a crash mid-run re-pulls
+        rather than drops threads (design §3.9). TRUE CAS: `expected_history_id` is
+        the value read at pull time (None on a rowless first run); the update fires
+        ONLY when the row still holds it, so a slower older tick can never rewind a
+        newer tick's cursor, and a concurrent first-run insert makes the loser's
+        upsert a no-op (False -> that tick's slice re-pulls next time). A CAS-matched
+        advance ALWAYS heals: state='active', attempts=0 — including the same-value
+        case (quiet mailbox after an 'error'/'stale' tick), which the previous
+        history_id-changed-only guard skipped, leaving error rows sticky forever.
+        Returns True iff this call owned the advance (insert or CAS-matched update)."""
+        async with self._pool.acquire() as con:
+            row = await con.fetchrow(
+                """INSERT INTO inbox_cursor (account_id, history_id)
+                   VALUES ($1, $2)
+                   ON CONFLICT (account_id) DO UPDATE
+                       SET history_id = EXCLUDED.history_id, state = 'active',
+                           attempts = 0, updated_at = now()
+                     WHERE inbox_cursor.history_id IS NOT DISTINCT FROM $3
+                   RETURNING account_id""",
+                account_id, history_id, expected_history_id)
+        return row is not None
+
+    async def inbox_mark_cursor_error(self, account_id: str, state: str,
+                                      expected_history_id: object = _UNBOUND) -> bool:
+        """Record a failed tick for the account: 'error' (pull/process failed) or
+        'stale' (users.history.list 404 — cursor expired, awaiting the bounded
+        backfill re-establish, design §4). Increments attempts so a persistently
+        failing account is visible; the next advance resets both. `state` is
+        validated here fail-closed (the DB CHECK is the backstop).
+
+        `expected_history_id` (r10 #2 + #3):
+        - omitted (_UNBOUND) — legacy unbound mark: UPDATE by account only; no-op False
+          on a missing row. Used by pre-pull failure paths that never read the cursor.
+        - a str — CAS-BOUND mark: increments ONLY if the row still holds the history_id
+          this tick read at pull time. A slow failed tick that lost the race to a newer
+          advance must not pollute the new cursor's attempts (the valve would fire
+          against a legitimately in-flight slice).
+        - None — the tick read NO row (first run): SEED an error row with NULL
+          history_id so attempts can accumulate; the pull path treats NULL as no-cursor
+          (bounded backfill), so the seed cannot corrupt incremental pulls. On conflict
+          the increment stays bound to a still-NULL row (same CAS discipline).
+        Returns True iff a row was written."""
+        if state not in ("error", "stale"):
+            raise ValueError(f"inbox_mark_cursor_error: bad state {state!r} (expected error|stale)")
+        async with self._pool.acquire() as con:
+            if expected_history_id is _UNBOUND:
+                row = await con.fetchrow(
+                    """UPDATE inbox_cursor
+                          SET state = $2, attempts = attempts + 1, updated_at = now()
+                        WHERE account_id = $1
+                        RETURNING account_id""",
+                    account_id, state)
+            elif expected_history_id is None:
+                # NULL-seed (or bound-to-seed) path. The canonical 0014 shape has history_id
+                # NULLABLE. If a DB ran this migration's interim NOT NULL form (dev only — 0014
+                # never shipped to main, and main's additivity lint FORBIDS an ALTER DROP NOT
+                # NULL in the migration body) this INSERT raises NotNullViolationError. We FAIL
+                # CLOSED (review r12, both reviewers): do NOT swallow it — a silently-dead
+                # bounded-loss valve is worse than a loud crash, and the exception propagates
+                # to the tick's nonzero exit so the operator SEES it. Repair a stale dev DB by
+                # recreating inbox_cursor (it holds only regenerable cursor state).
+                row = await con.fetchrow(
+                    """INSERT INTO inbox_cursor (account_id, history_id, state, attempts)
+                            VALUES ($1, NULL, $2, 1)
+                       ON CONFLICT (account_id) DO UPDATE
+                            SET state = $2, attempts = inbox_cursor.attempts + 1,
+                                updated_at = now()
+                          WHERE inbox_cursor.history_id IS NULL
+                        RETURNING account_id""",
+                    account_id, state)
+            else:
+                row = await con.fetchrow(
+                    """UPDATE inbox_cursor
+                          SET state = $2, attempts = attempts + 1, updated_at = now()
+                        WHERE account_id = $1
+                          AND history_id IS NOT DISTINCT FROM $3
+                        RETURNING account_id""",
+                    account_id, state, expected_history_id)
         return row is not None
 
     # ---- review skills ("+learning" rung) — DESIGN v0.3 governing sections --------------

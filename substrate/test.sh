@@ -81,7 +81,7 @@ ok '[[ "$(python3 "$PG" "$TMP/evil.plist" EnvironmentVariables.MYNDAIX_DSN)" == 
 echo "== manifest: build + check =="
 good_factory "$TMP/mf.env"    # good_factory already sets DEPLOY_CLONE=$REPO
 ok 'python3 "$MF" build "$TMP/mf.env" >/dev/null 2>&1' "manifest build -> exit 0"
-ok '[[ "$(python3 "$MF" build "$TMP/mf.env" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin)[\"migration_head\"])")" == "dial_shadow_snapshot" ]]' "manifest records migration head object"
+ok '[[ "$(python3 "$MF" build "$TMP/mf.env" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin)[\"migration_head\"])")" == "inbox_cursor" ]]' "manifest records migration head object"
 # config_hash strips DSN userinfo (no secrets in the receipt)
 ok 'python3 "$MF" build "$TMP/evil.env" 2>/dev/null | grep -q config_hash && ! python3 "$MF" build "$TMP/evil.env" 2>/dev/null | grep -q "u:p&a"' "manifest config_hash carries no DSN userinfo"
 
