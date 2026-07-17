@@ -19,12 +19,15 @@ THRESHOLD=2   # consecutive failing checks before alerting (~2 intervals)
 # ---- single-instance lock (review r1 #2/#3/#4) ------------------------------
 # All streak/latch state is read-modify-write on shared files; launchd won't double-start
 # the label, but a manual run alongside the timer would race. Atomic mkdir lock with a
-# stale-reclaim (crashed holder) at 2 intervals — the watchers-rules pattern (no flock on
-# stock macOS). find -mmin is used for the age check (stat flags differ macOS/Linux).
+# stale-reclaim (crashed holder) — the watchers-rules pattern (no flock on stock macOS).
+# find -mmin is used for the age check (stat flags differ macOS/Linux). Threshold: >14 min
+# (~one 900s interval). A live run holds the lock only for its seconds-long duration, so a
+# lock older than a full interval is a crashed holder — reclaimed on the NEXT tick (not two
+# ticks later, which `-mmin +30` would cause: +30 means STRICTLY >30 min = the 3rd tick).
 LOCK_DIR="$STATE_DIR/canary.lock"
 acquire_lock() {
   mkdir "$LOCK_DIR" 2>/dev/null && return 0
-  if [[ -n "$(find "$STATE_DIR" -maxdepth 1 -name "$(basename "$LOCK_DIR")" -mmin +30 2>/dev/null)" ]]; then
+  if [[ -n "$(find "$STATE_DIR" -maxdepth 1 -name "$(basename "$LOCK_DIR")" -mmin +14 2>/dev/null)" ]]; then
     rmdir "$LOCK_DIR" 2>/dev/null || true
     mkdir "$LOCK_DIR" 2>/dev/null && { log "canary: reclaimed stale lock"; return 0; }
   fi
