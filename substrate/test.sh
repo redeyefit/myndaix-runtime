@@ -891,6 +891,9 @@ case "$1" in
   list)
     printf 'PID\tStatus\tLabel\n'
     for l in ${LV_LIST:-}; do printf -- '-\t0\t%s\n' "$l"; done
+    # LV_RAW emits ONE label verbatim (quoted) so a label containing a space/odd byte survives
+    # (the ${LV_LIST} loop word-splits) — used to exercise the malformed-label rogue path.
+    [[ -n "${LV_RAW:-}" ]] && printf -- '-\t0\t%s\n' "$LV_RAW"
     ;;
 esac
 exit 0
@@ -973,9 +976,80 @@ ok '[[ "$lv12rc" -eq 0 ]]' "read-only state dir mid-divergence -> canary STILL e
 ok 'printf "%s" "$lv12" | grep -q "ALARM could not write streak"' "streak-write failure ALARM-logged (not die, not silent)"
 ok 'printf "%s" "$lv12" | grep -q "WARN cannot touch .last_run"' ".last_run create-failure WARN-logged, run continues"
 ok '! grep -qE "^[[:space:]]*die " "$SUB/liveness-canary.sh"' "canary body never calls die (config-load die inside lib.sh is the accepted pre-check)"
-# mutual watch: drift-canary reverse-watches liveness-canary.out through its existing latch
-ok 'grep -q "liveness-canary.out" "$SUB/drift-canary.sh" && grep -A3 "liveness-canary.out stale" "$SUB/drift-canary.sh" | grep -q "rc=1"' "drift-canary folds a stale liveness-canary.out into its own streak+latch path"
 ok 'grep -qE "print|list" "$SUB/liveness-canary.sh" && ! grep -qE "\"\\\$LCTL\" (bootstrap|bootout|kickstart)" "$SUB/liveness-canary.sh"' "liveness-canary is READ-ONLY against launchd (print/list only)"
+
+echo "== liveness-canary: deep-audit folds (P1 grow-only latch, ERR/rogue, exit-fresh, content-aware install) =="
+# Fresh scenario, own clean state: all plists old (past grace), all .out fresh, no latch.
+rm -f "$LVH/inbox"/* "$LVH/state/liveness-streak" "$LVH/state/liveness-alerted" "$LVH/RECONCILE_ARMED" 2>/dev/null
+find "$LV/fakehome/Library/LaunchAgents" -name "*.plist" -exec touch -t 202601010000 {} +
+python3 "$LT" "$LVH/config.env" "$SUB"/plists/*.json | while IFS="$(printf '\t')" read -r l g s o; do
+  [[ -n "$o" ]] || continue; mkdir -p "$(dirname "$o")"; touch "$o"
+done
+# P1 grow-only latch: a NEW divergent label alerts EVEN WHILE a prior divergence is latched.
+# (Asserts on stdout + the latched key SET, not inbox file count: same-second runs collide on the
+# date-stamped alert filename — impossible live at 900s cadence, a pure test artifact.)
+touch -t 202601010000 "$LVH/orchestrator/controller.out"          # controller STALE
+lvPA="$(LV_MODE=clean lvrun)"                                      # tick A: streak 1, no alert
+ok '! printf "%s" "$lvPA" | grep -q "alert dropped"' "P1 tick A: below threshold -> no alert (streak 1)"
+lvPB="$(LV_MODE=clean lvrun)"                                      # tick B: streak 2 -> alert #1 (controller)
+ok 'printf "%s" "$lvPB" | grep -q "alert dropped"' "P1 tick B: streak 2 -> alert #1 (controller), latched"
+touch -t 202601010000 "$LVH/orchestrator/automerge.out"           # automerge NOW also STALE (new)
+lvP1="$(LV_MODE=clean lvrun)"                                      # tick C: new key -> alert #2
+ok 'printf "%s" "$lvP1" | grep -q "alert dropped"' "P1: a NEW divergent label alerts WHILE a prior one is latched (grow-only, not global-latch blind)"
+ok 'grep -q "new: ai.myndaix.automerge" "$LVH"/inbox/liveness-alert-*.md' "P1: the second alert names the NEW key (automerge), not a re-alert of controller"
+ok 'grep -q "ai.myndaix.controller" "$LVH/state/liveness-alerted" && grep -q "ai.myndaix.automerge" "$LVH/state/liveness-alerted"' "P1: the latch set now holds BOTH divergent keys"
+lvP1b="$(LV_MODE=clean lvrun)"                                     # tick D: no new key -> no alert
+ok '! printf "%s" "$lvP1b" | grep -q "alert dropped"' "P1: no NEW key -> no duplicate alert (latch holds the known set)"
+touch "$LVH/orchestrator/controller.out" "$LVH/orchestrator/automerge.out"  # both heal
+lvP1c="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lvP1c" | grep -q "all declared jobs alive" && [[ ! -e "$LVH/state/liveness-alerted" ]]' "P1: a fully-clean run clears the latched key set"
+# #3 exit-fresh gate: a STALE job's launchd-latched old nonzero exit does NOT double-report.
+touch -t 202601010000 "$LVH/orchestrator/controller.out"          # controller STALE again
+lvEC="$(LV_MODE=clean LV_EXIT_CODE=1 lvrun)"
+ok 'printf "%s" "$lvEC" | grep -q "ai.myndaix.controller: STALE"' "#3: a stale job reports STALE"
+ok '! printf "%s" "$lvEC" | grep -q "controller: last exit code"' "#3: exit-code is NOT evaluated on a STALE job (no double-report; latch-vs-tick debounce fix)"
+touch "$LVH/orchestrator/controller.out"                          # heal for the next checks
+# #4 ERR -> rogue sweep skipped: a corrupt descriptor for a still-loaded label must NOT flag it ROGUE.
+# Uses the PLISTS_DIR seam to point the canary at a fixture set where one descriptor is corrupt.
+LVBAD="$LV/badplists"; mkdir -p "$LVBAD"; cp "$SUB"/plists/*.json "$LVBAD"/
+printf '{corrupt' > "$LVBAD/ai.myndaix.controller.json"           # controller descriptor now corrupt
+lvERR="$(LV_MODE=clean LV_LIST="ai.myndaix.controller" LIVENESS_PLISTS_DIR="$LVBAD" lvrun)"
+ok 'printf "%s" "$lvERR" | grep -q "descriptor ai.myndaix.controller.json"' "#4: a corrupt descriptor is its own ERR divergence"
+ok '! printf "%s" "$lvERR" | grep -q "controller: ROGUE"' "#4: the ERR'd job's still-loaded label is NOT flagged ROGUE (rogue sweep skipped on incomplete declared set)"
+# #5 malformed rogue label: a TRAILING-SPACE label (LV_RAW, verbatim) must NOT get a bootout
+# remedy — tr-style stripping would alias it onto the healthy declared 'ai.myndaix.controller'.
+lvMAL="$(LV_MODE=clean LV_RAW='ai.myndaix.controller ' lvrun)"
+ok 'printf "%s" "$lvMAL" | grep -q "MALFORMED loaded label"' "#5: a label failing the strict regex is reported MALFORMED (hex), not sanitized"
+ok '! printf "%s" "$lvMAL" | grep -qE "bootout .*/ai.myndaix.controller$"' "#5: a mangled label gets NO bootout remedy (never aliases onto the healthy declared controller)"
+# #2 content-aware install: render is deterministic -> cmp -s skips a no-op converge (mtime honest).
+python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > "$TMP/ci1.plist"
+python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > "$TMP/ci2.plist"
+ok 'cmp -s "$TMP/ci1.plist" "$TMP/ci2.plist"' "#2: render is deterministic -> content-aware cmp -s skips a no-op converge (plist mtime preserved -> grace honest)"
+ok 'grep -q "cmp -s" "$SUB/reconcile.sh"' "#2: reconcile guards the plist install with cmp -s (only rewrites on a real change)"
+# #8 reconcile gap vs default poll: gap must be >= 2x the POLL_INTERVAL_S default (900).
+ok '[[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[\"liveness_max_gap_seconds\"])" "$SUB/plists/ai.myndaix.reconcile.json")" -ge 1800 ]]' "#8: reconcile liveness gap >= 2x the default POLL_INTERVAL_S (900) — no false STALE at default"
+ok 'grep -q "raise that gap" "$SUB/config.env.example"' "#8: config.env.example documents the POLL/gap coupling for non-default poll intervals"
+
+echo "== drift-canary: INDEPENDENT liveness-watch latch (deep-audit P2 mutual-watch void) =="
+DVH="$LV/drifthome"; DFH="$LV/dfakehome"
+mkdir -p "$DVH/state" "$DVH/inbox" "$DFH/Library/LaunchAgents"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$DVH" "$DVH" "$REPO" > "$DVH/config.env"
+dvrun(){ MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC="$1" /bin/bash "$SUB/drift-canary.sh" 2>&1; }
+# liveness plist installed long ago + no liveness-canary.out => the watcher is dead.
+: > "$DFH/Library/LaunchAgents/ai.myndaix.liveness.plist"; touch -t 202601010000 "$DFH/Library/LaunchAgents/ai.myndaix.liveness.plist"
+rm -f "$DVH/state/liveness-canary.out"
+# CONFIG CLEAN (rc=0) but liveness dead -> the liveness-watch must STILL alert (independent latch).
+dvrun 0 >/dev/null; dvL="$(dvrun 0)"
+ok 'ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2: liveness-watch alerts even when config drift is CLEAN (not folded into the drift latch)"
+ok '! ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2: no config-drift alert on a clean dry-run (rc=0)"
+ok 'grep -q "the execution watcher is not running" "$DVH"/inbox/liveness-watch-alert-*.md' "P2: the liveness-watch alert names the dead execution watcher"
+# Inverse: config DRIFT (rc=1) + FRESH liveness -> drift alerts, liveness-watch does NOT.
+rm -f "$DVH/inbox"/* "$DVH/state/drift-streak" "$DVH/state/drift-alerted" "$DVH/state/liveness-watch-streak" "$DVH/state/liveness-watch-alerted"
+touch "$DVH/state/liveness-canary.out"          # fresh watcher
+dvrun 1 >/dev/null; dvD="$(dvrun 1)"
+ok 'ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2 inverse: config drift (rc=1) alerts on its own latch"
+ok '! ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2 inverse: a FRESH liveness watcher does not false-alert the reverse watch"
+ok 'grep -q "canary_emit" "$SUB/drift-canary.sh" && grep -q "LW_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "LW_ALERTED_FILE" "$SUB/drift-canary.sh"' "P2: drift-canary uses SEPARATE streak+latch files for the liveness-watch (structural)"
 
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate

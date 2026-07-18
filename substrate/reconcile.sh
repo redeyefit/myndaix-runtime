@@ -192,8 +192,20 @@ install_artifacts() {
       rm -f "$tmp"; die "render failed for $label (see $STATE_DIR/reconcile.err)"
     fi
     plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "rendered plist for $label failed plutil -lint"; }
-    atomic_install "$tmp" "$LA_DIR/$label.plist" 0644
-    log "installed plist: $label"
+    # Content-aware install: only rewrite when the rendered plist DIFFERS from what's installed.
+    # An unconditional atomic_install cp+mv mints a fresh inode+mtime every converge, which would
+    # make the installed-plist mtime a lie — the liveness-canary keys its reconcile-grace on that
+    # mtime ("just (re)installed, hasn't run yet"), so a rewrite on every unrelated deploy would
+    # perpetually re-arm the grace and leave long-gap jobs (inbox-assistant, 25h) effectively
+    # unwatched (deep-audit P2). cmp is byte-exact and render is deterministic, so "identical" ==
+    # "nothing to converge" — skipping is correct AND cuts needless launchd-plist churn.
+    if [[ -f "$LA_DIR/$label.plist" ]] && cmp -s "$tmp" "$LA_DIR/$label.plist"; then
+      rm -f "$tmp"
+      log "plist unchanged: $label"
+    else
+      atomic_install "$tmp" "$LA_DIR/$label.plist" 0644
+      log "installed plist: $label"
+    fi
   done
 
   # 3.5 ORPHAN PRUNE — a previously-managed label no longer in ROLE_LABELS (descriptor removed / role
