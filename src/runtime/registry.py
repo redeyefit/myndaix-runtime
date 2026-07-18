@@ -187,6 +187,22 @@ V1_ROSTER: list[AgentSpec] = [
                                 "--safe-mode"],
                        "prompt_channel": "stdin", "staging_cwd": True, "scratch_home": True,
                        "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token
+    # librarian: the recall-librarian answer agent (second-brain rung-1, docs/mx-ask-librarian-design.md).
+    # `mxr ask` does the retrieval + fencing and INLINES the corpus in the prompt, so this agent needs
+    # ZERO tools: `--tools ""` disables ALL built-ins (no Read/Bash/web/dispatch) — stricter than the
+    # curator. A poisoned corpus doc (fenced DATA) can at most skew the ANSWER; with no tool/dispatch/
+    # web channel there is no exfil or action path (strictly inside the shelved Watch read-fence).
+    #  * RESPONDER: pure text-in/text-out, idempotent, no side effects -> auto-retry-safe.
+    #  * frontier model (injection resistance scales with tier). Belt: --strict-mcp-config + --safe-mode
+    #    + scratch_home (no inherited MCP/hooks/settings). prompt via stdin (fenced corpus can be large).
+    AgentSpec(agent_id="librarian", reach=Reach.CLI, authority=Authority.RESPONDER,
+              model="sonnet", role="recall librarian (read-only answer-with-citations over the corpus)",
+              profile=Profile(timeout_s=120),
+              adapter={"kind": "cli",
+                       "argv": ["claude", "-p", "--model", "sonnet", "--output-format", "text",
+                                "--tools", "", "--strict-mcp-config", "--safe-mode"],
+                       "prompt_channel": "stdin", "scratch_home": True,
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),
     AgentSpec(agent_id="recon", reach=Reach.API, authority=Authority.COMPOSITE,
               model="sonar-pro+claude", role="research (read-only)",
               profile=Profile(cost_budget=5.0),
