@@ -3,6 +3,8 @@
 # cheap interval; if drift PERSISTS past a threshold, drops one alert into the operator
 # inbox. It does NOT auto-fix — reconcile's own poll converges; the canary only shouts when
 # convergence isn't happening (e.g. a broken reconcile, a stuck migration, a hand-edit).
+# liveness-fire: every run logs >=1 stdout line unconditionally ("no drift" / "DRIFT"), so
+# this job's .out mtime is execution evidence for liveness-canary's freshness check.
 set -euo pipefail
 SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=substrate/lib.sh
@@ -18,6 +20,22 @@ THRESHOLD=2   # consecutive drifting checks before alerting (~2 intervals)
 set +e
 report="$(/bin/bash "$SUBSTRATE_DIR/reconcile.sh" --dry-run 2>&1)"; rc=$?
 set -e
+
+# Reverse watch (liveness-canary design): liveness-canary watches THIS job's recency like any
+# declared job; here we watch ITS .out mtime back — mutual coverage, no third component, no
+# cycle risk (each only READS the other's log mtime). Gated on its plist being installed past
+# one full window (deploy grace); a stale watcher folds into this canary's existing streak+latch.
+LIVENESS_OUT="$MYNDAIX_HOME/state/liveness-canary.out"
+LIVENESS_PLIST="$HOME/Library/LaunchAgents/ai.myndaix.liveness.plist"
+LIVENESS_MAX_AGE=1800   # 2x its 900s StartInterval
+lnow="$(date +%s)"
+lpm="$(stat -f %m "$LIVENESS_PLIST" 2>/dev/null || stat -c %Y "$LIVENESS_PLIST" 2>/dev/null || echo 0)"
+lom="$(stat -f %m "$LIVENESS_OUT" 2>/dev/null || stat -c %Y "$LIVENESS_OUT" 2>/dev/null || echo 0)"
+if [[ "$((10#$lpm))" -ne 0 ]] && (( lnow - 10#$lpm > LIVENESS_MAX_AGE )) && (( lnow - 10#$lom > LIVENESS_MAX_AGE )); then
+  report="liveness-canary.out stale ($((lnow - 10#$lom))s; max ${LIVENESS_MAX_AGE}s) — the execution watcher is not running
+$report"
+  rc=1
+fi
 
 if [[ "$rc" -eq 0 ]]; then
   # clean — reset the streak + clear any prior alert latch

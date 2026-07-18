@@ -7,6 +7,10 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+# liveness-fire: one unconditional stdout line per fire — liveness-canary reads this job's
+# .out mtime as execution evidence (the python tick can exit without printing).
+printf '[%s] [automerge-tick] tick fire\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 

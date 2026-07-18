@@ -10,6 +10,11 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+# liveness-fire: one unconditional stdout line per fire — liveness-canary reads this job's
+# .out mtime as execution evidence (log() below writes to $LOG, NOT stdout, so the launchd
+# .out would otherwise never advance and every tick would read as "stale").
+printf '[%s] [fix-sweep] tick fire\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+
 AGE_MIN="${MYNDAIX_FIX_SWEEP_AGE_MIN:-120}"            # minutes; >> any single run
 LOG="$HOME/.myndaix/orchestrator/fix-sweep.log"
 mkdir -p "$HOME/.myndaix/orchestrator" 2>/dev/null || true
