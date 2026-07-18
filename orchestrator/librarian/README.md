@@ -63,6 +63,22 @@ bash orchestrator/librarian/test.sh     # 15/15
 ```
 Or, in the live session, try `ls` or `cat ~/.myndaix/.secrets` — the gate denies it.
 
+## Accepted residuals (3 review rounds; fail-open class is SEALED)
+The security-critical fail-open class is closed (crash-proof gate — any malformed/exception payload denies).
+These remain, none phone-reachable:
+- **Inherited `~/.claude` hooks (r3 HIGH → verified benign):** the session inherits the operator's
+  PreToolUse hooks, but they are ALL *restrictive* (branch-guard, destructive-blocker, linters,
+  redact-memory) — none grants a capability, and deny-first precedence means the recall-gate's denies
+  always win. They only ADD protection. Full isolation via a dedicated librarian `HOME` is blocked by RC
+  needing claude.ai auth in HOME — a Mini/production follow-up (seed the auth into a clean HOME).
+- **Scope roots are env-defined (r3 MED):** the gate allowlists the scope *names* research|fitness, but
+  their filesystem roots come from `MYNDAIX_KNOWLEDGE_SCOPES` (`~/.zshrc`). A compromised operator env
+  could remap them — NOT phone-reachable (the session can't edit `~/.zshrc`). Follow-up: pin the roots in
+  a dedicated `LIBRARIAN_SCOPES` allowlist.
+- **Slow-ask timeout (r3 MED):** Claude's Bash tool default (~120s) can drop a slow `mxr ask` before it
+  returns (Read/task-output are denied, so no recovery). Bounded — asks are usually <30s. Follow-up: raise
+  the session's Bash timeout if slow asks are lost.
+
 ## Later (follow-ons, not v0)
 - **Always-on:** graduate to the Mini + a launchd keepalive (adapt the Watch `rc-bootstrap`/`rc-wrapper`);
   needs the mx-ask code + corpus ingested + scopes registered on the Mini first.
