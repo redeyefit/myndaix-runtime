@@ -937,10 +937,20 @@ touch -t 202601010000 "$LVH/orchestrator/controller.out"
 lv6="$(LV_MODE=clean lvrun)"
 ok 'printf "%s" "$lv6" | grep -q "ai.myndaix.controller: STALE"' "stale .out past max gap -> divergence naming the .out"
 ok '! printf "%s" "$lv6" | grep -q "ai.myndaix.automerge:"' "fresh .out passes (no false stale)"
-# run 7 — healthy freshness but last exit code nonzero -> divergence
-touch "$LVH/orchestrator/controller.out"
+# run 7 — a job firing FRESH but exiting nonzero diverges ONLY after TWO consecutive failed FIRES
+# (launchd latches last-exit-code; a single failed run re-read across ticks must not satisfy the
+# persistence threshold — KilaBz re-review). Two distinct-but-fresh .out mtimes = two fires.
+utime(){ python3 -c 'import os,sys,time; t=time.time()-float(sys.argv[2]); os.utime(sys.argv[1],(t,t))' "$1" "$2"; }
+rm -f "$LVH/state/liveness-ec-ai.myndaix.controller"
+utime "$LVH/orchestrator/controller.out" 300                      # fire 1 (fresh)
+lv7a="$(LV_MODE=clean LV_EXIT_CODE=78 lvrun)"
+ok '! printf "%s" "$lv7a" | grep -q "controller: exited nonzero"' "#3: ONE failed fire does NOT diverge (single latched exit is not persistence)"
+utime "$LVH/orchestrator/controller.out" 120                      # fire 2 (fresh, NEWER mtime)
 lv7="$(LV_MODE=clean LV_EXIT_CODE=78 lvrun)"
-ok 'printf "%s" "$lv7" | grep -q "last exit code = 78"' "nonzero last exit code -> divergence"
+ok 'printf "%s" "$lv7" | grep -q "ai.myndaix.controller: exited nonzero (78) on 2 consecutive fires"' "#3: TWO consecutive failed fires -> divergence (persistence across RUNS, not ticks)"
+touch "$LVH/orchestrator/controller.out"                          # fresh exit 0 resets the memory
+lv7c="$(LV_MODE=clean lvrun)"
+ok '! printf "%s" "$lv7c" | grep -q "controller: exited nonzero" && [[ ! -e "$LVH/state/liveness-ec-ai.myndaix.controller" ]]' "#3: a fresh exit 0 clears the consecutive-fail memory (recovered)"
 # run 8 — rogue sweep: an undeclared loaded ai.myndaix.* label flags; declared ones don't
 lv8="$(LV_MODE=clean LV_LIST="ai.myndaix.rogue ai.myndaix.controller" lvrun)"
 ok 'printf "%s" "$lv8" | grep -q "ai.myndaix.rogue: ROGUE"' "reverse sweep: undeclared loaded label -> rogue divergence"
@@ -956,9 +966,13 @@ touch -t 202601010000 "$LVH/state/liveness-last-run"
 lv10="$(LV_MODE=notloaded lvrun)"
 ok 'printf "%s" "$lv10" | grep -q "sleep/wake grace"' "stale own .last_run -> sleep-guard grace tick"
 ok '! printf "%s" "$lv10" | grep -q "DIVERGENT"' "grace tick checks nothing (no wake-up alert storm)"
-# run 11 — a NEGATIVE last exit code (signal-class) is caught too (KilaBz P3 fold)
+# run 11 — a NEGATIVE (signal-class) exit code is parsed + caught, also after two consecutive fires.
+rm -f "$LVH/state/liveness-ec-ai.myndaix.automerge"
+utime "$LVH/orchestrator/automerge.out" 300; LV_MODE=clean LV_EXIT_CODE=-1 lvrun >/dev/null   # fire 1
+utime "$LVH/orchestrator/automerge.out" 120                                                    # fire 2
 lv11="$(LV_MODE=clean LV_EXIT_CODE=-1 lvrun)"
-ok 'printf "%s" "$lv11" | grep -q "last exit code = -1"' "negative last exit code -> divergence (signal-class parse)"
+ok 'printf "%s" "$lv11" | grep -q "ai.myndaix.automerge: exited nonzero (-1) on 2 consecutive fires"' "negative signal-class exit code caught after two fires (parse handles the minus sign)"
+touch "$LVH/orchestrator/automerge.out"; LV_MODE=clean lvrun >/dev/null                        # reset
 # review folds: rogue sweep is GATED on a populated declared set (Oracle P3 — an empty set
 # must not flag every legit job ROGUE with a bootout remedy); exit-0-always covers state
 # writes too (KilaBz P2 — no die/set-e death on streak/latch/mkdir failures)
@@ -1007,8 +1021,8 @@ ok 'printf "%s" "$lvP1c" | grep -q "all declared jobs alive" && [[ ! -e "$LVH/st
 touch -t 202601010000 "$LVH/orchestrator/controller.out"          # controller STALE again
 lvEC="$(LV_MODE=clean LV_EXIT_CODE=1 lvrun)"
 ok 'printf "%s" "$lvEC" | grep -q "ai.myndaix.controller: STALE"' "#3: a stale job reports STALE"
-ok '! printf "%s" "$lvEC" | grep -q "controller: last exit code"' "#3: exit-code is NOT evaluated on a STALE job (no double-report; latch-vs-tick debounce fix)"
-touch "$LVH/orchestrator/controller.out"                          # heal for the next checks
+ok '! printf "%s" "$lvEC" | grep -q "controller: exited nonzero"' "#3: exit-code is NOT evaluated on a STALE job (no double-report; latch-vs-tick debounce fix)"
+touch "$LVH/orchestrator/controller.out"; rm -f "$LVH/state/liveness-ec-ai.myndaix.controller"  # heal + reset EC memory
 # #4 ERR -> rogue sweep skipped: a corrupt descriptor for a still-loaded label must NOT flag it ROGUE.
 # Uses the PLISTS_DIR seam to point the canary at a fixture set where one descriptor is corrupt.
 LVBAD="$LV/badplists"; mkdir -p "$LVBAD"; cp "$SUB"/plists/*.json "$LVBAD"/
@@ -1026,6 +1040,9 @@ python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > 
 python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > "$TMP/ci2.plist"
 ok 'cmp -s "$TMP/ci1.plist" "$TMP/ci2.plist"' "#2: render is deterministic -> content-aware cmp -s skips a no-op converge (plist mtime preserved -> grace honest)"
 ok 'grep -q "cmp -s" "$SUB/reconcile.sh"' "#2: reconcile guards the plist install with cmp -s (only rewrites on a real change)"
+# #2 (KilaBz re-review): the skip requires a REGULAR file at mode 0644 — a byte-identical but
+# wrong-mode/symlinked plist is NOT converged and must be repaired, not skipped.
+ok 'grep -q "! -L \"\$inst\"" "$SUB/reconcile.sh" && grep -q "imode" "$SUB/reconcile.sh"' "#2: content-aware skip also requires regular-file + mode 0644 (convergence completeness, not byte-only)"
 # #8 reconcile gap vs default poll: gap must be >= 2x the POLL_INTERVAL_S default (900).
 ok '[[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[\"liveness_max_gap_seconds\"])" "$SUB/plists/ai.myndaix.reconcile.json")" -ge 1800 ]]' "#8: reconcile liveness gap >= 2x the default POLL_INTERVAL_S (900) — no false STALE at default"
 ok 'grep -q "raise that gap" "$SUB/config.env.example"' "#8: config.env.example documents the POLL/gap coupling for non-default poll intervals"

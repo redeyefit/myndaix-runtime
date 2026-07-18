@@ -199,11 +199,17 @@ install_artifacts() {
     # perpetually re-arm the grace and leave long-gap jobs (inbox-assistant, 25h) effectively
     # unwatched (deep-audit P2). cmp is byte-exact and render is deterministic, so "identical" ==
     # "nothing to converge" — skipping is correct AND cuts needless launchd-plist churn.
-    if [[ -f "$LA_DIR/$label.plist" ]] && cmp -s "$tmp" "$LA_DIR/$label.plist"; then
+    # The skip requires a REGULAR file (not a symlink) at the intended mode 0644 too: a
+    # byte-identical but wrong-mode / symlinked / non-regular installed plist is NOT converged and
+    # must be repaired, not skipped (KilaBz re-review — convergence completeness on the load-bearing
+    # LaunchAgents path). Anything off-spec falls through to a real atomic_install.
+    inst="$LA_DIR/$label.plist"
+    imode="$(stat -f %Lp "$inst" 2>/dev/null || stat -c %a "$inst" 2>/dev/null || echo '')"
+    if [[ -f "$inst" && ! -L "$inst" && "$imode" == "644" ]] && cmp -s "$tmp" "$inst"; then
       rm -f "$tmp"
       log "plist unchanged: $label"
     else
-      atomic_install "$tmp" "$LA_DIR/$label.plist" 0644
+      atomic_install "$tmp" "$inst" 0644
       log "installed plist: $label"
     fi
   done
