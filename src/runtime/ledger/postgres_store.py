@@ -2136,6 +2136,30 @@ class PostgresLedger:
                 scope, tsq, k)
         return [dict(r) for r in rows]
 
+    async def knowledge_recall_or(self, scope: str, tokens: list[str], k: int) -> list[dict]:
+        """BROADEN rung (ask/librarian only): OR the sanitized prefix tokens (`t1:* | t2:* | …`) so a
+        doc matching ANY significant term surfaces, ranked by ts_rank_cd cover-density. The precision
+        ladder (FTS/prefix AND-match) is right for `mxr recall`; a natural-language QUESTION drops a
+        word the doc lacks and AND-misses, so the librarian falls back to OR-recall + LLM relevance
+        filtering. Tokens come from knowledge.prefix_tokens (conservative charset), never raw text."""
+        if not tokens:
+            return []
+        tsq = " | ".join(f"{t}:*" for t in tokens)
+        async with self._pool.acquire() as con:
+            rows = await con.fetch(
+                """SELECT path, title, doc_date, lossy, rank,
+                          ts_headline('english', body, q,
+                                      'MaxWords=30, MinWords=10, MaxFragments=2') AS headline
+                     FROM (SELECT path, title, doc_date, lossy, body, q,
+                                  ts_rank_cd(tsv, q, 1) AS rank
+                             FROM knowledge_doc_active,
+                                  to_tsquery('english', $2) AS q
+                            WHERE scope = $1 AND tsv @@ q
+                            ORDER BY rank DESC, path
+                            LIMIT $3) hits""",
+                scope, tsq, k)
+        return [dict(r) for r in rows]
+
     async def knowledge_recall_ilike(self, scope: str, pattern: str, k: int) -> list[dict]:
         """Ladder rung 3 (still nothing): substring over title+body — catches code tokens/paths
         (`play-review`, `mxr`) that FTS lexemes structurally can't. Pattern comes pre-escaped from

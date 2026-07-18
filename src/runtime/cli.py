@@ -279,6 +279,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if raw and raw[0] == "recall":
         from runtime import knowledgerecord
         return knowledgerecord.recall_main(["recall", *raw[1:]])
+    # `mxr ask --scope X "Q"` — the recall LIBRARIAN (synthesis over recall): retrieve fenced hits
+    # then dispatch the tool-less `librarian` RESPONDER to answer WITH citations. Read-only; unknown
+    # scope is a HARD error (exit 2). The second-brain rung-1 answer layer (docs/mx-ask-librarian-design.md).
+    if raw and raw[0] == "ask":
+        from runtime import knowledgerecord
+        return knowledgerecord.ask_main(["ask", *raw[1:]])
     if raw and raw[0] == "knowledge-index":
         from runtime import knowledgerecord
         return knowledgerecord.index_main(["knowledge-index", *raw[1:]])
