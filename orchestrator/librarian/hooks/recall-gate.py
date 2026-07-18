@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-# recall-gate.py — PreToolUse Bash gate for the READ-ONLY recall LIBRARIAN session (piece C).
-# The librarian is read-only: the ONLY Bash it may run is `mxr ask --scope research|fitness "<question>"`.
-# NO dispatch, NO other program, NO other scope, NO shell operators/expansion. settings.json removes
-# every non-Bash tool by canonical name, so this hook is the SOLE allow-er of Bash and MUST be airtight.
+# recall-gate.py — PreToolUse ALLOWLIST gate for the READ-ONLY recall LIBRARIAN session (piece C).
+# The librarian is read-only: the ONLY thing it may run is `mxr ask --scope research|fitness "<question>"`
+# (Bash). NO dispatch, NO other program, NO other scope, NO shell operators/expansion, NO other TOOL.
 #
-# FAIL-CLOSED (cross-family review r1, HIGH — confirmed vs Claude Code 2.1.x docs): under defaultMode
-# `dontAsk`, a PreToolUse hook that emits NO decision FALLS THROUGH TO ALLOW for Bash (Bash cannot be in
-# the deny list, or the hook could never allow a valid recall). So EVERY non-allow path emits an explicit
-# "deny" — NEVER a bare return. The one correct carve-out is tool_name != "Bash" (a Bash-matcher hook must
-# not opine on tools it doesn't gate; the deny-list covers those). A non-string command (e.g. an injected
-# array `{"command":["rm","-rf","/"]}`) and unparseable/malformed payloads all deny.
+# ALLOWLIST MODEL (keepalive review r2, HIGH-1/HIGH-2). settings.json is registered with matcher "*", so
+# this hook fires for EVERY tool call and is the SOLE decider: it ALLOWS only a valid `mxr ask` (Bash) and
+# emits an explicit "deny" for everything else — every other Bash command AND every non-Bash tool. This is
+# fail-closed by CONSTRUCTION and does NOT depend on the settings deny-list staying exhaustive as Claude
+# Code adds new tools (the enumeration that let a live write-capable tool, DesignSync, slip the deny-list).
+# The deny-list remains as belt (deny-first precedence), but the gate no longer relies on it.
+#
+# FAIL-CLOSED (also cross-family review r1, HIGH — vs Claude Code 2.1.x docs): under defaultMode `dontAsk`,
+# a PreToolUse hook that emits NO decision FALLS THROUGH TO ALLOW for (read-only-looking) Bash — so Bash
+# cannot be in the deny list and EVERY non-allow path here MUST emit an explicit "deny", never a bare
+# return. A non-string command (e.g. an injected array `{"command":["rm","-rf","/"]}`) and unparseable /
+# malformed payloads all deny. There is now NO silent path: non-Bash tools deny explicitly too.
 #
 # The injection guard is the regex fullmatch + the QUERY charset (excludes "  $ ` \  -> nothing closes the
 # double-quoted arg early or expands in-quote, and no trailing `; rm -rf` survives a fullmatch). A natural
@@ -43,8 +48,11 @@ def emit(decision: str, reason: str) -> NoReturn:
 def _decide(data) -> None:
     if not isinstance(data, dict):
         emit("deny", "malformed hook payload (not an object)")
-    if data.get("tool_name") != "Bash":
-        return                                                # correct carve-out: don't gate other tools
+    tool = data.get("tool_name")
+    if tool != "Bash":
+        # ALLOWLIST (keepalive review r2 HIGH): the gate fires for EVERY tool (matcher "*") and denies
+        # every non-Bash tool structurally — no dependency on the settings deny-list being exhaustive.
+        emit("deny", f"only `mxr ask` (Bash) is permitted; tool '{tool!r}' denied")
     ti = data.get("tool_input")
     if not isinstance(ti, dict):
         emit("deny", "malformed tool_input (not an object)")  # review r2 HIGH: a truthy non-dict crashed here
@@ -54,6 +62,12 @@ def _decide(data) -> None:
     cmd = ti.get("command", "")
     if not isinstance(cmd, str) or not cmd.strip():
         emit("deny", "missing / non-string / empty Bash command")   # blocks array-command injection etc.
+    # No control characters anywhere (keepalive review r2 self-probe): a legit `mxr ask` is a single
+    # line of printable text. Reject newlines/tabs/etc. so `strip()` below can't normalise a LEADING
+    # control char away into a match (e.g. "\nmxr ask ..." -> stripped "mxr ask ..."), and so no
+    # embedded newline can smuggle a second line.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in cmd):
+        emit("deny", "control character in Bash command (newline/tab/etc.)")
     stripped = cmd.strip()
 
     m = re.match(r"\s*(\S+)", cmd)
@@ -77,7 +91,7 @@ def main() -> None:
     # CRASH-PROOF FAIL-CLOSED (review r2 HIGH): ANY unexpected error — unparseable JSON, a truthy
     # non-dict tool_input, anything — must DENY, never emit nothing (a no-decision hook falls through to
     # ALLOW for Bash under dontAsk). emit() raises SystemExit, which we re-raise so the printed decision
-    # stands; every other exception denies. The one silent path is _decide's tool_name!=Bash return.
+    # stands; every other exception denies. There is NO silent path now: every tool_name emits a decision.
     try:
         _decide(json.load(sys.stdin))
     except SystemExit:
