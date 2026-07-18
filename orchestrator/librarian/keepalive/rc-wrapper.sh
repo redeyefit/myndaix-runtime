@@ -56,10 +56,15 @@ park() {
   printf 'PARKED reason=%s ts=%s\n' "$reason" "$(date '+%FT%T')" >"$PARK_MARKER" 2>/dev/null || true
   lib_log "PARK: $reason"
   lib_alert "$reason"
-  lib_log "parked — sleeping; recovery = claude auth login -> rm $PARK_MARKER -> kickstart"
-  # keep the pane (and thus the tmux session) alive so the operator can attach and the bootstrap
-  # does not thrash. Recovery is manual (see the header / README runbook).
-  while true; do sleep 3600; done
+  lib_log "parked — recovery = fix the cause, then: rm $PARK_MARKER (self-restarts within ~120s)"
+  # Keep the pane (and thus the tmux session) alive WHILE parked so the operator can attach and the
+  # bootstrap does not thrash (bootstrap refuses to (re)start while the marker exists). But EXIT the
+  # moment the marker is removed: the pane dies -> the tmux session ends -> the next bootstrap tick
+  # recreates a fresh session. Without this, `rm marker` alone never restarts RC (review r1 HIGH:
+  # bootstrap would see the still-sleeping parked session as 'already alive'). Recovery = fix + rm.
+  while [[ -e "$PARK_MARKER" ]]; do sleep 60; done
+  lib_log "park marker removed — exiting so bootstrap recreates a fresh session"
+  exit 0
 }
 
 reachable() {
@@ -74,14 +79,17 @@ reachable() {
   return 1
 }
 
-# startup assertion: the fence must be present, else the session would run unconfined. Park loud
-# rather than serve an unfenced RC session.
-if [[ ! -f "$LIB_WORKSPACE/.claude/settings.json" ]]; then
-  park "workspace-fence-missing ($LIB_WORKSPACE/.claude/settings.json)"
+# startup assertion: the fence must actually CONFINE (parse + smoke-run the gate), not merely exist —
+# else the session would serve an UNCONFINED Bash surface (review r1 CRITICAL). Park loud otherwise.
+if ! lib_validate_fence "$LIB_WORKSPACE"; then
+  park "workspace-fence-invalid (see librarian.log for the specific failure)"
 fi
-# and `mxr` must resolve, else every ask is command-not-found (deaf librarian).
-if ! command -v mxr >/dev/null 2>&1; then
-  park "mxr-not-on-PATH (expected \$HOME/.local/bin/mxr)"
+# `mxr` must resolve to the CANONICAL shim, not just any `mxr` on PATH — the recall-gate allows the
+# literal token `mxr`, so a different `mxr` on PATH would run under the allow (review r1 MED). The
+# wrapper prepends ~/.local/bin, so the canonical shim wins if present; assert it explicitly.
+mxr_resolved="$(command -v mxr 2>/dev/null || true)"
+if [[ "$mxr_resolved" != "$HOME/.local/bin/mxr" || ! -x "$mxr_resolved" ]]; then
+  park "mxr-not-canonical (want \$HOME/.local/bin/mxr, got '${mxr_resolved:-none}')"
 fi
 
 fast_exits=0
@@ -115,7 +123,7 @@ while true; do
   # --spawn same-dir: NOT worktree (LIB_WORKSPACE is not a git repo; worktree mode would fail).
   # --permission-mode dontAsk: spawned sessions are non-interactive (no human to answer prompts);
   #   the deny-list + recall-gate fully fence them. --name for a clear label in claude.ai/mobile.
-  ( cd "$LIB_WORKSPACE" && env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
+  ( cd "$LIB_WORKSPACE" && env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
       claude remote-control --capacity 1 --spawn same-dir --permission-mode dontAsk --name librarian )
   rc=$?
   end="$(date +%s)"
