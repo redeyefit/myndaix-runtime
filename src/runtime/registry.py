@@ -226,6 +226,49 @@ V1_ROSTER: list[AgentSpec] = [
                        "application": "/higgsfield-ai/dop/lite",
                        "max_segments": 12,
                        "non_idempotent": True}),   # paid; WORKSPACE_ACTOR already non-requeue (belt)
+    # mx-engine: the content-factory folder promoted to an agent (Rung 1). Option B — a
+    # DETERMINISTIC bash pipeline (reelcopy -> reel), NOT a confined claude producer: it runs the
+    # REAL mx-engine repo with its real env (Chrome/ffmpeg/.venv/personas/.ttscache), so it declares
+    # NO --tools / scratch_home (those are the curator's read-only belt; the opposite need here).
+    #  * WORKSPACE_ACTOR -> NEVER auto-retried: a reel render burns ElevenLabs TTS credits and is
+    #    non-idempotent, so a transient failure must never double-charge (same guarantee stitcher
+    #    /higgsfield rely on). NEVER dispatch mx-engine with a repo_id — a plain `mxr mx-engine
+    #    "topic"` carries none, so worker.py's C5 gate makes NO worktree and the self-locating
+    #    wrapper runs the real repo; a stray repo_id would spawn a useless checkout-copy worktree
+    #    (missing the gitignored venv/personas) — the wrapper's absolute path still works, just wasteful.
+    #  * The wrapper + child .sh scripts source ~/.myndaix/.secrets THEMSELVES, so no env_passthrough
+    #    is needed — real HOME/PATH from the P2 env-base is enough for them to self-load the keys.
+    #  * timeout_s 1500: copy (~30s Claude call) + one full narrated 9:16 render, with wide margin.
+    # REVIEW (kilabz r1, PR #101): FOLDED — concurrent dispatches could corrupt a render (reelgen
+    # shutil.rmtree's <repo>/reel-out/<topic> on start + a FIXED render port 8731); mx-produce.sh now
+    # takes a single-holder mkdir lock (2nd concurrent run fails fast, stale-reclaims past 1800s so a
+    # SIGKILL-on-timeout leak self-heals). ACCEPTED RESIDUALS (Rung-1, documented):
+    #  (a) nothing FORCES repo_id absent — the "NEVER dispatch with repo_id" contract is only doc'd.
+    #      Fail-closed/benign though: a logical --repo fails pre-invoke, an absolute-path --repo only
+    #      wastes a worktree (wrapper + reel*.py resolve every path from $0/__file__, never cwd, so it
+    #      still runs the REAL repo). Follow-up: a `no_worktree` adapter flag honored by worker.py.
+    #  (b) the wrapper self-sources the FULL ~/.myndaix/.secrets (bypasses _cli_env's per-agent
+    #      allowlist) — but that EQUALS the manual `./reel.sh` exposure (same operator/HOME/file) and
+    #      the topic reaches an LLM as COPY, never shell (no injection path). Follow-up: scope
+    #      mx-engine to a narrow secret file (ANTHROPIC/OAuth + ELEVENLABS only).
+    # PRE-DEPLOY AUDIT (5-dim adversarial fleet, 17 findings): FOLDED a BLOCKER the unit tests + diff
+    # review missed — mx-produce.sh staged reel.json in an ABSOLUTE tempdir, which reelgen serves to
+    # headless Chrome over http.server(cwd=repo); an out-of-root path 404s -> blank frame -> the MX
+    # head-clip gate aborts EVERY render. Fixed in mx-produce.sh: stage under a gitignored .mx-work/
+    # inside the repo + pass a DIR-relative path (regression-tested NON-paid in test_mx_produce.sh).
+    # Remaining live-only item (NOT code): headless Chrome runs under the launchd daemon with the
+    # operator's default profile — works from a GUI shell, first-run/profile-lock/TCC UNPROVEN from the
+    # pool; bounded (1500s timeout -> dead, never auto-retried), so the FIRST mxr mx-engine dispatch is
+    # a supervised smoke (don't run it while interactive Chrome holds the same profile). Other 15
+    # findings are all low, bounded, self-healing (dash/empty-topic footguns, sync-wait ~26min, lock
+    # stale-reclaim TOCTOU, stderr-on-success, stale-dest artifact) — documented, none block go-live.
+    AgentSpec(agent_id="mx-engine", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
+              model="pipeline", role="content factory (mx-engine folder-agent): topic -> narrated reel",
+              profile=Profile(timeout_s=1500),
+              adapter={"kind": "cli",
+                       "argv": ["bash",
+                                "/Users/stevenfernandez/code/active/mx-engine/mx-produce.sh"],
+                       "prompt_channel": "arg"}),   # whole dispatch string -> $1 = topic
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}
