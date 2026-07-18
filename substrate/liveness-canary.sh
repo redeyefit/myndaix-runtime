@@ -34,9 +34,18 @@ LA_DIR="$HOME/Library/LaunchAgents"
 LCTL="${LIVENESS_LAUNCHCTL:-launchctl}"
 PLISTS_DIR="${LIVENESS_PLISTS_DIR:-$SUBSTRATE_DIR/plists}"
 
-# mtime EPOCH seconds (macOS stat -f, Linux-CI stat -c); missing file -> 0. The `|| echo 0`
-# lives INSIDE the substitution so set -e -o pipefail can't kill the caller (bash rules).
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# mtime EPOCH seconds. macOS `stat -f %m` (BSD) is the factory; Linux CI is GNU `stat -c %Y`.
+# CRITICAL: the two forms must be &&-GUARDED, never `A || B` inside one substitution — on GNU,
+# `stat -f` means --file-system and prints a MULTILINE filesystem block to stdout while exiting
+# nonzero, so a `||` chain captures that garbage + the real mtime, and `$((10#$garbage))` then
+# aborts the canary under set -e (Linux CI red). Guarded: we emit ONLY a form's output when it
+# succeeded; a missing file falls through to 0. Always returns 0-status so callers don't trip set -e.
+mtime() {
+  local m
+  m="$(stat -f %m "$1" 2>/dev/null)" && { printf '%s' "$m"; return 0; }   # BSD (macOS)
+  m="$(stat -c %Y "$1" 2>/dev/null)" && { printf '%s' "$m"; return 0; }   # GNU (Linux)
+  printf '0'
+}
 
 now="$(date +%s)"
 

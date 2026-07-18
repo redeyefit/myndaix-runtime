@@ -204,7 +204,11 @@ install_artifacts() {
     # must be repaired, not skipped (KilaBz re-review — convergence completeness on the load-bearing
     # LaunchAgents path). Anything off-spec falls through to a real atomic_install.
     inst="$LA_DIR/$label.plist"
-    imode="$(stat -f %Lp "$inst" 2>/dev/null || stat -c %a "$inst" 2>/dev/null || echo '')"
+    # Separate assignments joined by || (NOT `A || B` inside one substitution): GNU `stat -f`
+    # means --file-system and leaks a multiline block to stdout while exiting nonzero; a chained
+    # substitution would capture that garbage. Here a failed `stat -f` (Linux) just re-assigns
+    # imode from `stat -c %a`. macOS BSD `stat -f %Lp` wins on the first try.
+    imode="$(stat -f %Lp "$inst" 2>/dev/null)" || imode="$(stat -c %a "$inst" 2>/dev/null)" || imode=""
     if [[ -f "$inst" && ! -L "$inst" && "$imode" == "644" ]] && cmp -s "$tmp" "$inst"; then
       rm -f "$tmp"
       log "plist unchanged: $label"

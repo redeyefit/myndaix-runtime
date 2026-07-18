@@ -991,6 +991,10 @@ ok 'printf "%s" "$lv12" | grep -q "ALARM could not write streak"' "streak-write 
 ok 'printf "%s" "$lv12" | grep -q "WARN cannot touch .last_run"' ".last_run create-failure WARN-logged, run continues"
 ok '! grep -qE "^[[:space:]]*die " "$SUB/liveness-canary.sh"' "canary body never calls die (config-load die inside lib.sh is the accepted pre-check)"
 ok 'grep -qE "print|list" "$SUB/liveness-canary.sh" && ! grep -qE "\"\\\$LCTL\" (bootstrap|bootout|kickstart)" "$SUB/liveness-canary.sh"' "liveness-canary is READ-ONLY against launchd (print/list only)"
+# CI-portability guard (the Linux-red regression): the leaky `stat -f ... || stat -c` INSIDE one
+# substitution captures GNU `stat -f`'s (--file-system) multiline stdout as garbage and aborts the
+# arithmetic under set -e. The fixed forms are &&-guarded or separate-assignment (no `|| stat -c`).
+ok '! grep -hE "\\|\\| stat -c" "$SUB/liveness-canary.sh" "$SUB/drift-canary.sh" "$SUB/reconcile.sh"' "no leaky 'stat -f ... || stat -c' chained substitution (GNU-stat safe on Linux CI)"
 
 echo "== liveness-canary: deep-audit folds (P1 grow-only latch, ERR/rogue, exit-fresh, content-aware install) =="
 # Fresh scenario, own clean state: all plists old (past grace), all .out fresh, no latch.

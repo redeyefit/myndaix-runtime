@@ -73,9 +73,13 @@ LW_ALERTED_FILE="$STATE_DIR/liveness-watch-alerted"
 LIVENESS_OUT="$MYNDAIX_HOME/state/liveness-canary.out"
 LIVENESS_PLIST="$HOME/Library/LaunchAgents/ai.myndaix.liveness.plist"
 LIVENESS_MAX_AGE=1800   # 2x its 900s StartInterval
+# mtime EPOCH seconds, &&-guarded (NOT `A || B` inside one substitution): GNU `stat -f` means
+# --file-system and leaks a multiline block to stdout while exiting nonzero, which a `||` chain
+# would capture as garbage and abort the arithmetic below (Linux CI). Emit only a form that won.
+_mtime() { local m; m="$(stat -f %m "$1" 2>/dev/null)" && { printf '%s' "$m"; return 0; }; m="$(stat -c %Y "$1" 2>/dev/null)" && { printf '%s' "$m"; return 0; }; printf '0'; }
 lnow="$(date +%s)"
-lpm="$(stat -f %m "$LIVENESS_PLIST" 2>/dev/null || stat -c %Y "$LIVENESS_PLIST" 2>/dev/null || echo 0)"
-lom="$(stat -f %m "$LIVENESS_OUT" 2>/dev/null || stat -c %Y "$LIVENESS_OUT" 2>/dev/null || echo 0)"
+lpm="$(_mtime "$LIVENESS_PLIST")"
+lom="$(_mtime "$LIVENESS_OUT")"
 if [[ "$((10#$lpm))" -ne 0 ]] && (( lnow - 10#$lpm > LIVENESS_MAX_AGE )) && (( lnow - 10#$lom > LIVENESS_MAX_AGE )); then
   canary_emit "$LW_STREAK_FILE" "$LW_ALERTED_FILE" "liveness-watch-alert" "liveness-watch DRIFT" \
     "drift-canary reverse watch: liveness-canary.out is stale ($((lnow - 10#$lom))s; max ${LIVENESS_MAX_AGE}s) — the execution watcher is not running. Every declared job's execution omission is now UNWATCHED. Investigate ai.myndaix.liveness (launchctl print $LA_DOMAIN/ai.myndaix.liveness)."
