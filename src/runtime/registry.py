@@ -195,6 +195,13 @@ V1_ROSTER: list[AgentSpec] = [
     #  * RESPONDER: pure text-in/text-out, idempotent, no side effects -> auto-retry-safe.
     #  * frontier model (injection resistance scales with tier). Belt: --strict-mcp-config + --safe-mode
     #    + scratch_home (no inherited MCP/hooks/settings). prompt via stdin (fenced corpus can be large).
+    #  * NO staging_cwd (unlike the curator) — intentional, NOT an omission (oracle/lobster r2 flagged it;
+    #    verified false alarm). A RESPONDER carries no worktree, so runner.invoke_cli leaves cwd=None and
+    #    allocates a fresh empty mkdtemp scratch cwd (runner.py:214) — the agent NEVER runs in the
+    #    operator's real cwd, so there's no untrusted .claude.json/.cursorrules to read (and --safe-mode
+    #    disables project config/hooks regardless, --tools "" leaves nothing to re-enable). ADDING
+    #    staging_cwd would FAIL-CLOSE every `ask`: it then requires a context.workdir inside the staging
+    #    root (runner.py:205-208), which the `mxr ask` dispatch does not pass. So it stays off by design.
     AgentSpec(agent_id="librarian", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="sonnet", role="recall librarian (read-only answer-with-citations over the corpus)",
               profile=Profile(timeout_s=120),
