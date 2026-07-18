@@ -856,11 +856,19 @@ prog = prog.replace("{DEPLOY_CLONE}", repo)
 # the reconcile poll runs the INSTALLED bootstrap-fetch copy; its source is in substrate/
 prog = prog.replace("{MYNDAIX_HOME}/bin/bootstrap-fetch", os.path.join(repo, "substrate", "bootstrap-fetch.sh"))
 txt = open(prog).read()
-# The marker documents the invariant; it must be BACKED by real fire plumbing (KilaBz P3):
-# either the wrappers' unconditional `... tick fire` printf, or an every-exit-path log()
-# (defined locally or sourced from lib.sh). A bare marker comment alone must not pass.
+# The marker documents the invariant; it must be BACKED by real fire plumbing on a
+# NON-COMMENT line (KilaBz re-review: comment-embedded strings must not pass): either the
+# wrappers' unconditional `printf ... tick fire`, or an every-exit-path log() (defined
+# locally, or lib.sh sourced — whose log the canaries call on every path; behaviorally
+# proven for the canaries by the stub runs below; the wrappers can't be behaviorally run
+# here without ticking live systems).
 marker = "liveness-fire" in txt
-plumbing = ("tick fire" in txt) or ("log() {" in txt) or ("log(){" in txt) or ("lib.sh" in txt)
+code = [l for l in txt.splitlines() if not l.lstrip().startswith("#")]
+plumbing = (
+    any("printf" in l and "tick fire" in l for l in code)
+    or any("log()" in l and "{" in l for l in code)
+    or any("source" in l and "lib.sh" in l for l in code)
+)
 sys.exit(0 if marker and plumbing else 1)
 PYEOF
 for d in "$SUB"/plists/*.json; do
@@ -949,7 +957,15 @@ ok 'printf "%s" "$lv11" | grep -q "last exit code = -1"' "negative last exit cod
 # must not flag every legit job ROGUE with a bootout remedy); exit-0-always covers state
 # writes too (KilaBz P2 — no die/set-e death on streak/latch/mkdir failures)
 ok 'grep -B8 "ROGUE" "$SUB/liveness-canary.sh" | grep -q "targets_ok" || grep -q "targets_ok\" -eq 1" "$SUB/liveness-canary.sh"' "rogue sweep skipped when the declared set failed to populate"
-ok '! grep -q "die \"could not write liveness streak\"" "$SUB/liveness-canary.sh" && grep -c "exit 0" "$SUB/liveness-canary.sh" | grep -qv "^[012]$"' "no die on state-write failure — every canary path exits 0"
+# run 12 — BEHAVIORAL exit-0-always proof (KilaBz re-review: a textual grep can't prove it):
+# a read-only state dir makes the .last_run touch AND the streak write fail mid-divergence;
+# the canary must ALARM-log and still exit 0 (no launchd failure record, no set -e death).
+chmod 555 "$LVH/state"
+lv12="$(LV_MODE=notloaded lvrun)"; lv12rc=$?
+chmod 755 "$LVH/state"
+ok '[[ "$lv12rc" -eq 0 ]]' "read-only state dir mid-divergence -> canary STILL exits 0 (behavioral exit-0-always)"
+ok 'printf "%s" "$lv12" | grep -q "ALARM could not write streak"' "streak-write failure ALARM-logged (not die, not silent)"
+ok '! grep -qE "^[[:space:]]*die " "$SUB/liveness-canary.sh"' "canary body never calls die (config-load die inside lib.sh is the accepted pre-check)"
 # mutual watch: drift-canary reverse-watches liveness-canary.out through its existing latch
 ok 'grep -q "liveness-canary.out" "$SUB/drift-canary.sh" && grep -A3 "liveness-canary.out stale" "$SUB/drift-canary.sh" | grep -q "rc=1"' "drift-canary folds a stale liveness-canary.out into its own streak+latch path"
 ok 'grep -qE "print|list" "$SUB/liveness-canary.sh" && ! grep -qE "\"\\\$LCTL\" (bootstrap|bootout|kickstart)" "$SUB/liveness-canary.sh"' "liveness-canary is READ-ONLY against launchd (print/list only)"
