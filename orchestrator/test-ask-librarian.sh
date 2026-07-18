@@ -40,13 +40,32 @@ if [ "$rc" -eq 2 ]; then ok "unknown scope -> exit 2 (fail-closed)"; else no "un
 "${PY[@]}" ask --scope asktest_a "" >/dev/null 2>&1; rc=$?
 if [ "$rc" -eq 2 ]; then ok "empty query -> exit 2"; else no "empty query exit $rc, want 2"; fi
 
-echo "== 2. retrieval: ingest scopes + OR-broaden finds an NL match (cheap, uses recall not the LLM) =="
+echo "== 2. retrieval: ingest + DETERMINISTIC broaden proof (precision misses, OR-broaden catches; no LLM) =="
 "${PY[@]}" knowledge-ingest --scope asktest_a >/dev/null 2>&1
 "${PY[@]}" knowledge-ingest --scope asktest_b >/dev/null 2>&1
-# recall (not ask) proves the index+OR retrieval without a paid call
-hits_a="$("${PY[@]}" recall --scope asktest_a "what launch color does the mascot use" 2>/dev/null | grep -c "greeting.md" || true)"
-if [ "${hits_a:-0}" -ge 1 ] || "${PY[@]}" recall --scope asktest_a "aurora color" 2>/dev/null | grep -q greeting.md; then
-  ok "retrieval finds the relevant doc in scope a"; else no "retrieval missed greeting.md"; fi
+# "teal purple orange": greeting.md has 'teal' but not purple/orange, so the AND precision ladder
+# (FTS/prefix/ilike) MUST miss and the OR-broaden rung MUST catch it. Exercises recall_hits(broaden=)
+# on BOTH settings via the real code path — the seam kilabz flagged (the old test used `mxr recall`,
+# which is broaden=False, so a broken knowledge_recall_or would have passed unnoticed).
+broaden_out="$(PYTHONPATH=src .venv/bin/python - <<'PY' 2>/dev/null
+import asyncio
+from runtime.ledger.postgres_store import PostgresLedger
+from runtime import knowledgerecord as K
+async def m():
+    led = await PostgresLedger.connect(K.DSN)
+    try:
+        rp, hp = await K.recall_hits(led, "asktest_a", "teal purple orange", 5, broaden=False)
+        rb, hb = await K.recall_hits(led, "asktest_a", "teal purple orange", 5, broaden=True)
+    finally:
+        await led.close()
+    print(f"precision_rung={rp} precision_hits={len(hp)} broaden_rung={rb} broaden_hits={len(hb)}")
+asyncio.run(m())
+PY
+)"
+echo "  $broaden_out"
+if echo "$broaden_out" | grep -q "precision_hits=0" && echo "$broaden_out" | grep -qE "broaden_rung=or broaden_hits=[1-9]"; then
+  ok "OR-broaden catches what the precision ladder misses (broaden gating proven)"
+else no "broaden rung not proven: $broaden_out"; fi
 echo "== 3. scope isolation: scope-a query never surfaces scope-b's secret =="
 if "${PY[@]}" recall --scope asktest_a "Borealis passphrase HUNTER" 2>/dev/null | grep -q "secret.md"; then
   no "scope-a leaked scope-b's secret.md"; else ok "scope-a cannot see scope-b (isolation holds)"; fi
