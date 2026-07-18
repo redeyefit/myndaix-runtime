@@ -824,6 +824,56 @@ echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) ==
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"
 ok 'grep -q "deny network" "$REPO/orchestrator/play-fix.sh"' "play-fix sandbox denies network (no live-ledger reach)"
 
+echo "== drift-canary: outbound-net probe (the Mini-strand alarm) + alert latch =="
+# Hermetic: copy the canary + its deps next to a STUB reconcile.sh, so no real fetch/reconcile
+# ever runs. The stub records that it was invoked and exits per STUB_RC.
+CAN="$TMP/canary"; mkdir -p "$CAN"
+cp "$SUB/drift-canary.sh" "$SUB/lib.sh" "$SUB/config_parse.py" "$CAN/"
+printf '#!/bin/bash\ntouch "$(dirname "$0")/reconcile-ran"\nexit "${STUB_RC:-0}"\n' > "$CAN/reconcile.sh"
+chmod +x "$CAN/reconcile.sh"
+mkdir -p "$TMP/canhome/inbox"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s/canhome\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/canhome/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$TMP" "$TMP" "$REPO" > "$TMP/canhome/config.env"
+# DEAD: nothing listens on port 1; curl fails instantly. LIVE: file:// URL — no network needed.
+DEAD_URL="http://127.0.0.1:1"
+LIVE_URL="file://$TMP/canhome/config.env"
+run_canary(){ MYNDAIX_HOME="$TMP/canhome" NET_PROBE_URLS="$1" STUB_RC="${2:-0}" /bin/bash "$CAN/drift-canary.sh" >/dev/null 2>&1; }
+
+ok 'run_canary "$DEAD_URL"' "net-down run 1 exits 0"
+ok '[[ "$(cat "$TMP/canhome/state/net-streak" 2>/dev/null)" == "1" ]]' "net streak bumped to 1"
+ok '! ls "$TMP/canhome/inbox"/net-alert-*.md >/dev/null 2>&1' "no alert below threshold"
+ok '[[ ! -e "$CAN/reconcile-ran" ]]' "dead net SKIPS the drift check (reconcile never invoked)"
+ok '[[ ! -e "$TMP/canhome/state/drift-streak" ]]' "dead net does not touch the drift streak"
+run_canary "$DEAD_URL"
+ok '[[ "$(ls "$TMP/canhome/inbox"/net-alert-*.md 2>/dev/null | wc -l)" -eq 1 ]]' "net alert dropped at threshold (streak 2)"
+ok 'grep -q "outbound network DOWN" "$TMP/canhome/inbox"/net-alert-*.md' "net alert names the failure distinctly (not drift)"
+run_canary "$DEAD_URL"
+ok '[[ "$(ls "$TMP/canhome/inbox"/net-alert-*.md 2>/dev/null | wc -l)" -eq 1 ]]' "latch: third net-down run does not re-alert"
+ok 'run_canary "$LIVE_URL"' "net-recovered run exits 0"
+ok '[[ ! -e "$TMP/canhome/state/net-streak" && ! -e "$TMP/canhome/state/net-alerted" ]]' "recovery clears net streak + latch"
+ok '[[ -e "$CAN/reconcile-ran" ]]' "live net proceeds to the drift check"
+ok '[[ ! -e "$TMP/canhome/state/drift-streak" ]]' "clean dry-run leaves no drift streak"
+# drift path still works through the shared deliver_alert (refactor regression guard)
+run_canary "$LIVE_URL" 1
+run_canary "$LIVE_URL" 1
+ok '[[ "$(ls "$TMP/canhome/inbox"/drift-alert-*.md 2>/dev/null | wc -l)" -eq 1 ]]' "drift alert still drops at threshold via deliver_alert"
+run_canary "$LIVE_URL" 1
+ok '[[ "$(ls "$TMP/canhome/inbox"/drift-alert-*.md 2>/dev/null | wc -l)" -eq 1 ]]' "drift latch still holds"
+run_canary "$LIVE_URL" 0
+ok '[[ ! -e "$TMP/canhome/state/drift-streak" && ! -e "$TMP/canhome/state/drift-alerted" ]]' "clean dry-run clears drift streak + latch"
+# single-instance lock (review r1): fresh lock held -> skip tick untouched; stale lock -> reclaimed
+mkdir "$TMP/canhome/state/canary.lock"
+ok 'run_canary "$DEAD_URL"' "held lock: tick exits 0"
+ok '[[ ! -e "$TMP/canhome/state/net-streak" ]]' "held lock: tick skipped (no streak bump)"
+touch -t 202001010000 "$TMP/canhome/state/canary.lock"
+run_canary "$DEAD_URL"
+ok '[[ "$(cat "$TMP/canhome/state/net-streak" 2>/dev/null)" == "1" ]]' "stale lock reclaimed: tick ran"
+ok '[[ ! -e "$TMP/canhome/state/canary.lock" ]]' "lock released on exit"
+run_canary "$LIVE_URL"
+# fail-closed streak read (review r1 #5): unreadable streak file dies, does not reset to 0
+mkdir "$TMP/canhome/state/net-streak"
+ok '! run_canary "$DEAD_URL"' "dir-at-streak-path: canary dies (no silent reset)"
+rmdir "$TMP/canhome/state/net-streak"
+
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
