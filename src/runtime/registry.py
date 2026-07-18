@@ -88,11 +88,19 @@ V1_ROSTER: list[AgentSpec] = [
     AgentSpec(agent_id="mack", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="opus", role="hands-on builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
-                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token (roster header)
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]},  # subscription token (roster header)
+              # timeout_s=7200: builders get BUILD-dispatch prompts (multi-file feature work in
+              # headless claude -p) that run 30-90+ min. Without a profile the exec cap falls to
+              # the dead 300s field default, and WORKSPACE_ACTOR is not requeue-safe, so one
+              # timeout = job dead (2026-07-12: the MX Quality Orchestrator build on 'mini' died
+              # at exactly 300s, one attempt, dead-letter). Same fix kilabz got on 2026-07-03.
+              profile=Profile(timeout_s=7200)),
     AgentSpec(agent_id="mini", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="claude", role="pipeline builder",
               adapter={"kind": "cli", "argv": ["claude", "-p"], "prompt_channel": "stdin",
-                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]}),  # subscription token (roster header)
+                       "env_passthrough": ["CLAUDE_CODE_OAUTH_TOKEN"]},  # subscription token (roster header)
+              # timeout_s=7200: see mack above — the 2026-07-12 dead build was THIS agent.
+              profile=Profile(timeout_s=7200)),
     AgentSpec(agent_id="kilabz", reach=Reach.CLI, authority=Authority.RESPONDER,
               model="gpt-5.5", role="code reviewer (read-only)",
               # PIN model + reasoning effort: without `-c model=...` codex runs the HOST's
