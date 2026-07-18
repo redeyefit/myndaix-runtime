@@ -863,12 +863,14 @@ txt = open(prog).read()
 # proven for the canaries by the stub runs below; the wrappers can't be behaviorally run
 # here without ticking live systems).
 marker = "liveness-fire" in txt
-code = [l for l in txt.splitlines() if not l.lstrip().startswith("#")]
-plumbing = (
-    any("printf" in l and "tick fire" in l for l in code)
-    or any("log()" in l and "{" in l for l in code)
-    or any("source" in l and "lib.sh" in l for l in code)
-)
+# FIRST-TOKEN-anchored shapes (KilaBz r3: `: # printf ... tick fire` style inline-comment
+# lines must not pass) — the fire plumbing must BE the command, not appear after one.
+import re as _re
+fire = _re.compile(r"^\s*printf\s.*tick fire")
+logdef = _re.compile(r"^\s*log\s*\(\)\s*\{")
+libsrc = _re.compile(r"^\s*(source|\.)\s+\S*lib\.sh")
+lines = txt.splitlines()
+plumbing = any(fire.match(l) or logdef.match(l) or libsrc.match(l) for l in lines)
 sys.exit(0 if marker and plumbing else 1)
 PYEOF
 for d in "$SUB"/plists/*.json; do
@@ -957,14 +959,18 @@ ok 'printf "%s" "$lv11" | grep -q "last exit code = -1"' "negative last exit cod
 # must not flag every legit job ROGUE with a bootout remedy); exit-0-always covers state
 # writes too (KilaBz P2 — no die/set-e death on streak/latch/mkdir failures)
 ok 'grep -B8 "ROGUE" "$SUB/liveness-canary.sh" | grep -q "targets_ok" || grep -q "targets_ok\" -eq 1" "$SUB/liveness-canary.sh"' "rogue sweep skipped when the declared set failed to populate"
-# run 12 — BEHAVIORAL exit-0-always proof (KilaBz re-review: a textual grep can't prove it):
-# a read-only state dir makes the .last_run touch AND the streak write fail mid-divergence;
-# the canary must ALARM-log and still exit 0 (no launchd failure record, no set -e death).
+# run 12 — BEHAVIORAL exit-0-always proof (KilaBz re-review: a textual grep can't prove it).
+# Why chmod 555 works here (KilaBz r3): 555 blocks directory-ENTRY creation, not writes to
+# existing files — so both failing paths are made CREATIONS: .last_run is removed first
+# (its touch becomes a create), and the streak write always creates "$STREAK_FILE.tmp"
+# (the tmp never persists — it is mv'd or rm'd every run). Both deterministically fail.
+rm -f "$LVH/state/liveness-last-run"
 chmod 555 "$LVH/state"
 lv12="$(LV_MODE=notloaded lvrun)"; lv12rc=$?
 chmod 755 "$LVH/state"
 ok '[[ "$lv12rc" -eq 0 ]]' "read-only state dir mid-divergence -> canary STILL exits 0 (behavioral exit-0-always)"
 ok 'printf "%s" "$lv12" | grep -q "ALARM could not write streak"' "streak-write failure ALARM-logged (not die, not silent)"
+ok 'printf "%s" "$lv12" | grep -q "WARN cannot touch .last_run"' ".last_run create-failure WARN-logged, run continues"
 ok '! grep -qE "^[[:space:]]*die " "$SUB/liveness-canary.sh"' "canary body never calls die (config-load die inside lib.sh is the accepted pre-check)"
 # mutual watch: drift-canary reverse-watches liveness-canary.out through its existing latch
 ok 'grep -q "liveness-canary.out" "$SUB/drift-canary.sh" && grep -A3 "liveness-canary.out stale" "$SUB/drift-canary.sh" | grep -q "rc=1"' "drift-canary folds a stale liveness-canary.out into its own streak+latch path"
