@@ -55,6 +55,16 @@ jobs:
             fi
           done
 
+      - name: Bash quality (shellcheck + our semgrep bug-rules + bats)
+        # bash-heavy repo; CodeQL doesn't cover bash. bash-check ERROR-gates (shellcheck + the custom
+        # bug-rules + pipefail); bats runs the shell test suite. See tools/README.md.
+        run: |
+          set -e
+          pip install semgrep
+          sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+          ./tools/bash-check.sh
+          bats tests/bash/
+
       - name: Substrate smoke + security harness
         # Fixture-only; portable (plistlib not macOS plutil; shellcheck skipped if absent). Catches
         # a stale migration_head.txt pin, config-parser/denylist regressions, quiesce-list drift.
