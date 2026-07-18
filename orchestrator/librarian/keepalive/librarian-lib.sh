@@ -65,3 +65,62 @@ lib_alert() {
   fi
   return 0
 }
+
+lib_validate_fence() {
+  # Fail-CLOSED fence validation (review r1 CRITICAL). Existence alone is NOT enough: under
+  # `defaultMode: dontAsk` with Bash intentionally un-denied, a present-but-broken gate (malformed
+  # settings.json, missing/wrong hook path, a hook that emits no decision) falls THROUGH to ALLOW —
+  # i.e. an UNCONFINED Bash session. So actually PROVE the fence before launch:
+  #   1. settings.json is valid JSON,
+  #   2. its deny-list covers the non-Bash surface (Read+Write as a proxy),
+  #   3. it wires a Bash PreToolUse hook whose command is an ABSOLUTE, EXECUTABLE path,
+  #   4. that hook actually DENIES a disallowed command AND ALLOWS a valid `mxr ask` (smoke-run).
+  # Returns 0 iff all hold; logs the specific failure and returns 1 otherwise. Side-effect-free
+  # (the recall-gate is a pure decision function).
+  local ws="${1:-$LIB_WORKSPACE}" settings hook prc
+  settings="$ws/.claude/settings.json"
+  if [[ ! -f "$settings" ]]; then lib_log "fence: settings.json missing ($settings)"; return 1; fi
+
+  # parse + structural asserts in one python pass. exit: 0 ok (prints hook cmd), 2 bad-json,
+  # 3 no-Bash-hook, 4 weak-deny.
+  hook="$(python3 - "$settings" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(2)
+deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
+if not {"Read", "Write"} <= deny:
+    sys.exit(4)
+for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
+    if str(h.get("matcher")) == "Bash":
+        for hh in (h.get("hooks") or []):
+            if hh.get("type") == "command" and hh.get("command"):
+                print(hh["command"]); sys.exit(0)
+sys.exit(3)
+PY
+)"
+  prc=$?
+  case "$prc" in
+    0) : ;;
+    2) lib_log "fence: settings.json is not valid JSON"; return 1 ;;
+    3) lib_log "fence: no Bash PreToolUse hook in settings.json"; return 1 ;;
+    4) lib_log "fence: deny-list does not cover the non-Bash surface (Read/Write)"; return 1 ;;
+    *) lib_log "fence: settings.json validation failed (rc=$prc)"; return 1 ;;
+  esac
+
+  case "$hook" in /*) : ;; *) lib_log "fence: hook path not absolute: $hook"; return 1 ;; esac
+  if [[ ! -x "$hook" ]]; then lib_log "fence: hook not executable: $hook"; return 1; fi
+
+  # smoke: a disallowed command MUST be denied.
+  if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' \
+       | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
+    lib_log "fence: hook did NOT deny a disallowed command (ls) — refusing to launch"; return 1
+  fi
+  # smoke: a valid `mxr ask` MUST be allowed (else the librarian would be dead-but-fenced; catch it).
+  if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"smoke\""}}' \
+       | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"allow"'; then
+    lib_log "fence: hook did NOT allow a valid mxr ask (research) — misconfigured gate"; return 1
+  fi
+  return 0
+}

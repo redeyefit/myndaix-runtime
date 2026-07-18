@@ -29,11 +29,13 @@ if [[ -e "$PARK_MARKER" ]]; then
   exit 0
 fi
 
-# (b) workspace must be staged — the RC session's fence (CLAUDE.md + .claude/settings.json + the
-# recall-gate) lives in LIB_WORKSPACE. Starting a session in an unstaged dir would run WITHOUT the
-# deny-list/gate. Fail-closed: refuse to start if the fence is not present.
-if [[ ! -f "$LIB_WORKSPACE/.claude/settings.json" ]]; then
-  lib_log "bootstrap: workspace fence missing ($LIB_WORKSPACE/.claude/settings.json), not starting (fail-closed)"
+# (b) workspace fence must be REAL, not merely present. Existence-only is fail-OPEN: under
+# `defaultMode: dontAsk` with Bash un-denied, a malformed settings.json / missing / wrong-path hook
+# lets RC come up with an UNCONFINED Bash session (review r1 CRITICAL). lib_validate_fence parses the
+# JSON, asserts the non-Bash deny surface, and SMOKE-RUNS the gate (must deny `ls`, allow a valid
+# `mxr ask`). Fail-closed: refuse to start unless the fence actually confines.
+if ! lib_validate_fence "$LIB_WORKSPACE"; then
+  lib_log "bootstrap: workspace fence invalid, not starting (fail-closed)"
   exit 0
 fi
 
