@@ -162,6 +162,17 @@ for label in ai.myndaix.runtime; do
   fi
 done
 
+# ---- known hand-managed labels OUTSIDE substrate, EXCLUDED from the rogue sweep, NOT watched here.
+# Each has its own supervisor/self-heal, so liveness-canary must not false-flag it as rogue (it would
+# emit a bootout remedy for a legitimate job) — but we deliberately don't hardcode another system's
+# .out path/gap here (keeps substrate decoupled). Added to `declared` only, no check run.
+#  - ai.myndaix.librarian-rc: the recall-librarian keepalive supervisor (StartInterval self-heal;
+#    orchestrator/librarian/keepalive/). It relaunches its own RC session — its liveness is its job.
+# shellcheck disable=SC2043  # single-item list is intentional — the roster grows in place
+for label in ai.myndaix.librarian-rc; do
+  declared="${declared}${label}"$'\n'
+done
+
 # ---- reverse sweep: loaded ai.myndaix.* minus declared minus static = rogue -------------
 # Enumeration uses `launchctl list` (tab-delimited, stable); `print` output is never parsed
 # for enumeration (brittle across macOS releases). SKIPPED when the declared set is incomplete —
