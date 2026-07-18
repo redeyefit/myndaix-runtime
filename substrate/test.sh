@@ -824,12 +824,260 @@ echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) ==
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"
 ok 'grep -q "deny network" "$REPO/orchestrator/play-fix.sh"' "play-fix sandbox denies network (no live-ledger reach)"
 
+echo "== liveness-canary: declared-set extraction (liveness_targets.py) =="
+LV="$TMP/lv"; LVH="$LV/home"
+mkdir -p "$LVH/inbox" "$LVH/state" "$LVH/orchestrator" "$LV/fakehome/Library/LaunchAgents" "$LV/plists"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$LVH" "$LVH" "$REPO" > "$LVH/config.env"
+LT="$SUB/liveness_targets.py"
+printf '{"label":"ai.myndaix.t1","roles":["factory"],"stdout":"{MYNDAIX_HOME}/orchestrator/t1.out","liveness_max_gap_seconds":100}' > "$LV/plists/t1.json"
+printf '{"label":"ai.myndaix.t2","roles":["lab"],"stdout":"{MYNDAIX_HOME}/orchestrator/t2.out","liveness_max_gap_seconds":100}' > "$LV/plists/t2.json"
+printf '{"label":"ai.myndaix.t3","roles":["factory"],"requires_sentinel":"T3_ARMED","stdout":"{MYNDAIX_HOME}/orchestrator/t3.out","liveness_max_gap_seconds":50}' > "$LV/plists/t3.json"
+printf '{broken' > "$LV/plists/t4.json"
+printf '{"label":"ai.myndaix.t5","roles":["factory"],"stdout":"{MYNDAIX_HOME}/orchestrator/t5.out"}' > "$LV/plists/t5.json"
+lt_out="$(python3 "$LT" "$LVH/config.env" "$LV"/plists/*.json)"; lt_rc=$?
+ok '[[ "$lt_rc" -eq 0 ]]' "targets: a corrupt descriptor does NOT sink the batch (exit 0)"
+ok '[[ "$(printf "%s\n" "$lt_out" | awk -F"\t" "\$1==\"ai.myndaix.t1\"{print \$2\":\"\$3\":\"\$4}")" == "100:-:$LVH/orchestrator/t1.out" ]]' "targets: watched job emits label/max_gap/-/resolved .out path"
+ok '! printf "%s\n" "$lt_out" | grep -q "ai.myndaix.t2"' "targets: other-role descriptor skipped (excluded, not missing)"
+ok '[[ "$(printf "%s\n" "$lt_out" | awk -F"\t" "\$1==\"ai.myndaix.t3\"{print \$3}")" == "T3_ARMED" ]]' "targets: requires_sentinel carried through"
+ok 'printf "%s\n" "$lt_out" | grep -q "^ERR	t4.json	"' "targets: corrupt JSON -> per-file ERR line (fail-closed, batch continues)"
+ok 'printf "%s\n" "$lt_out" | grep -q "^ERR	t5.json	.*liveness_max_gap_seconds"' "targets: watched-role descriptor MISSING liveness_max_gap_seconds -> ERR (unwatchable = the omission class)"
+
+echo "== liveness-canary: build gates — every descriptor watchable + every-tick-logs invariant =="
+for d in "$SUB"/plists/*.json; do
+  ok 'python3 -c "import json,sys; g=json.load(open(sys.argv[1])).get(\"liveness_max_gap_seconds\"); sys.exit(0 if isinstance(g,int) and not isinstance(g,bool) and g>0 else 1)" "'"$d"'"' "descriptor $(basename "$d") declares a positive liveness_max_gap_seconds"
+done
+# every descriptor's PROGRAM must write >=1 stdout line per fire (the .out mtime IS the
+# execution evidence) — asserted via the liveness-fire marker each program carries.
+cat > "$TMP/lvfire.py" <<'PYEOF'
+import json, os, sys
+repo, desc = sys.argv[1], sys.argv[2]
+prog = json.load(open(desc))["program"][-1]
+prog = prog.replace("{DEPLOY_CLONE}", repo)
+# the reconcile poll runs the INSTALLED bootstrap-fetch copy; its source is in substrate/
+prog = prog.replace("{MYNDAIX_HOME}/bin/bootstrap-fetch", os.path.join(repo, "substrate", "bootstrap-fetch.sh"))
+txt = open(prog).read()
+# The marker documents the invariant; it must be BACKED by real fire plumbing on a
+# NON-COMMENT line (KilaBz re-review: comment-embedded strings must not pass): either the
+# wrappers' unconditional `printf ... tick fire`, or an every-exit-path log() (defined
+# locally, or lib.sh sourced — whose log the canaries call on every path; behaviorally
+# proven for the canaries by the stub runs below; the wrappers can't be behaviorally run
+# here without ticking live systems).
+marker = "liveness-fire" in txt
+# FIRST-TOKEN-anchored shapes (KilaBz r3/r4: neither `: # printf ... tick fire` nor
+# `printf # tick fire` may pass) — 'tick fire' must be INSIDE printf's single-quoted
+# argument, i.e. it IS the emitted output, not an inline comment.
+import re as _re
+fire = _re.compile(r"^\s*printf\s+'[^']*tick fire[^']*'")
+logdef = _re.compile(r"^\s*log\s*\(\)\s*\{")
+libsrc = _re.compile(r"^\s*(source|\.)\s+\S*lib\.sh")
+lines = txt.splitlines()
+plumbing = any(fire.match(l) or logdef.match(l) or libsrc.match(l) for l in lines)
+sys.exit(0 if marker and plumbing else 1)
+PYEOF
+for d in "$SUB"/plists/*.json; do
+  ok 'python3 "$TMP/lvfire.py" "$REPO" "'"$d"'"' "every-tick-logs: $(basename "$d" .json) program carries the liveness-fire stdout invariant"
+done
+ok '[[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[\"schedule\"][\"StartInterval\"])" "$SUB/plists/ai.myndaix.liveness.json")" == "$(grep -m1 "^INTERVAL=" "$SUB/liveness-canary.sh" | cut -d= -f2 | cut -d" " -f1)" ]]' "canary INTERVAL matches its descriptor StartInterval"
+
+echo "== liveness-canary: runtime divergence paths (stub launchctl — live launchd untouched) =="
+cat > "$LV/launchctl" <<'EOF'
+#!/bin/bash
+# stub: LV_MODE=notloaded|clean, LV_EXIT_CODE=<n>, LV_LIST="<extra loaded labels>"
+case "$1" in
+  print)
+    [[ "${LV_MODE:-clean}" == "notloaded" ]] && exit 113
+    printf '\tstate = waiting\n\tpid = 4242\n\tlast exit code = %s\n' "${LV_EXIT_CODE:-0}"
+    ;;
+  list)
+    printf 'PID\tStatus\tLabel\n'
+    for l in ${LV_LIST:-}; do printf -- '-\t0\t%s\n' "$l"; done
+    # LV_RAW emits ONE label verbatim (quoted) so a label containing a space/odd byte survives
+    # (the ${LV_LIST} loop word-splits) — used to exercise the malformed-label rogue path.
+    [[ -n "${LV_RAW:-}" ]] && printf -- '-\t0\t%s\n' "$LV_RAW"
+    ;;
+esac
+exit 0
+EOF
+chmod +x "$LV/launchctl"
+lvrun() { MYNDAIX_HOME="$LVH" HOME="$LV/fakehome" LIVENESS_LAUNCHCTL="$LV/launchctl" /bin/bash "$SUB/liveness-canary.sh" 2>&1; }
+# run 1 — nothing loaded: divergences, streak=1, NO alert yet; sentinel-gated job skipped
+lv1="$(LV_MODE=notloaded lvrun)"; lv1rc=$?
+ok '[[ "$lv1rc" -eq 0 ]]' "canary exits 0 even when divergent (no launchd failure state)"
+ok 'printf "%s" "$lv1" | grep -q "ai.myndaix.controller: NOT LOADED"' "not-loaded declared job -> divergence with bootstrap remedy"
+ok '! printf "%s" "$lv1" | grep -q "ai.myndaix.reconcile"' "sentinel-gated job (unarmed) skipped — not a divergence"
+ok 'printf "%s" "$lv1" | grep -q "ai.myndaix.runtime: daemon NOT LOADED"' "static daemon (ai.myndaix.runtime) covered — pid liveness"
+ok '[[ "$(cat "$LVH/state/liveness-streak")" == "1" ]]' "streak=1 after first divergent run"
+ok '[[ "$(ls "$LVH/inbox" 2>/dev/null | wc -l | tr -d " ")" == "0" ]]' "below threshold: no alert dropped"
+ok '[[ -e "$LVH/state/liveness-last-run" ]]' ".last_run touched on a normal run (Oracle build note 1)"
+# run 2 — still divergent: threshold 2 -> alert + latch
+lv2="$(LV_MODE=notloaded lvrun)"
+ok 'ls "$LVH/inbox"/liveness-alert-*.md >/dev/null 2>&1' "streak threshold (2) -> alert dropped to operator inbox"
+ok '[[ -e "$LVH/state/liveness-alerted" ]]' "latch set only after a successful alert write"
+ok 'grep -q "NOT LOADED" "$LVH"/inbox/liveness-alert-*.md && grep -q "remedy" "$LVH"/inbox/liveness-alert-*.md' "alert lists each divergent label + which check failed + the remedy"
+# run 3 — latched: no duplicate alert
+lv3="$(LV_MODE=notloaded lvrun)"
+ok '[[ "$(ls "$LVH/inbox" | wc -l | tr -d " ")" == "1" ]]' "latched: no duplicate alert on run 3"
+# run 4 — clean via UNCONDITIONAL reconcile-grace (fresh plists) -> streak + latch reset
+for d in "$SUB"/plists/*.json; do
+  l="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["label"])' "$d")"
+  touch "$LV/fakehome/Library/LaunchAgents/$l.plist"
+done
+lv4="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv4" | grep -q "all declared jobs alive"' "fresh plist mtimes -> unconditional reconcile-grace PASS"
+ok '[[ ! -e "$LVH/state/liveness-streak" && ! -e "$LVH/state/liveness-alerted" ]]' "clean run resets streak + latch"
+# run 5 — grace expired, loaded, but NO .out ever -> never-ran divergence
+find "$LV/fakehome/Library/LaunchAgents" -name "*.plist" -exec touch -t 202601010000 {} +
+lv5="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv5" | grep -q "NEVER RAN"' "past grace with no execution evidence -> never-ran divergence"
+# run 6 — fresh evidence everywhere EXCEPT controller (stale) -> only controller flags
+python3 "$LT" "$LVH/config.env" "$SUB"/plists/*.json | while IFS="$(printf '\t')" read -r l g s o; do
+  [[ -n "$o" ]] || continue; mkdir -p "$(dirname "$o")"; touch "$o"
+done
+touch -t 202601010000 "$LVH/orchestrator/controller.out"
+lv6="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv6" | grep -q "ai.myndaix.controller: STALE"' "stale .out past max gap -> divergence naming the .out"
+ok '! printf "%s" "$lv6" | grep -q "ai.myndaix.automerge:"' "fresh .out passes (no false stale)"
+# run 7 — a job firing FRESH but exiting nonzero diverges ONLY after TWO consecutive failed FIRES
+# (launchd latches last-exit-code; a single failed run re-read across ticks must not satisfy the
+# persistence threshold — KilaBz re-review). Two distinct-but-fresh .out mtimes = two fires.
+utime(){ python3 -c 'import os,sys,time; t=time.time()-float(sys.argv[2]); os.utime(sys.argv[1],(t,t))' "$1" "$2"; }
+rm -f "$LVH/state/liveness-ec-ai.myndaix.controller"
+utime "$LVH/orchestrator/controller.out" 300                      # fire 1 (fresh)
+lv7a="$(LV_MODE=clean LV_EXIT_CODE=78 lvrun)"
+ok '! printf "%s" "$lv7a" | grep -q "controller: exited nonzero"' "#3: ONE failed fire does NOT diverge (single latched exit is not persistence)"
+utime "$LVH/orchestrator/controller.out" 120                      # fire 2 (fresh, NEWER mtime)
+lv7="$(LV_MODE=clean LV_EXIT_CODE=78 lvrun)"
+ok 'printf "%s" "$lv7" | grep -q "ai.myndaix.controller: exited nonzero (78) on 2 consecutive fires"' "#3: TWO consecutive failed fires -> divergence (persistence across RUNS, not ticks)"
+touch "$LVH/orchestrator/controller.out"                          # fresh exit 0 resets the memory
+lv7c="$(LV_MODE=clean lvrun)"
+ok '! printf "%s" "$lv7c" | grep -q "controller: exited nonzero" && [[ ! -e "$LVH/state/liveness-ec-ai.myndaix.controller" ]]' "#3: a fresh exit 0 clears the consecutive-fail memory (recovered)"
+# run 8 — rogue sweep: an undeclared loaded ai.myndaix.* label flags; declared ones don't
+lv8="$(LV_MODE=clean LV_LIST="ai.myndaix.rogue ai.myndaix.controller" lvrun)"
+ok 'printf "%s" "$lv8" | grep -q "ai.myndaix.rogue: ROGUE"' "reverse sweep: undeclared loaded label -> rogue divergence"
+ok '! printf "%s" "$lv8" | grep -q "ai.myndaix.controller: ROGUE"' "reverse sweep: declared label never flagged rogue"
+# run 9 — ARMED sentinel-gated job IS watched (missing evidence -> divergence)
+touch "$LVH/RECONCILE_ARMED"
+rm -f "$LVH/state/reconcile.out"   # run 6 pre-touched it (targets ignore arming; bash gates it)
+lv9="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv9" | grep -q "ai.myndaix.reconcile: NEVER RAN"' "armed sentinel job IS watched (no evidence -> divergence)"
+rm -f "$LVH/RECONCILE_ARMED"
+# run 10 — sleep/wake self-grace: own last-run stale -> touch + skip one tick, check nothing
+touch -t 202601010000 "$LVH/state/liveness-last-run"
+lv10="$(LV_MODE=notloaded lvrun)"
+ok 'printf "%s" "$lv10" | grep -q "sleep/wake grace"' "stale own .last_run -> sleep-guard grace tick"
+ok '! printf "%s" "$lv10" | grep -q "DIVERGENT"' "grace tick checks nothing (no wake-up alert storm)"
+# run 11 — a NEGATIVE (signal-class) exit code is parsed + caught, also after two consecutive fires.
+rm -f "$LVH/state/liveness-ec-ai.myndaix.automerge"
+utime "$LVH/orchestrator/automerge.out" 300; LV_MODE=clean LV_EXIT_CODE=-1 lvrun >/dev/null   # fire 1
+utime "$LVH/orchestrator/automerge.out" 120                                                    # fire 2
+lv11="$(LV_MODE=clean LV_EXIT_CODE=-1 lvrun)"
+ok 'printf "%s" "$lv11" | grep -q "ai.myndaix.automerge: exited nonzero (-1) on 2 consecutive fires"' "negative signal-class exit code caught after two fires (parse handles the minus sign)"
+touch "$LVH/orchestrator/automerge.out"; LV_MODE=clean lvrun >/dev/null                        # reset
+# review folds: rogue sweep is GATED on a populated declared set (Oracle P3 — an empty set
+# must not flag every legit job ROGUE with a bootout remedy); exit-0-always covers state
+# writes too (KilaBz P2 — no die/set-e death on streak/latch/mkdir failures)
+ok 'grep -B8 "ROGUE" "$SUB/liveness-canary.sh" | grep -q "targets_ok" || grep -q "targets_ok\" -eq 1" "$SUB/liveness-canary.sh"' "rogue sweep skipped when the declared set failed to populate"
+# run 12 — BEHAVIORAL exit-0-always proof (KilaBz re-review: a textual grep can't prove it).
+# Why chmod 555 works here (KilaBz r3): 555 blocks directory-ENTRY creation, not writes to
+# existing files — so both failing paths are made CREATIONS: .last_run is removed first
+# (its touch becomes a create), and the streak write always creates "$STREAK_FILE.tmp"
+# (the tmp never persists — it is mv'd or rm'd every run). Both deterministically fail.
+rm -f "$LVH/state/liveness-last-run"
+chmod 555 "$LVH/state"
+lv12="$(LV_MODE=notloaded lvrun)"; lv12rc=$?
+chmod 755 "$LVH/state"
+ok '[[ "$lv12rc" -eq 0 ]]' "read-only state dir mid-divergence -> canary STILL exits 0 (behavioral exit-0-always)"
+ok 'printf "%s" "$lv12" | grep -q "ALARM could not write streak"' "streak-write failure ALARM-logged (not die, not silent)"
+ok 'printf "%s" "$lv12" | grep -q "WARN cannot touch .last_run"' ".last_run create-failure WARN-logged, run continues"
+ok '! grep -qE "^[[:space:]]*die " "$SUB/liveness-canary.sh"' "canary body never calls die (config-load die inside lib.sh is the accepted pre-check)"
+ok 'grep -qE "print|list" "$SUB/liveness-canary.sh" && ! grep -qE "\"\\\$LCTL\" (bootstrap|bootout|kickstart)" "$SUB/liveness-canary.sh"' "liveness-canary is READ-ONLY against launchd (print/list only)"
+# CI-portability guard (the Linux-red regression): the leaky `stat -f ... || stat -c` INSIDE one
+# substitution captures GNU `stat -f`'s (--file-system) multiline stdout as garbage and aborts the
+# arithmetic under set -e. The fixed forms are &&-guarded or separate-assignment (no `|| stat -c`).
+ok '! grep -hE "\\|\\| stat -c" "$SUB/liveness-canary.sh" "$SUB/drift-canary.sh" "$SUB/reconcile.sh"' "no leaky 'stat -f ... || stat -c' chained substitution (GNU-stat safe on Linux CI)"
+
+echo "== liveness-canary: deep-audit folds (P1 grow-only latch, ERR/rogue, exit-fresh, content-aware install) =="
+# Fresh scenario, own clean state: all plists old (past grace), all .out fresh, no latch.
+rm -f "$LVH/inbox"/* "$LVH/state/liveness-streak" "$LVH/state/liveness-alerted" "$LVH/RECONCILE_ARMED" 2>/dev/null
+find "$LV/fakehome/Library/LaunchAgents" -name "*.plist" -exec touch -t 202601010000 {} +
+python3 "$LT" "$LVH/config.env" "$SUB"/plists/*.json | while IFS="$(printf '\t')" read -r l g s o; do
+  [[ -n "$o" ]] || continue; mkdir -p "$(dirname "$o")"; touch "$o"
+done
+# P1 grow-only latch: a NEW divergent label alerts EVEN WHILE a prior divergence is latched.
+# (Asserts on stdout + the latched key SET, not inbox file count: same-second runs collide on the
+# date-stamped alert filename — impossible live at 900s cadence, a pure test artifact.)
+touch -t 202601010000 "$LVH/orchestrator/controller.out"          # controller STALE
+lvPA="$(LV_MODE=clean lvrun)"                                      # tick A: streak 1, no alert
+ok '! printf "%s" "$lvPA" | grep -q "alert dropped"' "P1 tick A: below threshold -> no alert (streak 1)"
+lvPB="$(LV_MODE=clean lvrun)"                                      # tick B: streak 2 -> alert #1 (controller)
+ok 'printf "%s" "$lvPB" | grep -q "alert dropped"' "P1 tick B: streak 2 -> alert #1 (controller), latched"
+touch -t 202601010000 "$LVH/orchestrator/automerge.out"           # automerge NOW also STALE (new)
+lvP1="$(LV_MODE=clean lvrun)"                                      # tick C: new key -> alert #2
+ok 'printf "%s" "$lvP1" | grep -q "alert dropped"' "P1: a NEW divergent label alerts WHILE a prior one is latched (grow-only, not global-latch blind)"
+ok 'grep -q "new: ai.myndaix.automerge" "$LVH"/inbox/liveness-alert-*.md' "P1: the second alert names the NEW key (automerge), not a re-alert of controller"
+ok 'grep -q "ai.myndaix.controller" "$LVH/state/liveness-alerted" && grep -q "ai.myndaix.automerge" "$LVH/state/liveness-alerted"' "P1: the latch set now holds BOTH divergent keys"
+lvP1b="$(LV_MODE=clean lvrun)"                                     # tick D: no new key -> no alert
+ok '! printf "%s" "$lvP1b" | grep -q "alert dropped"' "P1: no NEW key -> no duplicate alert (latch holds the known set)"
+touch "$LVH/orchestrator/controller.out" "$LVH/orchestrator/automerge.out"  # both heal
+lvP1c="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lvP1c" | grep -q "all declared jobs alive" && [[ ! -e "$LVH/state/liveness-alerted" ]]' "P1: a fully-clean run clears the latched key set"
+# #3 exit-fresh gate: a STALE job's launchd-latched old nonzero exit does NOT double-report.
+touch -t 202601010000 "$LVH/orchestrator/controller.out"          # controller STALE again
+lvEC="$(LV_MODE=clean LV_EXIT_CODE=1 lvrun)"
+ok 'printf "%s" "$lvEC" | grep -q "ai.myndaix.controller: STALE"' "#3: a stale job reports STALE"
+ok '! printf "%s" "$lvEC" | grep -q "controller: exited nonzero"' "#3: exit-code is NOT evaluated on a STALE job (no double-report; latch-vs-tick debounce fix)"
+touch "$LVH/orchestrator/controller.out"; rm -f "$LVH/state/liveness-ec-ai.myndaix.controller"  # heal + reset EC memory
+# #4 ERR -> rogue sweep skipped: a corrupt descriptor for a still-loaded label must NOT flag it ROGUE.
+# Uses the PLISTS_DIR seam to point the canary at a fixture set where one descriptor is corrupt.
+LVBAD="$LV/badplists"; mkdir -p "$LVBAD"; cp "$SUB"/plists/*.json "$LVBAD"/
+printf '{corrupt' > "$LVBAD/ai.myndaix.controller.json"           # controller descriptor now corrupt
+lvERR="$(LV_MODE=clean LV_LIST="ai.myndaix.controller" LIVENESS_PLISTS_DIR="$LVBAD" lvrun)"
+ok 'printf "%s" "$lvERR" | grep -q "descriptor ai.myndaix.controller.json"' "#4: a corrupt descriptor is its own ERR divergence"
+ok '! printf "%s" "$lvERR" | grep -q "controller: ROGUE"' "#4: the ERR'd job's still-loaded label is NOT flagged ROGUE (rogue sweep skipped on incomplete declared set)"
+# #5 malformed rogue label: a TRAILING-SPACE label (LV_RAW, verbatim) must NOT get a bootout
+# remedy — tr-style stripping would alias it onto the healthy declared 'ai.myndaix.controller'.
+lvMAL="$(LV_MODE=clean LV_RAW='ai.myndaix.controller ' lvrun)"
+ok 'printf "%s" "$lvMAL" | grep -q "MALFORMED loaded label"' "#5: a label failing the strict regex is reported MALFORMED (hex), not sanitized"
+ok '! printf "%s" "$lvMAL" | grep -qE "bootout .*/ai.myndaix.controller$"' "#5: a mangled label gets NO bootout remedy (never aliases onto the healthy declared controller)"
+# #2 content-aware install: render is deterministic -> cmp -s skips a no-op converge (mtime honest).
+python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > "$TMP/ci1.plist"
+python3 "$RP" render "$SUB/plists/ai.myndaix.controller.json" "$TMP/good.env" > "$TMP/ci2.plist"
+ok 'cmp -s "$TMP/ci1.plist" "$TMP/ci2.plist"' "#2: render is deterministic -> content-aware cmp -s skips a no-op converge (plist mtime preserved -> grace honest)"
+ok 'grep -q "cmp -s" "$SUB/reconcile.sh"' "#2: reconcile guards the plist install with cmp -s (only rewrites on a real change)"
+# #2 (KilaBz re-review): the skip requires a REGULAR file at mode 0644 — a byte-identical but
+# wrong-mode/symlinked plist is NOT converged and must be repaired, not skipped.
+ok 'grep -q "! -L \"\$inst\"" "$SUB/reconcile.sh" && grep -q "imode" "$SUB/reconcile.sh"' "#2: content-aware skip also requires regular-file + mode 0644 (convergence completeness, not byte-only)"
+# #8 reconcile gap vs default poll: gap must be >= 2x the POLL_INTERVAL_S default (900).
+ok '[[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[\"liveness_max_gap_seconds\"])" "$SUB/plists/ai.myndaix.reconcile.json")" -ge 1800 ]]' "#8: reconcile liveness gap >= 2x the default POLL_INTERVAL_S (900) — no false STALE at default"
+ok 'grep -q "raise that gap" "$SUB/config.env.example"' "#8: config.env.example documents the POLL/gap coupling for non-default poll intervals"
+
+echo "== drift-canary: INDEPENDENT liveness-watch latch (deep-audit P2 mutual-watch void) =="
+DVH="$LV/drifthome"; DFH="$LV/dfakehome"
+mkdir -p "$DVH/state" "$DVH/inbox" "$DFH/Library/LaunchAgents"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$DVH" "$DVH" "$REPO" > "$DVH/config.env"
+dvrun(){ MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC="$1" /bin/bash "$SUB/drift-canary.sh" 2>&1; }
+# liveness plist installed long ago + no liveness-canary.out => the watcher is dead.
+: > "$DFH/Library/LaunchAgents/ai.myndaix.liveness.plist"; touch -t 202601010000 "$DFH/Library/LaunchAgents/ai.myndaix.liveness.plist"
+rm -f "$DVH/state/liveness-canary.out"
+# CONFIG CLEAN (rc=0) but liveness dead -> the liveness-watch must STILL alert (independent latch).
+dvrun 0 >/dev/null; dvL="$(dvrun 0)"
+ok 'ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2: liveness-watch alerts even when config drift is CLEAN (not folded into the drift latch)"
+ok '! ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2: no config-drift alert on a clean dry-run (rc=0)"
+ok 'grep -q "the execution watcher is not running" "$DVH"/inbox/liveness-watch-alert-*.md' "P2: the liveness-watch alert names the dead execution watcher"
+# Inverse: config DRIFT (rc=1) + FRESH liveness -> drift alerts, liveness-watch does NOT.
+rm -f "$DVH/inbox"/* "$DVH/state/drift-streak" "$DVH/state/drift-alerted" "$DVH/state/liveness-watch-streak" "$DVH/state/liveness-watch-alerted"
+touch "$DVH/state/liveness-canary.out"          # fresh watcher
+dvrun 1 >/dev/null; dvD="$(dvrun 1)"
+ok 'ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2 inverse: config drift (rc=1) alerts on its own latch"
+ok '! ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2 inverse: a FRESH liveness watcher does not false-alert the reverse watch"
+ok 'grep -q "canary_emit" "$SUB/drift-canary.sh" && grep -q "LW_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "LW_ALERTED_FILE" "$SUB/drift-canary.sh"' "P2: drift-canary uses SEPARATE streak+latch files for the liveness-watch (structural)"
+
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
 # into) — it is bash -n checked below. shellcheck is skipped gracefully if absent (Linux CI).
 HAVE_SC=1; command -v shellcheck >/dev/null 2>&1 || { HAVE_SC=0; echo "  --: SKIP shellcheck (not installed)"; }
-for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh; do
+for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh liveness-canary.sh; do
   ok 'bash -n "'"$SUB/$s"'"' "bash -n $s"
   [[ "$HAVE_SC" == 1 ]] && ok 'shellcheck -x -S warning "'"$SUB/$s"'" >/dev/null 2>&1' "shellcheck $s"
 done

@@ -192,8 +192,30 @@ install_artifacts() {
       rm -f "$tmp"; die "render failed for $label (see $STATE_DIR/reconcile.err)"
     fi
     plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "rendered plist for $label failed plutil -lint"; }
-    atomic_install "$tmp" "$LA_DIR/$label.plist" 0644
-    log "installed plist: $label"
+    # Content-aware install: only rewrite when the rendered plist DIFFERS from what's installed.
+    # An unconditional atomic_install cp+mv mints a fresh inode+mtime every converge, which would
+    # make the installed-plist mtime a lie — the liveness-canary keys its reconcile-grace on that
+    # mtime ("just (re)installed, hasn't run yet"), so a rewrite on every unrelated deploy would
+    # perpetually re-arm the grace and leave long-gap jobs (inbox-assistant, 25h) effectively
+    # unwatched (deep-audit P2). cmp is byte-exact and render is deterministic, so "identical" ==
+    # "nothing to converge" — skipping is correct AND cuts needless launchd-plist churn.
+    # The skip requires a REGULAR file (not a symlink) at the intended mode 0644 too: a
+    # byte-identical but wrong-mode / symlinked / non-regular installed plist is NOT converged and
+    # must be repaired, not skipped (KilaBz re-review — convergence completeness on the load-bearing
+    # LaunchAgents path). Anything off-spec falls through to a real atomic_install.
+    inst="$LA_DIR/$label.plist"
+    # Separate assignments joined by || (NOT `A || B` inside one substitution): GNU `stat -f`
+    # means --file-system and leaks a multiline block to stdout while exiting nonzero; a chained
+    # substitution would capture that garbage. Here a failed `stat -f` (Linux) just re-assigns
+    # imode from `stat -c %a`. macOS BSD `stat -f %Lp` wins on the first try.
+    imode="$(stat -f %Lp "$inst" 2>/dev/null)" || imode="$(stat -c %a "$inst" 2>/dev/null)" || imode=""
+    if [[ -f "$inst" && ! -L "$inst" && "$imode" == "644" ]] && cmp -s "$tmp" "$inst"; then
+      rm -f "$tmp"
+      log "plist unchanged: $label"
+    else
+      atomic_install "$tmp" "$inst" 0644
+      log "installed plist: $label"
+    fi
   done
 
   # 3.5 ORPHAN PRUNE — a previously-managed label no longer in ROLE_LABELS (descriptor removed / role

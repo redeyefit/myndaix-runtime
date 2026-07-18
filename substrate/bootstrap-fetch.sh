@@ -14,6 +14,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 # Bound the network fetch so a hung SSH connection can't stall the poll (macOS has no `timeout`).
 export GIT_SSH_COMMAND="ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes"
 
+# liveness-fire: every invocation writes >=1 line to the launchd .out (every exit path goes
+# through log/die, and stderr shares the .out via StandardErrorPath) — liveness-canary reads
+# that mtime as execution evidence for the ARMED reconcile poll.
 log() { printf '[%s] [bootstrap-fetch] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { log "ALARM: $*" >&2; exit 1; }
 
