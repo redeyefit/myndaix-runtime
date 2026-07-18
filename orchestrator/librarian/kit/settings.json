@@ -1,0 +1,40 @@
+{
+  "_comment": "Recall-librarian fail-closed permission posture (piece C; adapted from the reviewed Watch kit design/watch-v0.3 §3.2). Deploys to ~/librarian/.claude/settings.json. Fail-closed by REMOVING surfaces, not per-path denies. defaultMode=dontAsk (the valid fail-closed mode; 'deny' is INVALID as a mode). allow is EMPTY: the PreToolUse recall-gate hook is the SOLE allow-er of Bash and ONLY allows an exact `mxr ask|recall --scope <scope> \"<safe question>\"` — every other Bash (cat/grep/ls/curl/python, and any `mxr <agent>` DISPATCH) is denied, so nothing can read or act around the gate. The deny list uses BARE tool names to remove the read/exec/standing/subagent tools from the session ENTIRELY: Read/Grep/Glob/Notebook* (file reads), WebSearch/WebFetch (net — lethal-trifecta leg), mcp__*/ReadMcpResourceTool (inherited MCP servers), Agent/Task (a spawned subagent runs OUTSIDE this dir with default-permissive settings — the scariest escape), Monitor/Cron*/RemoteTrigger/ScheduleWakeup (standing-duty tools auto-allowed under dontAsk that break the no-loop, on-demand-only contract), LSP. MCP is also disabled at launch via CLAUDE_CODE_DISABLE_MCP=1. Net: the ONLY thing this session can DO is answer recall questions. Edit the hook path if the checkout is not /Users/stevenfernandez/code/active/myndaix-runtime.",
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [],
+    "deny": [
+      "Read",
+      "Grep",
+      "Glob",
+      "NotebookRead",
+      "NotebookEdit",
+      "WebSearch",
+      "WebFetch",
+      "ReadMcpResourceTool",
+      "mcp__*",
+      "Agent",
+      "Task",
+      "Monitor",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "RemoteTrigger",
+      "ScheduleWakeup",
+      "LSP"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/stevenfernandez/code/active/myndaix-runtime/orchestrator/librarian/hooks/recall-gate.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
