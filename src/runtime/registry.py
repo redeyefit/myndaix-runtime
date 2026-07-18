@@ -226,6 +226,26 @@ V1_ROSTER: list[AgentSpec] = [
                        "application": "/higgsfield-ai/dop/lite",
                        "max_segments": 12,
                        "non_idempotent": True}),   # paid; WORKSPACE_ACTOR already non-requeue (belt)
+    # mx-engine: the content-factory folder promoted to an agent (Rung 1). Option B — a
+    # DETERMINISTIC bash pipeline (reelcopy -> reel), NOT a confined claude producer: it runs the
+    # REAL mx-engine repo with its real env (Chrome/ffmpeg/.venv/personas/.ttscache), so it declares
+    # NO --tools / scratch_home (those are the curator's read-only belt; the opposite need here).
+    #  * WORKSPACE_ACTOR -> NEVER auto-retried: a reel render burns ElevenLabs TTS credits and is
+    #    non-idempotent, so a transient failure must never double-charge (same guarantee stitcher
+    #    /higgsfield rely on). NEVER dispatch mx-engine with a repo_id — a plain `mxr mx-engine
+    #    "topic"` carries none, so worker.py's C5 gate makes NO worktree and the self-locating
+    #    wrapper runs the real repo; a stray repo_id would spawn a useless checkout-copy worktree
+    #    (missing the gitignored venv/personas) — the wrapper's absolute path still works, just wasteful.
+    #  * The wrapper + child .sh scripts source ~/.myndaix/.secrets THEMSELVES, so no env_passthrough
+    #    is needed — real HOME/PATH from the P2 env-base is enough for them to self-load the keys.
+    #  * timeout_s 1500: copy (~30s Claude call) + one full narrated 9:16 render, with wide margin.
+    AgentSpec(agent_id="mx-engine", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
+              model="pipeline", role="content factory (mx-engine folder-agent): topic -> narrated reel",
+              profile=Profile(timeout_s=1500),
+              adapter={"kind": "cli",
+                       "argv": ["bash",
+                                "/Users/stevenfernandez/code/active/mx-engine/mx-produce.sh"],
+                       "prompt_channel": "arg"}),   # whole dispatch string -> $1 = topic
 ]
 
 REGISTRY: dict[str, AgentSpec] = {a.agent_id: a for a in V1_ROSTER}
