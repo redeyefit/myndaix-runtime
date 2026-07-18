@@ -115,16 +115,29 @@ while IFS=$'\t' read -r label max_gap sentinel out_path; do
   elif [[ "$fresh" -eq 0 ]]; then
     diverge "$label" "$label: STALE — last execution evidence $((now - out_m))s ago (max ${max_gap}s) — remedy: investigate $out_path"
   fi
-  # Last exit status — evaluated ONLY when the job is firing FRESH. launchd LATCHES `last exit
-  # code` until the next run, so on a non-firing job the same datum is re-read across canary
-  # ticks (900s < most job intervals) and the THRESHOLD=2 debounce degrades to threshold-1
-  # (deep-audit P2); and a stale job is already reported by STALE above. Scoped to fresh jobs it
-  # catches the unique "fires on schedule but exits nonzero" class; the grow-only latch debounces
-  # it to one alert per failure episode. A parse miss on a future macOS just skips this sub-check.
+  # Last exit status — evaluated ONLY when the job is firing FRESH, and only after TWO CONSECUTIVE
+  # failed FIRES. launchd LATCHES `last exit code` until the next run, so ONE failed fire is visible
+  # across many 900s canary ticks; counting ticks would let a single transient failure satisfy the
+  # THRESHOLD=2 persistence gate (deep-audit P2 + KilaBz re-review). We instead remember, per label,
+  # the .out mtime of the last failed fire and a consecutive-fail count, and only diverge once two
+  # DISTINCT fires (distinct .out mtimes) have failed — persistence across RUNS, not ticks. A fresh
+  # exit 0 resets the memory. STALE jobs are already reported above; a parse miss just skips this.
   if [[ "$fresh" -eq 1 ]]; then
+    ecf="$STATE_DIR/liveness-ec-$label"       # per validated label (safe as a filename)
     ec="$(printf '%s\n' "$pr" | sed -n 's/^[[:space:]]*last exit code = \(-\{0,1\}[0-9][0-9]*\).*/\1/p' | head -1 || true)"
     if [[ "$ec" =~ ^-?[0-9]+$ ]] && [[ "$ec" != "0" ]]; then
-      diverge "$label" "$label: last exit code = $ec (firing on schedule but failing) — remedy: investigate $out_path"
+      ec_line="$(cat "$ecf" 2>/dev/null || echo '0 0')"
+      ec_m="${ec_line%% *}"; ec_cnt="${ec_line##* }"
+      [[ "$ec_m" =~ ^[0-9]+$ ]] || ec_m=0; [[ "$ec_cnt" =~ ^[0-9]+$ ]] || ec_cnt=0
+      if [[ "$out_m" -ne "$((10#$ec_m))" ]]; then          # a NEW fire (distinct .out mtime) failed
+        ec_cnt=$(( 10#$ec_cnt + 1 )); [[ "$ec_cnt" -gt 9 ]] && ec_cnt=9
+        { printf '%s %s\n' "$out_m" "$ec_cnt" > "$ecf.tmp" && mv -f "$ecf.tmp" "$ecf"; } 2>/dev/null || true
+      fi
+      if [[ "$((10#$ec_cnt))" -ge 2 ]]; then               # persisted across >=2 distinct fires
+        diverge "$label" "$label: exited nonzero ($ec) on $((10#$ec_cnt)) consecutive fires (firing but failing) — remedy: investigate $out_path"
+      fi
+    else
+      rm -f "$ecf" 2>/dev/null || true                     # fresh exit 0 -> recovered, reset the memory
     fi
   fi
 done <<< "$targets"
