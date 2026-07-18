@@ -251,6 +251,17 @@ V1_ROSTER: list[AgentSpec] = [
     #      allowlist) — but that EQUALS the manual `./reel.sh` exposure (same operator/HOME/file) and
     #      the topic reaches an LLM as COPY, never shell (no injection path). Follow-up: scope
     #      mx-engine to a narrow secret file (ANTHROPIC/OAuth + ELEVENLABS only).
+    # PRE-DEPLOY AUDIT (5-dim adversarial fleet, 17 findings): FOLDED a BLOCKER the unit tests + diff
+    # review missed — mx-produce.sh staged reel.json in an ABSOLUTE tempdir, which reelgen serves to
+    # headless Chrome over http.server(cwd=repo); an out-of-root path 404s -> blank frame -> the MX
+    # head-clip gate aborts EVERY render. Fixed in mx-produce.sh: stage under a gitignored .mx-work/
+    # inside the repo + pass a DIR-relative path (regression-tested NON-paid in test_mx_produce.sh).
+    # Remaining live-only item (NOT code): headless Chrome runs under the launchd daemon with the
+    # operator's default profile — works from a GUI shell, first-run/profile-lock/TCC UNPROVEN from the
+    # pool; bounded (1500s timeout -> dead, never auto-retried), so the FIRST mxr mx-engine dispatch is
+    # a supervised smoke (don't run it while interactive Chrome holds the same profile). Other 15
+    # findings are all low, bounded, self-healing (dash/empty-topic footguns, sync-wait ~26min, lock
+    # stale-reclaim TOCTOU, stderr-on-success, stale-dest artifact) — documented, none block go-live.
     AgentSpec(agent_id="mx-engine", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="pipeline", role="content factory (mx-engine folder-agent): topic -> narrated reel",
               profile=Profile(timeout_s=1500),
