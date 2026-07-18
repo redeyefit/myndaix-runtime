@@ -92,8 +92,10 @@ except Exception:
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
 if not {"Read", "Write"} <= deny:
     sys.exit(4)
+# accept any matcher that fires for our tools: "*"/""/None (all tools, the allowlist model) or the
+# exact "Bash". The smoke-run below is the real behavioural check regardless of matcher.
 for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
-    if str(h.get("matcher")) == "Bash":
+    if str(h.get("matcher")) in ("*", "", "None", "Bash"):
         for hh in (h.get("hooks") or []):
             if hh.get("type") == "command" and hh.get("command"):
                 print(hh["command"]); sys.exit(0)
@@ -112,10 +114,16 @@ PY
   case "$hook" in /*) : ;; *) lib_log "fence: hook path not absolute: $hook"; return 1 ;; esac
   if [[ ! -x "$hook" ]]; then lib_log "fence: hook not executable: $hook"; return 1; fi
 
-  # smoke: a disallowed command MUST be denied.
+  # smoke: a disallowed Bash command MUST be denied.
   if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' \
        | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
     lib_log "fence: hook did NOT deny a disallowed command (ls) — refusing to launch"; return 1
+  fi
+  # smoke: a NON-Bash tool MUST be denied — proves the allowlist model is in effect (the gate fires
+  # for every tool, not just Bash), i.e. settings.json wired the hook with matcher "*" (r2 HIGH-2).
+  if ! printf '%s' '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' \
+       | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
+    lib_log "fence: hook did NOT deny a non-Bash tool (Read) — allowlist not in effect"; return 1
   fi
   # smoke: a valid `mxr ask` MUST be allowed (else the librarian would be dead-but-fenced; catch it).
   if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"smoke\""}}' \
