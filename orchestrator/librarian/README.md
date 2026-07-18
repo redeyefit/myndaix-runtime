@@ -15,12 +15,19 @@ when the MacBook is awake; graduate to the always-on Mini (+ a launchd keepalive
 | `hooks/recall-gate.{sh,py}` | PreToolUse Bash gate — allows ONLY `mxr ask`/`mxr recall`, denies dispatch + everything else (stays in the repo; settings.json references it by absolute path) |
 | `test.sh` | 15-check gate smoke test (allow safe recall; deny injection/dispatch/other programs) |
 
-## The fence (why it's safe)
-`defaultMode: dontAsk` + `allow: []` + a deny-list that REMOVES Read/Grep/Glob/Web*/MCP/Agent/Task/
-Monitor/Cron*/RemoteTrigger/LSP by bare name. The only Bash the session can run is what the
-recall-gate ALLOWS: an exact `mxr ask|recall --scope <scope> "<safe question>"`. No file reads, no web,
-no dispatch to other agents, no standing loops. A poisoned corpus answer can't escalate — there's no
-tool/dispatch/net channel. This is the fenced-reads-WITHOUT-dispatch half of the shelved Watch design.
+## The fence (why it's safe) — hardened per cross-family review r1
+- `defaultMode: dontAsk` + `allow: []` + a deny-list of the **full current canonical non-Bash tool
+  surface** by name (Read/Grep/Glob/Web*/MCP/Agent/Skill/Workflow/Task*/SendUserFile/… — everything
+  except Bash). Bash is left un-denied ONLY because a settings `deny` overrides a hook `allow`, so
+  `deny:["*"]` would kill Bash; the gate is Bash's sole allow-er.
+- The recall-gate is **fail-closed**: every non-allow path (unparseable/malformed/non-string payload,
+  wrong scope, dispatch, any other program) emits an explicit `deny` — never a bare return (which
+  falls through to ALLOW under `dontAsk`). It allows ONLY `mxr ask --scope research|fitness "<safe q>"`.
+- `mxr recall` is **not** allowed (raw snippets are unfenced); scope is allowlisted to research|fitness
+  (a future sensitive scope can't auto-become phone-reachable); MCP is off (`CLAUDE_CODE_DISABLE_MCP=1`
+  at launch + `disableClaudeAiConnectors`).
+- Net: a poisoned corpus answer can't escalate — no file reads, no web, no dispatch, no other tool. This
+  is the fenced-reads-WITHOUT-dispatch half of the shelved Watch design. 22/22 test.sh.
 
 ## Deploy (MacBook)
 
@@ -33,9 +40,10 @@ cp orchestrator/librarian/kit/settings.json  ~/librarian/.claude/settings.json
 
 **2. Interactive — Jefe's hands (RC rejects long-lived tokens):**
 - Launch from a **normal terminal** (so the session inherits `MYNDAIX_KNOWLEDGE_SCOPES` from `~/.zshrc`,
-  needed for the `fitness` scope; `research` works regardless):
+  needed for the `fitness` scope; `research` works regardless). **`CLAUDE_CODE_DISABLE_MCP=1` is
+  load-bearing** — it loads ZERO MCP servers (settings' `disableClaudeAiConnectors` is belt):
   ```
-  cd ~/librarian && claude
+  cd ~/librarian && CLAUDE_CODE_DISABLE_MCP=1 claude
   ```
 - If prompted, **`claude auth login`** (claude.ai OAuth — API keys / setup-tokens are rejected by RC).
 - **Accept the workspace-trust dialog** for `~/librarian` (one-time; RC refuses to start in an untrusted folder).
