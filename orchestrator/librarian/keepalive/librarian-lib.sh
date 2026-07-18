@@ -13,6 +13,13 @@
 #
 # House rules: bash-scripts.md (set -euo pipefail in the caller; quote all; no eval; 10# numerics).
 
+# This is a SOURCED library — it must NOT set -e or -u, which would pollute the sourcing shell
+# (rc-wrapper.sh deliberately runs `set -uo pipefail` WITHOUT -e, because its child `claude` exits
+# non-zero as normal control flow; forcing -e here would kill the supervisor loop). We enable ONLY
+# pipefail (bash-check's safety-header requirement) — every caller already sets it, so this is a no-op
+# for them, and it never turns on the caller-hostile options.
+set -o pipefail
+
 # ---- config (env-overridable, all fail-safe defaults) ----
 # WORKSPACE = the confined RC cwd (holds CLAUDE.md + .claude/settings.json + the recall-gate fence).
 LIB_WORKSPACE="${LIB_WORKSPACE:-$HOME/librarian}"
