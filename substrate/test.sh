@@ -824,12 +824,128 @@ echo "== work-isolation: play-fix verify sandbox has NO live DSN (r2-C1 lock) ==
 ok '! grep -nE "env -i" "$REPO/orchestrator/play-fix.sh" | grep -q "MYNDAIX_DSN"' "play-fix verify sandbox (env -i) injects no MYNDAIX_DSN"
 ok 'grep -q "deny network" "$REPO/orchestrator/play-fix.sh"' "play-fix sandbox denies network (no live-ledger reach)"
 
+echo "== liveness-canary: declared-set extraction (liveness_targets.py) =="
+LV="$TMP/lv"; LVH="$LV/home"
+mkdir -p "$LVH/inbox" "$LVH/state" "$LVH/orchestrator" "$LV/fakehome/Library/LaunchAgents" "$LV/plists"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$LVH" "$LVH" "$REPO" > "$LVH/config.env"
+LT="$SUB/liveness_targets.py"
+printf '{"label":"ai.myndaix.t1","roles":["factory"],"stdout":"{MYNDAIX_HOME}/orchestrator/t1.out","liveness_max_gap_seconds":100}' > "$LV/plists/t1.json"
+printf '{"label":"ai.myndaix.t2","roles":["lab"],"stdout":"{MYNDAIX_HOME}/orchestrator/t2.out","liveness_max_gap_seconds":100}' > "$LV/plists/t2.json"
+printf '{"label":"ai.myndaix.t3","roles":["factory"],"requires_sentinel":"T3_ARMED","stdout":"{MYNDAIX_HOME}/orchestrator/t3.out","liveness_max_gap_seconds":50}' > "$LV/plists/t3.json"
+printf '{broken' > "$LV/plists/t4.json"
+printf '{"label":"ai.myndaix.t5","roles":["factory"],"stdout":"{MYNDAIX_HOME}/orchestrator/t5.out"}' > "$LV/plists/t5.json"
+lt_out="$(python3 "$LT" "$LVH/config.env" "$LV"/plists/*.json)"; lt_rc=$?
+ok '[[ "$lt_rc" -eq 0 ]]' "targets: a corrupt descriptor does NOT sink the batch (exit 0)"
+ok '[[ "$(printf "%s\n" "$lt_out" | awk -F"\t" "\$1==\"ai.myndaix.t1\"{print \$2\":\"\$3\":\"\$4}")" == "100:-:$LVH/orchestrator/t1.out" ]]' "targets: watched job emits label/max_gap/-/resolved .out path"
+ok '! printf "%s\n" "$lt_out" | grep -q "ai.myndaix.t2"' "targets: other-role descriptor skipped (excluded, not missing)"
+ok '[[ "$(printf "%s\n" "$lt_out" | awk -F"\t" "\$1==\"ai.myndaix.t3\"{print \$3}")" == "T3_ARMED" ]]' "targets: requires_sentinel carried through"
+ok 'printf "%s\n" "$lt_out" | grep -q "^ERR	t4.json	"' "targets: corrupt JSON -> per-file ERR line (fail-closed, batch continues)"
+ok 'printf "%s\n" "$lt_out" | grep -q "^ERR	t5.json	.*liveness_max_gap_seconds"' "targets: watched-role descriptor MISSING liveness_max_gap_seconds -> ERR (unwatchable = the omission class)"
+
+echo "== liveness-canary: build gates — every descriptor watchable + every-tick-logs invariant =="
+for d in "$SUB"/plists/*.json; do
+  ok 'python3 -c "import json,sys; g=json.load(open(sys.argv[1])).get(\"liveness_max_gap_seconds\"); sys.exit(0 if isinstance(g,int) and not isinstance(g,bool) and g>0 else 1)" "'"$d"'"' "descriptor $(basename "$d") declares a positive liveness_max_gap_seconds"
+done
+# every descriptor's PROGRAM must write >=1 stdout line per fire (the .out mtime IS the
+# execution evidence) — asserted via the liveness-fire marker each program carries.
+cat > "$TMP/lvfire.py" <<'PYEOF'
+import json, os, sys
+repo, desc = sys.argv[1], sys.argv[2]
+prog = json.load(open(desc))["program"][-1]
+prog = prog.replace("{DEPLOY_CLONE}", repo)
+# the reconcile poll runs the INSTALLED bootstrap-fetch copy; its source is in substrate/
+prog = prog.replace("{MYNDAIX_HOME}/bin/bootstrap-fetch", os.path.join(repo, "substrate", "bootstrap-fetch.sh"))
+sys.exit(0 if "liveness-fire" in open(prog).read() else 1)
+PYEOF
+for d in "$SUB"/plists/*.json; do
+  ok 'python3 "$TMP/lvfire.py" "$REPO" "'"$d"'"' "every-tick-logs: $(basename "$d" .json) program carries the liveness-fire stdout invariant"
+done
+ok '[[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[\"schedule\"][\"StartInterval\"])" "$SUB/plists/ai.myndaix.liveness.json")" == "$(grep -m1 "^INTERVAL=" "$SUB/liveness-canary.sh" | cut -d= -f2 | cut -d" " -f1)" ]]' "canary INTERVAL matches its descriptor StartInterval"
+
+echo "== liveness-canary: runtime divergence paths (stub launchctl — live launchd untouched) =="
+cat > "$LV/launchctl" <<'EOF'
+#!/bin/bash
+# stub: LV_MODE=notloaded|clean, LV_EXIT_CODE=<n>, LV_LIST="<extra loaded labels>"
+case "$1" in
+  print)
+    [[ "${LV_MODE:-clean}" == "notloaded" ]] && exit 113
+    printf '\tstate = waiting\n\tpid = 4242\n\tlast exit code = %s\n' "${LV_EXIT_CODE:-0}"
+    ;;
+  list)
+    printf 'PID\tStatus\tLabel\n'
+    for l in ${LV_LIST:-}; do printf -- '-\t0\t%s\n' "$l"; done
+    ;;
+esac
+exit 0
+EOF
+chmod +x "$LV/launchctl"
+lvrun() { MYNDAIX_HOME="$LVH" HOME="$LV/fakehome" LIVENESS_LAUNCHCTL="$LV/launchctl" /bin/bash "$SUB/liveness-canary.sh" 2>&1; }
+# run 1 — nothing loaded: divergences, streak=1, NO alert yet; sentinel-gated job skipped
+lv1="$(LV_MODE=notloaded lvrun)"; lv1rc=$?
+ok '[[ "$lv1rc" -eq 0 ]]' "canary exits 0 even when divergent (no launchd failure state)"
+ok 'printf "%s" "$lv1" | grep -q "ai.myndaix.controller: NOT LOADED"' "not-loaded declared job -> divergence with bootstrap remedy"
+ok '! printf "%s" "$lv1" | grep -q "ai.myndaix.reconcile"' "sentinel-gated job (unarmed) skipped — not a divergence"
+ok 'printf "%s" "$lv1" | grep -q "ai.myndaix.runtime: daemon NOT LOADED"' "static daemon (ai.myndaix.runtime) covered — pid liveness"
+ok '[[ "$(cat "$LVH/state/liveness-streak")" == "1" ]]' "streak=1 after first divergent run"
+ok '[[ "$(ls "$LVH/inbox" 2>/dev/null | wc -l | tr -d " ")" == "0" ]]' "below threshold: no alert dropped"
+ok '[[ -e "$LVH/state/liveness-last-run" ]]' ".last_run touched on a normal run (Oracle build note 1)"
+# run 2 — still divergent: threshold 2 -> alert + latch
+lv2="$(LV_MODE=notloaded lvrun)"
+ok 'ls "$LVH/inbox"/liveness-alert-*.md >/dev/null 2>&1' "streak threshold (2) -> alert dropped to operator inbox"
+ok '[[ -e "$LVH/state/liveness-alerted" ]]' "latch set only after a successful alert write"
+ok 'grep -q "NOT LOADED" "$LVH"/inbox/liveness-alert-*.md && grep -q "remedy" "$LVH"/inbox/liveness-alert-*.md' "alert lists each divergent label + which check failed + the remedy"
+# run 3 — latched: no duplicate alert
+lv3="$(LV_MODE=notloaded lvrun)"
+ok '[[ "$(ls "$LVH/inbox" | wc -l | tr -d " ")" == "1" ]]' "latched: no duplicate alert on run 3"
+# run 4 — clean via UNCONDITIONAL reconcile-grace (fresh plists) -> streak + latch reset
+for d in "$SUB"/plists/*.json; do
+  l="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["label"])' "$d")"
+  touch "$LV/fakehome/Library/LaunchAgents/$l.plist"
+done
+lv4="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv4" | grep -q "all declared jobs alive"' "fresh plist mtimes -> unconditional reconcile-grace PASS"
+ok '[[ ! -e "$LVH/state/liveness-streak" && ! -e "$LVH/state/liveness-alerted" ]]' "clean run resets streak + latch"
+# run 5 — grace expired, loaded, but NO .out ever -> never-ran divergence
+find "$LV/fakehome/Library/LaunchAgents" -name "*.plist" -exec touch -t 202601010000 {} +
+lv5="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv5" | grep -q "NEVER RAN"' "past grace with no execution evidence -> never-ran divergence"
+# run 6 — fresh evidence everywhere EXCEPT controller (stale) -> only controller flags
+python3 "$LT" "$LVH/config.env" "$SUB"/plists/*.json | while IFS="$(printf '\t')" read -r l g s o; do
+  [[ -n "$o" ]] || continue; mkdir -p "$(dirname "$o")"; touch "$o"
+done
+touch -t 202601010000 "$LVH/orchestrator/controller.out"
+lv6="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv6" | grep -q "ai.myndaix.controller: STALE"' "stale .out past max gap -> divergence naming the .out"
+ok '! printf "%s" "$lv6" | grep -q "ai.myndaix.automerge:"' "fresh .out passes (no false stale)"
+# run 7 — healthy freshness but last exit code nonzero -> divergence
+touch "$LVH/orchestrator/controller.out"
+lv7="$(LV_MODE=clean LV_EXIT_CODE=78 lvrun)"
+ok 'printf "%s" "$lv7" | grep -q "last exit code = 78"' "nonzero last exit code -> divergence"
+# run 8 — rogue sweep: an undeclared loaded ai.myndaix.* label flags; declared ones don't
+lv8="$(LV_MODE=clean LV_LIST="ai.myndaix.rogue ai.myndaix.controller" lvrun)"
+ok 'printf "%s" "$lv8" | grep -q "ai.myndaix.rogue: ROGUE"' "reverse sweep: undeclared loaded label -> rogue divergence"
+ok '! printf "%s" "$lv8" | grep -q "ai.myndaix.controller: ROGUE"' "reverse sweep: declared label never flagged rogue"
+# run 9 — ARMED sentinel-gated job IS watched (missing evidence -> divergence)
+touch "$LVH/RECONCILE_ARMED"
+rm -f "$LVH/state/reconcile.out"   # run 6 pre-touched it (targets ignore arming; bash gates it)
+lv9="$(LV_MODE=clean lvrun)"
+ok 'printf "%s" "$lv9" | grep -q "ai.myndaix.reconcile: NEVER RAN"' "armed sentinel job IS watched (no evidence -> divergence)"
+rm -f "$LVH/RECONCILE_ARMED"
+# run 10 — sleep/wake self-grace: own last-run stale -> touch + skip one tick, check nothing
+touch -t 202601010000 "$LVH/state/liveness-last-run"
+lv10="$(LV_MODE=notloaded lvrun)"
+ok 'printf "%s" "$lv10" | grep -q "sleep/wake grace"' "stale own .last_run -> sleep-guard grace tick"
+ok '! printf "%s" "$lv10" | grep -q "DIVERGENT"' "grace tick checks nothing (no wake-up alert storm)"
+# mutual watch: drift-canary reverse-watches liveness-canary.out through its existing latch
+ok 'grep -q "liveness-canary.out" "$SUB/drift-canary.sh" && grep -A3 "liveness-canary.out stale" "$SUB/drift-canary.sh" | grep -q "rc=1"' "drift-canary folds a stale liveness-canary.out into its own streak+latch path"
+ok 'grep -qE "print|list" "$SUB/liveness-canary.sh" && ! grep -qE "\"\\\$LCTL\" (bootstrap|bootout|kickstart)" "$SUB/liveness-canary.sh"' "liveness-canary is READ-ONLY against launchd (print/list only)"
+
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
 # into) — it is bash -n checked below. shellcheck is skipped gracefully if absent (Linux CI).
 HAVE_SC=1; command -v shellcheck >/dev/null 2>&1 || { HAVE_SC=0; echo "  --: SKIP shellcheck (not installed)"; }
-for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh; do
+for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh liveness-canary.sh; do
   ok 'bash -n "'"$SUB/$s"'"' "bash -n $s"
   [[ "$HAVE_SC" == 1 ]] && ok 'shellcheck -x -S warning "'"$SUB/$s"'" >/dev/null 2>&1' "shellcheck $s"
 done

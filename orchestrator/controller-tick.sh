@@ -8,6 +8,11 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+# liveness-fire: one unconditional stdout line per fire — liveness-canary reads this job's
+# .out mtime as execution evidence, and the python tick has silent early-return paths
+# (no repos, lock held) that would otherwise leave the mtime frozen (false "stale" alert).
+printf '[%s] [controller-tick] tick fire\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+
 # repo root = this script's parent dir's parent (orchestrator/..), so the wrapper is
 # portable across machines without a hardcoded path.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

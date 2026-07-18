@@ -6,5 +6,6 @@
   "schedule": {"StartInterval": "{POLL_INTERVAL_S}"},
   "stdout": "{MYNDAIX_HOME}/state/reconcile.out",
   "env": {"MYNDAIX_HOME": "MYNDAIX_HOME", "PATH": "AGENT_CLI_PATH"},
-  "env_literal": {"RECONCILE_POLL": "1"}
+  "env_literal": {"RECONCILE_POLL": "1"},
+  "liveness_max_gap_seconds": 2100
 }
