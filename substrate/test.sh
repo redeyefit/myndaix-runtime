@@ -855,7 +855,13 @@ prog = json.load(open(desc))["program"][-1]
 prog = prog.replace("{DEPLOY_CLONE}", repo)
 # the reconcile poll runs the INSTALLED bootstrap-fetch copy; its source is in substrate/
 prog = prog.replace("{MYNDAIX_HOME}/bin/bootstrap-fetch", os.path.join(repo, "substrate", "bootstrap-fetch.sh"))
-sys.exit(0 if "liveness-fire" in open(prog).read() else 1)
+txt = open(prog).read()
+# The marker documents the invariant; it must be BACKED by real fire plumbing (KilaBz P3):
+# either the wrappers' unconditional `... tick fire` printf, or an every-exit-path log()
+# (defined locally or sourced from lib.sh). A bare marker comment alone must not pass.
+marker = "liveness-fire" in txt
+plumbing = ("tick fire" in txt) or ("log() {" in txt) or ("log(){" in txt) or ("lib.sh" in txt)
+sys.exit(0 if marker and plumbing else 1)
 PYEOF
 for d in "$SUB"/plists/*.json; do
   ok 'python3 "$TMP/lvfire.py" "$REPO" "'"$d"'"' "every-tick-logs: $(basename "$d" .json) program carries the liveness-fire stdout invariant"
@@ -936,6 +942,14 @@ touch -t 202601010000 "$LVH/state/liveness-last-run"
 lv10="$(LV_MODE=notloaded lvrun)"
 ok 'printf "%s" "$lv10" | grep -q "sleep/wake grace"' "stale own .last_run -> sleep-guard grace tick"
 ok '! printf "%s" "$lv10" | grep -q "DIVERGENT"' "grace tick checks nothing (no wake-up alert storm)"
+# run 11 — a NEGATIVE last exit code (signal-class) is caught too (KilaBz P3 fold)
+lv11="$(LV_MODE=clean LV_EXIT_CODE=-1 lvrun)"
+ok 'printf "%s" "$lv11" | grep -q "last exit code = -1"' "negative last exit code -> divergence (signal-class parse)"
+# review folds: rogue sweep is GATED on a populated declared set (Oracle P3 — an empty set
+# must not flag every legit job ROGUE with a bootout remedy); exit-0-always covers state
+# writes too (KilaBz P2 — no die/set-e death on streak/latch/mkdir failures)
+ok 'grep -B8 "ROGUE" "$SUB/liveness-canary.sh" | grep -q "targets_ok" || grep -q "targets_ok\" -eq 1" "$SUB/liveness-canary.sh"' "rogue sweep skipped when the declared set failed to populate"
+ok '! grep -q "die \"could not write liveness streak\"" "$SUB/liveness-canary.sh" && grep -c "exit 0" "$SUB/liveness-canary.sh" | grep -qv "^[012]$"' "no die on state-write failure — every canary path exits 0"
 # mutual watch: drift-canary reverse-watches liveness-canary.out through its existing latch
 ok 'grep -q "liveness-canary.out" "$SUB/drift-canary.sh" && grep -A3 "liveness-canary.out stale" "$SUB/drift-canary.sh" | grep -q "rc=1"' "drift-canary folds a stale liveness-canary.out into its own streak+latch path"
 ok 'grep -qE "print|list" "$SUB/liveness-canary.sh" && ! grep -qE "\"\\\$LCTL\" (bootstrap|bootout|kickstart)" "$SUB/liveness-canary.sh"' "liveness-canary is READ-ONLY against launchd (print/list only)"
