@@ -40,16 +40,18 @@ def emit(decision: str, reason: str) -> NoReturn:
     sys.exit(0)
 
 
-def main():
-    try:
-        data = json.load(sys.stdin)
-    except Exception:
-        emit("deny", "unparseable hook payload")              # FAIL-CLOSED (was a bare return = fail-open)
+def _decide(data) -> None:
     if not isinstance(data, dict):
         emit("deny", "malformed hook payload (not an object)")
     if data.get("tool_name") != "Bash":
         return                                                # correct carve-out: don't gate other tools
-    cmd = (data.get("tool_input") or {}).get("command", "")
+    ti = data.get("tool_input")
+    if not isinstance(ti, dict):
+        emit("deny", "malformed tool_input (not an object)")  # review r2 HIGH: a truthy non-dict crashed here
+    for k in ("env", "cwd", "environment", "working_directory"):
+        if k in ti:
+            emit("deny", f"forbidden tool_input key '{k}' (no env/cwd override)")   # review r2 MED
+    cmd = ti.get("command", "")
     if not isinstance(cmd, str) or not cmd.strip():
         emit("deny", "missing / non-string / empty Bash command")   # blocks array-command injection etc.
     stripped = cmd.strip()
@@ -69,6 +71,19 @@ def main():
              'no $ ` \\ or double-quote>"  — no dispatch, no other scope, one command')
 
     emit("deny", f"'{base}' is not permitted — the librarian runs ONLY `mxr ask --scope research|fitness`")
+
+
+def main() -> None:
+    # CRASH-PROOF FAIL-CLOSED (review r2 HIGH): ANY unexpected error — unparseable JSON, a truthy
+    # non-dict tool_input, anything — must DENY, never emit nothing (a no-decision hook falls through to
+    # ALLOW for Bash under dontAsk). emit() raises SystemExit, which we re-raise so the printed decision
+    # stands; every other exception denies. The one silent path is _decide's tool_name!=Bash return.
+    try:
+        _decide(json.load(sys.stdin))
+    except SystemExit:
+        raise
+    except Exception:
+        emit("deny", "gate internal error — fail-closed")
 
 
 main()

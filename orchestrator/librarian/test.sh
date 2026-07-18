@@ -52,12 +52,17 @@ decide deny 'cat /Users/stevenfernandez/.myndaix/.secrets'
 decide deny 'python3 -c "import os"'
 decide deny 'ls ~'
 
-echo "== DENY: FAIL-CLOSED on malformed payloads (review r1 HIGH — no bare-return fall-through) =="
+echo "== DENY: FAIL-CLOSED on malformed payloads (review r1/r2 HIGH — no bare-return / no crash fall-through) =="
 decide_raw deny '{"tool_name":"Bash","tool_input":{"command":["rm","-rf","/"]}}'
 decide_raw deny 'this is not json'
 decide_raw deny '{"tool_name":"Bash","tool_input":{"command":""}}'
 decide_raw deny '{"tool_name":"Bash","tool_input":{}}'
 decide_raw deny '["a","list","not","an","object"]'
+decide_raw deny '{"tool_name":"Bash","tool_input":"ls"}'
+decide_raw deny '{"tool_name":"Bash","tool_input":["mxr","ask"]}'
+echo "== DENY: env/cwd override keys (r2 MED — valid command but poisoned execution env) =="
+decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"","env":{"LD_PRELOAD":"/tmp/evil.so"}}}'
+decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"","cwd":"/tmp"}}'
 echo "== SILENT (no decision) for tools this hook does not gate — the deny-list covers them =="
 decide_raw none '{"tool_name":"Read","tool_input":{"file_path":"/etc/passwd"}}'
 

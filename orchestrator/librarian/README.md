@@ -12,8 +12,8 @@ when the MacBook is awake; graduate to the always-on Mini (+ a launchd keepalive
 |---|---|
 | `kit/settings.json` | fail-closed permission posture → `~/librarian/.claude/settings.json` (removes read/web/MCP/agent surfaces; the gate is the sole Bash allow-er) |
 | `kit/CLAUDE.md` | the librarian identity → `~/librarian/CLAUDE.md` |
-| `hooks/recall-gate.{sh,py}` | PreToolUse Bash gate — allows ONLY `mxr ask`/`mxr recall`, denies dispatch + everything else (stays in the repo; settings.json references it by absolute path) |
-| `test.sh` | 15-check gate smoke test (allow safe recall; deny injection/dispatch/other programs) |
+| `hooks/recall-gate.{sh,py}` | PreToolUse Bash gate — allows ONLY `mxr ask --scope research\|fitness "…"`; denies recall, dispatch, other programs, malformed payloads (crash-proof fail-closed). Stays in the repo; settings.json references it by absolute path |
+| `test.sh` | 22-check gate smoke test (allow safe ask; deny injection/dispatch/other programs/wrong-scope/malformed payloads) |
 
 ## The fence (why it's safe) — hardened per cross-family review r1
 - `defaultMode: dontAsk` + `allow: []` + a deny-list of the **full current canonical non-Bash tool
@@ -40,11 +40,16 @@ cp orchestrator/librarian/kit/settings.json  ~/librarian/.claude/settings.json
 
 **2. Interactive — Jefe's hands (RC rejects long-lived tokens):**
 - Launch from a **normal terminal** (so the session inherits `MYNDAIX_KNOWLEDGE_SCOPES` from `~/.zshrc`,
-  needed for the `fitness` scope; `research` works regardless). **`CLAUDE_CODE_DISABLE_MCP=1` is
-  load-bearing** — it loads ZERO MCP servers (settings' `disableClaudeAiConnectors` is belt):
+  needed for the `fitness` scope; `research` works regardless). **The MCP-off flags are load-bearing** —
+  `--strict-mcp-config` (the proven control, as the curator uses) makes it ignore ALL inherited MCP
+  servers; `CLAUDE_CODE_DISABLE_MCP=1` + settings' `disableClaudeAiConnectors` are belts:
   ```
-  cd ~/librarian && CLAUDE_CODE_DISABLE_MCP=1 claude
+  cd ~/librarian && CLAUDE_CODE_DISABLE_MCP=1 claude --strict-mcp-config
   ```
+  Residual (review r2, LOW): the gate validates the literal text `mxr`, not the resolved executable. If
+  YOUR `~/.zshrc` defines an `mxr` alias/function, `mxr ask …` runs that. Not attacker-reachable (the
+  session can't write files/shell config; the alias is your own → still the mxr wrapper), but keep the
+  wrapper on PATH as the canonical `mxr`.
 - If prompted, **`claude auth login`** (claude.ai OAuth — API keys / setup-tokens are rejected by RC).
 - **Accept the workspace-trust dialog** for `~/librarian` (one-time; RC refuses to start in an untrusted folder).
 - **Enable Remote Control** on this session and **pair your phone** (Claude app).
