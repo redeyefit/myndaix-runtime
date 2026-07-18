@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Recall librarian — the Mini's always-on, phone-reachable recall front door (second-brain rung-1,
+  graduated from the MacBook piece-C prototype to the always-on Mini). This is a LaunchAgent (gui
+  domain), NOT a LaunchDaemon and NOT cron: Claude Code needs the logged-in claude.ai OAuth
+  (keychain) context, which only exists in the user's GUI session.
+
+  Install (Mini, as jefe — AFTER staging ~/librarian AND the test.sh smoke run):
+    cp orchestrator/librarian/keepalive/ai.myndaix.librarian-rc.plist.example \
+       ~/Library/LaunchAgents/ai.myndaix.librarian-rc.plist
+    launchctl load ~/Library/LaunchAgents/ai.myndaix.librarian-rc.plist
+  Rollback (instant):
+    launchctl unload ~/Library/LaunchAgents/ai.myndaix.librarian-rc.plist
+    tmux -S ~/.local/state/librarian.tmux kill-session -t librarian   # end the live RC session
+  Edit the bootstrap path below if your runtime checkout is not /Users/jefe/code/active/myndaix-runtime.
+
+  NOT KeepAlive=true: booleans restart-loop every 10s ThrottleInterval when the program manages its
+  own lifecycle. rc-bootstrap.sh is idempotent, so RunAtLoad + a StartInterval recheck is the right
+  shape — it re-creates the tmux session only if it has died, and refuses if parked.
+
+  AbandonProcessGroup=true is LOAD-BEARING: the short-lived bootstrap detaches a long-lived tmux
+  server + wrapper; without this key launchd reaps the whole process group when bootstrap exits,
+  killing the session it just created.
+
+  WorkingDirectory pins cwd so the dir-keyed CLAUDE.md identity + the .claude/settings.json fence
+  load (launchd's default cwd is / — wrong identity / no fence otherwise). The bootstrap also passes
+  the workspace cwd to tmux new-session, but this is the belt.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.myndaix.librarian-rc</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jefe/code/active/myndaix-runtime/orchestrator/librarian/keepalive/rc-bootstrap.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/Users/jefe/librarian</string>
+  <key>StandardOutPath</key>
+  <string>/Users/jefe/.myndaix/orchestrator/librarian/rc-keepalive.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jefe/.myndaix/orchestrator/librarian/rc-keepalive.out</string>
+</dict>
+</plist>
