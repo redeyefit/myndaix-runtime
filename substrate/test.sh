@@ -863,10 +863,11 @@ txt = open(prog).read()
 # proven for the canaries by the stub runs below; the wrappers can't be behaviorally run
 # here without ticking live systems).
 marker = "liveness-fire" in txt
-# FIRST-TOKEN-anchored shapes (KilaBz r3: `: # printf ... tick fire` style inline-comment
-# lines must not pass) — the fire plumbing must BE the command, not appear after one.
+# FIRST-TOKEN-anchored shapes (KilaBz r3/r4: neither `: # printf ... tick fire` nor
+# `printf # tick fire` may pass) — 'tick fire' must be INSIDE printf's single-quoted
+# argument, i.e. it IS the emitted output, not an inline comment.
 import re as _re
-fire = _re.compile(r"^\s*printf\s.*tick fire")
+fire = _re.compile(r"^\s*printf\s+'[^']*tick fire[^']*'")
 logdef = _re.compile(r"^\s*log\s*\(\)\s*\{")
 libsrc = _re.compile(r"^\s*(source|\.)\s+\S*lib\.sh")
 lines = txt.splitlines()
