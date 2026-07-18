@@ -30,8 +30,20 @@ never sourced** (`config_parse.py` — strict `KEY=value`, fail-closed on a bad/
 
 - **`lab`** (MacBook): interactive `serve` + pre-push review hook, autonomy OFF. Runs only
   `reconcile.sh --dry-run` (a pre-push drift sanity check) — never a full converge.
-- **`factory`** (Mini): `serve` + all autonomy ticks + the 15-min reconcile poll + drift-canary.
-  The deploy clone is pull-only; converge is factory-only.
+- **`factory`** (Mini): `serve` + all autonomy ticks + the 15-min reconcile poll + drift-canary
+  + the 15-min **liveness-canary** (`ai.myndaix.liveness`). The deploy clone is pull-only;
+  converge is factory-only.
+
+  **Two canaries, distinct jobs.** `drift-canary` watches *config-level* convergence (descriptor →
+  installed → loaded) and drops `drift-alert-*.md` / `liveness-watch-alert-*.md` into
+  `$OPERATOR_INBOX`. `liveness-canary` watches *runtime execution* — every declared job for this
+  role is loaded, its last exit healthy, and its `.out` fresh within the descriptor's
+  `liveness_max_gap_seconds` — plus flags loaded-but-undeclared `ai.myndaix.*` labels; it drops
+  `liveness-alert-*.md` and keeps `state/liveness-*` (streak/latch/last-run) files. The two watch
+  each other's `.out` freshness (mutual coverage). **Every watched descriptor MUST carry a
+  `liveness_max_gap_seconds` field** (`substrate/test.sh` asserts it); the reconcile poll's value
+  assumes the default `POLL_INTERVAL_S=900` — if you raise the poll interval, raise that gap to
+  ≥ 2× it (else the armed poll reads perpetually STALE).
 
 ## Commands
 

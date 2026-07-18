@@ -28,9 +28,11 @@ STREAK_FILE="$STATE_DIR/liveness-streak"
 ALERTED_FILE="$STATE_DIR/liveness-alerted"
 LAST_RUN_FILE="$STATE_DIR/liveness-last-run"
 LA_DIR="$HOME/Library/LaunchAgents"
-# Test seam ONLY: test.sh injects a stub so every divergence path runs behaviorally without
-# touching live launchd. The live plist never sets this; read-only calls either way.
+# Test seams ONLY (mirrors nothing in the live plist): LCTL injects a stub launchctl so every
+# divergence path runs without touching live launchd; PLISTS_DIR points the descriptor glob at
+# a fixture dir. Both default to the real values; read-only either way.
 LCTL="${LIVENESS_LAUNCHCTL:-launchctl}"
+PLISTS_DIR="${LIVENESS_PLISTS_DIR:-$SUBSTRATE_DIR/plists}"
 
 # mtime EPOCH seconds (macOS stat -f, Linux-CI stat -c); missing file -> 0. The `|| echo 0`
 # lives INSIDE the substitution so set -e -o pipefail can't kill the caller (bash rules).
@@ -49,36 +51,48 @@ if [[ "$last_run" -ne 0 ]] && (( now - last_run > 2 * INTERVAL )); then
   exit 0
 fi
 
-div=""; div_n=0
-diverge() { div="${div}- ${1}"$'\n'; div_n=$((div_n + 1)); log "liveness: DIVERGENT ${1}"; }
+div=""; div_n=0; div_keys=$'\n'
+# diverge KEY MESSAGE — KEY is the stable per-divergence identity (the label, or a synthetic
+# key for non-label problems) used by the grow-only latch to decide what's NEW; MESSAGE is the
+# human line in the alert body. Multiple sub-problems of one job share the label KEY (grouped).
+diverge() {
+  local key="$1" msg="$2"
+  div="${div}- ${msg}"$'\n'; div_n=$((div_n + 1))
+  case "$div_keys" in *$'\n'"$key"$'\n'*) : ;; *) div_keys="${div_keys}${key}"$'\n' ;; esac
+  log "liveness: DIVERGENT ${msg}"
+}
 
 # ---- declared set: ONE python3 pass over all descriptors (paths via argv) ---------------
 # liveness_targets.py emits label/max_gap/sentinel/out_path per watched job and a per-file
 # ERR line on a corrupt descriptor (fail-closed, never sinks the batch). Its own nonzero
 # exit means the CONFIG is unreadable — the whole declared set is unverifiable.
-targets_ok=1
-if ! targets="$(python3 "$SUBSTRATE_DIR/liveness_targets.py" "$CONFIG_FILE" "$SUBSTRATE_DIR"/plists/*.json)"; then
+targets_ok=1; err_n=0
+if ! targets="$(python3 "$SUBSTRATE_DIR/liveness_targets.py" "$CONFIG_FILE" "$PLISTS_DIR"/*.json)"; then
   targets=""
   targets_ok=0
-  diverge "liveness_targets.py failed (invalid config?) — declared set unverifiable, remedy: run reconcile --dry-run"
+  diverge "config" "liveness_targets.py failed (invalid config?) — declared set unverifiable, remedy: run reconcile --dry-run"
 fi
 
 declared=$'\n'   # newline-framed membership string (bash-3.2 safe; no arrays)
 while IFS=$'\t' read -r label max_gap sentinel out_path; do
   [[ -n "$label" ]] || continue
   if [[ "$label" == "ERR" ]]; then
-    # fields here are: ERR <file> <reason> — an unwatchable descriptor IS the omission class
-    diverge "descriptor $max_gap: $sentinel"
+    # fields here are: ERR <file> <reason> — an unwatchable descriptor IS the omission class.
+    # Count it: a per-file ERR means the declared set is INCOMPLETE (this job's label may be
+    # absent), so the rogue sweep must be suppressed too (see its gate below) — else the ERR'd
+    # job's still-loaded label gets flagged ROGUE with a bootout remedy (deep-audit P2).
+    err_n=$((err_n + 1))
+    diverge "descriptor:$max_gap" "descriptor $max_gap: $sentinel"
     continue
   fi
   declared="${declared}${label}"$'\n'
   # Belt behind the python-side validation: never interpolate an unvalidated label into a
   # launchctl target or an alert body (design §Security Surface).
   if ! [[ "$label" =~ ^ai\.myndaix\.[A-Za-z0-9._-]+$ ]]; then
-    diverge "declared-set line carries an invalid label — refusing to query launchd with it"
+    diverge "declared-invalid" "declared-set line carries an invalid label — refusing to query launchd with it"
     continue
   fi
-  [[ "$max_gap" =~ ^[0-9]+$ ]] || { diverge "$label: non-numeric max gap in declared set"; continue; }
+  [[ "$max_gap" =~ ^[0-9]+$ ]] || { diverge "$label" "$label: non-numeric max gap in declared set"; continue; }
   max_gap=$((10#$max_gap))
   # Sentinel-gated + unarmed => the job is LEGITIMATELY unloaded — skip, not divergence.
   if [[ "$sentinel" != "-" && ! -e "$MYNDAIX_HOME/$sentinel" ]]; then continue; fi
@@ -89,22 +103,29 @@ while IFS=$'\t' read -r label max_gap sentinel out_path; do
   # Loaded? Targeted print on the validated label only; a nonzero exit (incl. permission/SIP
   # quirks) = "not loaded" divergence, never a crash.
   if ! pr="$("$LCTL" print "$LA_DOMAIN/$label" 2>/dev/null)"; then
-    diverge "$label: NOT LOADED — remedy: launchctl bootstrap $LA_DOMAIN $LA_DIR/$label.plist (or let reconcile converge)"
+    diverge "$label" "$label: NOT LOADED — remedy: launchctl bootstrap $LA_DOMAIN $LA_DIR/$label.plist (or let reconcile converge)"
     continue
-  fi
-  # Last exit status: targeted parse; a format miss on a future macOS SKIPS this sub-check
-  # (the loaded + freshness checks still stand) rather than false-alerting.
-  ec="$(printf '%s\n' "$pr" | sed -n 's/^[[:space:]]*last exit code = \(-\{0,1\}[0-9][0-9]*\).*/\1/p' | head -1 || true)"
-  if [[ "$ec" =~ ^-?[0-9]+$ ]] && [[ "$ec" != "0" ]]; then
-    diverge "$label: last exit code = $ec — remedy: investigate $out_path"
   fi
   # Freshness: the job's stdout log mtime is the execution evidence (every descriptor's
   # program writes >=1 stdout line per fire — the liveness-fire invariant, test-asserted).
   out_m="$(mtime "$out_path")"; out_m=$((10#$out_m))
+  fresh=0; [[ "$out_m" -ne 0 ]] && (( now - out_m <= max_gap )) && fresh=1
   if [[ "$out_m" -eq 0 ]]; then
-    diverge "$label: NEVER RAN — no $out_path past the install grace — remedy: investigate why launchd isn't firing it"
-  elif (( now - out_m > max_gap )); then
-    diverge "$label: STALE — last execution evidence $((now - out_m))s ago (max ${max_gap}s) — remedy: investigate $out_path"
+    diverge "$label" "$label: NEVER RAN — no $out_path past the install grace — remedy: investigate why launchd isn't firing it"
+  elif [[ "$fresh" -eq 0 ]]; then
+    diverge "$label" "$label: STALE — last execution evidence $((now - out_m))s ago (max ${max_gap}s) — remedy: investigate $out_path"
+  fi
+  # Last exit status — evaluated ONLY when the job is firing FRESH. launchd LATCHES `last exit
+  # code` until the next run, so on a non-firing job the same datum is re-read across canary
+  # ticks (900s < most job intervals) and the THRESHOLD=2 debounce degrades to threshold-1
+  # (deep-audit P2); and a stale job is already reported by STALE above. Scoped to fresh jobs it
+  # catches the unique "fires on schedule but exits nonzero" class; the grow-only latch debounces
+  # it to one alert per failure episode. A parse miss on a future macOS just skips this sub-check.
+  if [[ "$fresh" -eq 1 ]]; then
+    ec="$(printf '%s\n' "$pr" | sed -n 's/^[[:space:]]*last exit code = \(-\{0,1\}[0-9][0-9]*\).*/\1/p' | head -1 || true)"
+    if [[ "$ec" =~ ^-?[0-9]+$ ]] && [[ "$ec" != "0" ]]; then
+      diverge "$label" "$label: last exit code = $ec (firing on schedule but failing) — remedy: investigate $out_path"
+    fi
   fi
 done <<< "$targets"
 
@@ -113,30 +134,46 @@ done <<< "$targets"
 for label in ai.myndaix.runtime; do
   declared="${declared}${label}"$'\n'
   if ! pr="$("$LCTL" print "$LA_DOMAIN/$label" 2>/dev/null)"; then
-    diverge "$label: daemon NOT LOADED — remedy: launchctl bootstrap $LA_DOMAIN $LA_DIR/$label.plist"
+    diverge "$label" "$label: daemon NOT LOADED — remedy: launchctl bootstrap $LA_DOMAIN $LA_DIR/$label.plist"
   elif ! printf '%s\n' "$pr" | grep -qE '^[[:space:]]*pid = [0-9]+'; then
-    diverge "$label: daemon loaded but NO RUNNING PID — remedy: launchctl kickstart -k $LA_DOMAIN/$label"
+    diverge "$label" "$label: daemon loaded but NO RUNNING PID — remedy: launchctl kickstart -k $LA_DOMAIN/$label"
   fi
 done
 
 # ---- reverse sweep: loaded ai.myndaix.* minus declared minus static = rogue -------------
 # Enumeration uses `launchctl list` (tab-delimited, stable); `print` output is never parsed
-# for enumeration (brittle across macOS releases). SKIPPED when the declared set failed to
-# populate (Oracle P3): an empty declared set would flag every legitimate job ROGUE with a
-# bootout remedy — an operator following it during a transient config failure would cause a
-# self-inflicted outage. The targets failure is already its own divergence above.
-if [[ "$targets_ok" -eq 1 ]]; then
+# for enumeration (brittle across macOS releases). SKIPPED when the declared set is incomplete —
+# a whole-batch config failure (targets_ok=0) OR any per-file ERR (err_n>0): an incomplete
+# declared set would flag a legitimate-but-unparsed job ROGUE with a bootout remedy, and an
+# operator following it would cause a self-inflicted outage (Oracle P3 + deep-audit P2). The
+# incompleteness is already its own divergence above.
+if [[ "$targets_ok" -eq 1 && "$err_n" -eq 0 ]]; then
   rogue_src="$("$LCTL" list 2>/dev/null | awk -F'\t' '$3 ~ /^ai\.myndaix\./ {print $3}' || true)"
   while IFS= read -r label; do
     [[ -n "$label" ]] || continue
     [[ "$declared" == *$'\n'"$label"$'\n'* ]] && continue
-    # Labels come from launchctl output — sanitize before embedding in the alert body.
-    safe="$(printf '%s' "$label" | tr -cd 'A-Za-z0-9._-')"
-    diverge "$safe: ROGUE — loaded in $LA_DOMAIN but not declared in substrate/plists/ — remedy: investigate, then launchctl bootout $LA_DOMAIN/$safe"
+    # VALIDATE (don't sanitize-by-deletion): a label that passes the strict regex gets the
+    # copy-paste bootout remedy. One that FAILS must NEVER get a bootout — tr-style stripping
+    # would ALIAS a mangled name (e.g. 'ai.myndaix.controller ' with a trailing space) onto a
+    # healthy DECLARED job, and an operator following the remedy boots out the wrong one
+    # (deep-audit P2). Report it by raw bytes, investigate-only.
+    if [[ "$label" =~ ^ai\.myndaix\.[A-Za-z0-9._-]+$ ]]; then
+      diverge "$label" "$label: ROGUE — loaded in $LA_DOMAIN but not declared in substrate/plists/ — remedy: investigate, then launchctl bootout $LA_DOMAIN/$label"
+    else
+      hex="$(printf '%s' "$label" | od -An -tx1 | tr -d ' \n' || true)"
+      diverge "malformed:$hex" "MALFORMED loaded label (bytes 0x$hex) — not declared and not a valid ai.myndaix.* name; investigate manually, do NOT blind-bootout a mangled name"
+    fi
   done <<< "$rogue_src"
 fi
 
-# ---- streak + latch + alert (the drift-canary pattern, verbatim) ------------------------
+# ---- streak + GROW-ONLY latch + alert ---------------------------------------------------
+# A bare global latch (drift-canary's model — correct there, it watches ONE signal) would blind
+# this N-signal canary: once any divergence latched, a NEW job going bad would produce ZERO
+# alerts until the first fully heals — the exact silent-omission class this exists to kill
+# (deep-audit P1). Instead the latch stores the SET of already-alerted divergence keys; we alert
+# only when a NEW key appears (grow-only). Partial healing does not re-alert; a fully-clean run
+# clears the set. THRESHOLD debounces the FIRST divergence (2 consecutive ticks); a new key
+# arriving mid-incident alerts on sight, which is correct — we're already in an alerting state.
 if [[ "$div_n" -eq 0 ]]; then
   rm -f "$STREAK_FILE" "$ALERTED_FILE" || log "liveness: WARN could not clear streak/latch"
   log "liveness: all declared jobs alive"
@@ -156,8 +193,20 @@ if ! { printf '%s\n' "$streak" > "$STREAK_FILE.tmp" && mv -f "$STREAK_FILE.tmp" 
 fi
 log "liveness: $div_n divergence(s) (streak=$streak)"
 
-if [[ "$streak" -ge "$THRESHOLD" && ! -e "$ALERTED_FILE" ]]; then
-  msg="liveness-canary: declared-vs-runtime divergence persisting (${streak} checks). Jobs declared in substrate/plists/ are not executing as declared:
+# Load the already-alerted key set (newline-framed); a missing file = nothing alerted yet.
+alerted=$'\n'
+if [[ -e "$ALERTED_FILE" ]]; then
+  while IFS= read -r k; do [[ -n "$k" ]] && alerted="${alerted}${k}"$'\n'; done < "$ALERTED_FILE"
+fi
+# Any divergence key NOT previously alerted is NEW. Also build the union to persist on alert.
+new_keys=""; union="$alerted"
+while IFS= read -r k; do
+  [[ -n "$k" ]] || continue
+  if [[ "$union" != *$'\n'"$k"$'\n'* ]]; then new_keys="${new_keys}${k} "; union="${union}${k}"$'\n'; fi
+done <<< "$div_keys"
+
+if [[ "$streak" -ge "$THRESHOLD" && -n "$new_keys" ]]; then
+  msg="liveness-canary: declared-vs-runtime divergence (${streak} checks; new: ${new_keys}). Jobs declared in substrate/plists/ are not executing as declared:
 
 $div"
   if [[ -n "${OPERATOR_INBOX:-}" && -d "$OPERATOR_INBOX" ]]; then
@@ -165,9 +214,11 @@ $div"
     # Latch ONLY after the alert write succeeds — a failed write (disk full) must not
     # suppress all future alerts (drift-canary's exact rule).
     if { printf '%s\n' "$msg" > "$alert.tmp" && mv -f "$alert.tmp" "$alert"; }; then
-      # A failed latch write must not kill the run (set -e): worst case is a duplicate
-      # alert next tick — fail-noisy, never fail-dead (KilaBz P2).
-      : > "$ALERTED_FILE" 2>/dev/null || log "liveness: WARN latch write failed — a duplicate alert may drop next tick"
+      # Persist the union (grow-only) so these keys don't re-alert until a fully-clean run
+      # clears the set. A failed latch write must not kill the run (set -e): worst case is a
+      # duplicate alert next tick — fail-noisy, never fail-dead (KilaBz P2).
+      { printf '%s' "$union" > "$ALERTED_FILE.tmp" && mv -f "$ALERTED_FILE.tmp" "$ALERTED_FILE"; } \
+        || log "liveness: WARN latch write failed — a duplicate alert may drop next tick"
       log "liveness: alert dropped -> $alert"
     else
       rm -f "$alert.tmp"
