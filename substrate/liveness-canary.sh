@@ -21,7 +21,9 @@ substrate_load_config
 INTERVAL=900        # MUST equal StartInterval in plists/ai.myndaix.liveness.json (test-asserted)
 THRESHOLD=2         # consecutive divergent runs before alerting (~2 intervals)
 STATE_DIR="$MYNDAIX_HOME/state"
-mkdir -p "$STATE_DIR"
+# Exit-0-always applies to STATE failures too (KilaBz P2): a canary that can't write its
+# state must log-and-exit-0, never let set -e hand launchd a failure record.
+mkdir -p "$STATE_DIR" || { log "liveness: ALARM cannot create $STATE_DIR — skipping this tick"; exit 0; }
 STREAK_FILE="$STATE_DIR/liveness-streak"
 ALERTED_FILE="$STATE_DIR/liveness-alerted"
 LAST_RUN_FILE="$STATE_DIR/liveness-last-run"
@@ -41,7 +43,7 @@ now="$(date +%s)"
 # evidence is equally stale. Touch + skip one tick so each job catches up, instead of a
 # wake-up alert storm. .last_run is touched on EVERY normal run (Oracle re-review note 1).
 last_run="$(mtime "$LAST_RUN_FILE")"; last_run=$((10#$last_run))
-touch "$LAST_RUN_FILE"
+touch "$LAST_RUN_FILE" || log "liveness: WARN cannot touch .last_run (next tick may sleep-grace)"
 if [[ "$last_run" -ne 0 ]] && (( now - last_run > 2 * INTERVAL )); then
   log "liveness: own last run $((now - last_run))s ago (>2x interval) — sleep/wake grace, skipping one tick"
   exit 0
@@ -54,8 +56,10 @@ diverge() { div="${div}- ${1}"$'\n'; div_n=$((div_n + 1)); log "liveness: DIVERG
 # liveness_targets.py emits label/max_gap/sentinel/out_path per watched job and a per-file
 # ERR line on a corrupt descriptor (fail-closed, never sinks the batch). Its own nonzero
 # exit means the CONFIG is unreadable — the whole declared set is unverifiable.
+targets_ok=1
 if ! targets="$(python3 "$SUBSTRATE_DIR/liveness_targets.py" "$CONFIG_FILE" "$SUBSTRATE_DIR"/plists/*.json)"; then
   targets=""
+  targets_ok=0
   diverge "liveness_targets.py failed (invalid config?) — declared set unverifiable, remedy: run reconcile --dry-run"
 fi
 
@@ -90,9 +94,9 @@ while IFS=$'\t' read -r label max_gap sentinel out_path; do
   fi
   # Last exit status: targeted parse; a format miss on a future macOS SKIPS this sub-check
   # (the loaded + freshness checks still stand) rather than false-alerting.
-  ec="$(printf '%s\n' "$pr" | sed -n 's/^[[:space:]]*last exit code = \([0-9][0-9]*\).*/\1/p' | head -1 || true)"
-  if [[ "$ec" =~ ^[0-9]+$ ]] && [[ "$((10#$ec))" -ne 0 ]]; then
-    diverge "$label: last exit code = $((10#$ec)) — remedy: investigate $out_path"
+  ec="$(printf '%s\n' "$pr" | sed -n 's/^[[:space:]]*last exit code = \(-\{0,1\}[0-9][0-9]*\).*/\1/p' | head -1 || true)"
+  if [[ "$ec" =~ ^-?[0-9]+$ ]] && [[ "$ec" != "0" ]]; then
+    diverge "$label: last exit code = $ec — remedy: investigate $out_path"
   fi
   # Freshness: the job's stdout log mtime is the execution evidence (every descriptor's
   # program writes >=1 stdout line per fire — the liveness-fire invariant, test-asserted).
@@ -117,19 +121,24 @@ done
 
 # ---- reverse sweep: loaded ai.myndaix.* minus declared minus static = rogue -------------
 # Enumeration uses `launchctl list` (tab-delimited, stable); `print` output is never parsed
-# for enumeration (brittle across macOS releases).
-rogue_src="$("$LCTL" list 2>/dev/null | awk -F'\t' '$3 ~ /^ai\.myndaix\./ {print $3}' || true)"
-while IFS= read -r label; do
-  [[ -n "$label" ]] || continue
-  [[ "$declared" == *$'\n'"$label"$'\n'* ]] && continue
-  # Labels come from launchctl output — sanitize before embedding in the alert body.
-  safe="$(printf '%s' "$label" | tr -cd 'A-Za-z0-9._-')"
-  diverge "$safe: ROGUE — loaded in $LA_DOMAIN but not declared in substrate/plists/ — remedy: investigate, then launchctl bootout $LA_DOMAIN/$safe"
-done <<< "$rogue_src"
+# for enumeration (brittle across macOS releases). SKIPPED when the declared set failed to
+# populate (Oracle P3): an empty declared set would flag every legitimate job ROGUE with a
+# bootout remedy — an operator following it during a transient config failure would cause a
+# self-inflicted outage. The targets failure is already its own divergence above.
+if [[ "$targets_ok" -eq 1 ]]; then
+  rogue_src="$("$LCTL" list 2>/dev/null | awk -F'\t' '$3 ~ /^ai\.myndaix\./ {print $3}' || true)"
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    [[ "$declared" == *$'\n'"$label"$'\n'* ]] && continue
+    # Labels come from launchctl output — sanitize before embedding in the alert body.
+    safe="$(printf '%s' "$label" | tr -cd 'A-Za-z0-9._-')"
+    diverge "$safe: ROGUE — loaded in $LA_DOMAIN but not declared in substrate/plists/ — remedy: investigate, then launchctl bootout $LA_DOMAIN/$safe"
+  done <<< "$rogue_src"
+fi
 
 # ---- streak + latch + alert (the drift-canary pattern, verbatim) ------------------------
 if [[ "$div_n" -eq 0 ]]; then
-  rm -f "$STREAK_FILE" "$ALERTED_FILE"
+  rm -f "$STREAK_FILE" "$ALERTED_FILE" || log "liveness: WARN could not clear streak/latch"
   log "liveness: all declared jobs alive"
   exit 0
 fi
@@ -138,9 +147,12 @@ streak="$(cat "$STREAK_FILE" 2>/dev/null || echo 0)"
 [[ "$streak" =~ ^[0-9]+$ ]] || streak=0
 streak=$(( 10#$streak + 1 ))
 # Explicit fail-closed write (a `printf > tmp && mv` &&-chain is exempt from set -e on the
-# non-final link — the #89 class).
+# non-final link — the #89 class). ALARM-log + exit 0, NOT die (KilaBz P2): exit-0-always
+# outranks the streak — a nonzero exit would hand launchd a failure record for the canary
+# itself, and next tick both retries the write and reports this run's exit code anyway.
 if ! { printf '%s\n' "$streak" > "$STREAK_FILE.tmp" && mv -f "$STREAK_FILE.tmp" "$STREAK_FILE"; }; then
-  die "could not write liveness streak"
+  log "liveness: ALARM could not write streak file — divergences logged above, retrying next tick"
+  exit 0
 fi
 log "liveness: $div_n divergence(s) (streak=$streak)"
 
@@ -153,7 +165,9 @@ $div"
     # Latch ONLY after the alert write succeeds — a failed write (disk full) must not
     # suppress all future alerts (drift-canary's exact rule).
     if { printf '%s\n' "$msg" > "$alert.tmp" && mv -f "$alert.tmp" "$alert"; }; then
-      : > "$ALERTED_FILE"
+      # A failed latch write must not kill the run (set -e): worst case is a duplicate
+      # alert next tick — fail-noisy, never fail-dead (KilaBz P2).
+      : > "$ALERTED_FILE" 2>/dev/null || log "liveness: WARN latch write failed — a duplicate alert may drop next tick"
       log "liveness: alert dropped -> $alert"
     else
       rm -f "$alert.tmp"
