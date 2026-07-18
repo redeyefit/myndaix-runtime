@@ -63,8 +63,15 @@ decide_raw deny '{"tool_name":"Bash","tool_input":["mxr","ask"]}'
 echo "== DENY: env/cwd override keys (r2 MED — valid command but poisoned execution env) =="
 decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"","env":{"LD_PRELOAD":"/tmp/evil.so"}}}'
 decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"","cwd":"/tmp"}}'
-echo "== SILENT (no decision) for tools this hook does not gate — the deny-list covers them =="
-decide_raw none '{"tool_name":"Read","tool_input":{"file_path":"/etc/passwd"}}'
+echo "== DENY: every NON-Bash tool (ALLOWLIST model, keepalive review r2 HIGH-1/HIGH-2 — matcher \"*\") =="
+# The gate now fires for EVERY tool and denies anything that is not a valid `mxr ask`. This is
+# fail-closed WITHOUT relying on the settings deny-list staying exhaustive (DesignSync had slipped it).
+decide_raw deny '{"tool_name":"Read","tool_input":{"file_path":"/etc/passwd"}}'
+decide_raw deny '{"tool_name":"Write","tool_input":{"file_path":"/x","content":"y"}}'
+decide_raw deny '{"tool_name":"DesignSync","tool_input":{}}'
+decide_raw deny '{"tool_name":"WebFetch","tool_input":{"url":"http://evil"}}'
+decide_raw deny '{"tool_name":"SomeFutureTool","tool_input":{}}'
+decide_raw deny '{"tool_name":null,"tool_input":{}}'
 
 echo ""
 echo "== RESULT: $pass passed, $fail failed =="

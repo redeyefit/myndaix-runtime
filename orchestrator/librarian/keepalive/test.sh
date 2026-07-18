@@ -43,7 +43,7 @@ write_valid_fence() {
   "permissions": { "defaultMode": "dontAsk", "allow": [],
     "deny": ["Read","Write","Edit","WebFetch","WebSearch","Agent","Glob","Grep"] },
   "hooks": { "PreToolUse": [
-    { "matcher": "Bash", "hooks": [ { "type": "command", "command": "'"$hook"'" } ] } ] }
+    { "matcher": "*", "hooks": [ { "type": "command", "command": "'"$hook"'" } ] } ] }
 }' > "$LIB_WORKSPACE/.claude/settings.json"
 }
 

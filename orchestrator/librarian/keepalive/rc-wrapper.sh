@@ -79,22 +79,29 @@ reachable() {
   return 1
 }
 
-# startup assertion: the fence must actually CONFINE (parse + smoke-run the gate), not merely exist —
-# else the session would serve an UNCONFINED Bash surface (review r1 CRITICAL). Park loud otherwise.
-if ! lib_validate_fence "$LIB_WORKSPACE"; then
-  park "workspace-fence-invalid (see librarian.log for the specific failure)"
-fi
-# `mxr` must resolve to the CANONICAL shim, not just any `mxr` on PATH — the recall-gate allows the
-# literal token `mxr`, so a different `mxr` on PATH would run under the allow (review r1 MED). The
-# wrapper prepends ~/.local/bin, so the canonical shim wins if present; assert it explicitly.
-mxr_resolved="$(command -v mxr 2>/dev/null || true)"
-if [[ "$mxr_resolved" != "$HOME/.local/bin/mxr" || ! -x "$mxr_resolved" ]]; then
-  park "mxr-not-canonical (want \$HOME/.local/bin/mxr, got '${mxr_resolved:-none}')"
-fi
-
 fast_exits=0
 backoff="$BACKOFF_MIN"
 lib_log "wrapper start (remote-control, capacity 1, workspace=$LIB_WORKSPACE)"
+
+# preflight() — validated IMMEDIATELY BEFORE EVERY launch (review r2 HIGH-3/LOW-2/MED-1), not once
+# at start: the wrapper can live for weeks, so a mid-life fence break (deploy / python move / a
+# `git checkout` to a branch without the hook), a wrong `mxr` on PATH, or a filled disk must be
+# caught before the NEXT relaunch — never serve a broken/unconfined session. Non-transient failures
+# (fence, mxr) PARK; a low disk is transient (log rotation / temp reaper) so it BACKS OFF instead.
+preflight() {
+  # fence must actually CONFINE (parse + smoke-run the gate: deny ls, deny a non-Bash tool, allow a
+  # valid `mxr ask`), not merely exist — else RC would serve an UNCONFINED surface (r1 CRITICAL).
+  if ! lib_validate_fence "$LIB_WORKSPACE"; then
+    park "workspace-fence-invalid (see librarian.log for the specific failure)"
+  fi
+  # `mxr` must resolve to the CANONICAL shim, not just any `mxr` on PATH — the recall-gate allows the
+  # literal token `mxr`, so a different `mxr` would run under the allow (r1 MED).
+  local mxr_resolved
+  mxr_resolved="$(command -v mxr 2>/dev/null || true)"
+  if [[ "$mxr_resolved" != "$HOME/.local/bin/mxr" || ! -x "$mxr_resolved" ]]; then
+    park "mxr-not-canonical (want \$HOME/.local/bin/mxr, got '${mxr_resolved:-none}')"
+  fi
+}
 
 while true; do
   # a lingering park marker means a prior park; bootstrap should have refused to (re)start us, but
@@ -116,6 +123,19 @@ while true; do
     ""|https://api.anthropic.com|https://api.anthropic.com/) : ;;
     *) park "nonstandard-ANTHROPIC_BASE_URL" ;;
   esac
+
+  # disk floor, re-checked every relaunch (MED-1): RC JSONL transcripts share the disk with the
+  # Postgres ledger (logged no-space class). Transient -> back off + retry, don't park (self-heals).
+  avail_kb="$(df -k "$LIB_HOME" 2>/dev/null | awk 'NR==2{print $4}' | tr -dc '0-9' || true)"
+  avail_kb="$((10#${avail_kb:-0}))"
+  if (( avail_kb < 524288 )); then
+    lib_log "low/unknown disk ${avail_kb}KB — not launching this cycle, backing off"
+    sleep "$backoff"; backoff=$(( backoff * 2 )); (( backoff > BACKOFF_MAX )) && backoff="$BACKOFF_MAX"
+    continue
+  fi
+
+  # fence + mxr must still hold right now (non-transient failures park). See preflight() header.
+  preflight
 
   start="$(date +%s)"
   lib_log "launch claude remote-control --capacity 1 --spawn same-dir --permission-mode dontAsk"

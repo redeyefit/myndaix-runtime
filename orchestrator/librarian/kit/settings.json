@@ -1,5 +1,5 @@
 {
-  "_comment": "Recall-librarian fail-closed permission posture (piece C). Deploys to ~/librarian/.claude/settings.json. THE CONFINEMENT (cross-family review r1): fail-closed by denying the FULL current canonical NON-Bash tool surface by name (verified vs Claude Code 2.1.x tools-reference). Bash is the ONE tool left un-denied — because a settings `deny` OVERRIDES a hook `allow` (deny-first precedence), so `deny:[\"*\"]` would kill Bash and the recall-gate could never allow a valid `mxr ask`. So: deny every non-Bash tool here; the PreToolUse recall-gate is the SOLE allow-er of Bash and only allows an exact `mxr ask --scope research|fitness \"<safe question>\"` (fail-closed on every other path). RESIDUAL: this list must be extended when Claude Code adds a NEW no-prompt tool (there is no deny-all-except-Bash primitive). MCP: `disableClaudeAiConnectors:true` blocks the claude.ai connectors; the launch ALSO sets CLAUDE_CODE_DISABLE_MCP=1 (README) to load zero MCP servers — `mcp__*` here is belt. Edit the hook path if the checkout is not /Users/stevenfernandez/code/active/myndaix-runtime.",
+  "_comment": "Recall-librarian fail-closed permission posture (piece C). Deploys to ~/librarian/.claude/settings.json. THE CONFINEMENT (keepalive review r2, HIGH-1/HIGH-2 — ALLOWLIST model): the PreToolUse recall-gate is registered with matcher \"*\", so it fires for EVERY tool call and is the SOLE decider — it ALLOWS only an exact `mxr ask --scope research|fitness \"<safe question>\"` (Bash) and DENIES everything else, including every non-Bash tool, structurally. This does NOT depend on the deny-list below staying exhaustive as Claude Code adds tools (the enumeration model previously missed a live write-capable tool, DesignSync). The deny-list is retained as BELT (deny-first precedence: a settings `deny` also overrides any hook `allow`) — Bash stays un-denied so a valid recall can be allowed. MCP: `disableClaudeAiConnectors:true` blocks claude.ai connectors; the launch ALSO sets CLAUDE_CODE_DISABLE_MCP=1 (README) to load zero MCP servers — `mcp__*` here is belt. Edit the hook path if the checkout is not /Users/stevenfernandez/code/active/myndaix-runtime.",
   "disableClaudeAiConnectors": true,
   "permissions": {
     "defaultMode": "dontAsk",
@@ -11,6 +11,7 @@
       "CronCreate",
       "CronDelete",
       "CronList",
+      "DesignSync",
       "Edit",
       "EnterPlanMode",
       "EnterWorktree",
@@ -53,7 +54,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
