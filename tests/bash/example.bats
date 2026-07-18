@@ -29,12 +29,13 @@ norm10() { printf '%s\n' "$((10#$1))"; }   # the CORRECT base-10 normalization (
   [ "$status" -eq 3 ]
 }
 
-# --- TEMPLATE: setup/teardown with a temp workspace (auto-cleaned) ---
-setup_file() { export BATS_TMP="$(mktemp -d -t bats-example)"; }
-teardown_file() { [ -n "${BATS_TMP:-}" ] && [ -d "$BATS_TMP" ] && find "$BATS_TMP" -mindepth 0 -delete 2>/dev/null || true; }
-
+# --- TEMPLATE: an isolated temp workspace per test. Use bats's BATS_TEST_TMPDIR when present (modern
+# bats auto-creates + auto-cleans it), falling back to BATS_TMPDIR so it's portable across bats versions
+# — relying on a setup_file export was NOT portable (older ubuntu bats didn't propagate it; CI caught it). ---
 @test "template — write + read within an isolated temp dir" {
-  printf 'data' > "$BATS_TMP/f"
-  run cat "$BATS_TMP/f"
+  tmp="$(mktemp -d "${BATS_TEST_TMPDIR:-${BATS_TMPDIR:-/tmp}}/bats-ex.XXXXXX")"
+  printf 'data' > "$tmp/f"
+  run cat "$tmp/f"
   [ "$output" = "data" ]
+  rm -rf "$tmp"
 }
