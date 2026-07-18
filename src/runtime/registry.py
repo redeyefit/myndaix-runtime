@@ -239,6 +239,18 @@ V1_ROSTER: list[AgentSpec] = [
     #  * The wrapper + child .sh scripts source ~/.myndaix/.secrets THEMSELVES, so no env_passthrough
     #    is needed — real HOME/PATH from the P2 env-base is enough for them to self-load the keys.
     #  * timeout_s 1500: copy (~30s Claude call) + one full narrated 9:16 render, with wide margin.
+    # REVIEW (kilabz r1, PR #101): FOLDED — concurrent dispatches could corrupt a render (reelgen
+    # shutil.rmtree's <repo>/reel-out/<topic> on start + a FIXED render port 8731); mx-produce.sh now
+    # takes a single-holder mkdir lock (2nd concurrent run fails fast, stale-reclaims past 1800s so a
+    # SIGKILL-on-timeout leak self-heals). ACCEPTED RESIDUALS (Rung-1, documented):
+    #  (a) nothing FORCES repo_id absent — the "NEVER dispatch with repo_id" contract is only doc'd.
+    #      Fail-closed/benign though: a logical --repo fails pre-invoke, an absolute-path --repo only
+    #      wastes a worktree (wrapper + reel*.py resolve every path from $0/__file__, never cwd, so it
+    #      still runs the REAL repo). Follow-up: a `no_worktree` adapter flag honored by worker.py.
+    #  (b) the wrapper self-sources the FULL ~/.myndaix/.secrets (bypasses _cli_env's per-agent
+    #      allowlist) — but that EQUALS the manual `./reel.sh` exposure (same operator/HOME/file) and
+    #      the topic reaches an LLM as COPY, never shell (no injection path). Follow-up: scope
+    #      mx-engine to a narrow secret file (ANTHROPIC/OAuth + ELEVENLABS only).
     AgentSpec(agent_id="mx-engine", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="pipeline", role="content factory (mx-engine folder-agent): topic -> narrated reel",
               profile=Profile(timeout_s=1500),
