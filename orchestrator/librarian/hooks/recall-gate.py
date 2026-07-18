@@ -62,6 +62,12 @@ def _decide(data) -> None:
     cmd = ti.get("command", "")
     if not isinstance(cmd, str) or not cmd.strip():
         emit("deny", "missing / non-string / empty Bash command")   # blocks array-command injection etc.
+    # No control characters anywhere (keepalive review r2 self-probe): a legit `mxr ask` is a single
+    # line of printable text. Reject newlines/tabs/etc. so `strip()` below can't normalise a LEADING
+    # control char away into a match (e.g. "\nmxr ask ..." -> stripped "mxr ask ..."), and so no
+    # embedded newline can smuggle a second line.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in cmd):
+        emit("deny", "control character in Bash command (newline/tab/etc.)")
     stripped = cmd.strip()
 
     m = re.match(r"\s*(\S+)", cmd)

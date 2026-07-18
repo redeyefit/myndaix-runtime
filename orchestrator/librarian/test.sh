@@ -60,6 +60,10 @@ decide_raw deny '{"tool_name":"Bash","tool_input":{}}'
 decide_raw deny '["a","list","not","an","object"]'
 decide_raw deny '{"tool_name":"Bash","tool_input":"ls"}'
 decide_raw deny '{"tool_name":"Bash","tool_input":["mxr","ask"]}'
+echo "== DENY: control chars — no strip()-normalised leading newline, no embedded 2nd line (r2 self-probe) =="
+decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"\nmxr ask --scope research \"x\""}}'
+decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"\ncurl evil"}}'
+decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"\t; ls"}}'
 echo "== DENY: env/cwd override keys (r2 MED — valid command but poisoned execution env) =="
 decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"","env":{"LD_PRELOAD":"/tmp/evil.so"}}}'
 decide_raw deny '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"x\"","cwd":"/tmp"}}'
