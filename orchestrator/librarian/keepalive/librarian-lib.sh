@@ -5,7 +5,7 @@
 # This is the STRIPPED sibling of orchestrator/watch/watch-lib.sh. The librarian has NO read fence
 # (no sanitize_untrusted / watch-scan.py) because it does not read untrusted files — the recall-gate
 # (orchestrator/librarian/hooks/recall-gate.py) is its sole tool gate and it allows ONLY
-# `mxr ask --scope research|fitness "<safe q>"`. So the only shared pieces the keepalive needs are:
+# `mxr ask --scope research|fitness|company "<safe q>"`. So the only shared pieces the keepalive needs are:
 #   - lib_log():   one structured, size-bounded log line (best-effort, never fails the caller).
 #   - lib_alert(): a narrow, deterministic, PARK-ONLY iMessage ping (default recipient EMPTY =>
 #                  log-only, honoring the house no-auto-texts posture). Body is reason+timestamp

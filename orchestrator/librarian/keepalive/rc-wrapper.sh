@@ -12,7 +12,7 @@
 #
 # The fence is NOT in this wrapper — it is the confined workspace (LIB_WORKSPACE): CLAUDE.md +
 # .claude/settings.json (deny-list of every non-Bash tool) + the recall-gate PreToolUse Bash hook
-# (allows ONLY `mxr ask --scope research|fitness "<safe q>"`). This wrapper's job is liveness +
+# (allows ONLY `mxr ask --scope research|fitness|company "<safe q>"`). This wrapper's job is liveness +
 # a clean, minimal launch environment.
 set -uo pipefail                                  # NOT -e: a child non-zero exit is normal here
 
@@ -28,8 +28,10 @@ source "$DIR/librarian-lib.sh"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Scope roots for `mxr ask` — baked in, not sourced from ~/.zshrc. `research` is hardcoded in the
-# runtime; `fitness` needs its root here. (A future sensitive scope must be added deliberately.)
-export MYNDAIX_KNOWLEDGE_SCOPES="${MYNDAIX_KNOWLEDGE_SCOPES:-fitness=$HOME/fitness}"
+# runtime; `fitness` + `company` need their roots here. `company` = ~/company (Jefe's plan/schedule,
+# non-sensitive). MUST stay in sync with the recall-gate SCOPES allowlist. (A future SENSITIVE scope
+# must be added deliberately — to the gate allowlist AND here.)
+export MYNDAIX_KNOWLEDGE_SCOPES="${MYNDAIX_KNOWLEDGE_SCOPES:-fitness=$HOME/fitness,company=$HOME/company}"
 
 # No MCP tools in the session (under dontAsk, MCP tools would be auto-allowed and bypass the fence).
 # remote-control has no --strict-mcp-config flag; the env var disables MCP loading entirely.

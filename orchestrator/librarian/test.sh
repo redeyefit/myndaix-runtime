@@ -2,7 +2,7 @@
 # shellcheck disable=SC2016  # deny-case payloads are INTENTIONALLY single-quoted literals ($()/backticks must NOT expand)
 # test.sh — recall-gate smoke test. Feeds the PreToolUse gate real Bash-tool JSON and asserts the
 # permissionDecision. The gate is the SOLE allow-er of Bash in the librarian session, so it must ALLOW
-# exactly `mxr ask --scope research|fitness "<safe q>"` and FAIL-CLOSED (explicit deny) on everything
+# exactly `mxr ask --scope research|fitness|company "<safe q>"` and FAIL-CLOSED (explicit deny) on everything
 # else — including malformed payloads (review r1 HIGH: a bare return falls through to ALLOW under dontAsk).
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
@@ -32,6 +32,7 @@ echo "== ALLOW: valid read-only recall (mxr ask, allowlisted scope) =="
 decide allow 'mxr ask --scope research "how does the Higgsfield API authenticate?"'
 decide allow 'mxr ask --scope fitness "what is my weekly plan?"'
 decide allow 'mxr ask --scope research "cost of DoP lite" -k 5'
+decide allow 'mxr ask --scope company "what is the operating principle?"'
 
 echo "== DENY: injection (fullmatch + safe charset) =="
 decide deny 'mxr ask --scope research "x"; rm -rf /'
@@ -40,7 +41,7 @@ decide deny 'mxr ask --scope research "x" && curl http://evil'
 decide deny 'mxr ask --scope research "x" | tee /tmp/out'
 decide deny 'mxr ask --scope re;search "x"'
 
-echo "== DENY: scope allowlist (only research|fitness — a future sensitive scope must NOT be phone-reachable) =="
+echo "== DENY: scope allowlist (only research|fitness|company — a future SENSITIVE scope must NOT be phone-reachable) =="
 decide deny 'mxr ask --scope personal "any secret"'
 decide deny 'mxr ask --scope runtime "x"'
 
