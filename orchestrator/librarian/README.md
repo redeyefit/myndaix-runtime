@@ -12,8 +12,8 @@ when the MacBook is awake; graduate to the always-on Mini (+ a launchd keepalive
 |---|---|
 | `kit/settings.json` | fail-closed permission posture → `~/librarian/.claude/settings.json` (removes read/web/MCP/agent surfaces; the gate is the sole Bash allow-er) |
 | `kit/CLAUDE.md` | the librarian identity → `~/librarian/CLAUDE.md` |
-| `hooks/recall-gate.{sh,py}` | PreToolUse Bash gate — allows ONLY `mxr ask --scope research\|fitness "…"`; denies recall, dispatch, other programs, malformed payloads (crash-proof fail-closed). Stays in the repo; settings.json references it by absolute path |
-| `test.sh` | 22-check gate smoke test (allow safe ask; deny injection/dispatch/other programs/wrong-scope/malformed payloads) |
+| `hooks/recall-gate.{sh,py}` | PreToolUse Bash gate — allows ONLY `mxr ask --scope research\|fitness\|company "…"`; denies recall, dispatch, other programs, malformed payloads (crash-proof fail-closed). Stays in the repo; settings.json references it by absolute path |
+| `test.sh` | 35-check gate smoke test (allow safe ask; deny injection/dispatch/other programs/wrong-scope/malformed payloads) |
 
 ## The fence (why it's safe) — hardened per cross-family review r1
 - `defaultMode: dontAsk` + `allow: []` + a deny-list of the **full current canonical non-Bash tool
@@ -22,12 +22,12 @@ when the MacBook is awake; graduate to the always-on Mini (+ a launchd keepalive
   `deny:["*"]` would kill Bash; the gate is Bash's sole allow-er.
 - The recall-gate is **fail-closed**: every non-allow path (unparseable/malformed/non-string payload,
   wrong scope, dispatch, any other program) emits an explicit `deny` — never a bare return (which
-  falls through to ALLOW under `dontAsk`). It allows ONLY `mxr ask --scope research|fitness "<safe q>"`.
-- `mxr recall` is **not** allowed (raw snippets are unfenced); scope is allowlisted to research|fitness
-  (a future sensitive scope can't auto-become phone-reachable); MCP is off (`CLAUDE_CODE_DISABLE_MCP=1`
+  falls through to ALLOW under `dontAsk`). It allows ONLY `mxr ask --scope research|fitness|company "<safe q>"`.
+- `mxr recall` is **not** allowed (raw snippets are unfenced); scope is allowlisted to research|fitness|company
+  (`company` = ~/company plan notes, non-sensitive; a future SENSITIVE scope can't auto-become phone-reachable); MCP is off (`CLAUDE_CODE_DISABLE_MCP=1`
   at launch + `disableClaudeAiConnectors`).
 - Net: a poisoned corpus answer can't escalate — no file reads, no web, no dispatch, no other tool. This
-  is the fenced-reads-WITHOUT-dispatch half of the shelved Watch design. 22/22 test.sh.
+  is the fenced-reads-WITHOUT-dispatch half of the shelved Watch design. 35/35 test.sh.
 
 ## Deploy (MacBook)
 
@@ -59,7 +59,7 @@ cp orchestrator/librarian/kit/settings.json  ~/librarian/.claude/settings.json
 
 ## Verify the fence locally (anytime)
 ```
-bash orchestrator/librarian/test.sh     # 15/15
+bash orchestrator/librarian/test.sh     # 35/35
 ```
 Or, in the live session, try `ls` or `cat ~/.myndaix/.secrets` — the gate denies it.
 
@@ -71,7 +71,7 @@ These remain, none phone-reachable:
   redact-memory) — none grants a capability, and deny-first precedence means the recall-gate's denies
   always win. They only ADD protection. Full isolation via a dedicated librarian `HOME` is blocked by RC
   needing claude.ai auth in HOME — a Mini/production follow-up (seed the auth into a clean HOME).
-- **Scope roots are env-defined (r3 MED):** the gate allowlists the scope *names* research|fitness, but
+- **Scope roots are env-defined (r3 MED):** the gate allowlists the scope *names* research|fitness|company, but
   their filesystem roots come from `MYNDAIX_KNOWLEDGE_SCOPES` (`~/.zshrc`). A compromised operator env
   could remap them — NOT phone-reachable (the session can't edit `~/.zshrc`). Follow-up: pin the roots in
   a dedicated `LIBRARIAN_SCOPES` allowlist.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # recall-gate.py — PreToolUse ALLOWLIST gate for the READ-ONLY recall LIBRARIAN session (piece C).
-# The librarian is read-only: the ONLY thing it may run is `mxr ask --scope research|fitness "<question>"`
+# The librarian is read-only: the ONLY thing it may run is `mxr ask --scope research|fitness|company "<question>"`
 # (Bash). NO dispatch, NO other program, NO other scope, NO shell operators/expansion, NO other TOOL.
 #
 # ALLOWLIST MODEL (keepalive review r2, HIGH-1/HIGH-2). settings.json is registered with matcher "*", so
@@ -27,7 +27,8 @@ from typing import NoReturn
 # EXPLICIT scope allowlist (review r1 MEDIUM): ONLY these are phone-queryable, regardless of what
 # MYNDAIX_KNOWLEDGE_SCOPES holds — a future sensitive scope (e.g. personal) must NOT auto-become
 # reachable from the phone. Add a scope here (and register it in the runtime) to widen, deliberately.
-SCOPES = "research|fitness"
+# `company` = Jefe's own plan/schedule notes (~/company) — non-sensitive, same class as research/fitness.
+SCOPES = "research|fitness|company"
 QUERY = r"[A-Za-z0-9 ._,:/?!'@#%+=()-]"
 # ONLY `mxr ask` (review r1 MEDIUM: raw `mxr recall` snippets are UNFENCED and could carry injection into
 # the outer session; `ask` returns a synthesized answer, and the RC gate bounds any injection in it anyway).
@@ -81,10 +82,10 @@ def _decide(data) -> None:
         if RECALL.fullmatch(stripped):
             emit("allow", "read-only recall (mxr ask, allowlisted scope)")
         emit("deny",
-             'recall rejected: must be EXACTLY  mxr ask --scope research|fitness "<printable question, '
+             f'recall rejected: must be EXACTLY  mxr ask --scope {SCOPES} "<printable question, '
              'no $ ` \\ or double-quote>"  — no dispatch, no other scope, one command')
 
-    emit("deny", f"'{base}' is not permitted — the librarian runs ONLY `mxr ask --scope research|fitness`")
+    emit("deny", f"'{base}' is not permitted — the librarian runs ONLY `mxr ask --scope {SCOPES}`")
 
 
 def main() -> None:

@@ -1,13 +1,13 @@
 # Recall librarian — always-on keepalive (graduate piece C to the Mini)
 
 Keeps the phone-reachable recall librarian (piece C) **always on** on the Mini: one supervised
-`claude remote-control` session, confined to answering `mxr ask --scope research|fitness "…"`,
+`claude remote-control` session, confined to answering `mxr ask --scope research|fitness|company "…"`,
 restarted if it dies, parked (not thrashed) if it can't come up. This is the second-brain rung-1
 graduation — "reachable when the MacBook is awake" → "reachable 24/7 from the phone."
 
 This is the **supervisor**. The **fence** it supervises is piece C (`orchestrator/librarian/`):
 CLAUDE.md + `.claude/settings.json` (deny every non-Bash tool) + the recall-gate PreToolUse hook
-(allow ONLY `mxr ask --scope research|fitness "<safe q>"`). The keepalive adds no capability — it
+(allow ONLY `mxr ask --scope research|fitness|company "<safe q>"`). The keepalive adds no capability — it
 only keeps a session alive **inside** that fence.
 
 ## Design — borrowed from Watch, stripped for read-only recall
@@ -77,7 +77,8 @@ doc can at worst produce a wrong *answer*.
 2. **`mxr` on PATH**: `~/.local/bin/mxr` exists (DSN `postgresql://127.0.0.1/runtime`). The wrapper
    prepends `~/.local/bin`, so login-shell PATH is not required for the keepalive — but keep the shim
    there as the canonical `mxr`.
-3. **Corpus ingested** on the Mini: `mxr knowledge-ingest --scope research` and `--scope fitness`.
+3. **Corpus ingested** on the Mini: `mxr knowledge-ingest --scope research`, `--scope fitness`, and
+   `--scope company` (the last requires `~/company` present on the Mini — see the MVP copy note below).
 4. **Stage the confined workspace** — and **rewrite the hook path for this machine**. The recall-gate
    stays in the repo; `settings.json` references it by ABSOLUTE path, hardcoded to the MacBook
    checkout (`/Users/stevenfernandez/...`). On the Mini it MUST point at the Mini checkout. If it
@@ -94,7 +95,7 @@ doc can at worst produce a wrong *answer*.
    test -x "$(grep -oE '/Users/[^"]*recall-gate.sh' ~/librarian/.claude/settings.json)" && echo hook-ok
    ```
 5. **Smoke test the supervisor**: `bash orchestrator/librarian/keepalive/test.sh` (17/17 local) and
-   the gate: `bash orchestrator/librarian/test.sh` (31/31).
+   the gate: `bash orchestrator/librarian/test.sh` (35/35).
 
 ## Deploy — Jefe's hands (interactive: RC needs claude.ai OAuth)
 
