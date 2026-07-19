@@ -95,7 +95,7 @@ doc can at worst produce a wrong *answer*.
    test -x "$(grep -oE '/Users/[^"]*recall-gate.sh' ~/librarian/.claude/settings.json)" && echo hook-ok
    ```
 5. **Smoke test the supervisor**: `bash orchestrator/librarian/keepalive/test.sh` (17/17 local) and
-   the gate: `bash orchestrator/librarian/test.sh` (31/31).
+   the gate: `bash orchestrator/librarian/test.sh` (35/35).
 
 ## Deploy — Jefe's hands (interactive: RC needs claude.ai OAuth)
 

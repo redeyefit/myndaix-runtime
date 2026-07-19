@@ -27,7 +27,7 @@ when the MacBook is awake; graduate to the always-on Mini (+ a launchd keepalive
   (`company` = ~/company plan notes, non-sensitive; a future SENSITIVE scope can't auto-become phone-reachable); MCP is off (`CLAUDE_CODE_DISABLE_MCP=1`
   at launch + `disableClaudeAiConnectors`).
 - Net: a poisoned corpus answer can't escalate — no file reads, no web, no dispatch, no other tool. This
-  is the fenced-reads-WITHOUT-dispatch half of the shelved Watch design. 22/22 test.sh.
+  is the fenced-reads-WITHOUT-dispatch half of the shelved Watch design. 35/35 test.sh.
 
 ## Deploy (MacBook)
 
@@ -59,7 +59,7 @@ cp orchestrator/librarian/kit/settings.json  ~/librarian/.claude/settings.json
 
 ## Verify the fence locally (anytime)
 ```
-bash orchestrator/librarian/test.sh     # 15/15
+bash orchestrator/librarian/test.sh     # 35/35
 ```
 Or, in the live session, try `ls` or `cat ~/.myndaix/.secrets` — the gate denies it.
 
