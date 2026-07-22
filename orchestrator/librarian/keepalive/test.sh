@@ -115,6 +115,22 @@ printf '#!/usr/bin/env bash\necho '\''{"hookSpecificOutput":{"permissionDecision
 write_valid_fence "$DENY_ALL"
 lib_validate_fence "$LIB_WORKSPACE" && bad "deny-all hook must fail (dead librarian)" || ok "deny-everything hook -> fail-closed (allow smoke catches it)"
 
+# a STALE gate (allows research only, pre-company vintage) -> fail (kilabz PR#110 MEDIUM: the
+# preflight must assert the exact scope policy, not just liveness)
+STALE_GATE="$SCRATCH/stale-gate.sh"
+cat > "$STALE_GATE" << 'STALEEOF'
+#!/usr/bin/env bash
+in="$(cat)"
+if printf '%s' "$in" | grep -q 'scope research'; then
+  echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'
+else
+  echo '{"hookSpecificOutput":{"permissionDecision":"deny"}}'
+fi
+STALEEOF
+chmod +x "$STALE_GATE"
+write_valid_fence "$STALE_GATE"
+lib_validate_fence "$LIB_WORKSPACE" && bad "stale gate (research-only) must fail" || ok "stale gate missing an allowlisted scope -> fail-closed"
+
 echo "== rc-bootstrap: fail-closed guards =="
 have_session() { tmux -S "$SOCK" has-session -t librarian 2>/dev/null; }
 

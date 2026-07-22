@@ -81,7 +81,8 @@ lib_validate_fence() {
   #   1. settings.json is valid JSON,
   #   2. its deny-list covers the non-Bash surface (Read+Write as a proxy),
   #   3. it wires a Bash PreToolUse hook whose command is an ABSOLUTE, EXECUTABLE path,
-  #   4. that hook actually DENIES a disallowed command AND ALLOWS a valid `mxr ask` (smoke-run).
+  #   4. that hook actually DENIES a disallowed command AND enforces the EXACT scope policy
+  #      (smoke-run: every phone-queryable scope allowed, a sensitive scope denied).
   # Returns 0 iff all hold; logs the specific failure and returns 1 otherwise. Side-effect-free
   # (the recall-gate is a pure decision function).
   local ws="${1:-$LIB_WORKSPACE}" settings hook prc
@@ -132,10 +133,22 @@ PY
        | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
     lib_log "fence: hook did NOT deny a non-Bash tool (Read) — allowlist not in effect"; return 1
   fi
-  # smoke: a valid `mxr ask` MUST be allowed (else the librarian would be dead-but-fenced; catch it).
-  if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"mxr ask --scope research \"smoke\""}}' \
-       | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"allow"'; then
-    lib_log "fence: hook did NOT allow a valid mxr ask (research) — misconfigured gate"; return 1
-  fi
+  # smoke: the EXACT scope policy must hold (kilabz PR#110 MEDIUM: a stale deployed gate lacking a
+  # scope, or a drifted one allowing an extra scope, must NOT pass launch preflight). Every
+  # phone-queryable scope MUST be allowed (else dead-but-fenced); a sensitive/unlisted scope MUST be
+  # explicitly denied. MUST stay in sync with SCOPES in hooks/recall-gate.py.
+  local s
+  for s in research fitness company; do
+    if ! printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"mxr ask --scope $s \\\"smoke\\\"\"}}" \
+         | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"allow"'; then
+      lib_log "fence: hook did NOT allow a valid mxr ask ($s) — stale/misconfigured gate"; return 1
+    fi
+  done
+  for s in personal runtime; do
+    if ! printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"mxr ask --scope $s \\\"smoke\\\"\"}}" \
+         | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
+      lib_log "fence: hook did NOT explicitly deny a non-allowlisted scope ($s) — drifted gate"; return 1
+    fi
+  done
   return 0
 }
