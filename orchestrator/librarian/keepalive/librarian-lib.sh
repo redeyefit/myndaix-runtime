@@ -123,32 +123,58 @@ PY
   if [[ ! -x "$hook" ]]; then lib_log "fence: hook not executable: $hook"; return 1; fi
 
   # smoke: a disallowed Bash command MUST be denied.
-  if ! printf '%s' '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' \
-       | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
+  if [[ "$(_lib_gate_decision "$hook" '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}')" != "deny" ]]; then
     lib_log "fence: hook did NOT deny a disallowed command (ls) — refusing to launch"; return 1
   fi
   # smoke: a NON-Bash tool MUST be denied — proves the allowlist model is in effect (the gate fires
   # for every tool, not just Bash), i.e. settings.json wired the hook with matcher "*" (r2 HIGH-2).
-  if ! printf '%s' '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' \
-       | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
+  if [[ "$(_lib_gate_decision "$hook" '{"tool_name":"Read","tool_input":{"file_path":"/x"}}')" != "deny" ]]; then
     lib_log "fence: hook did NOT deny a non-Bash tool (Read) — allowlist not in effect"; return 1
   fi
   # smoke: the EXACT scope policy must hold (kilabz PR#110 MEDIUM: a stale deployed gate lacking a
   # scope, or a drifted one allowing an extra scope, must NOT pass launch preflight). Every
   # phone-queryable scope MUST be allowed (else dead-but-fenced); a sensitive/unlisted scope MUST be
-  # explicitly denied. MUST stay in sync with SCOPES in hooks/recall-gate.py.
+  # explicitly denied — including a synthetic NEVER-allowlisted canary, so a blacklist-style gate
+  # (denies the known two, allows the rest) cannot pass (PR#111 review HIGH). MUST stay in sync with
+  # SCOPES in hooks/recall-gate.py.
   local s
   for s in research fitness company; do
-    if ! printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"mxr ask --scope $s \\\"smoke\\\"\"}}" \
-         | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"allow"'; then
+    if [[ "$(_lib_gate_decision "$hook" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"mxr ask --scope $s \\\"smoke\\\"\"}}")" != "allow" ]]; then
       lib_log "fence: hook did NOT allow a valid mxr ask ($s) — stale/misconfigured gate"; return 1
     fi
   done
-  for s in personal runtime; do
-    if ! printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"mxr ask --scope $s \\\"smoke\\\"\"}}" \
-         | "$hook" 2>/dev/null | grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"'; then
+  for s in personal runtime zz-canary-unlisted; do
+    if [[ "$(_lib_gate_decision "$hook" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"mxr ask --scope $s \\\"smoke\\\"\"}}")" != "deny" ]]; then
       lib_log "fence: hook did NOT explicitly deny a non-allowlisted scope ($s) — drifted gate"; return 1
     fi
   done
   return 0
+}
+
+_lib_gate_decision() {
+  # $1=hook $2=probe-payload-json → prints the gate's permissionDecision, or "" (⇒ caller fails
+  # closed). STRUCTURAL parse, not substring grep (PR#111 review CRITICAL: a malformed gate whose
+  # output contains both "allow" and "deny" strings could dual-match grep and pass every check).
+  # Accepts the Claude hook schema ({"hookSpecificOutput":{"permissionDecision":…}}) and the flat
+  # form. Gate stderr is captured and logged, never discarded (PR#111 review MEDIUM: 2>/dev/null hid
+  # gate crashes — a missing dep looked like a scope mismatch).
+  local hook="$1" payload="$2" out err_f
+  err_f="$(mktemp)" || { lib_log "fence: mktemp failed for gate probe"; return 0; }
+  out="$(printf '%s' "$payload" | "$hook" 2>"$err_f" || true)"
+  if [[ -s "$err_f" ]]; then
+    lib_log "fence: gate stderr during probe: $(head -c 300 "$err_f" | tr -d '\n\r')"
+  fi
+  rm -f "$err_f"
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)  # not a single JSON doc -> no decision -> caller fails closed
+if not isinstance(d, dict):
+    sys.exit(0)
+v = (d.get("hookSpecificOutput") or {}).get("permissionDecision") or d.get("permissionDecision")
+if v in ("allow", "deny", "ask"):
+    print(v)
+' || true
 }

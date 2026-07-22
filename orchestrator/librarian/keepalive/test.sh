@@ -131,6 +131,31 @@ chmod +x "$STALE_GATE"
 write_valid_fence "$STALE_GATE"
 lib_validate_fence "$LIB_WORKSPACE" && bad "stale gate (research-only) must fail" || ok "stale gate missing an allowlisted scope -> fail-closed"
 
+# a BLACKLIST-style gate (denies only the two known sensitive scopes, allows everything else) ->
+# fail (PR#111 review HIGH: the synthetic canary scope can never be allowlisted; allowing it proves
+# the gate is a blacklist)
+BLACKLIST_GATE="$SCRATCH/blacklist-gate.sh"
+cat > "$BLACKLIST_GATE" << 'BLEOF'
+#!/usr/bin/env bash
+in="$(cat)"
+if printf '%s' "$in" | grep -Eq 'scope (personal|runtime)'; then
+  echo '{"hookSpecificOutput":{"permissionDecision":"deny"}}'
+else
+  echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'
+fi
+BLEOF
+chmod +x "$BLACKLIST_GATE"
+write_valid_fence "$BLACKLIST_GATE"
+lib_validate_fence "$LIB_WORKSPACE" && bad "blacklist gate must fail (canary scope allowed)" || ok "blacklist-style gate -> fail-closed (canary scope catches it)"
+
+# a MALFORMED gate whose output contains BOTH decision strings -> fail (PR#111 review CRITICAL:
+# substring grep would dual-match; the structural parse must reject non-single-JSON output)
+DUAL_GATE="$SCRATCH/dual-gate.sh"
+printf '#!/usr/bin/env bash\necho '\''{"debug":"permissionDecision: allow","hookSpecificOutput":{"permissionDecision":"deny"}}{"hookSpecificOutput":{"permissionDecision":"allow"}}'\''\n' > "$DUAL_GATE"
+chmod +x "$DUAL_GATE"
+write_valid_fence "$DUAL_GATE"
+lib_validate_fence "$LIB_WORKSPACE" && bad "dual-decision malformed gate must fail" || ok "dual-decision malformed output -> fail-closed (structural parse)"
+
 echo "== rc-bootstrap: fail-closed guards =="
 have_session() { tmux -S "$SOCK" has-session -t librarian 2>/dev/null; }
 
