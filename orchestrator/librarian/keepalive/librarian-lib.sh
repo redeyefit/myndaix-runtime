@@ -100,13 +100,15 @@ except Exception:
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
 if not {"Read", "Write"} <= deny:
     sys.exit(4)
-# accept ONLY a universal matcher ("*"/""/None = all tools — the allowlist model). "Bash" is
-# REJECTED (PR#111 r2 HIGH): the smoke probes below exec the hook binary DIRECTLY, so they cannot
-# prove live Claude routes non-Bash tools through a Bash-scoped hook — a "Bash" matcher would
-# certify a fence whose whole non-Bash surface rides on the deny-list enumeration alone (the model
-# that previously missed DesignSync). The kit ships matcher "*"; anything narrower fails preflight.
+# accept ONLY a universal matcher ("*", "", or an ABSENT/null matcher = all tools — the allowlist
+# model). "Bash" is REJECTED (PR#111 r2 HIGH): the smoke probes below exec the hook binary
+# DIRECTLY, so they cannot prove live Claude routes non-Bash tools through a Bash-scoped hook —
+# that would ride on the deny-list enumeration alone (the model that missed DesignSync). TYPE-
+# aware check (r3 HIGH): str() made the literal JSON string "None" pass as universal — it is a
+# narrow matcher (matches a tool literally named None), so it must fail like any other.
 for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
-    if str(h.get("matcher")) in ("*", "", "None"):
+    m = h.get("matcher")
+    if m is None or m in ("*", ""):
         for hh in (h.get("hooks") or []):
             if hh.get("type") == "command" and hh.get("command"):
                 print(hh["command"]); sys.exit(0)
@@ -168,26 +170,34 @@ _lib_gate_decision() {
   #   - probe scratch is a private mktemp -d with a template (FIX-5/8: no reopen-by-path TOCTOU
   #     on a predictable file).
   # Gate stderr is captured and logged, never discarded (r1 MEDIUM); parse rejects are printed to
-  # stderr, not swallowed (FIX-7), and hook output is decoded explicitly (FIX-10).
-  local hook="$1" payload="$2" out hook_rc err_d
+  # stderr, not swallowed (FIX-7). r3 HIGH: stdout is captured to a FILE in the private scratch
+  # and decoded STRICTLY — bash command substitution silently strips NUL bytes, and a lenient
+  # errors="replace" decode would normalize invalid UTF-8 before parsing, so the preflight could
+  # certify byte streams that are not the gate's valid JSON. Any non-UTF-8 byte → no decision →
+  # caller fails closed.
+  local hook="$1" payload="$2" hook_rc scratch
   if ! command -v python3 >/dev/null 2>&1; then
     # FIX-6: without python3 the parse below can never certify — say so instead of a misleading
     # scope-mismatch log. (The real gate is itself python3, so this host could never pass anyway.)
     lib_log "fence: python3 not on PATH — cannot parse gate output, refusing to certify"; return 0
   fi
-  err_d="$(mktemp -d "${TMPDIR:-/tmp}/lib-gate.XXXXXX")" || { lib_log "fence: mktemp failed for gate probe"; return 0; }
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/lib-gate.XXXXXX")" || { lib_log "fence: mktemp failed for gate probe"; return 0; }
   hook_rc=0
-  out="$(printf '%s' "$payload" | "$hook" 2>"$err_d/err")" || hook_rc=$?
-  if [[ -s "$err_d/err" ]]; then
-    lib_log "fence: gate stderr during probe: $(head -c 300 "$err_d/err" | tr -d '\n\r')"
+  printf '%s' "$payload" | "$hook" >"$scratch/out" 2>"$scratch/err" || hook_rc=$?
+  if [[ -s "$scratch/err" ]]; then
+    lib_log "fence: gate stderr during probe: $(head -c 300 "$scratch/err" | tr -d '\n\r')"
   fi
-  rm -rf "$err_d"
   if (( hook_rc != 0 )); then
-    lib_log "fence: gate probe exited rc=$hook_rc — live Claude would IGNORE its decision"; return 0
+    lib_log "fence: gate probe exited rc=$hook_rc — live Claude would IGNORE its decision"
+    rm -rf "$scratch"; return 0
   fi
-  printf '%s' "$out" | python3 -c '
+  python3 - "$scratch/out" <<'PY' || true
 import json, sys
-raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+try:
+    raw = open(sys.argv[1], "rb").read().decode("utf-8", errors="strict")
+except Exception as e:
+    print(f"gate output is not strict UTF-8: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(0)  # no decision -> caller fails closed
 try:
     d = json.loads(raw)
 except Exception as e:
@@ -197,5 +207,6 @@ hso = d.get("hookSpecificOutput") if isinstance(d, dict) else None
 v = hso.get("permissionDecision") if isinstance(hso, dict) else None
 if v in ("allow", "deny", "ask"):
     print(v)
-' || true
+PY
+  rm -rf "$scratch"
 }

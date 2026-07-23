@@ -171,12 +171,45 @@ write_valid_fence "$EXIT1_GATE"
 lib_validate_fence "$LIB_WORKSPACE" && bad "correct-but-exit-1 gate must fail" || ok "right decision + non-zero exit -> fail-closed (runtime would ignore it)"
 
 # a gate emitting the decision at the FLAT top level (not hookSpecificOutput) -> fail (PR#111 r2
-# HIGH: the documented PreToolUse shape is nested; a flat-only gate may carry no live decision)
+# HIGH: the documented PreToolUse shape is nested; a flat-only gate may carry no live decision).
+# POLICY-CORRECT fixture (r3 LOW: the old deny-everything flat gate also failed the allow smoke,
+# so it never isolated the schema requirement) — the ONLY reason this one can fail is the shape.
 FLAT_GATE="$SCRATCH/flat-gate.sh"
-printf '#!/usr/bin/env bash\necho '\''{"permissionDecision":"deny"}'\''\n' > "$FLAT_GATE"
+cat > "$FLAT_GATE" << 'FLATEOF'
+#!/usr/bin/env bash
+in="$(cat)"
+if printf '%s' "$in" | grep -Eq 'mxr ask --scope (research|fitness|company) '; then
+  echo '{"permissionDecision":"allow"}'
+else
+  echo '{"permissionDecision":"deny"}'
+fi
+FLATEOF
 chmod +x "$FLAT_GATE"
 write_valid_fence "$FLAT_GATE"
-lib_validate_fence "$LIB_WORKSPACE" && bad "flat-schema gate must fail" || ok "flat top-level decision -> fail-closed (nested shape required)"
+lib_validate_fence "$LIB_WORKSPACE" && bad "flat-schema gate must fail" || ok "flat top-level decision (policy-correct) -> fail-closed (nested shape required)"
+
+# the literal STRING matcher "None" -> fail (r3 HIGH: str() coercion let it pass as universal;
+# it is a narrow matcher — a tool literally named None — not an absent one)
+printf '%s\n' '{ "permissions": {"deny":["Read","Write"]}, "hooks": {"PreToolUse":[{"matcher":"None","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
+  > "$LIB_WORKSPACE/.claude/settings.json"
+lib_validate_fence "$LIB_WORKSPACE" && bad "string-None matcher must fail" || ok "matcher \"None\" (literal string) -> fail-closed"
+
+# a gate whose otherwise-valid decision JSON carries an invalid UTF-8 byte in an IGNORED field ->
+# fail (r3 HIGH: strict decode). POLICY-CORRECT like the flat fixture, so a lenient replace-decode
+# would parse it and PASS validation — only the strict decode can (and must) reject it.
+BADUTF_GATE="$SCRATCH/badutf-gate.sh"
+cat > "$BADUTF_GATE" << 'BUEOF'
+#!/usr/bin/env bash
+in="$(cat)"
+if printf '%s' "$in" | grep -Eq 'mxr ask --scope (research|fitness|company) '; then
+  printf '{"x":"\xff","hookSpecificOutput":{"permissionDecision":"allow"}}\n'
+else
+  printf '{"x":"\xff","hookSpecificOutput":{"permissionDecision":"deny"}}\n'
+fi
+BUEOF
+chmod +x "$BADUTF_GATE"
+write_valid_fence "$BADUTF_GATE"
+lib_validate_fence "$LIB_WORKSPACE" && bad "invalid-UTF-8 gate must fail" || ok "invalid UTF-8 in gate output (policy-correct) -> fail-closed (strict decode)"
 
 echo "== rc-bootstrap: fail-closed guards =="
 have_session() { tmux -S "$SOCK" has-session -t librarian 2>/dev/null; }
