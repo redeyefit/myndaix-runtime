@@ -27,7 +27,10 @@ RUNS="$ORCH/fix-runs"
 MAX_FIXLIST=65536                                       # byte cap; over-cap fails closed (no truncation)
 DAILY_CAP="${PLAY_FIX_DAILY_CAP:-20}"
 VERIFY_TIMEOUT="${MYNDAIX_FIX_TIMEOUT:-300}"           # per sandboxed command (no `timeout` on macOS)
-[[ "$VERIFY_TIMEOUT" =~ ^[0-9]+$ ]] || VERIFY_TIMEOUT=300  # numeric guard — feeds $((…)) below
+# numeric guard — feeds $((…)) below. LENGTH-bounded (r3 MEDIUM): a 20-digit all-digit value
+# overflows 64-bit bash arithmetic and wraps STALE negative (every lock then reads as stale). The
+# regex cap rejects it BEFORE any arithmetic ever parses it; {1,5} → ≤99999s (~27h) ceiling.
+[[ "$VERIFY_TIMEOUT" =~ ^[0-9]{1,5}$ ]] || VERIFY_TIMEOUT=300
 VERIFY_TIMEOUT=$((10#$VERIFY_TIMEOUT))                     # base-10 (leading-zero octal trap)
 # STALE is DERIVED from the same constants that bound worst-case IN-LOCK runtime — never a guessed
 # number (PR#112 r1 HIGH found the class; the armed autofix's patch caught the double sync-wait a
@@ -209,13 +212,41 @@ fi
 lock="$STATE/lock"
 claim_lock(){ mkdir "$lock" 2>/dev/null && printf '%s' "$play" > "$lock/owner" 2>/dev/null; }
 release_lock(){
-  [[ "$(cat "$lock/owner" 2>/dev/null || true)" == "$play" ]] && rm -rf "$lock" 2>/dev/null
+  # CAS release (r3 HIGH-2): a bare check-then-delete lets a reaper swap the lock between our cat
+  # and our rm, so the rm would kill the SUCCESSOR's lock. Atomic `mv` (rename, atomic on APFS)
+  # takes sole ownership FIRST; only then inspect and delete. Fast-path ownership peek keeps us
+  # from ever touching a lock that is already visibly not ours.
+  local held="$lock.rel.$play"
+  [[ "$(cat "$lock/owner" 2>/dev/null || true)" == "$play" ]] || return 0
+  mv "$lock" "$held" 2>/dev/null || return 0            # lost the race — nothing is ours to delete
+  if [[ "$(cat "$held/owner" 2>/dev/null || true)" == "$play" ]]; then
+    rm -rf "$held" 2>/dev/null || true
+  else
+    # we briefly took a lock that turned out not to be ours (reaped-and-reclaimed in the peek→mv
+    # window) — put it BACK; if a new lock appeared meanwhile, log loudly and leave the displaced
+    # dir for the lock.* stray-prune below.
+    mv "$held" "$lock" 2>/dev/null || note "WARN: lock restore failed after release CAS ($held) — stray-prune will collect"
+  fi
   return 0
 }
 if ! claim_lock; then
   now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
-  if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; claim_lock || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
+  if (( now - mt > STALE )); then
+    # CAS reap (r3 HIGH-1): two contenders can both judge the lock stale; a bare rm-then-mkdir
+    # lets the slower one delete the winner's FRESH lock. Atomic `mv` to a per-job name means
+    # exactly ONE contender wins the old lock (the loser's mv fails and it just proceeds to
+    # claim_lock, where mkdir arbitrates).
+    reap="$lock.reap.$play"
+    if mv "$lock" "$reap" 2>/dev/null; then rm -rf "$reap" 2>/dev/null || true; fi
+    claim_lock || fail_closed "another fix is running"
+  else
+    fail_closed "another fix is running"
+  fi
 fi
+# stray-prune (we HOLD the lock here, so this can't race a live contender): a crash inside either
+# CAS window can strand a displaced lock.reap.*/lock.rel.* sibling that the $lock stale reaper
+# never looks at — collect any older than STALE.
+find "$STATE" -maxdepth 1 -name 'lock.*' -type d -mmin +"$(( STALE / 60 ))" -exec rm -rf {} + 2>/dev/null || true
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
 # AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. A lock-releasing
 # EXIT trap is armed FIRST so a mktemp failure or any validation abort can't strand the lock (codex
