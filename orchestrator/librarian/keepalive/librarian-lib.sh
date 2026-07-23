@@ -90,7 +90,7 @@ lib_validate_fence() {
   if [[ ! -f "$settings" ]]; then lib_log "fence: settings.json missing ($settings)"; return 1; fi
 
   # parse + structural asserts in one python pass. exit: 0 ok (prints hook cmd), 2 bad-json,
-  # 3 no-universal-hook, 4 weak-deny, 5 unrecognized handler fields (r4 HIGH).
+  # 3 no-universal-hook, 4 weak-deny, 5 unrecognized entry/handler fields (r4 HIGH + r5 HIGH).
   hook="$(python3 - "$settings" <<'PY'
 import json, sys
 try:
@@ -109,13 +109,17 @@ if not {"Read", "Write"} <= deny:
 for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
     m = h.get("matcher")
     if m is None or m in ("*", ""):
+        # r4 HIGH + r5 HIGH-1: a narrowing field at EITHER level (handler "if"; entry
+        # "platforms"/"environment"/…) can scope the gate below universal while the direct-exec
+        # probes still pass. We cannot enumerate every current/future narrowing key, so FAIL
+        # CLOSED on ANY key beyond the known-safe sets — including "timeout" (r5 HIGH-2: a
+        # deployed timeout:0 cancels the gate pre-decision at runtime = no-decision fall-through
+        # under dontAsk; the kit ships no timeout, so none is certifiable).
+        if set(h.keys()) - {"matcher", "hooks"}:
+            sys.exit(5)
         for hh in (h.get("hooks") or []):
             if hh.get("type") == "command" and hh.get("command"):
-                # r4 HIGH: a handler-level field (e.g. "if") can narrow the handler below
-                # universal while the direct-exec probes still pass. We cannot enumerate every
-                # current/future narrowing key, so FAIL CLOSED on ANY key beyond the known
-                # non-narrowing set.
-                if set(hh.keys()) - {"type", "command", "timeout"}:
+                if set(hh.keys()) - {"type", "command"}:
                     sys.exit(5)
                 print(hh["command"]); sys.exit(0)
 sys.exit(3)

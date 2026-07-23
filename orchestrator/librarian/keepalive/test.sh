@@ -198,12 +198,34 @@ lib_validate_fence "$LIB_WORKSPACE" && bad "flat-schema gate must fail" || ok "f
 write_fence_matcher "None"
 lib_validate_fence "$LIB_WORKSPACE" && bad "string-None matcher must fail" || ok "matcher \"None\" (literal string) -> fail-closed"
 
-# a handler carrying an UNRECOGNIZED field (e.g. "if") -> fail (r4 HIGH: a handler-level field can
-# narrow the handler below universal while direct-exec probes still pass; unknown keys fail closed)
+# a handler carrying an UNRECOGNIZED field (e.g. "if") -> fail via the rc=5 path SPECIFICALLY
+# (r4 HIGH; r5 MEDIUM: the first version of this fixture was a jq SYNTAX error — `if` is a jq
+# keyword — that truncated settings.json and passed through the WRONG failure path (rc=2) while
+# reporting ok. The key is now quoted AND the log line is asserted so a wrong-path pass cannot lie.)
 jq -n --arg cmd "$REAL_HOOK" '{ permissions: {deny:["Read","Write"]},
-  hooks: {PreToolUse:[{matcher:"*",hooks:[{type:"command",command:$cmd,if:"Bash(mxr ask *)"}]}]} }' \
+  hooks: {PreToolUse:[{matcher:"*",hooks:[{type:"command",command:$cmd,"if":"Bash(mxr ask *)"}]}]} }' \
   > "$LIB_WORKSPACE/.claude/settings.json"
-lib_validate_fence "$LIB_WORKSPACE" && bad "handler with 'if' field must fail" || ok "unrecognized handler field ('if') -> fail-closed"
+[[ -s "$LIB_WORKSPACE/.claude/settings.json" ]] || bad "jq failed to build the 'if' fixture"
+if ! lib_validate_fence "$LIB_WORKSPACE" && grep -q 'unrecognized' "$LIB_LOG"; then
+  ok "unrecognized handler field ('if') -> fail-closed via the rc=5 path"
+else
+  bad "handler with 'if' field must fail via the unrecognized-field path"
+fi
+
+# an OUTER entry carrying an unrecognized field (e.g. "platforms") -> fail via rc=5 (r5 HIGH-1:
+# entry-level narrowing — platforms:["windows"] skips the hook entirely on macOS)
+jq -n --arg cmd "$REAL_HOOK" '{ permissions: {deny:["Read","Write"]},
+  hooks: {PreToolUse:[{matcher:"*",platforms:["windows"],hooks:[{type:"command",command:$cmd}]}]} }' \
+  > "$LIB_WORKSPACE/.claude/settings.json"
+[[ -s "$LIB_WORKSPACE/.claude/settings.json" ]] || bad "jq failed to build the platforms fixture"
+lib_validate_fence "$LIB_WORKSPACE" && bad "entry with 'platforms' field must fail" || ok "unrecognized entry field ('platforms') -> fail-closed"
+
+# a handler with a timeout -> fail (r5 HIGH-2: timeout:0 cancels the gate pre-decision at runtime
+# = no-decision fall-through under dontAsk; the kit ships no timeout, so none is certifiable)
+jq -n --arg cmd "$REAL_HOOK" '{ permissions: {deny:["Read","Write"]},
+  hooks: {PreToolUse:[{matcher:"*",hooks:[{type:"command",command:$cmd,timeout:0}]}]} }' \
+  > "$LIB_WORKSPACE/.claude/settings.json"
+lib_validate_fence "$LIB_WORKSPACE" && bad "handler with timeout must fail" || ok "handler timeout field -> fail-closed"
 
 # a gate whose otherwise-valid decision JSON carries an invalid UTF-8 byte in an IGNORED field ->
 # fail (r3 HIGH: strict decode). POLICY-CORRECT like the flat fixture, so a lenient replace-decode
