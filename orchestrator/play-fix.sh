@@ -116,9 +116,12 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
   # not just one under $HOME/.myndaix (codex C1). $run is never under $EXEC, so this can't block the test.
   prof="$prof(deny file-read* (subpath \"$RUN_CANON\"))"
   set -m 2>/dev/null || true                            # each bg job gets its own process group
+  # 9>&- (r5 CRITICAL): NEVER let the sandboxed (untrusted-patched) code inherit the global-lock
+  # fd — flock lives on the shared open-file-description, so a child could LOCK_UN it mid-run or
+  # pin it open after we exit (wedging every future fix now that stale-reap is gone).
   ( cd "$cwd" && exec env -i PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
       HOME="$sh" TMPDIR="$st" PYTHONDONTWRITEBYTECODE=1 \
-      sandbox-exec -p "$prof" "$@" ) &
+      sandbox-exec -p "$prof" "$@" ) 9>&- &
   local pid=$!
   ( sleep "$VERIFY_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) &
   local wd=$!
@@ -212,8 +215,15 @@ except OSError:
     sys.exit(1)'; then
   fail_closed "another fix is running"
 fi
-# one-time migration: a pre-flock version's mkdir-style lock dir (plus any CAS strays) is inert
-# under the new primitive — remove so it can't confuse an operator reading $STATE.
+# legacy-lock transition (r5 HIGH): an OLD pre-flock play-fix started before a deploy may still be
+# LIVE and holding the mkdir-style $STATE/lock — deleting it blind would let us run concurrently
+# with it. Respect the old protocol: claim it the way the old version did; if it can't be claimed
+# AND is recent (< 2h — past any old worst-case runtime), back off. Claimed or stale → it plus the
+# old CAS strays are inert; remove so they can't confuse an operator reading $STATE.
+if ! mkdir "$STATE/lock" 2>/dev/null; then
+  legacy_mt="$(stat -f %m "$STATE/lock" 2>/dev/null || echo 0)"
+  (( $(date +%s) - legacy_mt < 7200 )) && fail_closed "legacy lock dir is present and recent — an old-version fix may still be running"
+fi
 rm -rf "$STATE/lock" "$STATE"/lock.reap.* "$STATE"/lock.rel.* 2>/dev/null || true
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
 # AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. No lock
@@ -270,7 +280,7 @@ elif [[ -n "${MYNDAIX_FIX_PATCH_OVERRIDE:-}" ]]; then
   fail_closed "MYNDAIX_FIX_PATCH_OVERRIDE set without MYNDAIX_FIX_TEST_MODE=1 — refusing (not a production path)"
 else
   command -v mxr >/dev/null 2>&1 || fail_closed "mxr not on PATH"
-  mxr codex "reply with exactly: READY" >/dev/null 2>&1 || fail_closed "codex unreachable (auth or pool down)"
+  mxr codex "reply with exactly: READY" >/dev/null 2>&1 9>&- || fail_closed "codex unreachable (auth or pool down)"
   printf '%s' "$((n + 1))" > "$day"
   # audit the live repo's local git config across the fix job (codex BLOCKER 4: a linked
   # worktree shares .git admin — flag any drift the fixer may have caused)
@@ -281,7 +291,9 @@ else
 $(fence fix-list "$fixlist")"
   # require a successful submit; take the FIRST JOB_ID (the trusted mxr line precedes any
   # agent stderr) (codex MAJOR / Oracle 7)
-  if mxr codex "$prompt" --repo "$repo_path" --base-ref "$base_sha" >/dev/null 2>"$run/codex.err"; then :; else fail_closed "fix job did not complete (codex/pool failure — see $run/codex.err)"; fi
+  # 9>&- on both mxr calls too (r5 CRITICAL): a long-lived/detached descendant must not pin the
+  # lock fd open past our exit.
+  if mxr codex "$prompt" --repo "$repo_path" --base-ref "$base_sha" >/dev/null 2>"$run/codex.err" 9>&-; then :; else fail_closed "fix job did not complete (codex/pool failure — see $run/codex.err)"; fi
   jid="$(grep '^JOB_ID=' "$run/codex.err" | head -1 | cut -d= -f2 || true)"
   [[ "$jid" =~ ^[0-9a-fA-F-]{36}$ ]] || fail_closed "no valid job id from submit"
   cfg_after="$(git -C "$repo_path" config --local --list 2>/dev/null | shasum -a 256 | awk '{print $1}')"
