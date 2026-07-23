@@ -123,7 +123,7 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
       HOME="$sh" TMPDIR="$st" PYTHONDONTWRITEBYTECODE=1 \
       sandbox-exec -p "$prof" "$@" ) 9>&- &
   local pid=$!
-  ( sleep "$VERIFY_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) &
+  ( sleep "$VERIFY_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
   kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
@@ -224,13 +224,16 @@ if ! mkdir "$STATE/lock" 2>/dev/null; then
   legacy_mt="$(stat -f %m "$STATE/lock" 2>/dev/null || echo 0)"
   (( $(date +%s) - legacy_mt < 7200 )) && fail_closed "legacy lock dir is present and recent — an old-version fix may still be running"
 fi
-rm -rf "$STATE/lock" "$STATE"/lock.reap.* "$STATE"/lock.rel.* 2>/dev/null || true
+# HOLD the claimed legacy dir for the whole run (r6 HIGH: an eager rm re-opens the door for an
+# old-version instance STARTING after the rm to mkdir it and run beside us) — the EXIT traps and
+# cleanup() reap it. Only the genuinely-inert CAS strays go now.
+rm -rf "$STATE"/lock.reap.* "$STATE"/lock.rel.* 2>/dev/null || true
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
 # AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. No lock
 # release is needed in ANY trap — the kernel drops the flock when the process (and its fd 9) dies.
 trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
 EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
-trap 'rm -rf "$EXEC" 2>/dev/null || true' EXIT          # reap scratch on any abort, incl. validation below
+trap 'rm -rf "$EXEC" "$STATE/lock" 2>/dev/null || true' EXIT  # reap scratch + held legacy dir on any abort
 EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
 [[ "$HOME_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "home path unsafe for the sandbox profile: $HOME_CANON"
 # reject a TMPDIR that lands ON or UNDER a read-denied dir; the trailing '/' avoids a false hit on a
@@ -255,7 +258,9 @@ cleanup(){
     rm -rf "$EXEC" >/dev/null 2>&1 || true
   done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
-  # no lock release: the fd-held flock dies with the process, whatever the exit path
+  # no flock release needed (dies with the process); the HELD legacy mkdir-dir does need reaping
+  # here — this trap REPLACES the earlier one that did it (r6 HIGH).
+  rm -rf "$STATE/lock" >/dev/null 2>&1 || true
   [[ -e "$EXEC" ]] && note "WARN: could not fully remove $EXEC (adversarial lockdown?) — left for periodic sweep"
   return 0                                              # cleanup is the EXIT trap: never let its last test set $?
 }
