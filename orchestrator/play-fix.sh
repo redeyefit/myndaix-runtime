@@ -27,16 +27,23 @@ RUNS="$ORCH/fix-runs"
 MAX_FIXLIST=65536                                       # byte cap; over-cap fails closed (no truncation)
 DAILY_CAP="${PLAY_FIX_DAILY_CAP:-20}"
 VERIFY_TIMEOUT="${MYNDAIX_FIX_TIMEOUT:-300}"           # per sandboxed command (no `timeout` on macOS)
-# STALE must exceed WORST-CASE total IN-LOCK runtime, else the reaper steals a LIVE lock (PR#112
-# review HIGH; the number then corrected by the armed autofix's own patch, which caught what the
-# manual fold missed): TWO `mxr codex` calls run inside the lock — the READY canary probe AND the
-# real fix submit — each with a 1860s worst-case derived sync-wait (codex Profile 1800 + 60
-# margin), plus the multi-command verify phase (VERIFY_TIMEOUT per command). 5400 ≈ 2×1860 + verify
-# headroom. A stolen live lock breaks one-fix-at-a-time (racing $day counter + worktrees); an
-# over-long stale window merely delays recovery from a SIGKILL-stranded lock. NOTE (review LOW,
-# accepted): a silently hung codex job holds this lock for up to the full 30-min exec budget —
-# WORKSPACE_ACTOR has no retry and invoke_cli no heartbeat; the timeout is the backstop.
-STALE=5400
+[[ "$VERIFY_TIMEOUT" =~ ^[0-9]+$ ]] || VERIFY_TIMEOUT=300  # numeric guard — feeds $((…)) below
+VERIFY_TIMEOUT=$((10#$VERIFY_TIMEOUT))                     # base-10 (leading-zero octal trap)
+# STALE is DERIVED from the same constants that bound worst-case IN-LOCK runtime — never a guessed
+# number (PR#112 r1 HIGH found the class; the armed autofix's patch caught the double sync-wait a
+# manual fold missed; r2 CRITICAL showed any hardcode is refuted by an env-raised VERIFY_TIMEOUT):
+#   - TWO in-lock `mxr codex` calls (READY canary probe + real submit), each blocking up to the
+#     derived sync-wait = codex Profile timeout 1800 + contracts._SYNC_WAIT_MARGIN_S 60. Keep
+#     MXR_SYNC_WAIT in sync with those two sources.
+#   - up to 4 run_sandboxed verify commands (precheck, optional build, verify suite, F2P), each
+#     bounded by VERIFY_TIMEOUT — which is env-overridable, hence the derivation.
+# Defaults: 2*1860 + 4*300 + 480 = 5400. A stolen live lock breaks one-fix-at-a-time (racing $day
+# counter + worktrees); an over-long stale window merely delays recovery of a SIGKILL-stranded
+# lock. NOTE (r1 LOW, accepted): a silently hung codex job holds the lock for the full exec budget
+# — WORKSPACE_ACTOR has no retry and invoke_cli no heartbeat; the timeout is the backstop.
+MXR_SYNC_WAIT=1860
+N_VERIFY_CMDS=4
+STALE=$(( 2*MXR_SYNC_WAIT + N_VERIFY_CMDS*VERIFY_TIMEOUT + 480 ))
 PRUNE_DAYS=14
 # A patch touching the harness = TAMPERED ceiling. Covers: test DIRS, test FILES (naming
 # conventions), and test-config / dependency-manifest / build files (codex M2 / Oracle 6).
@@ -193,22 +200,32 @@ if [[ -n "$f2p_selector" ]]; then
   f2p_argv_json="$(printf '%s' "$f2p_tmpl_json" | jq -c --arg t "$f2p_selector" 'map(if . == "{TEST}" then $t else . end)')"
 fi
 
-# --- global lock (one fix at a time), stale-reaped; trap reaps worktrees + bg children ---
+# --- global lock (one fix at a time), stale-reaped + OWNER-STAMPED; trap reaps worktrees + bg children ---
+# Ownership (PR#112 r2 HIGH): every acquisition stamps $lock/owner with this job's $play id, and
+# release deletes ONLY on a matching stamp — else a job whose lock was stale-reaped would, on its
+# own (late) EXIT, delete the SUCCESSOR's live lock and let a third run race in. A crash in the
+# one-statement window between mkdir and the stamp leaves an ownerless lock: release skips it and
+# the STALE reaper is the catch-all, same as for any SIGKILL strand.
 lock="$STATE/lock"
-if ! mkdir "$lock" 2>/dev/null; then
+claim_lock(){ mkdir "$lock" 2>/dev/null && printf '%s' "$play" > "$lock/owner" 2>/dev/null; }
+release_lock(){
+  [[ "$(cat "$lock/owner" 2>/dev/null || true)" == "$play" ]] && rm -rf "$lock" 2>/dev/null
+  return 0
+}
+if ! claim_lock; then
   now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
-  if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; mkdir "$lock" 2>/dev/null || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
+  if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; claim_lock || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
 fi
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
-# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. A lock-removing
+# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. A lock-releasing
 # EXIT trap is armed FIRST so a mktemp failure or any validation abort can't strand the lock (codex
 # MAJOR). RESIDUAL (accepted): a signal landing in the one-statement window between `mkdir "$lock"` and
 # this trap — like an un-trappable SIGKILL — can still strand it; the STALE-lock reaper (line ~183) is
 # the catch-all for that, same as for any crash.
-trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+trap 'release_lock' EXIT
 trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
 EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
-trap 'rm -rf "$EXEC" "$lock" 2>/dev/null || true' EXIT  # now reap BOTH on any abort, incl. validation below
+trap 'rm -rf "$EXEC" 2>/dev/null || true; release_lock' EXIT  # now reap BOTH on any abort, incl. validation below
 EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
 [[ "$HOME_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "home path unsafe for the sandbox profile: $HOME_CANON"
 # reject a TMPDIR that lands ON or UNDER a read-denied dir; the trailing '/' avoids a false hit on a
@@ -233,7 +250,7 @@ cleanup(){
     rm -rf "$EXEC" >/dev/null 2>&1 || true
   done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
-  rm -rf "$lock" >/dev/null 2>&1 || true
+  release_lock
   [[ -e "$EXEC" ]] && note "WARN: could not fully remove $EXEC (adversarial lockdown?) — left for periodic sweep"
   return 0                                              # cleanup is the EXIT trap: never let its last test set $?
 }
