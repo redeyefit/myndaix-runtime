@@ -218,22 +218,34 @@ fi
 # legacy-lock transition (r5 HIGH): an OLD pre-flock play-fix started before a deploy may still be
 # LIVE and holding the mkdir-style $STATE/lock — deleting it blind would let us run concurrently
 # with it. Respect the old protocol: claim it the way the old version did; if it can't be claimed
-# AND is recent (< 2h — past any old worst-case runtime), back off. Claimed or stale → it plus the
-# old CAS strays are inert; remove so they can't confuse an operator reading $STATE.
-if ! mkdir "$STATE/lock" 2>/dev/null; then
-  legacy_mt="$(stat -f %m "$STATE/lock" 2>/dev/null || echo 0)"
+# AND is recent (< 2h — past any old worst-case runtime), back off. Claimed or stale → held for the
+# whole run (r6 HIGH), reaped by the traps; only the inert CAS strays are removed now.
+# r7 folds: the reap traps are armed BEFORE the claim (r7 CRIT: a signal/mktemp-fail in the gap
+# stranded a fresh marker that fail-closed future runs for 2h) and gated on legacy_held so an
+# early fail_closed can never reap ANOTHER instance's dir; a non-EEXIST mkdir failure or unstat-
+# able dir fails CLOSED instead of sliding past the age check on `echo 0` (r7 HIGH-1); proceeding
+# past a STALE dir refreshes its mtime so a concurrently-starting old version sees it FRESH and
+# backs off rather than CAS-reaping it beside us (r7 HIGH-2).
+legacy_held=0
+trap '[[ "$legacy_held" == 1 ]] && rm -rf "$STATE/lock" 2>/dev/null || true' EXIT
+trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
+if mkdir "$STATE/lock" 2>/dev/null; then
+  legacy_held=1
+else
+  [[ -d "$STATE/lock" ]] || fail_closed "legacy lock claim failed for a non-EEXIST reason (permissions?)"
+  legacy_mt="$(stat -f %m "$STATE/lock" 2>/dev/null || echo "")"
+  [[ "$legacy_mt" =~ ^[0-9]+$ ]] || fail_closed "legacy lock dir present but unstat-able — refusing"
+  legacy_mt=$((10#$legacy_mt))
   (( $(date +%s) - legacy_mt < 7200 )) && fail_closed "legacy lock dir is present and recent — an old-version fix may still be running"
+  touch "$STATE/lock" 2>/dev/null || true
+  legacy_held=1
 fi
-# HOLD the claimed legacy dir for the whole run (r6 HIGH: an eager rm re-opens the door for an
-# old-version instance STARTING after the rm to mkdir it and run beside us) — the EXIT traps and
-# cleanup() reap it. Only the genuinely-inert CAS strays go now.
 rm -rf "$STATE"/lock.reap.* "$STATE"/lock.rel.* 2>/dev/null || true
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
-# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. No lock
-# release is needed in ANY trap — the kernel drops the flock when the process (and its fd 9) dies.
-trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
+# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. No flock
+# release is needed in ANY trap — the kernel drops it when the process (and its fd 9) dies.
 EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
-trap 'rm -rf "$EXEC" "$STATE/lock" 2>/dev/null || true' EXIT  # reap scratch + held legacy dir on any abort
+trap 'rm -rf "$EXEC" 2>/dev/null || true; [[ "$legacy_held" == 1 ]] && rm -rf "$STATE/lock" 2>/dev/null || true' EXIT
 EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
 [[ "$HOME_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "home path unsafe for the sandbox profile: $HOME_CANON"
 # reject a TMPDIR that lands ON or UNDER a read-denied dir; the trailing '/' avoids a false hit on a
