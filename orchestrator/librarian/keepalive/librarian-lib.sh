@@ -100,10 +100,13 @@ except Exception:
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
 if not {"Read", "Write"} <= deny:
     sys.exit(4)
-# accept any matcher that fires for our tools: "*"/""/None (all tools, the allowlist model) or the
-# exact "Bash". The smoke-run below is the real behavioural check regardless of matcher.
+# accept ONLY a universal matcher ("*"/""/None = all tools — the allowlist model). "Bash" is
+# REJECTED (PR#111 r2 HIGH): the smoke probes below exec the hook binary DIRECTLY, so they cannot
+# prove live Claude routes non-Bash tools through a Bash-scoped hook — a "Bash" matcher would
+# certify a fence whose whole non-Bash surface rides on the deny-list enumeration alone (the model
+# that previously missed DesignSync). The kit ships matcher "*"; anything narrower fails preflight.
 for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
-    if str(h.get("matcher")) in ("*", "", "None", "Bash"):
+    if str(h.get("matcher")) in ("*", "", "None"):
         for hh in (h.get("hooks") or []):
             if hh.get("type") == "command" and hh.get("command"):
                 print(hh["command"]); sys.exit(0)
@@ -114,7 +117,7 @@ PY
   case "$prc" in
     0) : ;;
     2) lib_log "fence: settings.json is not valid JSON"; return 1 ;;
-    3) lib_log "fence: no Bash PreToolUse hook in settings.json"; return 1 ;;
+    3) lib_log "fence: no universal-matcher PreToolUse hook in settings.json (matcher must be \"*\")"; return 1 ;;
     4) lib_log "fence: deny-list does not cover the non-Bash surface (Read/Write)"; return 1 ;;
     *) lib_log "fence: settings.json validation failed (rc=$prc)"; return 1 ;;
   esac
@@ -153,27 +156,45 @@ PY
 
 _lib_gate_decision() {
   # $1=hook $2=probe-payload-json → prints the gate's permissionDecision, or "" (⇒ caller fails
-  # closed). STRUCTURAL parse, not substring grep (PR#111 review CRITICAL: a malformed gate whose
+  # closed). STRUCTURAL parse, not substring grep (PR#111 r1 CRITICAL: a malformed gate whose
   # output contains both "allow" and "deny" strings could dual-match grep and pass every check).
-  # Accepts the Claude hook schema ({"hookSpecificOutput":{"permissionDecision":…}}) and the flat
-  # form. Gate stderr is captured and logged, never discarded (PR#111 review MEDIUM: 2>/dev/null hid
-  # gate crashes — a missing dep looked like a scope mismatch).
-  local hook="$1" payload="$2" out err_f
-  err_f="$(mktemp)" || { lib_log "fence: mktemp failed for gate probe"; return 0; }
-  out="$(printf '%s' "$payload" | "$hook" 2>"$err_f" || true)"
-  if [[ -s "$err_f" ]]; then
-    lib_log "fence: gate stderr during probe: $(head -c 300 "$err_f" | tr -d '\n\r')"
+  # r2 folds:
+  #   - hook must EXIT 0 (FIX-1): live Claude processes hook JSON only on exit 0 — a gate that
+  #     prints a decision but exits non-zero is IGNORED at runtime, so certify nothing.
+  #   - decision must live at hookSpecificOutput.permissionDecision, the documented PreToolUse
+  #     shape — the flat top-level fallback is DROPPED (FIX-4: live Claude may ignore a flat-only
+  #     gate) and membership-tested, never truthiness-chained (FIX-3: a falsy "" must not fall
+  #     through to another key).
+  #   - probe scratch is a private mktemp -d with a template (FIX-5/8: no reopen-by-path TOCTOU
+  #     on a predictable file).
+  # Gate stderr is captured and logged, never discarded (r1 MEDIUM); parse rejects are printed to
+  # stderr, not swallowed (FIX-7), and hook output is decoded explicitly (FIX-10).
+  local hook="$1" payload="$2" out hook_rc err_d
+  if ! command -v python3 >/dev/null 2>&1; then
+    # FIX-6: without python3 the parse below can never certify — say so instead of a misleading
+    # scope-mismatch log. (The real gate is itself python3, so this host could never pass anyway.)
+    lib_log "fence: python3 not on PATH — cannot parse gate output, refusing to certify"; return 0
   fi
-  rm -f "$err_f"
+  err_d="$(mktemp -d "${TMPDIR:-/tmp}/lib-gate.XXXXXX")" || { lib_log "fence: mktemp failed for gate probe"; return 0; }
+  hook_rc=0
+  out="$(printf '%s' "$payload" | "$hook" 2>"$err_d/err")" || hook_rc=$?
+  if [[ -s "$err_d/err" ]]; then
+    lib_log "fence: gate stderr during probe: $(head -c 300 "$err_d/err" | tr -d '\n\r')"
+  fi
+  rm -rf "$err_d"
+  if (( hook_rc != 0 )); then
+    lib_log "fence: gate probe exited rc=$hook_rc — live Claude would IGNORE its decision"; return 0
+  fi
   printf '%s' "$out" | python3 -c '
 import json, sys
+raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)  # not a single JSON doc -> no decision -> caller fails closed
-if not isinstance(d, dict):
-    sys.exit(0)
-v = (d.get("hookSpecificOutput") or {}).get("permissionDecision") or d.get("permissionDecision")
+    d = json.loads(raw)
+except Exception as e:
+    print(f"gate output is not a single JSON doc: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(0)  # no decision -> caller fails closed
+hso = d.get("hookSpecificOutput") if isinstance(d, dict) else None
+v = hso.get("permissionDecision") if isinstance(hso, dict) else None
 if v in ("allow", "deny", "ask"):
     print(v)
 ' || true

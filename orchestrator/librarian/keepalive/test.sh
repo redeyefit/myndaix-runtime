@@ -156,6 +156,28 @@ chmod +x "$DUAL_GATE"
 write_valid_fence "$DUAL_GATE"
 lib_validate_fence "$LIB_WORKSPACE" && bad "dual-decision malformed gate must fail" || ok "dual-decision malformed output -> fail-closed (structural parse)"
 
+# a Bash-scoped matcher -> fail (PR#111 r2 HIGH: direct-exec probes can't prove live routing of
+# non-Bash tools through a "Bash"-matched hook; only the universal matcher is certifiable)
+printf '%s\n' '{ "permissions": {"deny":["Read","Write"]}, "hooks": {"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
+  > "$LIB_WORKSPACE/.claude/settings.json"
+lib_validate_fence "$LIB_WORKSPACE" && bad "Bash-scoped matcher must fail" || ok "matcher \"Bash\" (non-universal) -> fail-closed"
+
+# a gate that answers CORRECTLY but exits non-zero -> fail (PR#111 r2 HIGH: live Claude processes
+# hook JSON only on exit 0, so a non-zero gate is ignored at runtime = unconfined under dontAsk)
+EXIT1_GATE="$SCRATCH/exit1-gate.sh"
+printf '#!/usr/bin/env bash\n"%s"\nexit 1\n' "$REAL_HOOK" > "$EXIT1_GATE"
+chmod +x "$EXIT1_GATE"
+write_valid_fence "$EXIT1_GATE"
+lib_validate_fence "$LIB_WORKSPACE" && bad "correct-but-exit-1 gate must fail" || ok "right decision + non-zero exit -> fail-closed (runtime would ignore it)"
+
+# a gate emitting the decision at the FLAT top level (not hookSpecificOutput) -> fail (PR#111 r2
+# HIGH: the documented PreToolUse shape is nested; a flat-only gate may carry no live decision)
+FLAT_GATE="$SCRATCH/flat-gate.sh"
+printf '#!/usr/bin/env bash\necho '\''{"permissionDecision":"deny"}'\''\n' > "$FLAT_GATE"
+chmod +x "$FLAT_GATE"
+write_valid_fence "$FLAT_GATE"
+lib_validate_fence "$LIB_WORKSPACE" && bad "flat-schema gate must fail" || ok "flat top-level decision -> fail-closed (nested shape required)"
+
 echo "== rc-bootstrap: fail-closed guards =="
 have_session() { tmux -S "$SOCK" has-session -t librarian 2>/dev/null; }
 
