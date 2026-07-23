@@ -141,6 +141,13 @@ V1_ROSTER: list[AgentSpec] = [
               # declare, regardless of sandbox config.
               # scratch_home: run under a throwaway HOME seeded with only codex's auth (PR-4
               # fix-stage containment) so an injected fix-list can't read ~/.ssh/~/.aws/~/.myndaix.
+              # timeout_s=1800: same dead-300s-default class as kilabz above (2026-07-22: the FIRST
+              # armed autofix attempt — PR#111's 3-finding fold — died at "timeout after 300s";
+              # WORKSPACE_ACTOR is never retried, so one killed attempt = job dead = fix ABORTED).
+              # A real multi-finding fix (edit + reason over a worktree) needs builder-scale time,
+              # not responder-scale. Profile timeout also drives the DERIVED mxr sync-wait
+              # (Profile.sync_wait), so play-fix's un-enved `mxr codex` submit waits long enough too.
+              profile=Profile(timeout_s=1800),
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "workspace-write",
                        "-c", "sandbox_workspace_write.network_access=false",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",

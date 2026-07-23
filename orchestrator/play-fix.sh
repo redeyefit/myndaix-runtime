@@ -27,7 +27,14 @@ RUNS="$ORCH/fix-runs"
 MAX_FIXLIST=65536                                       # byte cap; over-cap fails closed (no truncation)
 DAILY_CAP="${PLAY_FIX_DAILY_CAP:-20}"
 VERIFY_TIMEOUT="${MYNDAIX_FIX_TIMEOUT:-300}"           # per sandboxed command (no `timeout` on macOS)
-STALE=1800
+# numeric guard, LENGTH-bounded (r3 MEDIUM): a 20-digit all-digit value overflows 64-bit bash
+# arithmetic wherever this feeds $((…)) / sleep. The regex cap rejects it BEFORE any arithmetic
+# ever parses it; {1,5} → ≤99999s (~27h) ceiling.
+[[ "$VERIFY_TIMEOUT" =~ ^[0-9]{1,5}$ ]] || VERIFY_TIMEOUT=300
+VERIFY_TIMEOUT=$((10#$VERIFY_TIMEOUT))                     # base-10 (leading-zero octal trap)
+# (No STALE constant: the global lock is a kernel-owned fd-held flock — see the lock block below —
+# which self-releases on process death, so there is no stale-age arithmetic to get wrong. The
+# PR#112 r1–r4 history of deriving/patching STALE is preserved in git if ever needed.)
 PRUNE_DAYS=14
 # A patch touching the harness = TAMPERED ceiling. Covers: test DIRS, test FILES (naming
 # conventions), and test-config / dependency-manifest / build files (codex M2 / Oracle 6).
@@ -109,11 +116,14 @@ run_sandboxed(){ # run_sandboxed <cwd> <abs-argv...> -> rc (timeout+pgroup kill)
   # not just one under $HOME/.myndaix (codex C1). $run is never under $EXEC, so this can't block the test.
   prof="$prof(deny file-read* (subpath \"$RUN_CANON\"))"
   set -m 2>/dev/null || true                            # each bg job gets its own process group
+  # 9>&- (r5 CRITICAL): NEVER let the sandboxed (untrusted-patched) code inherit the global-lock
+  # fd — flock lives on the shared open-file-description, so a child could LOCK_UN it mid-run or
+  # pin it open after we exit (wedging every future fix now that stale-reap is gone).
   ( cd "$cwd" && exec env -i PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
       HOME="$sh" TMPDIR="$st" PYTHONDONTWRITEBYTECODE=1 \
-      sandbox-exec -p "$prof" "$@" ) &
+      sandbox-exec -p "$prof" "$@" ) 9>&- &
   local pid=$!
-  ( sleep "$VERIFY_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) &
+  ( sleep "$VERIFY_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
   kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
@@ -184,22 +194,52 @@ if [[ -n "$f2p_selector" ]]; then
   f2p_argv_json="$(printf '%s' "$f2p_tmpl_json" | jq -c --arg t "$f2p_selector" 'map(if . == "{TEST}" then $t else . end)')"
 fi
 
-# --- global lock (one fix at a time), stale-reaped; trap reaps worktrees + bg children ---
-lock="$STATE/lock"
-if ! mkdir "$lock" 2>/dev/null; then
-  now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
-  if (( now - mt > STALE )); then rm -rf "$lock" 2>/dev/null || true; mkdir "$lock" 2>/dev/null || fail_closed "another fix is running"; else fail_closed "another fix is running"; fi
+# --- global lock (one fix at a time) — KERNEL-OWNED, fd-held flock; trap reaps worktrees + bg children ---
+# PRIMITIVE CHANGE (PR#112 r4): three review rounds proved the mkdir+mtime+mv lock UNSOUND — every
+# CAS refinement still had a stat→mv or peek→mv window (r2 CRIT, r3 HIGH×2, r4 CRIT×2 + the
+# mv-nests-into-existing-dir trap), because bash file ops can't bind a decision to an inode. An
+# flock(2) on a HELD file descriptor has none of those races BY CONSTRUCTION: acquisition is one
+# atomic kernel op, and the kernel releases the lock when the last fd closes — i.e. on ANY process
+# death, including SIGKILL. So the stale-reaper, owner-stamp, CAS release, and stray-prune are all
+# DELETED, not patched (STALE/MXR_SYNC_WAIT machinery went with them). fd 9 stays open for the
+# script's whole life; python3 locks the INHERITED fd (the lock lives on the shared open-file-
+# description, so it survives python's exit and dies with bash's). A hung holder blocks new fixes
+# until its bounded phases (runner exec timeout / VERIFY_TIMEOUT / pgroup kills) end it — same
+# accepted posture as the r1 no-heartbeat residual.
+LOCKFILE="$STATE/lock.fd"
+exec 9>>"$LOCKFILE" || fail_closed "cannot open lock file $LOCKFILE"
+if ! python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)'; then
+  fail_closed "another fix is running"
 fi
-# exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
-# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. A lock-removing
-# EXIT trap is armed FIRST so a mktemp failure or any validation abort can't strand the lock (codex
-# MAJOR). RESIDUAL (accepted): a signal landing in the one-statement window between `mkdir "$lock"` and
-# this trap — like an un-trappable SIGKILL — can still strand it; the STALE-lock reaper (line ~183) is
-# the catch-all for that, same as for any crash.
-trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+# legacy marker — a one-way SIGNAL to pre-flock instances, NOT a lock (r9 CRIT closes the r5–r9
+# series): the flock above is the ONLY lock; this marker exists solely so an old-version
+# play-fix launched around a deploy sees $STATE/lock and backs off. Because it is not a lock,
+# none of the r5–r8 racing logic (stat/age/touch/CAS) exists: present → fail closed with the
+# one-time operator remedy; absent → plant it (mkdir) and reap it on exit. The reap is gated on
+# marker_planted so no exit path can ever delete a FOREIGN marker (flag stays 0 on both
+# fail_closed paths). RESIDUAL (accepted, fail-closed class): a signal in the one-statement gap
+# between mkdir and marker_planted=1 strands OUR marker; the next run then fails closed once
+# with the self-describing by-hand remedy — bash cannot make mkdir+flag atomic, and the
+# alternative (ungated reap) could delete a live old instance's marker, which is worse.
+marker_planted=0
+EXEC=""
+trap '[[ -n "$EXEC" ]] && rm -rf "$EXEC" 2>/dev/null; [[ "$marker_planted" == 1 ]] && rm -rf "${STATE:?}/lock" 2>/dev/null; true' EXIT
 trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
+if [[ -e "$STATE/lock" ]]; then
+  fail_closed "legacy lock marker exists ($STATE/lock) — verify no pre-flock play-fix is running, then delete that path once by hand"
+fi
+mkdir "$STATE/lock" 2>/dev/null || fail_closed "legacy marker appeared mid-start (old-version launch race) — rerun"
+marker_planted=1
+rm -rf "${STATE:?}"/lock.reap.* "${STATE:?}"/lock.rel.* 2>/dev/null || true
+# exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
+# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined; the EXIT
+# trap above is armed BEFORE mktemp (r9 LOW: a signal in the mktemp→trap gap leaked the scratch
+# dir). No flock release in any trap — the kernel drops it when the process (and its fd 9) dies.
 EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
-trap 'rm -rf "$EXEC" "$lock" 2>/dev/null || true' EXIT  # now reap BOTH on any abort, incl. validation below
 EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
 [[ "$HOME_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "home path unsafe for the sandbox profile: $HOME_CANON"
 # reject a TMPDIR that lands ON or UNDER a read-denied dir; the trailing '/' avoids a false hit on a
@@ -224,7 +264,10 @@ cleanup(){
     rm -rf "$EXEC" >/dev/null 2>&1 || true
   done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
-  rm -rf "$lock" >/dev/null 2>&1 || true
+  # no flock release needed (dies with the process); the planted legacy SIGNAL marker (r9) does
+  # need reaping here — this trap REPLACES the early one — and stays flag-gated so no path ever
+  # deletes a foreign marker.
+  [[ "$marker_planted" == 1 ]] && rm -rf "${STATE:?}/lock" >/dev/null 2>&1
   [[ -e "$EXEC" ]] && note "WARN: could not fully remove $EXEC (adversarial lockdown?) — left for periodic sweep"
   return 0                                              # cleanup is the EXIT trap: never let its last test set $?
 }
@@ -249,7 +292,7 @@ elif [[ -n "${MYNDAIX_FIX_PATCH_OVERRIDE:-}" ]]; then
   fail_closed "MYNDAIX_FIX_PATCH_OVERRIDE set without MYNDAIX_FIX_TEST_MODE=1 — refusing (not a production path)"
 else
   command -v mxr >/dev/null 2>&1 || fail_closed "mxr not on PATH"
-  mxr codex "reply with exactly: READY" >/dev/null 2>&1 || fail_closed "codex unreachable (auth or pool down)"
+  mxr codex "reply with exactly: READY" >/dev/null 2>&1 9>&- || fail_closed "codex unreachable (auth or pool down)"
   printf '%s' "$((n + 1))" > "$day"
   # audit the live repo's local git config across the fix job (codex BLOCKER 4: a linked
   # worktree shares .git admin — flag any drift the fixer may have caused)
@@ -260,7 +303,9 @@ else
 $(fence fix-list "$fixlist")"
   # require a successful submit; take the FIRST JOB_ID (the trusted mxr line precedes any
   # agent stderr) (codex MAJOR / Oracle 7)
-  if mxr codex "$prompt" --repo "$repo_path" --base-ref "$base_sha" >/dev/null 2>"$run/codex.err"; then :; else fail_closed "fix job did not complete (codex/pool failure — see $run/codex.err)"; fi
+  # 9>&- on both mxr calls too (r5 CRITICAL): a long-lived/detached descendant must not pin the
+  # lock fd open past our exit.
+  if mxr codex "$prompt" --repo "$repo_path" --base-ref "$base_sha" >/dev/null 2>"$run/codex.err" 9>&-; then :; else fail_closed "fix job did not complete (codex/pool failure — see $run/codex.err)"; fi
   jid="$(grep '^JOB_ID=' "$run/codex.err" | head -1 | cut -d= -f2 || true)"
   [[ "$jid" =~ ^[0-9a-fA-F-]{36}$ ]] || fail_closed "no valid job id from submit"
   cfg_after="$(git -C "$repo_path" config --local --list 2>/dev/null | shasum -a 256 | awk '{print $1}')"
