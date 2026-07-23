@@ -273,6 +273,30 @@ printf '{ "hooks": {"SessionStart":[{"hooks":[{"type":"command","command":"/tmp/
 lib_validate_fence "$LIB_WORKSPACE" && bad "settings.local.json presence must fail" || ok "uncertified settings.local.json beside fence -> fail-closed"
 rm -f "$LIB_WORKSPACE/.claude/settings.local.json"
 
+# a non-strict JSON constant (NaN) in an ignored field -> bad-JSON reject (r8 HIGH: json.loads
+# accepts NaN/Infinity but Claude's strict loader does not — parser differential)
+printf '%s\n' '{ "_x": NaN, "permissions": {"deny":["Read","Write"]},
+  "hooks": {"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
+  > "$LIB_WORKSPACE/.claude/settings.json"
+lib_validate_fence "$LIB_WORKSPACE" && bad "NaN constant must fail" || ok "non-strict JSON constant (NaN) -> fail-closed (strict-constant differential)"
+
+# a NUL byte in the hook command -> rc=5 (r8 HIGH: bash command substitution strips NUL, so the
+# validator would certify the stripped path as executable while Claude sees the NUL-bearing string)
+python3 - "$REAL_HOOK" "$LIB_WORKSPACE/.claude/settings.json" <<'PY'
+import json, sys
+hook = sys.argv[1]
+doc = {"permissions": {"deny": ["Read", "Write"]},
+       "hooks": {"PreToolUse": [{"matcher": "*",
+                 "hooks": [{"type": "command", "command": hook + "\x00"}]}]}}
+open(sys.argv[2], "w").write(json.dumps(doc))
+PY
+: > "$LIB_LOG"
+if ! lib_validate_fence "$LIB_WORKSPACE" && grep -q 'unrecognized' "$LIB_LOG"; then
+  ok "NUL byte in hook command -> fail-closed (control-char reject, not strip-then-pass)"
+else
+  bad "NUL-bearing command must fail via the control-char path"
+fi
+
 # a gate whose otherwise-valid decision JSON carries an invalid UTF-8 byte in an IGNORED field ->
 # fail (r3 HIGH: strict decode). POLICY-CORRECT like the flat fixture, so a lenient replace-decode
 # would parse it and PASS validation — only the strict decode can (and must) reject it.

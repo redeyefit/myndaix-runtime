@@ -98,8 +98,9 @@ lib_validate_fence() {
     lib_log "fence: an uncertified settings.local.json exists beside the fence — refusing"; return 1
   fi
 
-  # parse + structural asserts in one python pass. exit: 0 ok (prints hook cmd), 2 bad-json,
-  # 3 no-universal-hook, 4 weak-deny, 5 unrecognized entry/handler fields (r4 HIGH + r5 HIGH).
+  # parse + structural asserts in one python pass. exit: 0 ok (prints hook cmd), 2 bad-json
+  # (incl. duplicate keys + non-strict NaN/Inf constants — r7/r8 parser-differential), 3
+  # no-universal-hook, 4 weak-deny, 5 unrecognized fields / control chars (r4/r5/r8).
   hook="$(python3 - "$settings" <<'PY'
 import json, sys
 def _no_dup(pairs):
@@ -112,8 +113,14 @@ def _no_dup(pairs):
             raise ValueError(f"duplicate key {k!r}")
         d[k] = v
     return d
+def _no_const(tok):
+    # r8 HIGH: json.loads ACCEPTS NaN/Infinity/-Infinity (a Python extension); Claude's settings
+    # loader is strict JSON and rejects them — another parser differential (a benign fence + an
+    # ignored "_x": NaN passes us, fails/ignored by Claude). Reject the constants entirely.
+    raise ValueError(f"non-strict JSON constant {tok!r}")
 try:
-    d = json.loads(open(sys.argv[1]).read(), object_pairs_hook=_no_dup)
+    d = json.loads(open(sys.argv[1]).read(),
+                   object_pairs_hook=_no_dup, parse_constant=_no_const)
 except Exception:
     sys.exit(2)
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
@@ -155,8 +162,12 @@ if hh.get("type") != "command" or not hh.get("command"):
 if set(hh.keys()) - {"type", "command"}:
     sys.exit(5)
 cmd = hh["command"]
-if "\n" in cmd or "\r" in cmd:   # r7 LOW: a newline in the path breaks the absolute-path check's
-    sys.exit(5)                  # first-line-only match (fail-closed already, but no garbled log)
+# r8 HIGH: reject ANY C0 control or DEL, not just LF/CR. Bash command substitution STRIPS NUL, so
+# a "/gate " command would certify as "/gate" (executable → pass) while Claude's loader sees
+# the NUL-bearing string (reject/ignore → unconfined). Catching every control char in Python —
+# where the raw byte is still visible — closes the whole class, not one delimiter.
+if any(ord(c) < 0x20 or ord(c) == 0x7f for c in cmd):
+    sys.exit(5)
 print(cmd); sys.exit(0)
 PY
 )"
