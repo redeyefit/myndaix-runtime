@@ -81,6 +81,17 @@ These remain, none phone-reachable:
 - **Slow-ask timeout (r3 MED):** Claude's Bash tool default (~120s) can drop a slow `mxr ask` before it
   returns (Read/task-output are denied, so no recovery). Bounded — asks are usually <30s. Follow-up: raise
   the session's Bash timeout if slow asks are lost.
+- **Global `~/.claude/settings.json` (r7 HIGH, partial):** the fence validator certifies the workspace
+  `settings.json` and now refuses a sibling `settings.local.json`, but Claude still merges the operator's
+  GLOBAL `~/.claude/settings.json`. A `disableAllHooks` or a capability-granting hook there would weaken
+  the fence — but it is the operator's OWN file, unwritable by the confined session (same trust boundary
+  as the accepted inherited-hooks residual), so NOT phone-reachable. `--settings` only ADDS sources, so
+  full isolation needs a dedicated `HOME` (the same Mini/production follow-up as the inherited-hooks item).
+- **Validate→launch TOCTOU (r7 MED):** `preflight` validates `settings.json` immediately before the
+  `claude` exec, but they are separate steps; a writer that swaps the file in that window is not caught.
+  The confined session cannot write the workspace, so the only writer is the operator/deploy — same trust
+  boundary as above, and the live path is a manual single launch. Follow-up (keepalive/Mini): hold a
+  `flock` across validate+launch.
 
 ## Later (follow-ons, not v0)
 - **Always-on:** graduate to the Mini + a launchd keepalive (adapt the Watch `rc-bootstrap`/`rc-wrapper`);

@@ -88,13 +88,32 @@ lib_validate_fence() {
   local ws="${1:-$LIB_WORKSPACE}" settings hook prc
   settings="$ws/.claude/settings.json"
   if [[ ! -f "$settings" ]]; then lib_log "fence: settings.json missing ($settings)"; return 1; fi
+  # r7 HIGH: Claude MERGES $ws/.claude/settings.local.json over the certified file, so an
+  # uncertified local override (a SessionStart hook, a 2nd PreToolUse entry, disableAllHooks)
+  # would silently void the shape we prove. We validate only settings.json, so a sibling
+  # settings.local.json MUST NOT exist. (The ~/.claude global file is the operator's own,
+  # unwritable by the confined session — same trust boundary as the accepted r3 inherited-hooks
+  # residual; documented, not phone-reachable.)
+  if [[ -e "$ws/.claude/settings.local.json" ]]; then
+    lib_log "fence: an uncertified settings.local.json exists beside the fence — refusing"; return 1
+  fi
 
   # parse + structural asserts in one python pass. exit: 0 ok (prints hook cmd), 2 bad-json,
   # 3 no-universal-hook, 4 weak-deny, 5 unrecognized entry/handler fields (r4 HIGH + r5 HIGH).
   hook="$(python3 - "$settings" <<'PY'
 import json, sys
+def _no_dup(pairs):
+    # r7 HIGH: json.load collapses duplicate keys last-wins; if Claude's parser is first-wins, a
+    # doubled "PreToolUse"/"hooks"/"command" lets us validate the benign copy while Claude runs the
+    # evil one. Reject ANY duplicate key so the two parsers can never diverge.
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"duplicate key {k!r}")
+        d[k] = v
+    return d
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.loads(open(sys.argv[1]).read(), object_pairs_hook=_no_dup)
 except Exception:
     sys.exit(2)
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
@@ -117,7 +136,9 @@ hooks_obj = d.get("hooks") or {}
 if set(hooks_obj.keys()) - {"PreToolUse"}:
     sys.exit(5)
 entries = hooks_obj.get("PreToolUse") or []
-if len(entries) != 1:
+if len(entries) == 0:
+    sys.exit(3)   # r7 INFO: missing PreToolUse is "no hook" (3), not "extra fields" (5)
+if len(entries) > 1:
     sys.exit(5)
 h = entries[0] if isinstance(entries[0], dict) else {}
 m = h.get("matcher")
@@ -133,7 +154,10 @@ if hh.get("type") != "command" or not hh.get("command"):
     sys.exit(3)
 if set(hh.keys()) - {"type", "command"}:
     sys.exit(5)
-print(hh["command"]); sys.exit(0)
+cmd = hh["command"]
+if "\n" in cmd or "\r" in cmd:   # r7 LOW: a newline in the path breaks the absolute-path check's
+    sys.exit(5)                  # first-line-only match (fail-closed already, but no garbled log)
+print(cmd); sys.exit(0)
 PY
 )"
   prc=$?
