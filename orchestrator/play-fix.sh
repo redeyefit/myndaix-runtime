@@ -215,23 +215,31 @@ except OSError:
     sys.exit(1)'; then
   fail_closed "another fix is running"
 fi
-# legacy-lock check (r8, ends the r5–r8 series): every attempt to RACE a possible old-version
-# holder of the mkdir-style $STATE/lock (claim/hold/refresh/CAS) produced the next round's TOCTOU
-# — the accommodation itself was the bug surface. So: NO accommodation. If the legacy marker
-# exists AT ALL, fail closed and tell the operator the one-time remedy; nothing here creates,
-# touches, or deletes it, so there is no window and no poison state. Once removed post-deploy it
-# can never reappear (no pre-flock code exists after this version). Only the inert CAS strays of
-# intermediate unreleased versions are swept.
+# legacy marker — a one-way SIGNAL to pre-flock instances, NOT a lock (r9 CRIT closes the r5–r9
+# series): the flock above is the ONLY lock; this marker exists solely so an old-version
+# play-fix launched around a deploy sees $STATE/lock and backs off. Because it is not a lock,
+# none of the r5–r8 racing logic (stat/age/touch/CAS) exists: present → fail closed with the
+# one-time operator remedy; absent → plant it (mkdir) and reap it on exit. The reap is gated on
+# marker_planted so no exit path can ever delete a FOREIGN marker (flag stays 0 on both
+# fail_closed paths). RESIDUAL (accepted, fail-closed class): a signal in the one-statement gap
+# between mkdir and marker_planted=1 strands OUR marker; the next run then fails closed once
+# with the self-describing by-hand remedy — bash cannot make mkdir+flag atomic, and the
+# alternative (ungated reap) could delete a live old instance's marker, which is worse.
+marker_planted=0
+EXEC=""
+trap '[[ -n "$EXEC" ]] && rm -rf "$EXEC" 2>/dev/null; [[ "$marker_planted" == 1 ]] && rm -rf "${STATE:?}/lock" 2>/dev/null; true' EXIT
+trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
 if [[ -e "$STATE/lock" ]]; then
   fail_closed "legacy lock marker exists ($STATE/lock) — verify no pre-flock play-fix is running, then delete that path once by hand"
 fi
+mkdir "$STATE/lock" 2>/dev/null || fail_closed "legacy marker appeared mid-start (old-version launch race) — rerun"
+marker_planted=1
 rm -rf "${STATE:?}"/lock.reap.* "${STATE:?}"/lock.rel.* 2>/dev/null || true
 # exec dir (C4): sandboxed worktrees + scratch live OUTSIDE the read-denied tree. Created here —
-# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined. No flock
-# release is needed in ANY trap — the kernel drops it when the process (and its fd 9) dies.
-trap 'exit 143' INT TERM                                # signal -> exit -> EXIT trap runs, no resumption (O2)
+# AFTER the lock (so lock-contention never mints one) and after fail_closed is defined; the EXIT
+# trap above is armed BEFORE mktemp (r9 LOW: a signal in the mktemp→trap gap leaked the scratch
+# dir). No flock release in any trap — the kernel drops it when the process (and its fd 9) dies.
 EXEC="$(mktemp -d "${TMPDIR:-/tmp}/myndaix-fix.XXXXXX")" || fail_closed "could not create exec dir (mktemp failed)"
-trap 'rm -rf "$EXEC" 2>/dev/null || true' EXIT          # reap scratch on any abort, incl. validation below
 EXEC="$(cd "$EXEC" && pwd -P)"                           # canonical (sandbox subpaths must match)
 [[ "$HOME_CANON" =~ ^[A-Za-z0-9_./-]+$ ]] || fail_closed "home path unsafe for the sandbox profile: $HOME_CANON"
 # reject a TMPDIR that lands ON or UNDER a read-denied dir; the trailing '/' avoids a false hit on a
@@ -256,8 +264,10 @@ cleanup(){
     rm -rf "$EXEC" >/dev/null 2>&1 || true
   done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
-  # no flock release needed (dies with the process); we never create or hold the legacy marker
-  # anymore (r8: its existence fails closed up front), so nothing to reap here either.
+  # no flock release needed (dies with the process); the planted legacy SIGNAL marker (r9) does
+  # need reaping here — this trap REPLACES the early one — and stays flag-gated so no path ever
+  # deletes a foreign marker.
+  [[ "$marker_planted" == 1 ]] && rm -rf "${STATE:?}/lock" >/dev/null 2>&1
   [[ -e "$EXEC" ]] && note "WARN: could not fully remove $EXEC (adversarial lockdown?) — left for periodic sweep"
   return 0                                              # cleanup is the EXIT trap: never let its last test set $?
 }
