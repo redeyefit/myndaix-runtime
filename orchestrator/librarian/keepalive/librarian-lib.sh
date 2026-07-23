@@ -119,8 +119,11 @@ def _no_const(tok):
     # ignored "_x": NaN passes us, fails/ignored by Claude). Reject the constants entirely.
     raise ValueError(f"non-strict JSON constant {tok!r}")
 try:
-    d = json.loads(open(sys.argv[1]).read(),
-                   object_pairs_hook=_no_dup, parse_constant=_no_const)
+    _raw = open(sys.argv[1]).read()   # r9 LOW: read OUTSIDE the parse try so a genuine I/O error
+except OSError:                        # (perms/missing) is distinguishable from a parse failure —
+    sys.exit(2)                        # both still fail closed, but the exit reason isn't masked.
+try:
+    d = json.loads(_raw, object_pairs_hook=_no_dup, parse_constant=_no_const)
 except Exception:
     sys.exit(2)
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
@@ -163,7 +166,7 @@ if set(hh.keys()) - {"type", "command"}:
     sys.exit(5)
 cmd = hh["command"]
 # r8 HIGH: reject ANY C0 control or DEL, not just LF/CR. Bash command substitution STRIPS NUL, so
-# a "/gate " command would certify as "/gate" (executable → pass) while Claude's loader sees
+# a "/gate" command would certify as "/gate" (executable → pass) while Claude's loader sees
 # the NUL-bearing string (reject/ignore → unconfined). Catching every control char in Python —
 # where the raw byte is still visible — closes the whole class, not one delimiter.
 if any(ord(c) < 0x20 or ord(c) == 0x7f for c in cmd):

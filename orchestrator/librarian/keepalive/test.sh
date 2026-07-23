@@ -274,10 +274,18 @@ lib_validate_fence "$LIB_WORKSPACE" && bad "settings.local.json presence must fa
 rm -f "$LIB_WORKSPACE/.claude/settings.local.json"
 
 # a non-strict JSON constant (NaN) in an ignored field -> bad-JSON reject (r8 HIGH: json.loads
-# accepts NaN/Infinity but Claude's strict loader does not — parser differential)
-printf '%s\n' '{ "_x": NaN, "permissions": {"deny":["Read","Write"]},
-  "hooks": {"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
-  > "$LIB_WORKSPACE/.claude/settings.json"
+# accepts NaN/Infinity but Claude's strict loader does not — parser differential). $REAL_HOOK is
+# json.dumps-serialized (r9 MEDIUM) — the literal NaN token is injected as a bareword since no
+# JSON serializer can emit it.
+python3 - "$REAL_HOOK" "$LIB_WORKSPACE/.claude/settings.json" <<'PY'
+import json, sys
+hook = sys.argv[1]
+inner = {"permissions": {"deny": ["Read", "Write"]},
+         "hooks": {"PreToolUse": [{"matcher": "*",
+                   "hooks": [{"type": "command", "command": hook}]}]}}
+body = json.dumps(inner)[1:]  # drop the leading '{' so we can prepend the NaN field
+open(sys.argv[2], "w").write('{"_x": NaN,' + body)
+PY
 lib_validate_fence "$LIB_WORKSPACE" && bad "NaN constant must fail" || ok "non-strict JSON constant (NaN) -> fail-closed (strict-constant differential)"
 
 # a NUL byte in the hook command -> rc=5 (r8 HIGH: bash command substitution strips NUL, so the
