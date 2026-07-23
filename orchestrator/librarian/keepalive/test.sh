@@ -36,15 +36,21 @@ mkdir -p "$LIB_HOME" "$LIB_WORKSPACE/.claude"
 # shellcheck source=/dev/null
 source "$DIR/librarian-lib.sh"
 
-# --- helper: write a VALID fence (deny-list + Bash PreToolUse hook -> the real recall-gate) ---
+# --- helpers: jq-built settings (r4 LOW: raw path splicing into JSON silently malformed the doc
+# on any JSON-special char in the path — jq --arg escapes correctly by construction) ---
 write_valid_fence() {
   local hook="${1:-$REAL_HOOK}"
-  printf '%s\n' '{
-  "permissions": { "defaultMode": "dontAsk", "allow": [],
-    "deny": ["Read","Write","Edit","WebFetch","WebSearch","Agent","Glob","Grep"] },
-  "hooks": { "PreToolUse": [
-    { "matcher": "*", "hooks": [ { "type": "command", "command": "'"$hook"'" } ] } ] }
-}' > "$LIB_WORKSPACE/.claude/settings.json"
+  jq -n --arg cmd "$hook" '{
+    permissions: { defaultMode: "dontAsk", allow: [],
+      deny: ["Read","Write","Edit","WebFetch","WebSearch","Agent","Glob","Grep"] },
+    hooks: { PreToolUse: [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ] }
+  }' > "$LIB_WORKSPACE/.claude/settings.json"
+}
+write_fence_matcher() { # $1=matcher value; real hook, strong deny-list — isolates the matcher
+  jq -n --arg m "$1" --arg cmd "$REAL_HOOK" '{
+    permissions: { deny: ["Read","Write"] },
+    hooks: { PreToolUse: [ { matcher: $m, hooks: [ { type: "command", command: $cmd } ] } ] }
+  }' > "$LIB_WORKSPACE/.claude/settings.json"
 }
 
 echo "== librarian-lib: log =="
@@ -90,7 +96,7 @@ printf '{ not json' > "$LIB_WORKSPACE/.claude/settings.json"
 lib_validate_fence "$LIB_WORKSPACE" && bad "malformed JSON must fail" || ok "malformed settings.json -> fail-closed"
 
 # weak deny-list (no Read/Write) -> fail
-printf '%s\n' '{ "permissions": {"deny":["Edit"]}, "hooks": {"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
+jq -n --arg cmd "$REAL_HOOK" '{ permissions: {deny:["Edit"]}, hooks: {PreToolUse:[{matcher:"*",hooks:[{type:"command",command:$cmd}]}]} }' \
   > "$LIB_WORKSPACE/.claude/settings.json"
 lib_validate_fence "$LIB_WORKSPACE" && bad "weak deny-list must fail" || ok "deny-list missing Read/Write -> fail-closed"
 
@@ -158,14 +164,13 @@ lib_validate_fence "$LIB_WORKSPACE" && bad "dual-decision malformed gate must fa
 
 # a Bash-scoped matcher -> fail (PR#111 r2 HIGH: direct-exec probes can't prove live routing of
 # non-Bash tools through a "Bash"-matched hook; only the universal matcher is certifiable)
-printf '%s\n' '{ "permissions": {"deny":["Read","Write"]}, "hooks": {"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
-  > "$LIB_WORKSPACE/.claude/settings.json"
+write_fence_matcher "Bash"
 lib_validate_fence "$LIB_WORKSPACE" && bad "Bash-scoped matcher must fail" || ok "matcher \"Bash\" (non-universal) -> fail-closed"
 
 # a gate that answers CORRECTLY but exits non-zero -> fail (PR#111 r2 HIGH: live Claude processes
 # hook JSON only on exit 0, so a non-zero gate is ignored at runtime = unconfined under dontAsk)
 EXIT1_GATE="$SCRATCH/exit1-gate.sh"
-printf '#!/usr/bin/env bash\n"%s"\nexit 1\n' "$REAL_HOOK" > "$EXIT1_GATE"
+printf '#!/usr/bin/env bash\n%q\nexit 1\n' "$REAL_HOOK" > "$EXIT1_GATE"
 chmod +x "$EXIT1_GATE"
 write_valid_fence "$EXIT1_GATE"
 lib_validate_fence "$LIB_WORKSPACE" && bad "correct-but-exit-1 gate must fail" || ok "right decision + non-zero exit -> fail-closed (runtime would ignore it)"
@@ -190,9 +195,15 @@ lib_validate_fence "$LIB_WORKSPACE" && bad "flat-schema gate must fail" || ok "f
 
 # the literal STRING matcher "None" -> fail (r3 HIGH: str() coercion let it pass as universal;
 # it is a narrow matcher — a tool literally named None — not an absent one)
-printf '%s\n' '{ "permissions": {"deny":["Read","Write"]}, "hooks": {"PreToolUse":[{"matcher":"None","hooks":[{"type":"command","command":"'"$REAL_HOOK"'"}]}]} }' \
-  > "$LIB_WORKSPACE/.claude/settings.json"
+write_fence_matcher "None"
 lib_validate_fence "$LIB_WORKSPACE" && bad "string-None matcher must fail" || ok "matcher \"None\" (literal string) -> fail-closed"
+
+# a handler carrying an UNRECOGNIZED field (e.g. "if") -> fail (r4 HIGH: a handler-level field can
+# narrow the handler below universal while direct-exec probes still pass; unknown keys fail closed)
+jq -n --arg cmd "$REAL_HOOK" '{ permissions: {deny:["Read","Write"]},
+  hooks: {PreToolUse:[{matcher:"*",hooks:[{type:"command",command:$cmd,if:"Bash(mxr ask *)"}]}]} }' \
+  > "$LIB_WORKSPACE/.claude/settings.json"
+lib_validate_fence "$LIB_WORKSPACE" && bad "handler with 'if' field must fail" || ok "unrecognized handler field ('if') -> fail-closed"
 
 # a gate whose otherwise-valid decision JSON carries an invalid UTF-8 byte in an IGNORED field ->
 # fail (r3 HIGH: strict decode). POLICY-CORRECT like the flat fixture, so a lenient replace-decode

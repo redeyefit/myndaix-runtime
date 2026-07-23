@@ -90,7 +90,7 @@ lib_validate_fence() {
   if [[ ! -f "$settings" ]]; then lib_log "fence: settings.json missing ($settings)"; return 1; fi
 
   # parse + structural asserts in one python pass. exit: 0 ok (prints hook cmd), 2 bad-json,
-  # 3 no-Bash-hook, 4 weak-deny.
+  # 3 no-universal-hook, 4 weak-deny, 5 unrecognized handler fields (r4 HIGH).
   hook="$(python3 - "$settings" <<'PY'
 import json, sys
 try:
@@ -111,6 +111,12 @@ for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
     if m is None or m in ("*", ""):
         for hh in (h.get("hooks") or []):
             if hh.get("type") == "command" and hh.get("command"):
+                # r4 HIGH: a handler-level field (e.g. "if") can narrow the handler below
+                # universal while the direct-exec probes still pass. We cannot enumerate every
+                # current/future narrowing key, so FAIL CLOSED on ANY key beyond the known
+                # non-narrowing set.
+                if set(hh.keys()) - {"type", "command", "timeout"}:
+                    sys.exit(5)
                 print(hh["command"]); sys.exit(0)
 sys.exit(3)
 PY
@@ -121,6 +127,7 @@ PY
     2) lib_log "fence: settings.json is not valid JSON"; return 1 ;;
     3) lib_log "fence: no universal-matcher PreToolUse hook in settings.json (matcher must be \"*\")"; return 1 ;;
     4) lib_log "fence: deny-list does not cover the non-Bash surface (Read/Write)"; return 1 ;;
+    5) lib_log "fence: gate handler carries unrecognized (possibly scope-narrowing) fields — refusing"; return 1 ;;
     *) lib_log "fence: settings.json validation failed (rc=$prc)"; return 1 ;;
   esac
 
