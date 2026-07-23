@@ -27,7 +27,14 @@ RUNS="$ORCH/fix-runs"
 MAX_FIXLIST=65536                                       # byte cap; over-cap fails closed (no truncation)
 DAILY_CAP="${PLAY_FIX_DAILY_CAP:-20}"
 VERIFY_TIMEOUT="${MYNDAIX_FIX_TIMEOUT:-300}"           # per sandboxed command (no `timeout` on macOS)
-STALE=1800
+# STALE must exceed WORST-CASE total runtime, else the reaper steals a LIVE lock (PR#112 review
+# HIGH): the codex fixer's exec budget is 1800s (registry Profile) and mxr's derived sync-wait is
+# 1860s, plus the multi-command verify phase (VERIFY_TIMEOUT per command). 3600 = 1860 + generous
+# verify headroom; a stolen live lock breaks one-fix-at-a-time (racing $day counter + worktrees),
+# while an over-long stale window merely delays recovery from a SIGKILL-stranded lock. NOTE
+# (review LOW, accepted): a silently hung codex job holds this lock for up to the full 30-min exec
+# budget — WORKSPACE_ACTOR has no retry and invoke_cli no heartbeat; the timeout is the backstop.
+STALE=3600
 PRUNE_DAYS=14
 # A patch touching the harness = TAMPERED ceiling. Covers: test DIRS, test FILES (naming
 # conventions), and test-config / dependency-manifest / build files (codex M2 / Oracle 6).
