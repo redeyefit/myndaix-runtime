@@ -119,11 +119,14 @@ def _no_const(tok):
     # ignored "_x": NaN passes us, fails/ignored by Claude). Reject the constants entirely.
     raise ValueError(f"non-strict JSON constant {tok!r}")
 try:
-    _raw = open(sys.argv[1]).read()   # r9 LOW: read OUTSIDE the parse try so a genuine I/O error
-except OSError:                        # (perms/missing) is distinguishable from a parse failure —
-    sys.exit(2)                        # both still fail closed, but the exit reason isn't masked.
-try:
-    d = json.loads(_raw, object_pairs_hook=_no_dup, parse_constant=_no_const)
+    # ONE catch-all: any bad input — unreadable/missing file (OSError), bad encoding
+    # (UnicodeDecodeError), missing arg (IndexError), malformed/duplicate-key/non-strict JSON —
+    # is a single fail-closed "bad input" outcome (exit 2). r10 reverted the r9 read/parse split:
+    # it split hazards without a real payoff (both branches exited 2 anyway) while narrowing the
+    # except to OSError-only, letting Unicode/Index errors escape as tracebacks. The catch-all is
+    # simpler AND strictly safer (no traceback leak, no uncaught path).
+    d = json.loads(open(sys.argv[1]).read(),
+                   object_pairs_hook=_no_dup, parse_constant=_no_const)
 except Exception:
     sys.exit(2)
 deny = set(((d.get("permissions") or {}).get("deny")) or d.get("deny") or [])
