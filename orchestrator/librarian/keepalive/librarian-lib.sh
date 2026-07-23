@@ -106,23 +106,34 @@ if not {"Read", "Write"} <= deny:
 # that would ride on the deny-list enumeration alone (the model that missed DesignSync). TYPE-
 # aware check (r3 HIGH): str() made the literal JSON string "None" pass as universal — it is a
 # narrow matcher (matches a tool literally named None), so it must fail like any other.
-for h in ((d.get("hooks") or {}).get("PreToolUse") or []):
-    m = h.get("matcher")
-    if m is None or m in ("*", ""):
-        # r4 HIGH + r5 HIGH-1: a narrowing field at EITHER level (handler "if"; entry
-        # "platforms"/"environment"/…) can scope the gate below universal while the direct-exec
-        # probes still pass. We cannot enumerate every current/future narrowing key, so FAIL
-        # CLOSED on ANY key beyond the known-safe sets — including "timeout" (r5 HIGH-2: a
-        # deployed timeout:0 cancels the gate pre-decision at runtime = no-decision fall-through
-        # under dontAsk; the kit ships no timeout, so none is certifiable).
-        if set(h.keys()) - {"matcher", "hooks"}:
-            sys.exit(5)
-        for hh in (h.get("hooks") or []):
-            if hh.get("type") == "command" and hh.get("command"):
-                if set(hh.keys()) - {"type", "command"}:
-                    sys.exit(5)
-                print(hh["command"]); sys.exit(0)
-sys.exit(3)
+# EXACTLY-ONE-OF-EVERYTHING shape (r6 HIGH-1/2 + r4/r5): the certifiable settings shape is ONE
+# PreToolUse entry (universal matcher) holding ONE {type,command} handler, and NOTHING else —
+# no other hook EVENT types (a SessionStart/UserPromptSubmit entry is arbitrary command exec
+# outside the Bash allowlist), no extra entries/handlers (Claude runs ALL matching hooks; a
+# second command is smuggled execution the early-exit scan never inspected), no narrowing keys
+# at either level (r4 "if", r5 "platforms"), no "timeout" (r5: timeout:0 cancels the gate
+# pre-decision = no-decision fall-through under dontAsk).
+hooks_obj = d.get("hooks") or {}
+if set(hooks_obj.keys()) - {"PreToolUse"}:
+    sys.exit(5)
+entries = hooks_obj.get("PreToolUse") or []
+if len(entries) != 1:
+    sys.exit(5)
+h = entries[0] if isinstance(entries[0], dict) else {}
+m = h.get("matcher")
+if not (m is None or m in ("*", "")):
+    sys.exit(3)
+if set(h.keys()) - {"matcher", "hooks"}:
+    sys.exit(5)
+handlers = h.get("hooks") or []
+if len(handlers) != 1:
+    sys.exit(5)
+hh = handlers[0] if isinstance(handlers[0], dict) else {}
+if hh.get("type") != "command" or not hh.get("command"):
+    sys.exit(3)
+if set(hh.keys()) - {"type", "command"}:
+    sys.exit(5)
+print(hh["command"]); sys.exit(0)
 PY
 )"
   prc=$?
@@ -131,7 +142,7 @@ PY
     2) lib_log "fence: settings.json is not valid JSON"; return 1 ;;
     3) lib_log "fence: no universal-matcher PreToolUse hook in settings.json (matcher must be \"*\")"; return 1 ;;
     4) lib_log "fence: deny-list does not cover the non-Bash surface (Read/Write)"; return 1 ;;
-    5) lib_log "fence: gate handler carries unrecognized (possibly scope-narrowing) fields — refusing"; return 1 ;;
+    5) lib_log "fence: settings shape not certifiable — extra hook events/entries/handlers or unrecognized fields; refusing"; return 1 ;;
     *) lib_log "fence: settings.json validation failed (rc=$prc)"; return 1 ;;
   esac
 
