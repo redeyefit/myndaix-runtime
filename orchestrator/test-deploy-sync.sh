@@ -44,6 +44,19 @@ rm -f "$SCRATCH/play-fix.sh"; ln -s /etc/hosts "$SCRATCH/play-fix.sh"
 "$SYNC" --apply "$REF" >/dev/null 2>&1 && ok "apply over a symlink exits 0" || bad "apply over symlink failed"
 [[ ! -L "$SCRATCH/play-fix.sh" ]] && ok "symlinked dest replaced by a regular file" || bad "still a symlink"
 
+echo "== --check flags a SYMLINK as drift (security invariant, review MED-2) =="
+"$SYNC" --apply "$REF" >/dev/null 2>&1                             # clean slate
+rm -f "$SCRATCH/play-fix.sh"; ln -s /etc/hosts "$SCRATCH/play-fix.sh"
+if "$SYNC" --check "$REF" >/dev/null 2>&1; then bad "check must flag a symlinked copy"; else ok "symlinked deployed copy -> check reports drift (not fooled by referent content)"; fi
+"$SYNC" --apply "$REF" >/dev/null 2>&1                             # heal back to a real file
+
+echo "== --apply refuses when a deploy lock is held (review MED-1) =="
+mkdir "$SCRATCH/.deploy.lock"
+if "$SYNC" --apply "$REF" >/dev/null 2>&1; then bad "apply must refuse while lock held"; else ok "held deploy lock -> apply refuses (no torn deploy)"; fi
+rmdir "$SCRATCH/.deploy.lock"
+"$SYNC" --apply "$REF" >/dev/null 2>&1 && ok "apply works again after lock released" || bad "apply should work once lock cleared"
+[[ ! -e "$SCRATCH/.deploy.lock" ]] && ok "apply releases its lock on exit" || bad "lock leaked after apply"
+
 echo "== --preflight is ADVISORY (always exit 0), even on drift =="
 printf '\n# tampered again\n' >> "$SCRATCH/play-review.sh"
 "$SYNC" --preflight "$REF" >/dev/null 2>&1 && ok "preflight exits 0 despite drift (cannot brick pool)" || bad "preflight must not fail"

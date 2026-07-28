@@ -48,6 +48,12 @@ disk_blob(){ git -C "$REPO" hash-object "$1" 2>/dev/null || echo "MISSING"; }
 do_check(){
   local drift=0 f want have
   for f in "${FILES[@]}"; do
+    # SECURITY-boundary invariant (review MED-2): git hash-object follows symlinks, so a symlinked
+    # deployed copy pointing at matching content would hash SAME and hide the violation. Check the
+    # link-ness FIRST — a symlink is drift regardless of what it points at.
+    if [[ -L "$DEST/$f" ]]; then
+      log "DRIFT $f  SECURITY: deployed copy is a SYMLINK (must be a real regular file)"; drift=1; continue
+    fi
     want="$(ref_blob "$f")" || die "path not found at $ref: orchestrator/$f"
     have="$(disk_blob "$DEST/$f")"
     if [[ "$want" == "$have" ]]; then
@@ -60,13 +66,22 @@ do_check(){
 }
 
 do_apply(){
-  local f want tmp bak deployed_sha
+  local f want tmp bak deployed_sha lock="$DEST/.deploy.lock"
+  # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
+  # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
+  # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
+  # loud, operator-clearable signal, not worth the reaper complexity #112 cycled on).
+  mkdir "$lock" 2>/dev/null || die "another deploy holds $lock — remove it if stale"
+  trap 'rmdir "'"$lock"'" 2>/dev/null || true' EXIT
   # refresh the tracking ref only when deploying from a remote (skip for local refs / tests)
   case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || log "WARN: fetch failed — using local $ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
   for f in "${FILES[@]}"; do
     want="$(ref_blob "$f")" || die "path not found at $ref: orchestrator/$f"
-    tmp="$DEST/.$f.tmp.$$"
+    # unpredictable, O_EXCL temp (review HIGH-1): a PID-named ($$) temp with '>' follows a
+    # pre-planted same-user symlink; mktemp uses O_EXCL + random suffix, closing that vector on the
+    # very files that ARE the security boundary.
+    tmp="$(mktemp "$DEST/.$f.tmp.XXXXXX")" || die "mktemp failed in $DEST"
     # materialize the EXACT committed blob (not the working tree — avoids dirty-tree bleed)
     git -C "$REPO" show "$ref:orchestrator/$f" > "$tmp" || { rm -f "$tmp"; die "git show failed for $f"; }
     chmod +x "$tmp"
@@ -87,6 +102,7 @@ do_preflight(){
   # ADVISORY only — never fails the caller (pool start must not be bricked by this guard).
   local f want have head_sha stamped
   for f in "${FILES[@]}"; do
+    [[ -L "$DEST/$f" ]] && log "PREFLIGHT WARN: $f is a SYMLINK — security-boundary violation (must be a real file)"
     want="$(ref_blob "$f" 2>/dev/null || echo '?')"; have="$(disk_blob "$DEST/$f")"
     [[ "$want" == "$have" ]] || log "PREFLIGHT WARN: deployed $f drifts from $ref (deployed=$have want=$want)"
   done
