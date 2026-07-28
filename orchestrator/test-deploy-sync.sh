@@ -67,6 +67,15 @@ rm -f "$SCRATCH/play-fix.sh"; ln -s /etc/hosts "$SCRATCH/play-fix.sh"
 "$SYNC" --preflight "$REF" >/dev/null 2>&1 && ok "preflight on a symlink completes + exits 0 (continues, never hashes)" || bad "preflight must not fail/hang on symlink"
 "$SYNC" --apply "$REF" >/dev/null 2>&1                             # heal
 
+echo "== --apply does NOT hang on a FIFO at the dest path (review r4 HIGH) =="
+"$SYNC" --apply "$REF" >/dev/null 2>&1
+rm -f "$SCRATCH/play-fix.sh"; mkfifo "$SCRATCH/play-fix.sh"
+# with the -f&&!-L backup guard, cp never touches the FIFO; run in bg + kill-guard so a REGRESSION
+# (hang) fails the test instead of wedging the suite.
+( "$SYNC" --apply "$REF" >/dev/null 2>&1 ) & ap=$!
+( sleep 15; kill "$ap" 2>/dev/null ) & kg=$!
+if wait "$ap" 2>/dev/null; then kill "$kg" 2>/dev/null; [[ -f "$SCRATCH/play-fix.sh" && ! -p "$SCRATCH/play-fix.sh" ]] && ok "FIFO at dest -> apply completes + heals to a regular file (no cp hang)" || bad "FIFO not healed to regular file"; else bad "apply HUNG on a FIFO (r4 regression)"; fi
+
 echo "== trap does NOT execute injected command substitution (review r2 CRITICAL) =="
 PWN="$SCRATCH/PWNED_MARKER"
 EVIL_DEST="$SCRATCH/d\$(touch $PWN)x"                              # dir name literally contains \$(...)

@@ -62,6 +62,7 @@ disk_blob(){ [[ -f "$1" && ! -L "$1" ]] || { echo "MISSING"; return; }; git -C "
 
 do_check(){
   local drift=0 f want have
+  ref="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"  # pin (r4): one commit for all files
   for f in "${FILES[@]}"; do
     # SECURITY-boundary invariant (review MED-2): git hash-object follows symlinks, so a symlinked
     # deployed copy pointing at matching content would hash SAME and hide the violation. Check the
@@ -87,13 +88,18 @@ do_apply(){
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
   # loud, operator-clearable signal, not worth the reaper complexity #112 cycled on).
   _LOCK="$DEST/.deploy.lock"
-  # ACCEPTED RESIDUAL (review r3, declined): a non-EEXIST mkdir failure (perms/ENOSPC) reports the
-  # same "another deploy holds" message. Rare (the operator owns $DEST) and still fail-closed —
-  # both cases correctly stop the deploy; not worth branching the error text.
-  mkdir "$_LOCK" 2>/dev/null || die "another deploy holds $_LOCK — remove it if stale (or check perms/space on $DEST)"
+  # distinguish EEXIST (another deploy) from a real mkdir failure (perms/ENOSPC) — surface the OS
+  # error instead of a misleading "another deploy holds" (review r4).
+  local mkerr
+  if ! mkerr="$(mkdir "$_LOCK" 2>&1)"; then
+    if [[ -d "$_LOCK" ]]; then die "another deploy holds $_LOCK — remove it if stale"
+    else die "cannot create lock $_LOCK: $mkerr"; fi
+  fi
   trap _release_lock EXIT                             # function form — no path interpolation (r2 CRIT)
-  # refresh the tracking ref only when deploying from a remote (skip for local refs / tests)
-  case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || log "WARN: fetch failed — using local $ref" ;; esac
+  # refresh the tracking ref when deploying from a remote. Fetch failure is FATAL in --apply (review
+  # r4): silently deploying a stale/rolled-back local origin/main is the exact silent-non-deploy this
+  # tool exists to prevent. (--preflight tolerates it — it's advisory.)
+  case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
   # PIN to the immutable commit for the rest of the loop (review r3 MAJOR-1): reading blobs through
   # the moving $ref (origin/main) could deploy file A from one commit and file B from another if the
@@ -114,10 +120,12 @@ do_apply(){
     # backup any existing REGULAR deployed copy (reversible). SKIP a symlinked source (review r3
     # MAJOR-2): cp -p follows the link and would hang forever on a symlink-to-FIFO/device — and
     # backing up a planted symlink is pointless anyway. The mv below heals it to a regular file.
-    if [[ -L "$DEST/$f" ]]; then
-      log "SECURITY: $f was a SYMLINK — not backing up; healing to a regular file"
+    if [[ -f "$DEST/$f" && ! -L "$DEST/$f" ]]; then
+      bak="$DEST/$f.bak-$(date '+%Y%m%d%H%M%S')"; cp -Pp "$DEST/$f" "$bak"   # -P: never deref (belt)
     elif [[ -e "$DEST/$f" ]]; then
-      bak="$DEST/$f.bak-$(date '+%Y%m%d%H%M%S')"; cp -p "$DEST/$f" "$bak"
+      # a SYMLINK or a special file (FIFO/device) sits where a real script should — do NOT cp it
+      # (cp would hang forever on a FIFO; review r4), just log and let the mv below heal it.
+      log "SECURITY: $f is not a regular file (symlink/FIFO/device) — not backing up; healing"
     fi
     mv -f "$tmp" "$DEST/$f"                                # atomic rename (same fs); replaces a symlink
     [[ ! -L "$DEST/$f" ]] || die "SECURITY: $f became a symlink — refusing"   # regular-file invariant
@@ -131,6 +139,7 @@ do_apply(){
 do_preflight(){
   # ADVISORY only — never fails the caller (pool start must not be bricked by this guard).
   local f want have head_sha stamped
+  ref="$(git -C "$REPO" rev-parse --verify "$ref" 2>/dev/null || printf '%s' "$ref")"  # best-effort pin (r4); never dies
   for f in "${FILES[@]}"; do
     # continue BEFORE hashing (review r2 MED): never call git hash-object on a symlink — it would
     # hang forever on a symlink-to-FIFO/device, and this advisory must never stall pool start.
