@@ -61,6 +61,19 @@ echo "== --preflight is ADVISORY (always exit 0), even on drift =="
 printf '\n# tampered again\n' >> "$SCRATCH/play-review.sh"
 "$SYNC" --preflight "$REF" >/dev/null 2>&1 && ok "preflight exits 0 despite drift (cannot brick pool)" || bad "preflight must not fail"
 
+echo "== --preflight does NOT hash a symlink (no FIFO-hang, review r2 MED-2) =="
+"$SYNC" --apply "$REF" >/dev/null 2>&1
+rm -f "$SCRATCH/play-fix.sh"; ln -s /etc/hosts "$SCRATCH/play-fix.sh"
+"$SYNC" --preflight "$REF" >/dev/null 2>&1 && ok "preflight on a symlink completes + exits 0 (continues, never hashes)" || bad "preflight must not fail/hang on symlink"
+"$SYNC" --apply "$REF" >/dev/null 2>&1                             # heal
+
+echo "== trap does NOT execute injected command substitution (review r2 CRITICAL) =="
+PWN="$SCRATCH/PWNED_MARKER"
+EVIL_DEST="$SCRATCH/d\$(touch $PWN)x"                              # dir name literally contains \$(...)
+mkdir -p "$EVIL_DEST"
+DEPLOY_SYNC_DEST="$EVIL_DEST" "$SYNC" --apply "$REF" >/dev/null 2>&1 || true
+[[ ! -e "$PWN" ]] && ok "a \$()-bearing DEPLOY_SYNC_DEST does not execute on trap fire" || bad "TRAP INJECTION FIRED"
+
 echo ""
 echo "== RESULT: $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

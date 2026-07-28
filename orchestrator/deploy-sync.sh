@@ -34,16 +34,24 @@ FILES=(play-fix.sh play-review.sh)                        # the audited copied s
 mode="${1:-}"
 ref="${2:-origin/main}"
 
+_LOCK=""                                              # script-scope so the EXIT trap sees it (review r2 CRIT)
+
 log(){ printf '[%s] [deploy-sync] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die(){ log "ERROR: $*" >&2; exit 1; }
+# lock release as a FUNCTION (never interpolate a path into a trap string — a $()-bearing
+# DEPLOY_SYNC_DEST would inject live command substitution at trap-fire time; review r2 CRITICAL).
+_release_lock(){ [[ -n "${_LOCK:-}" ]] && rmdir "$_LOCK" 2>/dev/null; return 0; }
 
 [[ -d "$REPO/.git" ]] || die "repo not a git dir: $REPO"
 [[ -d "$DEST" ]]      || die "deploy dest missing: $DEST"
 
 # blob sha of a path AT a git ref (the intended/committed content)
 ref_blob(){ git -C "$REPO" rev-parse --verify --quiet "$ref:orchestrator/$1"; }
-# blob sha of a file's CURRENT content on disk (git's own content hash — comparable to ref_blob)
-disk_blob(){ git -C "$REPO" hash-object "$1" 2>/dev/null || echo "MISSING"; }
+# blob sha of a file's CURRENT content on disk (git's own content hash — comparable to ref_blob).
+# NEVER follow a symlink (review r2): git hash-object dereferences, which both hides a symlink
+# security-boundary violation AND can hang forever on a symlink-to-FIFO/device. A non-regular or
+# symlinked path returns MISSING (reads as drift) rather than being hashed.
+disk_blob(){ [[ -f "$1" && ! -L "$1" ]] || { echo "MISSING"; return; }; git -C "$REPO" hash-object "$1" 2>/dev/null || echo "MISSING"; }
 
 do_check(){
   local drift=0 f want have
@@ -66,13 +74,14 @@ do_check(){
 }
 
 do_apply(){
-  local f want tmp bak deployed_sha lock="$DEST/.deploy.lock"
+  local f want tmp bak deployed_sha
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
   # loud, operator-clearable signal, not worth the reaper complexity #112 cycled on).
-  mkdir "$lock" 2>/dev/null || die "another deploy holds $lock — remove it if stale"
-  trap 'rmdir "'"$lock"'" 2>/dev/null || true' EXIT
+  _LOCK="$DEST/.deploy.lock"
+  mkdir "$_LOCK" 2>/dev/null || die "another deploy holds $_LOCK — remove it if stale"
+  trap _release_lock EXIT                             # function form — no path interpolation (r2 CRIT)
   # refresh the tracking ref only when deploying from a remote (skip for local refs / tests)
   case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || log "WARN: fetch failed — using local $ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
@@ -102,7 +111,11 @@ do_preflight(){
   # ADVISORY only — never fails the caller (pool start must not be bricked by this guard).
   local f want have head_sha stamped
   for f in "${FILES[@]}"; do
-    [[ -L "$DEST/$f" ]] && log "PREFLIGHT WARN: $f is a SYMLINK — security-boundary violation (must be a real file)"
+    # continue BEFORE hashing (review r2 MED): never call git hash-object on a symlink — it would
+    # hang forever on a symlink-to-FIFO/device, and this advisory must never stall pool start.
+    if [[ -L "$DEST/$f" ]]; then
+      log "PREFLIGHT WARN: $f is a SYMLINK — security-boundary violation (must be a real file)"; continue
+    fi
     want="$(ref_blob "$f" 2>/dev/null || echo '?')"; have="$(disk_blob "$DEST/$f")"
     [[ "$want" == "$have" ]] || log "PREFLIGHT WARN: deployed $f drifts from $ref (deployed=$have want=$want)"
   done
