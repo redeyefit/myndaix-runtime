@@ -51,6 +51,13 @@ ref_blob(){ git -C "$REPO" rev-parse --verify --quiet "$ref:orchestrator/$1"; }
 # NEVER follow a symlink (review r2): git hash-object dereferences, which both hides a symlink
 # security-boundary violation AND can hang forever on a symlink-to-FIFO/device. A non-regular or
 # symlinked path returns MISSING (reads as drift) rather than being hashed.
+# ACCEPTED RESIDUALS (review r3, declined by design):
+#  - the [[ -f && ! -L ]] guard and the hash are separate syscalls (a same-user writer could swap a
+#    symlink in between). NOT in the threat model: a same-user process on this solo single-host box
+#    can edit the deployed files directly — racing this guard buys nothing. The O_NOFOLLOW fd dance
+#    to close it is over-engineering for a non-threat.
+#  - a git hash-object FAILURE (not just absence) also returns MISSING → fail-safe (reads as drift →
+#    redeploy). We don't log it: disk_blob runs in tight check/preflight loops; noise > signal here.
 disk_blob(){ [[ -f "$1" && ! -L "$1" ]] || { echo "MISSING"; return; }; git -C "$REPO" hash-object "$1" 2>/dev/null || echo "MISSING"; }
 
 do_check(){
@@ -80,13 +87,21 @@ do_apply(){
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
   # loud, operator-clearable signal, not worth the reaper complexity #112 cycled on).
   _LOCK="$DEST/.deploy.lock"
-  mkdir "$_LOCK" 2>/dev/null || die "another deploy holds $_LOCK — remove it if stale"
+  # ACCEPTED RESIDUAL (review r3, declined): a non-EEXIST mkdir failure (perms/ENOSPC) reports the
+  # same "another deploy holds" message. Rare (the operator owns $DEST) and still fail-closed —
+  # both cases correctly stop the deploy; not worth branching the error text.
+  mkdir "$_LOCK" 2>/dev/null || die "another deploy holds $_LOCK — remove it if stale (or check perms/space on $DEST)"
   trap _release_lock EXIT                             # function form — no path interpolation (r2 CRIT)
   # refresh the tracking ref only when deploying from a remote (skip for local refs / tests)
   case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || log "WARN: fetch failed — using local $ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
+  # PIN to the immutable commit for the rest of the loop (review r3 MAJOR-1): reading blobs through
+  # the moving $ref (origin/main) could deploy file A from one commit and file B from another if the
+  # ref advances mid-loop, then stamp the earlier sha — a silent mixed-commit deploy. All subsequent
+  # blob reads use $deployed_sha, so the two files + the stamp always describe ONE commit.
+  ref="$deployed_sha"
   for f in "${FILES[@]}"; do
-    want="$(ref_blob "$f")" || die "path not found at $ref: orchestrator/$f"
+    want="$(ref_blob "$f")" || die "path not found at $deployed_sha: orchestrator/$f"
     # unpredictable, O_EXCL temp (review HIGH-1): a PID-named ($$) temp with '>' follows a
     # pre-planted same-user symlink; mktemp uses O_EXCL + random suffix, closing that vector on the
     # very files that ARE the security boundary.
@@ -96,9 +111,15 @@ do_apply(){
     chmod +x "$tmp"
     # verify BEFORE install — never place a mismatched file
     [[ "$(disk_blob "$tmp")" == "$want" ]] || { rm -f "$tmp"; die "hash mismatch building $f (refusing)"; }
-    # backup any existing deployed copy (reversible)
-    if [[ -e "$DEST/$f" ]]; then bak="$DEST/$f.bak-$(date '+%Y%m%d%H%M%S')"; cp -p "$DEST/$f" "$bak"; fi
-    mv -f "$tmp" "$DEST/$f"                                # atomic rename (same fs)
+    # backup any existing REGULAR deployed copy (reversible). SKIP a symlinked source (review r3
+    # MAJOR-2): cp -p follows the link and would hang forever on a symlink-to-FIFO/device — and
+    # backing up a planted symlink is pointless anyway. The mv below heals it to a regular file.
+    if [[ -L "$DEST/$f" ]]; then
+      log "SECURITY: $f was a SYMLINK — not backing up; healing to a regular file"
+    elif [[ -e "$DEST/$f" ]]; then
+      bak="$DEST/$f.bak-$(date '+%Y%m%d%H%M%S')"; cp -p "$DEST/$f" "$bak"
+    fi
+    mv -f "$tmp" "$DEST/$f"                                # atomic rename (same fs); replaces a symlink
     [[ ! -L "$DEST/$f" ]] || die "SECURITY: $f became a symlink — refusing"   # regular-file invariant
     [[ "$(disk_blob "$DEST/$f")" == "$want" ]] || die "post-install hash mismatch $f"
     log "APPLIED $f  ($want)"
