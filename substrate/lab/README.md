@@ -5,38 +5,68 @@ Anything here is installed BY HAND on the MacBook and is deliberately outside th
 
 ## tailnet-watch
 
-The lab watches the factory: probes the Mini's tailnet node (ssh port, then `tailscale ping`)
-every 10 min. Three consecutive failures → macOS notification (re-alerted at most once/day),
-recovery notice on heal. Exists because of the 2026-07-18→08-09 incident: the Mini ran dark
-off the tailnet for 22 days while its own liveness-canary stayed green (every LOCAL job was
-healthy — reachability had no watcher). The Mini is now also the offsite backup mirror, so a
-dark Mini = silently single-copy.
+The lab watches the factory: probes the Mini's tailnet node (ssh port via pinned
+`/usr/bin/nc`, then `tailscale ping`) every 10 min. Three consecutive **observed** failures
+→ macOS notification, re-armed every 4h while dark, recovery notice on heal. Ticks are
+**skipped, not counted** when this Mac itself is off the tailnet (plane, captive portal,
+wake race) — the watcher only asserts what it observed, and a fail streak with a >30 min
+observation gap restarts rather than lying about continuity.
 
-Design guards (lessons from the liveness-canary audit): per-signal latch with daily re-arm
-(no spam, no permanent silence), atomic state writes, `10#` base-10 normalization on all
-numerics read from state, corrupt-state fail-safe, BSD-only (`date -r`) — this is a
-macOS-lab-only script by design.
+Exists because of the 2026-07-18→08-09 incident: the Mini ran dark off the tailnet for 22
+days while its own liveness-canary stayed green (every LOCAL job was healthy — reachability
+had no watcher). The Mini is now also the offsite backup mirror, so a dark Mini = silently
+single-copy.
 
-### Install (once, on the MacBook)
+Runtime-audit-driven guards: observer-health gate; per-signal latch that only arms when the
+notification DELIVERED (failed osascript retries next tick, stderr goes to the log — no
+silent suppression on the alert path); 4h re-alert cadence (de-anchors retries from daily
+Focus windows); staleness window; atomic state writes; digit-capped `10#` parsing with
+future-timestamp clamps; runs from `~/.myndaix/bin`, NOT the git tree (a branch switch must
+never kill the monitor). macOS-only by design (`nc -G`, `date -r`).
+
+### Install (once, on the MacBook — every step required)
 
 ```
-mkdir -p ~/.myndaix/state   # launchd opens the plist's stdout/err paths BEFORE the script's own mkdir
+mkdir -p ~/.myndaix/state ~/.myndaix/bin    # launchd opens the plist stdout paths BEFORE the script runs
+cp substrate/lab/tailnet-watch.sh ~/.myndaix/bin/tailnet-watch.sh
 cp substrate/lab/ai.myndaix.tailnet-watch.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.myndaix.tailnet-watch.plist
 ```
 
-Note: `tailscale ping -c 1` is verified against the installed GUI-app CLI (1.90.x) — docs
-list variants; trust the binary.
+Then two one-time settings (macOS can silently suppress banners otherwise):
+1. System Settings → Notifications → **Script Editor** → style **Alerts** (persistent), sound on.
+2. Any Focus modes you use (Work, DND): add **Script Editor** to the allowed apps.
+
+**Mandatory delivery drill — you must SEE the banner before trusting the watcher:**
+
+```
+MYNDAIX_HOME="$(mktemp -d)" TW_HOST=192.0.2.1 TW_FAIL_THRESHOLD=1 bash ~/.myndaix/bin/tailnet-watch.sh
+```
+
+(The scratch `MYNDAIX_HOME` keeps the drill out of the live state file — without it the real
+agent's next tick would fire a spurious recovery notice.)
+
+### Update flow
+
+The installed copy at `~/.myndaix/bin/tailnet-watch.sh` is a HAND-COPIED deploy artifact
+(this consciously extends the known hand-copied set — see runtime-deploy-topology): after
+changing `substrate/lab/tailnet-watch.sh` on main, re-run the `cp` line. `diff` them if
+unsure which is newer.
 
 ### Verify / operate
 
 ```
-bash substrate/lab/test.sh                      # hermetic suite
+bash substrate/lab/test.sh                      # hermetic suite (repo copy)
 launchctl list | grep tailnet-watch             # loaded?
-tail ~/.myndaix/state/tailnet-watch.log         # transitions + alerts
-TW_HOST=192.0.2.1 TW_FAIL_THRESHOLD=1 bash substrate/lab/tailnet-watch.sh  # live alert drill
+tail ~/.myndaix/state/tailnet-watch.log         # transitions, alerts, notify failures, skips
 ```
 
-Residual (accepted): detection requires the MacBook to be awake — worst case is hours, not
-weeks. The 24/7 upgrade path is a healthchecks.io dead-man ping from the Mini (needs a Jefe
+Notes: `tailscale ping -c 1` is verified against the installed GUI-app CLI (1.90.x) — docs
+list variants; trust the binary. Flap behavior: an alert+recovery pair fires per distinct
+outage (the 4h cap applies within one outage) — accepted; revisit only if flap noise appears.
+
+Residuals (accepted): detection requires the MacBook awake and on the tailnet — worst case
+is hours, not weeks. A notification can still be missed if macOS suppresses it after the
+one-time settings above drift (OS update resets, new Focus modes) — the log is the forensic
+trail. The 24/7 upgrade path is a healthchecks.io dead-man ping from the Mini (needs a Jefe
 account); deliberately not built.

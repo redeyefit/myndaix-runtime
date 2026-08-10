@@ -1,21 +1,23 @@
 #!/bin/bash
 # tailnet-watch — the LAB watches the FACTORY.
-# LaunchAgent on the MacBook (macOS-only, hand-managed — NOT substrate-reconciled; the
-# factory's rogue sweep does not patrol the lab). Probes the Mini over the tailnet every
-# tick; 3 consecutive failures => macOS notification, re-alerted at most once per day,
-# recovery notice on heal. Closes the 22-day-dark-Mini class (2026-07-18..08-09): the
-# Mini's own liveness-canary was green the whole time because every LOCAL job was healthy —
-# nobody was watching reachability from outside. Install: see substrate/lab/README.md.
+# Installed copy runs from ~/.myndaix/bin (NOT the git tree — a branch switch must never
+# kill the monitor). Hand-managed LaunchAgent on the MacBook, macOS-only by design.
+# Probes the Mini over the tailnet each tick; 3 consecutive OBSERVED failures => macOS
+# notification (re-armed every 4h while dark), recovery notice on heal. Ticks are skipped
+# (not counted) when this Mac itself is off the tailnet — the watcher only asserts what it
+# actually observed. Closes the 22-day-dark-Mini class (2026-07-18..08-09).
+# Install/update/verify: substrate/lab/README.md.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 TW_HOST="${TW_HOST:-100.67.43.104}"          # jefes-mac-mini-1 (tagged factory node)
 TW_PORT="${TW_PORT:-22}"
 TS_BIN="${TW_TS_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
-NC_BIN="${TW_NC_BIN:-nc}"                     # overridable for hermetic tests
+NC_BIN="${TW_NC_BIN:-/usr/bin/nc}"            # pinned: a brew netcat lacks -G and would shadow via PATH
 OSA_BIN="${TW_OSA_BIN:-osascript}"
-FAIL_THRESHOLD="${TW_FAIL_THRESHOLD:-3}"      # consecutive ticks (~30 min at 600s)
-REALERT_SECONDS="${TW_REALERT_SECONDS:-86400}"
+FAIL_THRESHOLD="${TW_FAIL_THRESHOLD:-3}"      # consecutive observed ticks (~30 min awake)
+REALERT_SECONDS="${TW_REALERT_SECONDS:-14400}" # 4h: de-anchors retries from daily Focus windows
+STALE_SECONDS="${TW_STALE_SECONDS:-1800}"     # gap > 3 ticks => streak restarts (sleep honesty)
 STATE_DIR="${MYNDAIX_HOME:-$HOME/.myndaix}/state"
 STATE_FILE="$STATE_DIR/tailnet-watch.state"
 LOG_FILE="$STATE_DIR/tailnet-watch.log"
@@ -27,24 +29,37 @@ trap 'rm -f "$tmp"' EXIT INT TERM
 log() { printf '[%s] [tailnet-watch] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"; }
 
 notify() {
-  # $1 = message, passed as argv — never interpolated into AppleScript source, so no
-  # injection class even if future messages carry external text.
+  # $1 = message, passed as argv — never interpolated into AppleScript source. Returns
+  # osascript's rc; stderr goes to the log (no silent suppression on the alert path).
+  # rc=0 still cannot prove a BANNER rendered (Focus can suppress silently) — the README's
+  # mandatory install drill + Script-Editor-to-Alerts step covers that half.
   "$OSA_BIN" -e 'on run argv' \
     -e 'display notification (item 1 of argv) with title "MyndAIX tailnet-watch" sound name "Basso"' \
-    -e 'end run' -- "$1" >/dev/null 2>&1 || true
+    -e 'end run' -- "$1" >/dev/null 2>> "$LOG_FILE"
+}
+
+observer_online() {
+  # Can THIS Mac even judge the Mini? Gate on local tailnet health so planes, captive
+  # portals, wifi-off and wake races skip the tick instead of counting a false failure.
+  # If the CLI is missing, don't gate (nc may still reach the Mini over LAN).
+  [ -x "$TS_BIN" ] || return 0
+  local s
+  s="$("$TS_BIN" status --peers=false --json 2>/dev/null || true)"
+  printf '%s' "$s" | grep -q '"BackendState": "Running"' || return 1
+  printf '%s' "$s" | grep -q '"Online": true' || return 1
+  return 0
 }
 
 probe() {
-  # Reachable if the ssh port answers OR tailscale ping succeeds (either proves the path).
   if "$NC_BIN" -z -G 5 "$TW_HOST" "$TW_PORT" >/dev/null 2>&1; then return 0; fi
   if [ -x "$TS_BIN" ] && "$TS_BIN" ping -c 1 --timeout=5s "$TW_HOST" >/dev/null 2>&1; then return 0; fi
   return 1
 }
 
 # ---- read state (own file, key=value; missing file = first run) ----
-# Digit-count caps prevent bash arithmetic overflow from corrupt values; timestamp
-# clamps prevent a future-dated alerted_at from suppressing alerts indefinitely.
-fails=0; alerted_at=0; first_fail_at=0
+# Digit caps prevent arithmetic overflow from corrupt values; future-timestamp clamps
+# prevent a corrupt alerted_at from suppressing alerts indefinitely.
+fails=0; alerted_at=0; first_fail_at=0; last_tick_at=0
 if [ -f "$STATE_FILE" ]; then
   v="$(grep '^fails=' "$STATE_FILE" | cut -d= -f2 || true)"
   [[ "$v" =~ ^[0-9]{1,6}$ ]] && fails=$((10#$v))
@@ -52,36 +67,59 @@ if [ -f "$STATE_FILE" ]; then
   [[ "$v" =~ ^[0-9]{1,12}$ ]] && alerted_at=$((10#$v))
   v="$(grep '^first_fail_at=' "$STATE_FILE" | cut -d= -f2 || true)"
   [[ "$v" =~ ^[0-9]{1,12}$ ]] && first_fail_at=$((10#$v))
+  v="$(grep '^last_tick_at=' "$STATE_FILE" | cut -d= -f2 || true)"
+  [[ "$v" =~ ^[0-9]{1,12}$ ]] && last_tick_at=$((10#$v))
 fi
 
 now="$(date +%s)"
 [ "$fails" -gt 1000 ] && fails=1000
 [ "$alerted_at" -gt "$now" ] && alerted_at=0
 [ "$first_fail_at" -gt "$now" ] && first_fail_at=0
+[ "$last_tick_at" -gt "$now" ] && last_tick_at=0
+
+# A fail streak with a big observation gap (sleep, offline-observer skips) is stale —
+# "consecutive" means consecutively OBSERVED. Restart the window rather than lie.
+if [ "$fails" -gt 0 ] && [ "$last_tick_at" -gt 0 ] && [ $((now - last_tick_at)) -gt "$STALE_SECONDS" ]; then
+  log "streak stale (last observation $(( (now - last_tick_at) / 60 ))m ago) — restarting window"
+  fails=0; first_fail_at=0
+fi
 
 write_state() {
   tmp="$(mktemp "$STATE_DIR/.tailnet-watch.XXXXXX")"
-  printf 'fails=%s\nalerted_at=%s\nfirst_fail_at=%s\n' "$1" "$2" "$3" > "$tmp"
+  printf 'fails=%s\nalerted_at=%s\nfirst_fail_at=%s\nlast_tick_at=%s\n' "$1" "$2" "$3" "$4" > "$tmp"
   mv "$tmp" "$STATE_FILE"; tmp=""
 }
 
+if ! observer_online; then
+  # No state write: skipped ticks neither extend nor kill a streak (staleness handles gaps).
+  log "observer off the tailnet — tick skipped (cannot judge Mini)"
+  exit 0
+fi
+
 if probe; then
   if [ "$alerted_at" -gt 0 ]; then
-    downtime_min=$(( (now - first_fail_at) / 60 ))
-    log "RECOVERED after ~${downtime_min}m down"
-    notify "Mini is reachable again (was down ~${downtime_min} min)"
+    if [ "$first_fail_at" -gt 0 ] && [ "$now" -ge "$first_fail_at" ] && [ $(( (now - first_fail_at) / 60 )) -le 43200 ]; then
+      log "RECOVERED after ~$(( (now - first_fail_at) / 60 ))m down"
+      notify "Mini is reachable again (was down ~$(( (now - first_fail_at) / 60 )) min)" || log "recovery notify FAILED (rc=$?)"
+    else
+      log "RECOVERED (duration unknown — state was reset or clamped)"
+      notify "Mini is reachable again (downtime unknown)" || log "recovery notify FAILED (rc=$?)"
+    fi
   fi
   [ "$fails" -gt 0 ] && log "reachable again after $fails failed tick(s) (below threshold)"
-  write_state 0 0 0
+  write_state 0 0 0 "$now"
 else
   fails=$((fails + 1))
   [ "$first_fail_at" -eq 0 ] && first_fail_at="$now"
-  log "probe FAILED ($fails consecutive; threshold $FAIL_THRESHOLD)"
+  log "probe FAILED ($fails consecutive observed; threshold $FAIL_THRESHOLD)"
   if [ "$fails" -ge "$FAIL_THRESHOLD" ] && [ $((now - alerted_at)) -ge "$REALERT_SECONDS" ]; then
     since="$(date -r "$first_fail_at" '+%H:%M %m/%d')"
-    log "ALERT: Mini unreachable since $since"
-    notify "Mini unreachable on the tailnet since $since — factory + backup mirror are dark"
-    alerted_at="$now"
+    if notify "Mini unreachable from this Mac since $since — factory + backup mirror may be dark"; then
+      log "ALERT delivered: Mini unreachable since $since"
+      alerted_at="$now"
+    else
+      log "ALERT notify FAILED (rc=$?) — will retry next tick"
+    fi
   fi
-  write_state "$fails" "$alerted_at" "$first_fail_at"
+  write_state "$fails" "$alerted_at" "$first_fail_at" "$now"
 fi
