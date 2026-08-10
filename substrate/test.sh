@@ -1123,10 +1123,28 @@ ok '! lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_bad" >/dev/null 2>&1' "unverifia
 ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "unverifiable dump discarded"
 ok '! ls "$LBH/backups/ledger"/.ledger-partial.* >/dev/null 2>&1' "no partial temp left behind"
 
+echo "== ledger-backup: review folds — rc logging, KEEP_DAYS guard, lock, pre-trap invariant =="
+ok 'grep -q "FAIL pg_dump rc=1" "$LBH/backups/ledger-backup.log"' "pg_dump failure logs the REAL rc (not the negated 0)"
+
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" 0 >/dev/null 2>&1' "KEEP_DAYS=0 run exits 0 (falls back to default)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" -ge 1 ]' "KEEP_DAYS=0 did NOT rotate out the fresh dump"
+
+mkdir "$LBH/backups/.ledger-backup.lock"
+ok '! lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" > "$TMP/lb-lock.out" 2>/dev/null' "fresh lock blocks a second run (exit nonzero)"
+ok 'grep -q "liveness-fire: ledger-backup tick rc=1" "$TMP/lb-lock.out"' "locked-out run still fires the stdout line"
+ok 'grep -q "holds the lock" "$LBH/backups/ledger-backup.log"' "lock contention logged"
+touch -t 202601010000 "$LBH/backups/.ledger-backup.lock"
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "stale lock (backdated) is broken and the run proceeds"
+ok '! ls -d "$LBH/backups/.ledger-backup.lock" >/dev/null 2>&1' "lock released after run"
+
+LBH2="$TMP/lb-home2"; mkdir -p "$LBH2"; : > "$LBH2/backups"   # backups is a FILE -> mkdir -p fails pre-dump
+ok '! MYNDAIX_HOME="$LBH2" LEDGER_PG_DUMP="$TMP/pg_dump_ok" LEDGER_PG_RESTORE="$TMP/pg_restore_ok" bash "$LB" > "$TMP/lb-pretrap.out" 2>/dev/null' "uncreatable OUT_DIR exits nonzero"
+ok 'grep -q "liveness-fire: ledger-backup tick" "$TMP/lb-pretrap.out"' "pre-trap failure STILL emits the liveness-fire stdout line"
+
 sleep 1  # distinct timestamp so the fresh dump sorts newest
 for i in 01 02 03 04; do : > "$LBH/backups/ledger/ledger-2026080${i}-000000.dump"; done
 ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "rotation run exits 0"
-ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" = 6 ]' "pre-rotation fixture in place (1 prior + 4 fixtures + 1 new; KEEP_DAYS=14 keeps all)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-202608*.dump | wc -l | tr -d " ")" = 4 ]' "KEEP_DAYS=14 kept all 4 dated fixtures (no premature rotation)"
 ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" 3 >/dev/null' "KEEP_DAYS=3 rotation run exits 0"
 ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" = 3 ]' "rotation keeps exactly KEEP_DAYS"
 ok '! ls "$LBH/backups/ledger"/ledger-20260801-000000.dump >/dev/null 2>&1' "rotation dropped the OLDEST first"
