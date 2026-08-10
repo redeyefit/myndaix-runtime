@@ -1080,11 +1080,82 @@ echo "== shell hygiene: bash -n + shellcheck clean on the production substrate s
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
 # into) — it is bash -n checked below. shellcheck is skipped gracefully if absent (Linux CI).
 HAVE_SC=1; command -v shellcheck >/dev/null 2>&1 || { HAVE_SC=0; echo "  --: SKIP shellcheck (not installed)"; }
-for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh liveness-canary.sh; do
+for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh liveness-canary.sh ledger-backup.sh; do
   ok 'bash -n "'"$SUB/$s"'"' "bash -n $s"
   [[ "$HAVE_SC" == 1 ]] && ok 'shellcheck -x -S warning "'"$SUB/$s"'" >/dev/null 2>&1' "shellcheck $s"
 done
 ok 'bash -n "'"$SUB/test.sh"'"' "bash -n test.sh"
+
+echo "== ledger-backup: dump + verify + rotate, fail-loud paths =="
+LB="$SUB/ledger-backup.sh"
+LBH="$TMP/lb-home"; mkdir -p "$LBH"
+cat > "$TMP/pg_dump_ok" <<'EOF'
+#!/bin/bash
+# args: -Fc --no-password -f <file> <db>
+printf 'FAKE-PG-ARCHIVE' > "$4"
+EOF
+cat > "$TMP/pg_dump_fail" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+cat > "$TMP/pg_restore_ok" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+cat > "$TMP/pg_restore_bad" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$TMP/pg_dump_ok" "$TMP/pg_dump_fail" "$TMP/pg_restore_ok" "$TMP/pg_restore_bad"
+lb_run(){ MYNDAIX_HOME="$LBH" LEDGER_PG_DUMP="$1" LEDGER_PG_RESTORE="$2" LEDGER_KEEP_DAYS="${3:-14}" bash "$LB"; }
+
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" > "$TMP/lb1.out"' "happy path exits 0"
+ok 'grep -q "liveness-fire: ledger-backup tick rc=0" "$TMP/lb1.out"' "stdout carries the liveness-fire line (rc=0)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "exactly one dump written"
+ok 'grep -q "OK dump" "$LBH/backups/ledger-backup.log"' "success logged"
+
+ok '! lb_run "$TMP/pg_dump_fail" "$TMP/pg_restore_ok" > "$TMP/lb2.out" 2>/dev/null' "pg_dump failure exits nonzero"
+ok 'grep -q "liveness-fire: ledger-backup tick rc=1" "$TMP/lb2.out"' "failure path STILL fires the stdout line (rc=1)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "failed dump leaves no new file"
+ok 'grep -q "FAIL pg_dump" "$LBH/backups/ledger-backup.log"' "pg_dump failure logged loudly"
+
+ok '! lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_bad" >/dev/null 2>&1' "unverifiable dump exits nonzero"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "unverifiable dump discarded"
+ok '! ls "$LBH/backups/ledger"/.ledger-partial.* >/dev/null 2>&1' "no partial temp left behind"
+
+echo "== ledger-backup: review folds — rc logging, KEEP_DAYS guard, lock, pre-trap invariant =="
+ok 'grep -q "FAIL pg_dump rc=1" "$LBH/backups/ledger-backup.log"' "pg_dump failure logs the REAL rc (not the negated 0)"
+
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" 0 >/dev/null 2>&1' "KEEP_DAYS=0 run exits 0 (falls back to default)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" -ge 1 ]' "KEEP_DAYS=0 did NOT rotate out the fresh dump"
+
+mkdir "$LBH/backups/.ledger-backup.lock"
+ok '! lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" > "$TMP/lb-lock.out" 2>/dev/null' "fresh lock blocks a second run (exit nonzero)"
+ok 'grep -q "liveness-fire: ledger-backup tick rc=1" "$TMP/lb-lock.out"' "locked-out run still fires the stdout line"
+ok 'grep -q "holds the lock" "$LBH/backups/ledger-backup.log"' "lock contention logged"
+cat > "$TMP/py_broken" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$TMP/py_broken"
+ok '! MYNDAIX_HOME="$LBH" LEDGER_PY="$TMP/py_broken" LEDGER_PG_DUMP="$TMP/pg_dump_ok" LEDGER_PG_RESTORE="$TMP/pg_restore_ok" bash "$LB" >/dev/null 2>&1' "unreadable lock mtime FAILS CLOSED (lock treated as live)"
+ok 'ls -d "$LBH/backups/.ledger-backup.lock" >/dev/null 2>&1' "fail-closed path left the live lock intact"
+ok 'grep -q "treating lock as LIVE" "$LBH/backups/ledger-backup.log"' "fail-closed decision logged"
+touch -t 202601010000 "$LBH/backups/.ledger-backup.lock"
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "stale lock (backdated) is broken and the run proceeds"
+ok '! ls -d "$LBH/backups/.ledger-backup.lock" >/dev/null 2>&1' "lock released after run"
+
+LBH2="$TMP/lb-home2"; mkdir -p "$LBH2"; : > "$LBH2/backups"   # backups is a FILE -> mkdir -p fails pre-dump
+ok '! MYNDAIX_HOME="$LBH2" LEDGER_PG_DUMP="$TMP/pg_dump_ok" LEDGER_PG_RESTORE="$TMP/pg_restore_ok" bash "$LB" > "$TMP/lb-pretrap.out" 2>/dev/null' "uncreatable OUT_DIR exits nonzero"
+ok 'grep -q "liveness-fire: ledger-backup tick" "$TMP/lb-pretrap.out"' "pre-trap failure STILL emits the liveness-fire stdout line"
+
+sleep 1  # distinct timestamp so the fresh dump sorts newest
+for i in 1 2 3 4; do : > "$LBH/backups/ledger/ledger-2026080${i}-000000.dump"; done
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "rotation run exits 0"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-2026080[1-4]-000000.dump | wc -l | tr -d " ")" = 4 ]' "KEEP_DAYS=14 kept all 4 dated fixtures (no premature rotation)"
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" 3 >/dev/null' "KEEP_DAYS=3 rotation run exits 0"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" = 3 ]' "rotation keeps exactly KEEP_DAYS"
+ok '! ls "$LBH/backups/ledger"/ledger-20260801-000000.dump >/dev/null 2>&1' "rotation dropped the OLDEST first"
 
 echo "=================================================="
 echo "  substrate test.sh: $pass ok, $fail fail"
