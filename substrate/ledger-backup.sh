@@ -44,9 +44,16 @@ log() { printf '[%s] [ledger-backup] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >
 # (rc=1 -> visible in .out; persistent lock contention surfaces via the canary). A stale
 # lock (crashed run) older than LOCK_STALE_SECONDS is broken and this run proceeds.
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  # mtime via python3: portable across BSD/GNU (stat -f/-c is the canary's own CI-bug class)
-  lock_mtime="$(python3 -c 'import os,sys;print(int(os.path.getmtime(sys.argv[1])))' "$LOCK_DIR" 2>/dev/null || echo 0)"
-  lock_age=$(( $(date +%s) - lock_mtime ))
+  # mtime via python3: portable across BSD/GNU (stat -f/-c is the canary's own CI-bug class).
+  # FAIL CLOSED: an unreadable mtime must treat the lock as LIVE, never as stale (an
+  # "|| echo 0" fallback would let a broken python3 defeat the lock entirely).
+  PY_BIN="${LEDGER_PY:-python3}"
+  lock_mtime="$("$PY_BIN" -c 'import os,sys;print(int(os.path.getmtime(sys.argv[1])))' "$LOCK_DIR" 2>/dev/null || true)"
+  if ! [[ "$lock_mtime" =~ ^[0-9]{1,12}$ ]]; then
+    log "cannot read lock mtime — treating lock as LIVE, exiting"
+    exit 1
+  fi
+  lock_age=$(( $(date +%s) - 10#$lock_mtime ))
   if [ "$lock_age" -lt "$LOCK_STALE_SECONDS" ]; then
     log "another run holds the lock (age ${lock_age}s) — exiting"
     exit 1

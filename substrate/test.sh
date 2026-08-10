@@ -1133,6 +1133,14 @@ mkdir "$LBH/backups/.ledger-backup.lock"
 ok '! lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" > "$TMP/lb-lock.out" 2>/dev/null' "fresh lock blocks a second run (exit nonzero)"
 ok 'grep -q "liveness-fire: ledger-backup tick rc=1" "$TMP/lb-lock.out"' "locked-out run still fires the stdout line"
 ok 'grep -q "holds the lock" "$LBH/backups/ledger-backup.log"' "lock contention logged"
+cat > "$TMP/py_broken" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$TMP/py_broken"
+ok '! MYNDAIX_HOME="$LBH" LEDGER_PY="$TMP/py_broken" LEDGER_PG_DUMP="$TMP/pg_dump_ok" LEDGER_PG_RESTORE="$TMP/pg_restore_ok" bash "$LB" >/dev/null 2>&1' "unreadable lock mtime FAILS CLOSED (lock treated as live)"
+ok 'ls -d "$LBH/backups/.ledger-backup.lock" >/dev/null 2>&1' "fail-closed path left the live lock intact"
+ok 'grep -q "treating lock as LIVE" "$LBH/backups/ledger-backup.log"' "fail-closed decision logged"
 touch -t 202601010000 "$LBH/backups/.ledger-backup.lock"
 ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "stale lock (backdated) is broken and the run proceeds"
 ok '! ls -d "$LBH/backups/.ledger-backup.lock" >/dev/null 2>&1' "lock released after run"
