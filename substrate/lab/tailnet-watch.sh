@@ -27,9 +27,11 @@ trap 'rm -f "$tmp"' EXIT INT TERM
 log() { printf '[%s] [tailnet-watch] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"; }
 
 notify() {
-  # $1 = message. Title/sound fixed; message is built ONLY from our own timestamps/host
-  # (no external data enters the osascript string).
-  "$OSA_BIN" -e "display notification \"$1\" with title \"MyndAIX tailnet-watch\" sound name \"Basso\"" >/dev/null 2>&1 || true
+  # $1 = message, passed as argv — never interpolated into AppleScript source, so no
+  # injection class even if future messages carry external text.
+  "$OSA_BIN" -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "MyndAIX tailnet-watch" sound name "Basso"' \
+    -e 'end run' -- "$1" >/dev/null 2>&1 || true
 }
 
 probe() {
@@ -40,17 +42,22 @@ probe() {
 }
 
 # ---- read state (own file, key=value; missing file = first run) ----
+# Digit-count caps prevent bash arithmetic overflow from corrupt values; timestamp
+# clamps prevent a future-dated alerted_at from suppressing alerts indefinitely.
 fails=0; alerted_at=0; first_fail_at=0
 if [ -f "$STATE_FILE" ]; then
   v="$(grep '^fails=' "$STATE_FILE" | cut -d= -f2 || true)"
-  [[ "$v" =~ ^[0-9]+$ ]] && fails=$((10#$v))
+  [[ "$v" =~ ^[0-9]{1,6}$ ]] && fails=$((10#$v))
   v="$(grep '^alerted_at=' "$STATE_FILE" | cut -d= -f2 || true)"
-  [[ "$v" =~ ^[0-9]+$ ]] && alerted_at=$((10#$v))
+  [[ "$v" =~ ^[0-9]{1,12}$ ]] && alerted_at=$((10#$v))
   v="$(grep '^first_fail_at=' "$STATE_FILE" | cut -d= -f2 || true)"
-  [[ "$v" =~ ^[0-9]+$ ]] && first_fail_at=$((10#$v))
+  [[ "$v" =~ ^[0-9]{1,12}$ ]] && first_fail_at=$((10#$v))
 fi
 
 now="$(date +%s)"
+[ "$fails" -gt 1000 ] && fails=1000
+[ "$alerted_at" -gt "$now" ] && alerted_at=0
+[ "$first_fail_at" -gt "$now" ] && first_fail_at=0
 
 write_state() {
   tmp="$(mktemp "$STATE_DIR/.tailnet-watch.XXXXXX")"

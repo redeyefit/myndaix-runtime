@@ -20,9 +20,13 @@ macOS-lab-only script by design.
 ### Install (once, on the MacBook)
 
 ```
+mkdir -p ~/.myndaix/state   # launchd opens the plist's stdout/err paths BEFORE the script's own mkdir
 cp substrate/lab/ai.myndaix.tailnet-watch.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.myndaix.tailnet-watch.plist
 ```
+
+Note: `tailscale ping -c 1` is verified against the installed GUI-app CLI (1.90.x) — docs
+list variants; trust the binary.
 
 ### Verify / operate
 

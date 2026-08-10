@@ -19,7 +19,7 @@ exit "${TW_TEST_NC_EXIT:-0}"
 EOF
 cat > "$SCRATCH/bin/osascript" << 'EOF'
 #!/bin/bash
-printf '%s\n' "$2" >> "${TW_TEST_NOTIFY_LOG:?}"
+printf '%s\n' "$*" >> "${TW_TEST_NOTIFY_LOG:?}"
 EOF
 cat > "$SCRATCH/bin/ts-stub" << 'EOF'
 #!/bin/bash
@@ -79,6 +79,24 @@ echo "7. corrupt state — garbage values fall back safe (octal trap incl.)"
 printf 'fails=08\nalerted_at=banana\nfirst_fail_at=\n' > "$STATE"
 run_tick 0 || bad "corrupt state crashed the tick"
 grep -q '^fails=0$' "$STATE" && ok "corrupt state recovered" || bad "corrupt state persisted"
+
+echo "7b. numeric-corrupt state — future alerted_at cannot suppress alerts"
+printf 'fails=99\nalerted_at=99999999999\nfirst_fail_at=99999999999\n' > "$STATE"
+run_tick 1 || bad "numeric-corrupt state crashed the tick"
+grep -c 'unreachable' "$NOTES" | grep -qx 3 && ok "future alerted_at clamped, alert fired" || bad "future alerted_at suppressed alert"
+: > "$NOTES"; run_tick 0 > /dev/null; : > "$NOTES"
+
+echo "7c. tailscale fallback — nc fails but ts-ping succeeds = reachable"
+cat > "$SCRATCH/bin/ts-ok" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$SCRATCH/bin/ts-ok"
+MYNDAIX_HOME="$SCRATCH/home" TW_HOST="203.0.113.1" TW_TS_BIN="$SCRATCH/bin/ts-ok" \
+  TW_NC_BIN="$SCRATCH/bin/nc" TW_OSA_BIN="$SCRATCH/bin/osascript" TW_TEST_NC_EXIT=1 \
+  TW_TEST_NOTIFY_LOG="$NOTES" bash "$SCRIPT" || bad "ts-fallback tick errored"
+grep -q '^fails=0$' "$STATE" && ok "ts-ping fallback counts as reachable" || bad "fallback ignored"
+[ -s "$NOTES" ] && bad "fallback tick notified" || ok "no notification on fallback success"
 
 echo "8. structural — no GNU/BSD stat trap, no unquoted probe vars"
 grep -q 'stat -c' "$SCRIPT" && bad "GNU stat crept in" || ok "no stat portability trap"
