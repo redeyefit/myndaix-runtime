@@ -120,6 +120,12 @@ else
     else
       log "ALERT notify FAILED (rc=$?) — will retry next tick"
     fi
+    # Belt for the CRITICAL alert only: a dialog WINDOW — Focus modes and notification-style
+    # settings cannot suppress it, so the alert path has no drifting Settings dependency.
+    # Backgrounded (the tick must not block on a human); auto-dismisses after 10 min.
+    nohup "$OSA_BIN" -e 'on run argv' \
+      -e 'display dialog (item 1 of argv) with title "MyndAIX tailnet-watch" buttons {"OK"} default button 1 with icon caution giving up after 600' \
+      -e 'end run' -- "Mini unreachable from this Mac since $since — factory + backup mirror may be dark" >/dev/null 2>> "$LOG_FILE" &
   fi
   write_state "$fails" "$alerted_at" "$first_fail_at" "$now"
 fi

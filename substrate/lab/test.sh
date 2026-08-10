@@ -68,13 +68,14 @@ grep -q '^fails=2$' "$STATE" && ok "fails=2 persisted" || bad "fails wrong: $(ca
 [ -s "$NOTES" ] && bad "premature alert" || ok "no premature alert"
 
 echo "3. threshold hit — 3rd failure alerts exactly once, latches only on delivery"
-run_tick 1
-grep -c 'unreachable' "$NOTES" | grep -qx 1 && ok "one alert" || bad "alert count: $(grep -c 'unreachable' "$NOTES")"
+run_tick 1; sleep 1   # settle: the dialog belt is backgrounded
+grep -c 'display notification.*unreachable' "$NOTES" | grep -qx 1 && ok "one alert" || bad "alert count: $(grep -c 'display notification.*unreachable' "$NOTES")"
+grep -q 'display dialog.*unreachable' "$NOTES" && ok "dialog belt fired on the critical alert" || bad "no dialog belt"
 grep -q '^alerted_at=[1-9]' "$STATE" && ok "alerted_at latched after delivered notify" || bad "alerted_at not latched"
 
 echo "4. dedup — 4th/5th failures do NOT re-alert within window"
-run_tick 1; run_tick 1
-grep -c 'unreachable' "$NOTES" | grep -qx 1 && ok "still one alert" || bad "re-alerted too soon"
+run_tick 1; run_tick 1; sleep 1
+grep -c 'display notification.*unreachable' "$NOTES" | grep -qx 1 && ok "still one alert" || bad "re-alerted too soon"
 
 echo "5. re-alert after window — aged alerted_at fires again"
 python3 - "$STATE" << 'PYEOF'
@@ -83,12 +84,13 @@ p = sys.argv[1]; s = open(p).read()
 s = re.sub(r'alerted_at=\d+', 'alerted_at=1', s)
 open(p, 'w').write(s)
 PYEOF
-run_tick 1
-grep -c 'unreachable' "$NOTES" | grep -qx 2 && ok "re-alert after window" || bad "no re-alert after window"
+run_tick 1; sleep 1
+grep -c 'display notification.*unreachable' "$NOTES" | grep -qx 2 && ok "re-alert after window" || bad "no re-alert after window"
 
 echo "6. recovery — heal notifies once and resets"
-run_tick 0
+run_tick 0; sleep 1
 grep -q 'reachable again' "$NOTES" && ok "recovery notice" || bad "no recovery notice"
+grep -q 'display dialog.*reachable again' "$NOTES" && bad "recovery raised a dialog (should be notification-only)" || ok "no dialog on recovery"
 grep -q '^fails=0$' "$STATE" && ok "state reset on heal" || bad "state not reset"
 run_tick 0
 grep -c 'reachable again' "$NOTES" | grep -qx 1 && ok "no duplicate recovery" || bad "duplicate recovery"
@@ -101,7 +103,8 @@ grep -q '^fails=0$' "$STATE" && ok "corrupt state recovered" || bad "corrupt sta
 echo "7b. numeric-corrupt state — future alerted_at cannot suppress alerts"
 printf 'fails=99\nalerted_at=99999999999\nfirst_fail_at=99999999999\n' > "$STATE"
 run_tick 1 || bad "numeric-corrupt state crashed the tick"
-grep -c 'unreachable' "$NOTES" | grep -qx 3 && ok "future alerted_at clamped, alert fired" || bad "future alerted_at suppressed alert"
+sleep 1
+grep -c 'display notification.*unreachable' "$NOTES" | grep -qx 3 && ok "future alerted_at clamped, alert fired" || bad "future alerted_at suppressed alert"
 : > "$NOTES"; run_tick 0 > /dev/null; : > "$NOTES"
 
 echo "7c. tailscale fallback — nc fails but ts-ping succeeds = reachable"

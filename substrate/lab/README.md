@@ -33,9 +33,11 @@ cp substrate/lab/ai.myndaix.tailnet-watch.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.myndaix.tailnet-watch.plist
 ```
 
-Then two one-time settings (macOS can silently suppress banners otherwise):
-1. System Settings → Notifications → **Script Editor** → style **Alerts** (persistent), sound on.
-2. Any Focus modes you use (Work, DND): add **Script Editor** to the allowed apps.
+The CRITICAL alert also opens a dialog WINDOW (auto-dismisses after 10 min) — Focus modes and
+notification-style settings cannot suppress it, so the alert path carries no drifting Settings
+dependency. Optional polish (nicer banners; recovery notices visible inside Focus): System
+Settings → Notifications → **Script Editor** → style **Alerts**; add Script Editor to Focus
+allow-lists.
 
 **Mandatory delivery drill — you must SEE the banner before trusting the watcher:**
 
