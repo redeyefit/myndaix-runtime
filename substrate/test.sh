@@ -1080,11 +1080,56 @@ echo "== shell hygiene: bash -n + shellcheck clean on the production substrate s
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
 # into) — it is bash -n checked below. shellcheck is skipped gracefully if absent (Linux CI).
 HAVE_SC=1; command -v shellcheck >/dev/null 2>&1 || { HAVE_SC=0; echo "  --: SKIP shellcheck (not installed)"; }
-for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh liveness-canary.sh; do
+for s in lib.sh bootstrap-fetch.sh reconcile.sh drift-canary.sh liveness-canary.sh ledger-backup.sh; do
   ok 'bash -n "'"$SUB/$s"'"' "bash -n $s"
   [[ "$HAVE_SC" == 1 ]] && ok 'shellcheck -x -S warning "'"$SUB/$s"'" >/dev/null 2>&1' "shellcheck $s"
 done
 ok 'bash -n "'"$SUB/test.sh"'"' "bash -n test.sh"
+
+echo "== ledger-backup: dump + verify + rotate, fail-loud paths =="
+LB="$SUB/ledger-backup.sh"
+LBH="$TMP/lb-home"; mkdir -p "$LBH"
+cat > "$TMP/pg_dump_ok" <<'EOF'
+#!/bin/bash
+# args: -Fc --no-password -f <file> <db>
+printf 'FAKE-PG-ARCHIVE' > "$4"
+EOF
+cat > "$TMP/pg_dump_fail" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+cat > "$TMP/pg_restore_ok" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+cat > "$TMP/pg_restore_bad" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$TMP/pg_dump_ok" "$TMP/pg_dump_fail" "$TMP/pg_restore_ok" "$TMP/pg_restore_bad"
+lb_run(){ MYNDAIX_HOME="$LBH" LEDGER_PG_DUMP="$1" LEDGER_PG_RESTORE="$2" LEDGER_KEEP_DAYS="${3:-14}" bash "$LB"; }
+
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" > "$TMP/lb1.out"' "happy path exits 0"
+ok 'grep -q "liveness-fire: ledger-backup tick rc=0" "$TMP/lb1.out"' "stdout carries the liveness-fire line (rc=0)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "exactly one dump written"
+ok 'grep -q "OK dump" "$LBH/backups/ledger-backup.log"' "success logged"
+
+ok '! lb_run "$TMP/pg_dump_fail" "$TMP/pg_restore_ok" > "$TMP/lb2.out" 2>/dev/null' "pg_dump failure exits nonzero"
+ok 'grep -q "liveness-fire: ledger-backup tick rc=1" "$TMP/lb2.out"' "failure path STILL fires the stdout line (rc=1)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "failed dump leaves no new file"
+ok 'grep -q "FAIL pg_dump" "$LBH/backups/ledger-backup.log"' "pg_dump failure logged loudly"
+
+ok '! lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_bad" >/dev/null 2>&1' "unverifiable dump exits nonzero"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump 2>/dev/null | wc -l | tr -d " ")" = 1 ]' "unverifiable dump discarded"
+ok '! ls "$LBH/backups/ledger"/.ledger-partial.* >/dev/null 2>&1' "no partial temp left behind"
+
+sleep 1  # distinct timestamp so the fresh dump sorts newest
+for i in 01 02 03 04; do : > "$LBH/backups/ledger/ledger-2026080${i}-000000.dump"; done
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "rotation run exits 0"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" = 6 ]' "pre-rotation fixture in place (1 prior + 4 fixtures + 1 new; KEEP_DAYS=14 keeps all)"
+ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" 3 >/dev/null' "KEEP_DAYS=3 rotation run exits 0"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" = 3 ]' "rotation keeps exactly KEEP_DAYS"
+ok '! ls "$LBH/backups/ledger"/ledger-20260801-000000.dump >/dev/null 2>&1' "rotation dropped the OLDEST first"
 
 echo "=================================================="
 echo "  substrate test.sh: $pass ok, $fail fail"
