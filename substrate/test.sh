@@ -1142,9 +1142,9 @@ ok '! MYNDAIX_HOME="$LBH2" LEDGER_PG_DUMP="$TMP/pg_dump_ok" LEDGER_PG_RESTORE="$
 ok 'grep -q "liveness-fire: ledger-backup tick" "$TMP/lb-pretrap.out"' "pre-trap failure STILL emits the liveness-fire stdout line"
 
 sleep 1  # distinct timestamp so the fresh dump sorts newest
-for i in 01 02 03 04; do : > "$LBH/backups/ledger/ledger-2026080${i}-000000.dump"; done
+for i in 1 2 3 4; do : > "$LBH/backups/ledger/ledger-2026080${i}-000000.dump"; done
 ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" >/dev/null' "rotation run exits 0"
-ok '[ "$(ls "$LBH/backups/ledger"/ledger-202608*.dump | wc -l | tr -d " ")" = 4 ]' "KEEP_DAYS=14 kept all 4 dated fixtures (no premature rotation)"
+ok '[ "$(ls "$LBH/backups/ledger"/ledger-2026080[1-4]-000000.dump | wc -l | tr -d " ")" = 4 ]' "KEEP_DAYS=14 kept all 4 dated fixtures (no premature rotation)"
 ok 'lb_run "$TMP/pg_dump_ok" "$TMP/pg_restore_ok" 3 >/dev/null' "KEEP_DAYS=3 rotation run exits 0"
 ok '[ "$(ls "$LBH/backups/ledger"/ledger-*.dump | wc -l | tr -d " ")" = 3 ]' "rotation keeps exactly KEEP_DAYS"
 ok '! ls "$LBH/backups/ledger"/ledger-20260801-000000.dump >/dev/null 2>&1' "rotation dropped the OLDEST first"
