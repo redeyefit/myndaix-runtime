@@ -4,6 +4,14 @@
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
+# The watcher AND this suite are macOS-lab-only by design (BSD date -r, nc -G, osascript).
+# CI is Linux (GNU coreutils) — the canary's own history: a suite that only runs on one
+# platform must say so loudly instead of failing confusingly on the other.
+if [ "$(uname)" != "Darwin" ]; then
+  echo "tailnet-watch suite is macOS-only by design — skipped on $(uname)"
+  exit 0
+fi
+
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/tailnet-watch.sh"
 SCRATCH="$(mktemp -d /tmp/tw-test.XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM
