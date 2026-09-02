@@ -79,6 +79,14 @@ V1_ROSTER: list[AgentSpec] = [
               # lobster-with-snapshot at triage is the fabrication-killer: the CONFINED
               # synthesis agent verifies both reviews' claims against real code. The tool
               # whitelist above is unchanged — a cwd is not a permission.
+              # timeout_s=600: the triage mandate now includes a BOUNDED runtime-behavior pass
+              # over the snapshot (states/timing/crash-resume on the changed paths) before
+              # synthesis — the lens that caught what both diff reviewers missed on
+              # liveness-canary (10 bugs) and tailnet-watch (3 P1s). Reading the snapshot +
+              # modeling + synthesizing regularly exceeds the dead 300s field default on a
+              # real diff (same class as kilabz 2026-07-03); 600s stays well inside the
+              # REVIEW_CALL_TIMEOUT=1200 sync wait.
+              profile=Profile(timeout_s=600),
               adapter={"kind": "cli", "argv": ["claude", "-p", "--model", "sonnet",
                        "--output-format", "text", "--tools", "Read", "Glob", "Grep",
                        "--strict-mcp-config", "--safe-mode"],
@@ -127,6 +135,29 @@ V1_ROSTER: list[AgentSpec] = [
                        "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "staging_cwd": "optional",
+                       "env_passthrough": ["OPENAI_API_KEY"]}),
+    AgentSpec(agent_id="kilabz-sr", reach=Reach.CLI, authority=Authority.RESPONDER,
+              model="gpt-5.5", role="code reviewer, structured verdict (read-only)",
+              # kilabz with a MACHINE OUTPUT CONTRACT — a SEPARATE spec, not a kilabz edit,
+              # because the schema constrains EVERY final message: forcing it on plain kilabz
+              # would break the ad-hoc/design-verify prose calls (xreview design phase,
+              # refute-this dispatches). play-review's stage 1 uses THIS agent; everything
+              # else keeps kilabz. Same model/effort/timeout/staging as kilabz (all the
+              # rationale above applies unchanged).
+              # output_schema (package-relative; ships in-repo so it resolves on every host):
+              # codex validates the final message against it — the synthesis stage receives
+              # typed findings {severity, confidence, file, line, claim, evidence,
+              # failure_path}, not prose the triage model re-interprets.
+              # output_last_message: the reply is read from the `-o` final-message file, not
+              # stdout (codex exec's stdout wraps the final message in transcript noise that
+              # would corrupt JSON parsing).
+              profile=Profile(timeout_s=900),
+              adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
+                       "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",
+                       "--skip-git-repo-check"], "prompt_channel": "stdin",
+                       "staging_cwd": "optional",
+                       "output_schema": "schemas/kilabz_review.schema.json",
+                       "output_last_message": True,
                        "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="gpt-5.5", role="builder/debugger",
