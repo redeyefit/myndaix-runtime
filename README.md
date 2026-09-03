@@ -5,11 +5,11 @@
 A deterministic, Postgres-backed spine for multi-agent work. One Command API is the only thing that
 writes the ledger, so agents lease, run, and reply through database row locks instead of files — and the
 file-IPC bug classes (double-lease, lost update, duplicate delivery, a crashed worker's job stuck forever)
-can't happen. I built it clean-room after a real multi-agent system went down for ~3 hours, when comms,
+are excluded by construction. I built it clean-room after a real multi-agent system went down for ~3 hours, when comms,
 execution, and config were coupled into one event loop and any single slow part took the whole thing down.
 
 ```
-   client / transport          ┌──────────────────────────────────┐
+   client / transport           ┌──────────────────────────────────┐
    (HTTP API · terminal) ─────▶ │  Command API   (the SOLE writer) │
          ▲                      └─────────────────┬────────────────┘
          │ reply                                  │ ingest · submit
@@ -18,15 +18,15 @@ execution, and config were coupled into one event loop and any single slow part 
    │  transport   │ ◀────── │              Postgres ledger               │
    │ (dumb pipe)  │ deliver │  inbound_event · job · attempt · outbound  │
    └──────────────┘         │  status-guarded state machine, one lock    │
-                            │  order (attempt→job), FOR UPDATE SKIP       │
+                            │  order (attempt→job), FOR UPDATE SKIP      │
                             │  LOCKED, transactional outbox              │
                             └──────────────────┬─────────────────────────┘
                               lease (SKIP LOCKED) │ complete / reclaim
                                                   ▼
                             ┌────────────────────────────────────────────┐
-                            │      worker pool  (N workers + janitor)     │
-                            │  heartbeats keep long jobs; crashed and     │
-                            │  poison jobs are recovered, not lost        │
+                            │      worker pool  (N workers + janitor)    │
+                            │  heartbeats keep long jobs; crashed and    │
+                            │  poison jobs are recovered, not lost       │
                             └──────────────────┬─────────────────────────┘
                                                ▼
                             runner → agent (CLI/API), killed as a process
@@ -37,21 +37,26 @@ execution, and config were coupled into one event loop and any single slow part 
 The agents were never the problem — Codex, Gemini, and Claude all answer direct local shell calls. Only
 the wrapper around them was. This keeps the direct calls and replaces the wrapper with a durable state machine.
 
+Every slice shipped through adversarial review across model families, and every review caught a real bug
+the green tests had missed — the table in [How I built it](#how-i-built-it) is the proof. If you read only
+one section, read that one.
+
 ## Run it
 
-**Prerequisites:** Python 3.11+ and git — that's everything the zero-dep demos need. The Postgres demos
-add a local Postgres; the optional real-agent demos add an agent CLI (Node 18+). All three are below.
+**Prerequisites:** Python 3.11+ and git — plus one `pip install`, that's everything the no-infra demos
+need. The Postgres demos add a local Postgres; the optional real-agent demos add an agent CLI (Node 18+).
+All three are below.
 
 > **Full install guide** — every agent CLI (install / auth / verify), the always-on service, and
 > one-machine *and* two-machine deployment — is in **[SETUP.md](SETUP.md)**. What follows is the quick tour.
 > **Have Docker?** `docker compose up --build` brings up Postgres + the spine in one command (see [SETUP.md](SETUP.md#run-it-with-docker-postgres--service-one-command)).
 
-### 1. Clone and run (zero-dep — no Postgres, no API keys, no LLM)
+### 1. Clone and run (no infra — just pydantic; no Postgres, no API keys, no LLM)
 
 ```bash
 git clone https://github.com/redeyefit/myndaix-runtime && cd myndaix-runtime
 python3 -m venv .venv && source .venv/bin/activate   # avoids the PEP 668 error on modern macOS/Debian
-pip install pydantic                                  # the zero-dep demos need only this
+pip install pydantic                                  # the only dependency these demos need
 PYTHONPATH=src python3 demo.py            # route a message through the spine and back
 PYTHONPATH=src python3 demo.py --isolate  # an agent fixes a bug in a throwaway git worktree
 ```
@@ -179,16 +184,88 @@ I confirmed each fix by reproducing the bug, not just trusting the green bar. Fo
 `DeadlockDetectedError`, then re-applied the fix and watched it pass 150/150. Every fix here has a
 regression test that fails without it.
 
+## The crew it runs
+
+Every agent is one `AgentSpec` row in `src/runtime/registry.py` — a reach (cli or api; the async-media
+queue is an adapter kind under api) plus an authority (responder / workspace-actor / controller /
+composite). The call signs below show up all over the commits and docs, so — introductions:
+
+| Agent | Backed by | Authority | Job |
+|---|---|---|---|
+| `mack`, `mini` | Claude CLI | workspace-actor | the builders (laptop, and the always-on Mac Mini) |
+| `kilabz` | Codex CLI, read-only sandbox | responder | the adversarial code-review gate |
+| `codex` | Codex CLI, workspace-write, net pinned off (best-effort) | workspace-actor | sandboxed autonomous fix attempts |
+| `oracle` | Gemini CLI | responder | cross-family second opinion; design review |
+| `lobster` | Claude CLI, confined | controller | triage; merges the reviewer verdicts |
+| `curator` | Claude CLI, read-only tools, staged cwd | workspace-actor | knowledge-corpus curator |
+| `librarian` | Claude CLI, zero tools | responder | cited answers over personal corpora |
+| `recon` | Perplexity API | composite | research |
+| `higgsfield`, `stitcher` | Higgsfield render API | responder / workspace-actor | paid text/image→video (one clip / chained long-form) |
+| `mx-engine` | deterministic bash pipeline | workspace-actor | topic → finished narrated reel |
+
+The dispatch is deliberately cross-family — Claude builds, Codex gates, Gemini second-opinions —
+because different model families catch different bugs; the "How I built it" table shows exactly that.
+
+## What grew on top
+
+The spine above is the June core. Since then an autonomous loop grew around it — new modules and
+scripts behind the existing verbs, plus registry rows; none of it edited the spine's contracts or
+the ledger core:
+
+- **Review-on-push.** `orchestrator/play-review.sh` rides the repo's pre-push hook: every push gets an
+  injection-fenced diff review from `kilabz` (with `oracle` as second opinion), `lobster` merges the
+  verdicts, and the result lands as a file drop + desktop ping. The push itself is never blocked. An
+  hourly non-LLM controller tick ([`controller.py`](src/runtime/controller.py)) reconciles anything the
+  hook missed against a durable review cursor — the edge trigger has a level-triggered backstop
+  ([design](docs/controller-loop-design.md)).
+- **Autonomous fix, fail-closed.** A NEEDS-FIX verdict can trigger one sandboxed Codex fix attempt
+  (`play-fix.sh`): worktree-isolated, net egress pinned off (a best-effort seatbelt — the real backstop
+  is that nothing is ever auto-applied), verified against a clean checkout, delivered as an inert diff.
+  Arming it first requires a probe proving the sandbox cannot write the shared `.git`
+  ([design](docs/phase2-pr4-fix-stage-design.md)).
+- **Docs-only automerge.** The first deliberate removal of the human merge gate: a mechanical
+  diff-class gate proves every changed file is inert markdown before an hourly tick merges the PR —
+  flag-gated, capped, revertible ([design](docs/automerge-design.md)).
+- **A learning stack that measures before it acts.** A feedback loop that scores the reviewers
+  themselves: findings are recorded per-finding with an identity that survives diff shifts, humans
+  label them real / false-positive, and a shadow dial reports — with Wilson confidence bounds — which
+  reviewer×rule pairs could be trusted or suppressed, while acting on nothing. Review skills (lessons
+  from past reviews) inject as nonce-fenced untrusted hints
+  ([outcomes](docs/outcomes-ledger-design.md), [dial](docs/shadow-dial-design.md),
+  [skills](docs/learning-rung-design.md)).
+- **A second brain.** A tsvector-indexed knowledge corpus over real folders (`curate`, `mxr ask`) with
+  cited answers from the zero-tool `librarian` — phone-reachable through a Remote-Control session whose
+  PreToolUse hook allows exactly one command shape, so a poisoned document can at worst produce a wrong
+  answer, never a file read or a dispatch ([curator](docs/curator-design.md),
+  [ask](docs/mx-ask-librarian-design.md)).
+- **Substrate: GitOps for two machines** — the laptop (the lab) and an always-on Mac Mini (the
+  factory). The factory converges on `origin/main` via a 15-minute reconcile — config parsed, never
+  sourced; additive-only migration lint; health-gated restart; auto-revert to last-known-good —
+  watched by two independent canaries that also watch each other, plus a nightly verified `pg_dump`
+  of the ledger. The lab watches the factory back (`tailnet-watch`), so a dark Mini can't go
+  unnoticed for weeks again ([substrate/SETUP.md](substrate/SETUP.md)).
+- **Paid-media production.** Long-form video via chained renders + ffmpeg (`stitcher`), a deterministic
+  topic→narrated-reel pipeline (`mx-engine`), and a brief→motion-plate quality driver — all under the
+  same never-auto-retry-a-paid-job rule the Higgsfield section explains
+  ([stitcher](docs/stitcher-design.md), [quality driver](docs/MX_QUALITY_ORCHESTRATOR.md)).
+
+Each shipped the same way: design doc → cross-family adversarial review → build → review again. The
+raw transcripts for two of the larger slices (the automerge gate and the controller loop) are
+committed unedited in [`docs/reviews/`](docs/reviews/); the other slices record their review rounds
+and folded findings inside their design docs.
+
 ## What works, what doesn't
 
-**Built and tested (75 tests across 9 suites — real Postgres, real subprocesses, and real HTTP for the
-integration suites; mocked transports for the API-adapter units; the Higgsfield agent additionally
+**Built and tested (32 suites / 592 test functions, all wired into CI — real Postgres, real
+subprocesses, and the real FastAPI app driven in-process; the one suite that spends real tokens — the
+curator live-confinement gate — self-skips in CI and runs locally; the Higgsfield agent additionally
 live-verified end to end against the real API):**
 
 - A ledger-agnostic worker: one core drives the SQLite demo store *or* the Postgres production store.
-- The asyncpg Postgres ledger: all the Command-API verbs, **15 concurrency proofs** against a live Postgres
-  (50 workers racing one lease, a 200-trial reclaim-vs-complete mutual-exclusion proof, exactly-once
-  ingest/delivery, admission limits under 50 concurrent submits).
+- The asyncpg Postgres ledger: all the Command-API verbs, a 34-test suite against a live Postgres whose
+  **concurrency proofs** include 50 workers racing one lease, a 200-trial reclaim-vs-complete
+  mutual-exclusion proof, a 150-trial cancel-vs-finish deadlock proof, exactly-once ingest/delivery,
+  and admission limits under 50 concurrent submits.
 - A concurrent worker pool: no double-processing, crashed jobs recovered by the janitor, long jobs kept
   alive by heartbeats, and a poison job can't take down the fleet.
 - A terminal transport that never blocks on an agent, with replies delivered fully decoupled.
@@ -201,16 +278,22 @@ live-verified end to end against the real API):**
   double-charged; input URLs are SSRF-screened; the mp4 URL returns as `Result.artifact_ref`. Live-verified
   against the real API (a 31 MB video in 65s).
 
-**Not built yet (deferred, named on purpose):**
+**Not built, or built but deliberately not armed (named on purpose):**
 
-- A redelivering chat transport (Slack, say) — where the idempotent-dispatch guard already in the
-  ledger would start to pay off.
-- The C4 admission budgets (cost/chain-TTL), composite authority, capability-gated routing — specified in
-  `DESIGN.md`, not yet exercised in code.
+- A redelivering chat transport — Telegram is [designed](docs/telegram-transport-design.md), not built;
+  the phone surface shipped via the librarian's Remote-Control front door instead.
+- The C4 admission budgets (cost/chain-TTL) and capability-gated routing — specified in `DESIGN.md`,
+  not yet exercised in code. Composite authority ships as a value (`recon` is composite, treated
+  fail-closed for retries), but the multi-call net-authority semantics are not built.
+- The HTTP API runs in CI and the demo; nothing deploys it as a service yet.
+- The inbox assistant (Gmail → labels + reply drafts + one morning brief) is merged and CI-tested but
+  not armed — its [deploy runbook](docs/inbox-assistant-deploy.md) is explicitly marked NOT EXECUTED.
+- The learning stack's acting rungs (auto-suppress, auto-propose): measurement ships, acting is gated on
+  accrued human labels — two acting designs were refused in adversarial review as premature.
 
 ## Prior art
 
-This sits in a real, active 2026 category — local coding-agent CLI orchestrators with a durable ledger and
+This is a category others found too — local coding-agent CLI orchestrators with a durable ledger and
 git-worktree isolation — not a novel one. Independent projects converged on nearly the same design:
 [striatum](https://github.com/halbritt/striatum) (Go; daemon-owned Postgres, leases, append-only
 hash-chained provenance), [gobby](https://github.com/GobbyAI/gobby) (Python; PostgreSQL as the source of
@@ -226,15 +309,24 @@ bugs the green tests missed.
 
 ## Tests
 
-Each suite is a self-contained runner (no pytest config needed). The Postgres-backed suites need the DB
-from the "Run it" section above:
+32 suites / 592 test functions, all wired into CI (a Postgres 16 service container backs the ledger
+suites; the curator live-confinement gate self-skips there because it drives a real `claude` CLI and
+spends tokens — run it locally with `RUN_CURATOR_ENFORCEMENT=1`). 31 suites are self-contained
+runners — no pytest config needed; one is pytest-style. A separate bash layer covers the 33 tracked
+shell scripts: shellcheck, five repo-specific semgrep rules (this repo's recurring bash bugs,
+encoded), bats regression tests, a substrate smoke + security harness, and an additive-only migration
+lint. The Postgres-backed suites need the DB from the "Run it" section above:
 
 ```bash
-# zero-dep
+# no infra (SQLite)
 PYTHONPATH=src python3 tests/test_worker.py
 
-# Postgres-backed (e.g. the 15 concurrency proofs) — throwaway db; the suite resets the schema
+# Postgres-backed (e.g. the 34-test ledger suite with the concurrency proofs) — throwaway db;
+# the suite resets the schema
 LEDGER_TEST_DSN=postgresql://localhost/runtime_test PYTHONPATH=src python3 tests/test_postgres_ledger.py
+
+# the bash layer
+./tools/bash-check.sh && bats tests/bash/
 ```
 
 ## Layout
@@ -244,21 +336,39 @@ DESIGN.md                    the spec + decision log (v0.1 -> v0.4)
 demo.py                      the runnable demos above
 src/runtime/
   contracts.py               C0-C3 as Pydantic models
-  registry.py                the agent roster, as data
+  registry.py                the agent roster, as data (12 AgentSpec rows)
   command_api.py             the Command-API verb interface (sole ledger writer)
   api.py                     FastAPI HTTP surface + API-key auth
   runner.py                  C1 runner: CLI (process-group kill + timeout), the API
                              adapter, and the Higgsfield async-media adapter
-  cli.py                     mxr — submit a job from the terminal (e.g. --image)
+  cli.py                     mxr — submit a job from the terminal, plus the rung
+                             verbs (review, ask, outcome, dial-shadow, ...)
   worker.py                  the lease -> invoke -> result core (drives either store)
   pool.py                    concurrent worker pool (N workers + janitor + heartbeats)
   workspace.py               C5 ephemeral git-worktree isolation
+  serve.py                   the always-on service (auto-migrates on boot, fail-closed)
+  controller.py              the hourly review reconciler (non-LLM brain)
+  automerge.py               the docs-only PR auto-merge gate
+  staging.py, review.py      de-linked read-only review snapshots + the mxr review verb
+  skillmatch.py, skillselect.py, capture*.py, outcomes*.py, dialshadow*.py
+                             the measure-first learning stack
+  knowledge*.py, curate.py   the tsvector second brain (curator + mxr ask)
+  inbox_assistant.py, gmail_client.py
+                             the drafts-only Gmail brief (built, not armed)
+  orchestrator.py, runner_stitch.py, ffmpeg_util.py, critic.py
+                             paid-media production (quality driver, stitcher)
   ledger/
     schema.sql               the Postgres state machine (DDL)
     postgres_store.py        the asyncpg ledger (production)
-    sqlite_store.py          the SQLite store (zero-dep demo)
+    sqlite_store.py          the SQLite store (the no-infra demo)
     migrations/              idempotent ALTERs for an already-deployed db
   transport/
     terminal.py              C3 terminal transport (dumb pipe over the ledger)
-tests/                       75 tests across 9 suites
+orchestrator/                the autonomous review loop (play-review.sh, play-fix.sh,
+                             controller-tick.sh) + the librarian confinement kit
+substrate/                   two-machine GitOps: reconcile, drift + liveness canaries,
+                             nightly ledger backup, the lab's tailnet-watch
+tests/                       32 suites / 592 test functions (wired into CI)
+docs/                        per-feature design docs; docs/reviews/ holds the committed
+                             cross-family review transcripts (the audit trail)
 ```

@@ -40,7 +40,7 @@ orchestrator/         play-review.sh / play-fix.sh / controller-tick.sh + launch
                       autonomous review loop. Deploys via TRUSTED INSTALLED COPIES, not the tree.
 substrate/            two-machine GitOps: config.env parsing (parsed, never sourced),
                       reconcile.sh, canaries, plists
-tests/                self-contained runners (no pytest config), 75+ tests across 9+ suites
+tests/                32 suites / 592 test functions, wired into CI (curator gate self-skips there)
 docs/                 per-feature design docs + OPERATING.md
 ```
 
