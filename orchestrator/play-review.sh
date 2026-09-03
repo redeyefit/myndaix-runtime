@@ -87,14 +87,43 @@ if [[ "${1:-}" != "--worker" ]]; then
     [[ "$remoteref" == $TARGET_GLOB ]] || continue          # any branch; skip tags (unquoted RHS = glob)
     [[ "$localsha" == "$ZERO" ]] && continue                # branch delete
     if [[ "$remotesha" != "$ZERO" ]] && git -C "$repo" cat-file -e "${remotesha}^{commit}" 2>/dev/null; then
-      base="$remotesha"                                     # existing branch: review the incremental push
+      base="$remotesha"; orig_base="$remotesha"             # existing branch: review the incremental push
+      # --- skip-range fold-in (HOOK PUSHES ONLY) ---------------------------------------------
+      # If the sha we're stacking on was itself SKIPPED (lock contention), walk the recorded
+      # chain down to the last sha that actually got reviewed, so the skipped range folds into
+      # this review instead of being silently absorbed (the retrigger-gap bug: an empty-commit
+      # retrigger used to diff skipped-tip..empty = nothing). Direction: may OVER-review, can
+      # never lose a range; ANY anomaly stops the walk at the current base (today's behavior).
+      # Gated on a non-empty remote_url: the controller dispatches through this FRONT with an
+      # EMPTY url and manages its own ledger cursor + chunk caps — walking its base would bust
+      # PLAY_MAX_DIFF* and wedge the ref. Automerge never enters FRONT (direct --worker).
+      # set -e DISCIPLINE: this loop runs inside the pre-push hook, which must NEVER abort a
+      # push — every step is an if/fi guard, no bare command may fail.
+      if [[ -n "$remote_url" ]]; then
+        _rid="$(basename "$repo")"
+        _slug="${_rid//[^A-Za-z0-9._-]/-}-${remoteref//[^A-Za-z0-9._-]/-}"   # == worker marker_slug
+        _hops=0
+        while [[ "$_hops" -lt 10 ]]; do                     # bounded: >10 chained skips fold 10 deep
+          if [[ -e "$STATE/done-$_slug-$base" ]]; then break; fi  # base got reviewed after all — stop
+          _m="$STATE/skipped-$_slug-$base"
+          if [[ ! -f "$_m" ]]; then break; fi
+          _prev="$(head -c 64 "$_m" 2>/dev/null || true)"
+          if [[ ! "$_prev" =~ ^[0-9a-f]{40}$ ]]; then break; fi   # strict lowercase 40-hex only
+          if [[ "$_prev" == "$localsha" ]]; then break; fi        # would empty the whole diff
+          if ! git -C "$repo" cat-file -e "${_prev}^{commit}" 2>/dev/null; then break; fi
+          if ! git -C "$repo" merge-base --is-ancestor "$_prev" "$localsha" 2>/dev/null; then break; fi
+          base="$_prev"; _hops=$((_hops+1))
+        done
+      fi
     elif base="$(git -C "$repo" merge-base "$BASE_REF" "$localsha" 2>/dev/null)" \
          && [[ -n "$base" && "$base" != "$localsha" ]]; then
-      :                                                     # new branch: review vs its merge-base with main
+      orig_base="$base"                                     # new branch: review vs its merge-base with main
     else
-      base="$EMPTY_TREE"                                    # no base ref / root commit → whole-tree diff
+      base="$EMPTY_TREE"; orig_base="$EMPTY_TREE"           # no base ref / root commit → whole-tree diff
     fi
-    nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" "$remote_url" >/dev/null 2>&1 &
+    # arg 7 = the push's OWN base (pre-fold): the worker falls back to it if the folded range
+    # busts a diff cap — the fold may only ADD coverage, never cost the push its own review.
+    nohup "$self" --worker "$repo" "$base" "$localsha" "$remoteref" "$remote_url" "$orig_base" >/dev/null 2>&1 &
   done
   exit 0
 fi
@@ -102,7 +131,7 @@ fi
 # ===========================================================================
 # WORKER: canary -> review -> triage -> deliver. Bounded. Spine is the ledger.
 # ===========================================================================
-repo="$2"; base="$3"; tip="$4"; ref="$5"; remote_url="${6:-}"
+repo="$2"; base="$3"; tip="$4"; ref="$5"; remote_url="${6:-}"; orig_base="${7:-}"   # $7: pre-fold base (empty on direct/gate calls)
 repo_id="$(basename "$repo")"                        # repo bucket for per-repo concurrency (PR-2); review jobs carry it, canary stays cap-exempt
 # transient-marker scope — must derive IDENTICALLY to controller._transient_marker: repo basename
 # + ref, slugged like python _slug (every char outside [A-Za-z0-9._-] -> '-', so refs/heads/main
@@ -238,7 +267,12 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
 # captured ONCE in the main flow (never re-calls confirm_pushed — a 2nd ls-remote under the held
 # lock can wedge all reviews). pre-push fires before git confirms acceptance, so a rejected push
 # must stay re-reviewable.
-mark_done(){ [[ "${pushed:-0}" == "1" ]] && : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true; }
+mark_done(){
+  if [[ "${pushed:-0}" == "1" ]]; then
+    : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true
+    rm -f "$STATE/skipped-$marker_slug-$tip" 2>/dev/null || true   # a reviewed tip's skip record is spent
+  fi
+}
 
 # autofix_fire — PLAY_AUTOFIX bridge: auto-trigger play-fix.sh on a NEEDS-FIX verdict. Fail-CLOSED:
 # every guard must pass or it no-ops (the always-present manual hint is the fallback). It NEVER
@@ -306,15 +340,24 @@ autofix_fire(){
 }
 
 contention(){ # lock held by a live worker: record the skip (NEVER silent), then exit
-  : > "$STATE/SKIPPED-$tip" 2>/dev/null || true
   note contention "lock held; skipped $tip"
   gate && { write_verdict "ABORTED"; exit 2; }               # gate: contention = TRANSIENT (exit 2 -> retry next tick)
+  # Record the skipped RANGE durably (slug-scoped; content = the base sha) so the next hook
+  # push's FRONT folds it in (skip-range fold-in). Atomic tmp+mv: a racing FRONT walk must
+  # never read a partial write (the 40-hex validation would make that a safe fallback anyway).
+  # BELOW the gate exit ON PURPOSE: gate contention retries itself next tick, and its marker
+  # would land in the refs/heads/main slug that hook pushes walk.
+  if _skt="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)"; then
+    if printf '%s' "$base" > "$_skt" 2>/dev/null && mv -f "$_skt" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then
+      :
+    else rm -f "$_skt" 2>/dev/null || true; fi
+  fi
   # lock contention is TRANSIENT by definition (the lock stale-reaps at 45 min; the streak alert
   # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
   # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
   # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
   : > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true
-  deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. Re-push to retry (e.g. git commit --allow-empty -m retrigger && git push)." || true
+  deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. The skipped range is recorded: the next completed review of this branch folds it in automatically (within $PRUNE_DAYS days; an over-cap fold falls back loudly). Retrigger now: git commit --allow-empty -m retrigger && git push. Immediate manual option: orchestrator/xreview.sh code $repo ${base}..${tip}" || true
   exit 0
 }
 
@@ -386,18 +429,38 @@ for a in "${canary_agents[@]}"; do
 done
 
 # --- diff the pushed range; over-cap = FAIL fast (don't feed a 300s timeout) ---
-diff="$(git -C "$repo" diff "$base" "$tip" 2>/dev/null || true)"
-[[ -n "$diff" ]] || abort diff "empty/failed diff for ${base}..${tip}"
-[[ "$(printf '%s' "$diff" | wc -c)" -le "$MAX_DIFF" ]] || abort diff "diff over ${MAX_DIFF}B — split the push (v0 review budget)"
-# changed-lines cap: bytes under-count what actually costs review time (a 100KB one-line blob is
-# cheap; 3400 one-char changed lines is not). Same numstat metric as controller._diff_lines; a
-# failed numstat sums to 0 = fail OPEN (the byte cap above already bounded the input). The `|| true`
-# is LOAD-BEARING under set -e -o pipefail: a git failure fails the whole pipeline (awk still
-# prints 0) and would kill the worker OUTSIDE the abort path (no deliver, no marker) — kilabz #3.
-diff_lines="$(git -C "$repo" diff --numstat "$base" "$tip" 2>/dev/null \
-              | awk -F'\t' '{ if ($1 ~ /^[0-9]+$/) s+=$1; if ($2 ~ /^[0-9]+$/) s+=$2 } END { print s+0 }' || true)"
-[[ "$diff_lines" =~ ^[0-9]+$ ]] || diff_lines=0
-[[ "$diff_lines" -le "$MAX_DIFF_LINES" ]] || abort diff "diff spans ${diff_lines} changed lines (cap ${MAX_DIFF_LINES}) — one reviewer call would time out; split the push or raise PLAY_MAX_DIFF_LINES"
+# If the FRONT's skip-fold EXTENDED the range (orig_base set + != base), a failure here falls
+# back to the push's OWN range with a LOUD backlog banner in the verdict — the fold may only
+# ADD coverage, never cost the push its own review. Two passes max: the own range failing
+# aborts exactly as before. Gate/direct --worker calls have orig_base empty → single pass.
+backlog_banner=""
+while :; do
+  diff="$(git -C "$repo" diff "$base" "$tip" 2>/dev/null || true)"
+  diff_fail=""
+  if [[ -z "$diff" ]]; then diff_fail="empty/failed diff for ${base}..${tip}"; fi
+  if [[ -z "$diff_fail" && "$(printf '%s' "$diff" | wc -c)" -gt "$MAX_DIFF" ]]; then
+    diff_fail="diff over ${MAX_DIFF}B — split the push (v0 review budget)"
+  fi
+  # changed-lines cap: bytes under-count what actually costs review time (a 100KB one-line blob is
+  # cheap; 3400 one-char changed lines is not). Same numstat metric as controller._diff_lines; a
+  # failed numstat sums to 0 = fail OPEN (the byte cap above already bounded the input). The `|| true`
+  # is LOAD-BEARING under set -e -o pipefail: a git failure fails the whole pipeline (awk still
+  # prints 0) and would kill the worker OUTSIDE the abort path (no deliver, no marker) — kilabz #3.
+  diff_lines="$(git -C "$repo" diff --numstat "$base" "$tip" 2>/dev/null \
+                | awk -F'\t' '{ if ($1 ~ /^[0-9]+$/) s+=$1; if ($2 ~ /^[0-9]+$/) s+=$2 } END { print s+0 }' || true)"
+  [[ "$diff_lines" =~ ^[0-9]+$ ]] || diff_lines=0
+  if [[ -z "$diff_fail" && "$diff_lines" -gt "$MAX_DIFF_LINES" ]]; then
+    diff_fail="diff spans ${diff_lines} changed lines (cap ${MAX_DIFF_LINES}) — one reviewer call would time out; split the push or raise PLAY_MAX_DIFF_LINES"
+  fi
+  if [[ -z "$diff_fail" ]]; then break; fi
+  if [[ -n "$orig_base" && "$base" != "$orig_base" ]]; then
+    note foldback "folded range failed ($diff_fail); retrying with the push's own base"
+    backlog_banner="⚠ skip-fold hit a limit ($diff_fail). Reviewed ONLY this push (${orig_base}..${tip}); the backlog ${base}..${orig_base} is STILL UNREVIEWED — manual: orchestrator/xreview.sh code $repo ${base}..${orig_base}"
+    base="$orig_base"
+    continue
+  fi
+  abort diff "$diff_fail"
+done
 
 # canary + diff passed → this is a real review; charge the daily cap now (not on aborts).
 # gate mode does NOT charge the push-review cap (it's a separate, capped concern).
@@ -592,6 +655,9 @@ if confirm_pushed; then pushed=1; else pushed=0; fi
 # the whole body, so the reason (already control-stripped above) can't forge/erase the header.
 deg_banner=""
 [[ -n "$degraded" ]] && deg_banner="⚠ $degraded"$'\n\n'
+# fold fallback (over-cap): lead the verdict with the unreviewed-backlog banner — a fallback
+# review must never masquerade as having covered the folded range.
+[[ -n "$backlog_banner" ]] && deg_banner="${backlog_banner}"$'\n\n'"${deg_banner}"
 
 # --- gate: PASS iff trimmed == EXACTLY PLAY_PASS (no forgeable substring) ---
 if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimmed match — no embedded-space forgery

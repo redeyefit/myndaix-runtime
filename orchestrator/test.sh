@@ -148,7 +148,13 @@ echo "7j. deliver() strips control/ANSI (ESC) from the LLM verdict before it lan
   STUB_TRIAGE=$'1. \033[31mfake COMPLIANT\033[0m sneaky' run
   df="$(latest)"
   if [[ -n "$df" ]] && LC_ALL=C grep -q $'\033' "$df" 2>/dev/null; then echo "  FAIL: ESC survived into the verdict file"; FAIL=$((FAIL+1)); else echo "  ok: ESC stripped from delivered verdict"; PASS=$((PASS+1)); fi
-echo "8. contention records a visible skip"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"; ckfile "$STATE/SKIPPED-$TIP" "SKIPPED sentinel written"
+echo "8. contention records a slug-scoped skip marker (content = the skipped base)"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"
+  SKMARKER="$STATE/skipped-repo-refs-heads-main-$TIP"   # same hardcoded bash<->front contract as TMARKER/DMARKER
+  ckfile "$SKMARKER" "slug-scoped skipped marker written"
+  got="$(cat "$SKMARKER" 2>/dev/null)"
+  if [[ "$got" == "$EMPTY" ]]; then echo "  ok: marker content is the skipped range's base"; PASS=$((PASS+1)); else echo "  FAIL: marker content '$got' != $EMPTY"; FAIL=$((FAIL+1)); fi
+  cknofile "$STATE/SKIPPED-$TIP" "legacy global SKIPPED sentinel no longer written"
+  ck "notice: next review folds the range in" "folds it in" ; ck "notice offers the xreview manual option" "xreview.sh"
 echo "8b. contention marks transient (push mode); gate contention does NOT"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run
   ckfile "$TMARKER" "push-mode contention writes the scoped transient marker"
   reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
@@ -384,6 +390,97 @@ echo "48. PR-2: scope-flag count is still 3 (staged-workdir is additive, not a n
   rid="$(basename "$REPO")"; L="$(mlog)"
   nscoped="$(grep -c -- "--repo $rid --base-ref $TIP" "$L" 2>/dev/null || true)"; [[ "$nscoped" =~ ^[0-9]+$ ]] || nscoped=0
   [[ "$nscoped" -eq 3 ]] && { echo "  ok: still exactly 3 scoped review calls"; PASS=$((PASS+1)); } || { echo "  FAIL: scoped calls = $nscoped (want 3)"; FAIL=$((FAIL+1)); }
+
+
+# ====================== skip-range fold-in (skipped-marker adoption) ======================
+# The FRONT walk adopts a recorded skip-base so a contention-skipped range folds into the
+# next hook push. Observed via an argv RECORDER at the FIXED install path (the same seam
+# test 17 proves: FRONT prefers $ORCH/play-review.sh over the worktree copy).
+SKIPSLUG="repo-refs-heads-main"   # hardcoded bash<->front contract, same as TMARKER/DMARKER
+FRONT_ARGV="$FAKE/.myndaix/front-worker-argv"
+install_front_recorder(){ mkdir -p "$FAKE/.myndaix/orchestrator"
+  printf '%s\n' '#!/usr/bin/env bash' 'mkdir -p "$HOME/.myndaix" 2>/dev/null' \
+    'printf "%s\n" "$@" > "$HOME/.myndaix/front-worker-argv"' 'exit 0' \
+    > "$FAKE/.myndaix/orchestrator/play-review.sh"
+  chmod +x "$FAKE/.myndaix/orchestrator/play-review.sh"; }
+front_push(){ # front_push <localsha> <remotesha> — one pre-push stdin line into FRONT (hook shape:
+  # NON-empty remote_url — the walk is gated on it), wait for the recorder artifact
+  rm -f "$FRONT_ARGV"
+  ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/main "$1" refs/heads/main "$2" \
+      | env HOME="$FAKE" bash "$SCRIPT" origin "stub://remote" ) >/dev/null 2>&1
+  for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
+front_base(){ sed -n 3p "$FRONT_ARGV" 2>/dev/null; }   # recorder argv: --worker repo BASE tip ref url orig
+
+# fixture commits: TIP -> TIP2 (the skipped push's tip) -> TIP3 (the retrigger push)
+git -C "$REPO" commit -q --allow-empty -m skipped-tip; TIP2="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" commit -q --allow-empty -m retrigger;  TIP3="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" reset -q --hard "$TIP"   # restore; objects stay reachable (same trick as 7d)
+
+echo "49. FRONT folds a skipped range: remotesha == skipped tip -> worker gets the recorded base"; reset; install_front_recorder
+  mkdir -p "$STATE"; printf '%s' "$TIP" > "$STATE/skipped-$SKIPSLUG-$TIP2"
+  if front_push "$TIP3" "$TIP2"; then
+    b="$(front_base)"
+    if [[ "$b" == "$TIP" ]]; then echo "  ok: worker dispatched with the recorded base (range folded in)"; PASS=$((PASS+1)); else echo "  FAIL: base=$b want $TIP"; FAIL=$((FAIL+1)); fi
+    if [[ "$(sed -n 4p "$FRONT_ARGV")" == "$TIP3" ]]; then echo "  ok: tip stays the pushed localsha"; PASS=$((PASS+1)); else echo "  FAIL: tip mangled"; FAIL=$((FAIL+1)); fi
+    if [[ "$(sed -n 7p "$FRONT_ARGV")" == "$TIP2" ]]; then echo "  ok: arg7 carries the push's own base (over-cap fallback)"; PASS=$((PASS+1)); else echo "  FAIL: arg7=$(sed -n 7p "$FRONT_ARGV") want $TIP2"; FAIL=$((FAIL+1)); fi
+  else echo "  FAIL: front never dispatched a worker"; FAIL=$((FAIL+3)); fi
+
+echo "49b. chain fold (skip-of-skip walks 2 hops) + done-marker stops the walk"; reset; install_front_recorder
+  mkdir -p "$STATE"; printf '%s' "$TIP" > "$STATE/skipped-$SKIPSLUG-$TIP2"; printf '%s' "$TIP2" > "$STATE/skipped-$SKIPSLUG-$TIP3"
+  front_push "$TIP3" "$TIP3" >/dev/null 2>&1 || true   # remotesha=TIP3 (its marker points to TIP2, whose marker points to TIP)
+  b="$(front_base)"
+  if [[ "$b" == "$TIP" ]]; then echo "  ok: 2-hop chain walked to the deepest recorded base"; PASS=$((PASS+1)); else echo "  FAIL: chain base=$b want $TIP"; FAIL=$((FAIL+1)); fi
+  : > "$STATE/done-$SKIPSLUG-$TIP2"                    # TIP2 got reviewed after all -> walk must stop AT it
+  front_push "$TIP3" "$TIP3" >/dev/null 2>&1 || true
+  b="$(front_base)"
+  if [[ "$b" == "$TIP2" ]]; then echo "  ok: done marker stops the walk"; PASS=$((PASS+1)); else echo "  FAIL: done-stop base=$b want $TIP2"; FAIL=$((FAIL+1)); fi
+
+echo "50. fail-safe: bad markers fall back to base=remotesha (and the push is never aborted)"; reset; install_front_recorder; mkdir -p "$STATE"
+  printf 'not-a-sha\n' > "$STATE/skipped-$SKIPSLUG-$TIP2"
+  front_push "$TIP3" "$TIP2" || true
+  if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: garbage content -> base=remotesha"; PASS=$((PASS+1)); else echo "  FAIL: garbage content adopted ($(front_base))"; FAIL=$((FAIL+1)); fi
+  SIDETREE="$(git -C "$REPO" rev-parse "$TIP^{tree}")"
+  SIDE="$(git -C "$REPO" commit-tree -p "$TIP" -m side "$SIDETREE" 2>/dev/null)"   # real commit, NOT an ancestor of TIP3 (force-push shape)
+  printf '%s' "$SIDE" > "$STATE/skipped-$SKIPSLUG-$TIP2"
+  front_push "$TIP3" "$TIP2" || true
+  if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: non-ancestor recorded base -> base=remotesha"; PASS=$((PASS+1)); else echo "  FAIL: non-ancestor base adopted"; FAIL=$((FAIL+1)); fi
+  printf '%040d' 1 > "$STATE/skipped-$SKIPSLUG-$TIP2"                              # 40-hex, but no such object
+  front_push "$TIP3" "$TIP2" || true
+  if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: missing-commit base -> base=remotesha"; PASS=$((PASS+1)); else echo "  FAIL: missing-commit base adopted"; FAIL=$((FAIL+1)); fi
+  printf '%s' "$TIP3" > "$STATE/skipped-$SKIPSLUG-$TIP2"                           # marker pointing AT localsha would empty the diff
+  front_push "$TIP3" "$TIP2" || true
+  if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: marker==localsha rejected (empty-diff guard)"; PASS=$((PASS+1)); else echo "  FAIL: localsha marker adopted"; FAIL=$((FAIL+1)); fi
+
+echo "50b. controller shape (EMPTY remote_url) never walks — ledger cursor stays authoritative"; reset; install_front_recorder
+  mkdir -p "$STATE"; printf '%s' "$TIP" > "$STATE/skipped-$SKIPSLUG-$TIP2"
+  rm -f "$FRONT_ARGV"
+  ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/main "$TIP3" refs/heads/main "$TIP2" \
+      | env HOME="$FAKE" bash "$SCRIPT" origin "" ) >/dev/null 2>&1
+  for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && break; sleep 0.1; done
+  if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: empty remote_url -> no walk (base=remotesha)"; PASS=$((PASS+1)); else echo "  FAIL: controller-shape dispatch walked ($(front_base))"; FAIL=$((FAIL+1)); fi
+
+echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
+  seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"
+  printf 'x=1\n' > "$REPO/own.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm own; OWNTIP="$(git -C "$REPO" rev-parse HEAD)"   # own range = a REAL small diff
+  # worker invoked as the FRONT would after a walk: base=$EMPTY (folded, over-cap), arg7=$FOLDTIP (own base, tiny diff)
+  env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$OWNTIP" refs/heads/main "" "$FOLDTIP" 2>/dev/null
+  ck "fallback still reviews (PASS delivered)" "review PASS"
+  ck "verdict leads with the unreviewed-backlog banner" "STILL UNREVIEWED"
+  ck "banner names the manual xreview command" "xreview.sh"
+  git -C "$REPO" reset -q --hard "$TIP"   # restore
+
+echo "51b. own range ALSO over-cap still aborts (no infinite fallback)"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF=8 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" "$EMPTY" 2>/dev/null
+  ck "own-range over-cap aborts as before" "ABORTED — diff"
+
+echo "52. mark_done clears the tip's skipped marker (confirmed push)"; reset; mkdir -p "$STATE"
+  printf '%s' "$EMPTY" > "$STATE/skipped-$SKIPSLUG-$TIP"
+  STUB_TRIAGE="PLAY_PASS" run
+  cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "reviewed tip's skipped marker removed"
+
+echo "53. gate contention writes NO skip marker (gate retries itself; main slug stays clean)"; reset; mkdir -p "$STATE/lock"
+  STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
+  cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "gate-mode contention leaves no skipped marker"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
