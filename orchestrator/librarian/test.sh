@@ -49,7 +49,7 @@ echo "== DENY: recall verb dropped + dispatch + other programs =="
 decide deny 'mxr recall --scope research "higgsfield"'
 decide deny 'mxr kilabz "do a review"'
 decide deny 'mxr higgsfield "make a video"'
-decide deny 'cat /Users/stevenfernandez/.myndaix/.secrets'
+decide deny 'cat $HOME/.myndaix/.secrets'
 decide deny 'python3 -c "import os"'
 decide deny 'ls ~'
 

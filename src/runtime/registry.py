@@ -7,6 +7,7 @@ config/DB so the roster stays flexible. Models/commands change here, not in code
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
@@ -304,8 +305,10 @@ V1_ROSTER: list[AgentSpec] = [
               model="pipeline", role="content factory (mx-engine folder-agent): topic -> narrated reel",
               profile=Profile(timeout_s=1500),
               adapter={"kind": "cli",
+                       # expanduser keeps the argv ABSOLUTE (the self-locating wrapper contract
+                       # above) while resolving per-operator ($HOME differs lab vs factory).
                        "argv": ["bash",
-                                "/Users/stevenfernandez/code/active/mx-engine/mx-produce.sh"],
+                                os.path.expanduser("~/code/active/mx-engine/mx-produce.sh")],
                        "prompt_channel": "arg"}),   # whole dispatch string -> $1 = topic
 ]
 

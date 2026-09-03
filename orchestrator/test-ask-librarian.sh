@@ -5,7 +5,7 @@
 # + prompt-injection resistance (needs the pool running with the `librarian` row).
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-RT="/Users/stevenfernandez/code/active/myndaix-runtime"
+RT="${RT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$RT" || exit 1
 PY=(env PYTHONPATH=src .venv/bin/python -m runtime.cli)
 LIVE=0; [ "${1:-}" = "--live" ] && LIVE=1

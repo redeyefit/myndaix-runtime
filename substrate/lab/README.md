@@ -26,6 +26,10 @@ never kill the monitor). macOS-only by design (`nc -G`, `date -r`).
 
 ### Install (once, on the MacBook — every step required)
 
+First edit `substrate/lab/ai.myndaix.tailnet-watch.plist` — it is SITE CONFIG: set `TW_HOST`
+(your factory node's tailnet IP; the script fails fast without it) and replace `/Users/you`
+with your home directory (launchd does not expand `$HOME`). Then:
+
 ```
 mkdir -p ~/.myndaix/state ~/.myndaix/bin    # launchd opens the plist stdout paths BEFORE the script runs
 cp substrate/lab/tailnet-watch.sh ~/.myndaix/bin/tailnet-watch.sh
@@ -54,6 +58,13 @@ The installed copy at `~/.myndaix/bin/tailnet-watch.sh` is a HAND-COPIED deploy 
 (this consciously extends the known hand-copied set — see runtime-deploy-topology): after
 changing `substrate/lab/tailnet-watch.sh` on main, re-run the `cp` line. `diff` them if
 unsure which is newer.
+
+**Script and plist ship TOGETHER.** The script takes `TW_HOST` from the plist's
+`EnvironmentVariables`; if it is missing (a script-only update against an old plist) or still
+the unedited placeholder, every tick logs and raises a "misconfigured — the factory is
+UNWATCHED" alert until the plist is fixed — loud, but the watcher still is not watching. After
+any update, verify a live tick: `tail ~/.myndaix/state/tailnet-watch.log` shows a clean entry
+within 10 min.
 
 ### Verify / operate
 

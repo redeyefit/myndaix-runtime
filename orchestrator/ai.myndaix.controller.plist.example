@@ -25,7 +25,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/stevenfernandez/code/active/myndaix-runtime/orchestrator/controller-tick.sh</string>
+    <string>/Users/you/code/active/myndaix-runtime/orchestrator/controller-tick.sh</string>
   </array>
   <key>StartInterval</key>
   <integer>3600</integer>
@@ -36,8 +36,8 @@
   <key>AbandonProcessGroup</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/controller.out</string>
+  <string>/Users/you/.myndaix/orchestrator/controller.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/controller.out</string>
+  <string>/Users/you/.myndaix/orchestrator/controller.out</string>
 </dict>
 </plist>

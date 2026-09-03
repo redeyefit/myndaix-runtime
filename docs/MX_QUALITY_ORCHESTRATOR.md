@@ -85,7 +85,7 @@ The adversarial review returned **REVISE**. Apply these before/while building:
 
 # MX Quality Orchestrator — Design Doc (handoff-ready)
 
-**Status:** ready to build (v1) · **Lives in:** `/Users/stevenfernandez/code/active/myndaix-runtime` · **Date:** 2026-06-28
+**Status:** ready to build (v1) · **Lives in:** `~/code/active/myndaix-runtime` · **Date:** 2026-06-28
 **Author intent:** a builder (another agent/session) implements v1 from this doc alone. Every interface claim below is cited to real code (`file:line`). When a thing must be **BUILT**, it says BUILD. When it already **EXISTS**, it says EXISTS.
 
 ---

@@ -7,7 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/stevenfernandez/code/active/myndaix-runtime/orchestrator/disk-cleanup.sh</string>
+    <string>/Users/you/code/active/myndaix-runtime/orchestrator/disk-cleanup.sh</string>
   </array>
   <!-- Weekly: Sunday 04:00. RunAtLoad=false (maintenance, not boot-critical). launchd runs a
        missed job at next wake if the machine was asleep at the scheduled time. -->
@@ -20,8 +20,8 @@
   <key>RunAtLoad</key>
   <false/>
   <key>StandardOutPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/disk-cleanup.out</string>
+  <string>/Users/you/.myndaix/orchestrator/disk-cleanup.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/disk-cleanup.out</string>
+  <string>/Users/you/.myndaix/orchestrator/disk-cleanup.out</string>
 </dict>
 </plist>

@@ -204,7 +204,7 @@ A future operator-configurable `PLAY_FIX_AUTO=selector|all|off` mode is likewise
 1. **Codex builder confined + net=false (VERIFIED for prod).** `orchestrator/probe-git-write-vector.sh`
    PASSED: `workspace-write` confines writes to `{workdir,/tmp,$TMPDIR}` and denies shared-`.git` writes.
    **Condition:** the armed repo's path must NOT be under `/tmp` or `$TMPDIR`. Re-run the probe if the
-   codex CLI or its config changes. (myndaix-runtime: `/Users/stevenfernandez/code/active/...` — passes.)
+   codex CLI or its config changes. (myndaix-runtime: `~/code/active/...` — passes.)
 2. **Trusted install present + pinned:** `$ORCH/play-fix.sh` exists, is executable, and `shasum -a 256`
    matches the reviewed `orchestrator/play-fix.sh`. Deploy step: `cp orchestrator/play-fix.sh "$ORCH/play-fix.sh"`.
 3. **Armed repos are `fail_to_pass:null`** in the live repos.json (enforced at fire time too).
