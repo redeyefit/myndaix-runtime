@@ -60,10 +60,11 @@ changing `substrate/lab/tailnet-watch.sh` on main, re-run the `cp` line. `diff` 
 unsure which is newer.
 
 **Script and plist ship TOGETHER.** The script takes `TW_HOST` from the plist's
-`EnvironmentVariables`; if it is missing (a script-only update against an old plist), every
-tick logs and raises a "misconfigured — the factory is UNWATCHED" alert until the plist is
-fixed — loud, but the watcher still is not watching. After any update, verify a live tick:
-`tail ~/.myndaix/state/tailnet-watch.log` shows a clean entry within 10 min.
+`EnvironmentVariables`; if it is missing (a script-only update against an old plist) or still
+the unedited placeholder, every tick logs and raises a "misconfigured — the factory is
+UNWATCHED" alert until the plist is fixed — loud, but the watcher still is not watching. After
+any update, verify a live tick: `tail ~/.myndaix/state/tailnet-watch.log` shows a clean entry
+within 10 min.
 
 ### Verify / operate
 

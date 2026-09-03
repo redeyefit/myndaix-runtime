@@ -139,6 +139,26 @@ printf 'fails=3\nalerted_at=100\nfirst_fail_at=0\nlast_tick_at=%s\n' "$(date +%s
 run_tick 0
 grep -q 'downtime unknown' "$NOTES" && ok "unknown-duration guard" || bad "absurd duration: $(cat "$NOTES")"
 
+echo "13a. misconfig guard — missing TW_HOST alerts loudly and exits 1"
+: > "$NOTES"
+rc=0
+MYNDAIX_HOME="$SCRATCH/home" \
+  TW_TS_BIN="$SCRATCH/bin/ts" TW_NC_BIN="$SCRATCH/bin/nc" TW_OSA_BIN="$SCRATCH/bin/osascript" \
+  TW_TEST_NOTIFY_LOG="$NOTES" bash "$SCRIPT" || rc=$?
+[ "$rc" -eq 1 ] && ok "missing TW_HOST exits 1" || bad "missing TW_HOST rc=$rc"
+grep -q 'misconfigured' "$NOTES" && ok "missing TW_HOST raises the misconfigured alert" || bad "no misconfigured alert"
+
+echo "13b. misconfig guard — placeholder TW_HOST is treated as unset, not probed"
+: > "$NOTES"
+rc=0
+MYNDAIX_HOME="$SCRATCH/home" TW_HOST="REPLACE-ME-factory-tailnet-ip" \
+  TW_TS_BIN="$SCRATCH/bin/ts" TW_NC_BIN="$SCRATCH/bin/nc" TW_OSA_BIN="$SCRATCH/bin/osascript" \
+  TW_TEST_NOTIFY_LOG="$NOTES" bash "$SCRIPT" || rc=$?
+[ "$rc" -eq 1 ] && ok "placeholder exits 1" || bad "placeholder rc=$rc"
+grep -q 'misconfigured' "$NOTES" && ok "placeholder raises the misconfigured alert" || bad "placeholder probed instead of alerting"
+grep -q 'unreachable' "$NOTES" && bad "placeholder produced a false unreachable alert" || ok "no false unreachable alert"
+: > "$NOTES"
+
 echo "13. structural — pinned nc, no GNU stat trap, base-10 guards"
 grep -q 'NC_BIN="${TW_NC_BIN:-/usr/bin/nc}"' "$SCRIPT" && ok "nc pinned to /usr/bin (brew-shadow proof)" || bad "nc not pinned"
 grep -q 'stat -c' "$SCRIPT" && bad "GNU stat crept in" || ok "no stat portability trap"

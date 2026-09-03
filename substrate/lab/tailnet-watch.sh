@@ -42,10 +42,11 @@ notify() {
 }
 
 # Missing site config = the watcher is NOT watching. Alert every tick until fixed — a
-# script-only update against an old plist (no TW_HOST) must never go dark silently.
-if [ -z "$TW_HOST" ]; then
-  log "TW_HOST unset (script/plist skew) — set it in the plist EnvironmentVariables"
-  notify "tailnet-watch misconfigured: TW_HOST unset — the factory is UNWATCHED"
+# script-only update against an old plist (no TW_HOST), or a plist copied with the
+# placeholder unedited, must never turn into false "Mini unreachable" alerts or go dark.
+if [ -z "$TW_HOST" ] || [ "$TW_HOST" = "REPLACE-ME-factory-tailnet-ip" ]; then
+  log "TW_HOST unset or placeholder (script/plist skew) — set it in the plist EnvironmentVariables"
+  notify "tailnet-watch misconfigured: TW_HOST not set — the factory is UNWATCHED"
   exit 1
 fi
 
