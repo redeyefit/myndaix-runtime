@@ -16,7 +16,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/stevenfernandez/code/active/myndaix-runtime/orchestrator/automerge-tick.sh</string>
+    <string>/Users/you/code/active/myndaix-runtime/orchestrator/automerge-tick.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -24,8 +24,8 @@
     <integer>30</integer>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/automerge.out</string>
+  <string>/Users/you/.myndaix/orchestrator/automerge.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/automerge.out</string>
+  <string>/Users/you/.myndaix/orchestrator/automerge.out</string>
 </dict>
 </plist>

@@ -7,15 +7,15 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/stevenfernandez/code/active/myndaix-runtime/orchestrator/fix-sweep.sh</string>
+    <string>/Users/you/code/active/myndaix-runtime/orchestrator/fix-sweep.sh</string>
   </array>
   <key>StartInterval</key>
   <integer>3600</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/fix-sweep.out</string>
+  <string>/Users/you/.myndaix/orchestrator/fix-sweep.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/stevenfernandez/.myndaix/orchestrator/fix-sweep.out</string>
+  <string>/Users/you/.myndaix/orchestrator/fix-sweep.out</string>
 </dict>
 </plist>

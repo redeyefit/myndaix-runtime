@@ -10,7 +10,10 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-TW_HOST="${TW_HOST:-100.67.43.104}"          # jefes-mac-mini-1 (tagged factory node)
+# Site config, no default: TW_HOST (the factory node tailnet IP) comes from the LaunchAgent
+# plist EnvironmentVariables — see substrate/lab/README.md. Checked BELOW, after log/notify
+# exist, so a script/plist skew alerts loudly instead of dying silently into the .err file.
+TW_HOST="${TW_HOST:-}"
 TW_PORT="${TW_PORT:-22}"
 TS_BIN="${TW_TS_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 NC_BIN="${TW_NC_BIN:-/usr/bin/nc}"            # pinned: a brew netcat lacks -G and would shadow via PATH
@@ -37,6 +40,14 @@ notify() {
     -e 'display notification (item 1 of argv) with title "MyndAIX tailnet-watch" sound name "Basso"' \
     -e 'end run' -- "$1" >/dev/null 2>> "$LOG_FILE"
 }
+
+# Missing site config = the watcher is NOT watching. Alert every tick until fixed — a
+# script-only update against an old plist (no TW_HOST) must never go dark silently.
+if [ -z "$TW_HOST" ]; then
+  log "TW_HOST unset (script/plist skew) — set it in the plist EnvironmentVariables"
+  notify "tailnet-watch misconfigured: TW_HOST unset — the factory is UNWATCHED"
+  exit 1
+fi
 
 observer_online() {
   # Can THIS Mac even judge the Mini? Gate on local tailnet health so planes, captive

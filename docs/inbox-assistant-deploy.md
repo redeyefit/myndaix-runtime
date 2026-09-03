@@ -118,13 +118,13 @@ Add the `INBOX_*` keys (parsed, never sourced; strict `KEY=value`). Injected int
 the plist env:
 
 ```
-INBOX_ACCOUNTS=jefe@redeyefit.com,ops@redeyefit.com,stevenfernandez83@gmail.com
+INBOX_ACCOUNTS=you@yourdomain.com,ops@yourdomain.com,you@gmail.com
 # 1Password vault name (default 'Automation')
 INBOX_OP_VAULT=Automation
 # first-run bounded backfill window (default 90)
 INBOX_BACKFILL_DAYS=90
 # whose Drive receives the brief mirror; MUST be one of INBOX_ACCOUNTS; empty = Drive mirror off
-INBOX_DRIVE_ACCOUNT=jefe@redeyefit.com
+INBOX_DRIVE_ACCOUNT=you@yourdomain.com
 # the database shared with the integration (step 6); empty = Notion mirror off
 INBOX_NOTION_DB=<notion-database-id>
 # empty = ping off
