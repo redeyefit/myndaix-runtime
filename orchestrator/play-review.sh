@@ -297,10 +297,12 @@ write_skip_marker(){
 mark_done(){
   if [[ "${pushed:-0}" == "1" ]]; then
     if [[ -n "${backlog_base:-}" ]]; then
-      # over-cap fallback ran: the pre-recorded marker already carries this deep base (both are
-      # captured post-re-walk), so leaving it standing IS the backlog re-queue. The write below
-      # is a BELT for non-pre-recorded invocations (manual --worker with arg7) and is a no-op
-      # rewrite otherwise; a failure leaves the pre-record standing — never less coverage.
+      # over-cap fallback ran: the pre-recorded marker already carries this OWN-hop base
+      # (backlog_base == orig_base == the pre-record content, r3), so leaving it standing IS
+      # the backlog re-queue — the folded portion deeper down stays covered by the deeper
+      # markers whose owners never delivered. The write below is a BELT for non-pre-recorded
+      # invocations (manual --worker with arg7) and a no-op rewrite otherwise; a failure
+      # leaves the pre-record standing — never less coverage.
       write_skip_marker "$backlog_base" || note requeue "backlog re-queue write FAILED (pre-record may still cover it)"
     else
       rm -f "$STATE/skipped-$marker_slug-$tip" 2>/dev/null || true   # a delivered tip's skip record is spent
@@ -453,6 +455,25 @@ else mxr review-reap >/dev/null 2>&1 || true; fi
 #     gate mode skips this: it needs a FRESH verdict for THIS run (automerge dedups itself).
 if ! gate && [[ -e "$STATE/done-$marker_slug-$tip" ]]; then note dedupe "already reviewed $tip"; exit 0; fi
 
+# --- re-adopt skip markers UNDER THE LOCK (kilabz TOCTOU close): the FRONT walk runs at push
+# time, but a competing worker writes its skip marker at contention time — a fast follow-up
+# push can walk before the marker lands, orphaning the skipped range forever. Re-walking here,
+# holding the lock and past dedupe, sees every marker any earlier worker wrote. Same gates as
+# the FRONT walk: hook pushes only (non-empty remote_url; orig_base proves a FRONT dispatch),
+# never in gate mode (automerge validates the exact {base,head} it asked for).
+# ORDER (r3 HIGH fail-open): this block runs BEFORE the daily-cap check below — a cap abort
+# must leave the pre-record standing like every other abort, or capped ranges drop silently.
+if ! gate && [[ -n "$remote_url" && -n "$orig_base" ]]; then
+  base="$(fold_walk "$repo" "$marker_slug" "$base" "$tip")"
+  # PRE-RECORD this push as skipped-until-DELIVERED (r2 H-1/M-4): a crash, kill, or any abort
+  # between here and mark_done leaves the marker standing, so the NEXT push folds it back in.
+  # Content = orig_base, the push's OWN hop only (r3 MEDIUM toctou): deeper coverage lives in
+  # the still-standing deeper markers, and fold_walk composes the hops. Recording the FOLDED
+  # base would freeze a claim over ranges whose own workers may deliver (consuming their
+  # markers) later — that stale over-claim would re-queue forever through over-cap cycles.
+  write_skip_marker "$orig_base" || note prerecord "pre-record write FAILED — a crash before delivery would lose ${orig_base}..${tip}"
+fi
+
 # --- daily cap: numeric-guarded check now; CHARGE only when a real review runs ---
 #     gate mode is decoupled from the push-review DAILY_CAP (automerge has its own caps).
 # PER-REPO daily cap: the read-modify-write below is race-free only because THIS repo's lock
@@ -461,23 +482,6 @@ if ! gate && [[ -e "$STATE/done-$marker_slug-$tip" ]]; then note dedupe "already
 day="$STATE/count-${repo_id//[^A-Za-z0-9._-]/-}-$(date +%Y%m%d)"
 n="$(cat "$day" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
 if ! gate && [[ "$n" -ge "$DAILY_CAP" ]]; then abort cap "daily review cap ($DAILY_CAP) reached"; fi
-
-# --- re-adopt skip markers UNDER THE LOCK (kilabz TOCTOU close): the FRONT walk runs at push
-# time, but a competing worker writes its skip marker at contention time — a fast follow-up
-# push can walk before the marker lands, orphaning the skipped range forever. Re-walking here,
-# holding the lock and past dedupe, sees every marker any earlier worker wrote. Same gates as
-# the FRONT walk: hook pushes only (non-empty remote_url; orig_base proves a FRONT dispatch),
-# never in gate mode (automerge validates the exact {base,head} it asked for).
-if ! gate && [[ -n "$remote_url" && -n "$orig_base" ]]; then
-  base="$(fold_walk "$repo" "$marker_slug" "$base" "$tip")"
-  # PRE-RECORD the range as skipped-until-DELIVERED (review r2 H-1/M-4): a crash, kill, or any
-  # abort between here and mark_done leaves this marker standing, so the NEXT push folds the
-  # range back in — no crash window can silently lose it. mark_done consumes the marker on a
-  # delivered verdict (or leaves it as the backlog re-queue after an over-cap fallback).
-  # Hook pushes only, same gates as the walk: the controller path has its own PENDING_STALE
-  # re-dispatch, and gate mode owns no push markers.
-  write_skip_marker "$base" || note prerecord "pre-record write FAILED — a crash before delivery would lose ${base}..${tip}"
-fi
 
 # --- pre-flight live canary (reach only; not a guarantee the big review beats 300s) ---
 canary_agents=(kilabz lobster)
@@ -517,7 +521,10 @@ while :; do
   if [[ -n "$orig_base" && "$base" != "$orig_base" ]]; then
     note foldback "folded range failed ($diff_fail); retrying with the push's own base"
     backlog_banner="⚠ skip-fold hit a limit ($diff_fail). Reviewed ONLY this push (${orig_base}..${tip}); the backlog ${base}..${orig_base} is STILL UNREVIEWED and stays QUEUED (the next push re-attempts the fold) — review it now: orchestrator/xreview.sh code $repo ${base}..${orig_base}"
-    backlog_base="$base"   # mark_done re-queues this instead of clearing the tip's marker (oracle MEDIUM: banner-only recovery orphaned the backlog)
+    # r3 MEDIUM (toctou): re-queue the push's OWN hop only — the folded portion below orig_base
+    # is covered by the deeper markers that are still standing (their owners never delivered);
+    # re-queuing the folded $base here would freeze a stale over-claim across delivered ranges.
+    backlog_base="$orig_base"
     base="$orig_base"
     continue
   fi

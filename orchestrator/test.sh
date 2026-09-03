@@ -471,7 +471,7 @@ echo "51. over-cap fold falls back to the push's own range with a LOUD backlog b
   ck "banner names the manual xreview command" "xreview.sh"
   BQ="$STATE/skipped-$SKIPSLUG-$OWNTIP"
   ckfile "$BQ" "backlog RE-QUEUED on the reviewed tip (not banner-only recovery)"
-  if [[ "$(cat "$BQ" 2>/dev/null)" == "$EMPTY" ]]; then echo "  ok: re-queue marker content = the deep unfolded base"; PASS=$((PASS+1)); else echo "  FAIL: re-queue content '$(cat "$BQ" 2>/dev/null)' != $EMPTY"; FAIL=$((FAIL+1)); fi
+  if [[ "$(cat "$BQ" 2>/dev/null)" == "$FOLDTIP" ]]; then echo "  ok: re-queue content = the push's OWN base (own hop, r3 — deeper coverage lives in deeper markers)"; PASS=$((PASS+1)); else echo "  FAIL: re-queue content '$(cat "$BQ" 2>/dev/null)' want $FOLDTIP"; FAIL=$((FAIL+1)); fi
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 
 echo "51b. own range ALSO over-cap still aborts (no infinite fallback)"; reset
@@ -539,6 +539,17 @@ echo "60. a DELIVERED hook review CONSUMES the pre-record (no stale marker)"; re
   ck "review delivered" "review PASS"
   cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "pre-record consumed on delivery"
   ckfile "$DMARKER" "done marker written"
+
+echo "61. cap abort keeps the pre-record (r3 fail-open: capped ranges stay queued)"; reset; mkdir -p "$STATE"
+  printf 9999 > "$STATE/count-repo-$(date +%Y%m%d)"
+  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "$bare59" "$EMPTY" 2>/dev/null
+  ck "aborts on cap" "ABORTED — cap"
+  ckfile "$STATE/skipped-$SKIPSLUG-$TIP" "pre-record survives the cap abort (range stays queued)"
+
+echo "62. pre-record claims the OWN hop, not the folded base (r3 toctou)"; reset; mkdir -p "$STATE"
+  env HOME="$FAKE" STUB_KILABZ_FAIL=1 bash "$SCRIPT" --worker "$REPO" "$TIP" "$TIP3" refs/heads/main "$bare59" "$TIP2" 2>/dev/null || true
+  got="$(cat "$STATE/skipped-$SKIPSLUG-$TIP3" 2>/dev/null)"
+  if [[ "$got" == "$TIP2" ]]; then echo "  ok: marker content = orig_base (own hop), not the folded base"; PASS=$((PASS+1)); else echo "  FAIL: content '$got' want $TIP2 (own hop)"; FAIL=$((FAIL+1)); fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
