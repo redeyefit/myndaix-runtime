@@ -524,5 +524,21 @@ echo "58. the daily cap is PER-REPO — a foreign repo's spend never blocks this
   STUB_TRIAGE="PLAY_PASS" run
   ck "own repo's exhausted cap still aborts" "ABORTED — cap"
 
+
+# ====================== pre-record: skipped-until-DELIVERED (r2 H-1/H-3/M-4) ======================
+echo "59. an ABORTED hook review leaves its range QUEUED (crash/abort window closed)"; reset
+  bare59="$ROOT/bare59.git"; git init -q --bare "$bare59"; git -C "$REPO" push -q "$bare59" "$TIP:refs/heads/main" 2>/dev/null
+  env HOME="$FAKE" STUB_KILABZ_FAIL=1 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "$bare59" "$EMPTY" 2>/dev/null
+  ck "review aborted" "ABORTED"
+  PRM="$STATE/skipped-$SKIPSLUG-$TIP"
+  ckfile "$PRM" "pre-record survives the abort (range stays queued)"
+  if [[ "$(cat "$PRM" 2>/dev/null)" == "$EMPTY" ]]; then echo "  ok: pre-record content = the reviewed base"; PASS=$((PASS+1)); else echo "  FAIL: pre-record content '$(cat "$PRM" 2>/dev/null)'"; FAIL=$((FAIL+1)); fi
+
+echo "60. a DELIVERED hook review CONSUMES the pre-record (no stale marker)"; reset
+  env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "$bare59" "$EMPTY" 2>/dev/null
+  ck "review delivered" "review PASS"
+  cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "pre-record consumed on delivery"
+  ckfile "$DMARKER" "done marker written"
+
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

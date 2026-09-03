@@ -276,26 +276,36 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
   [[ "$got" == "$tip" ]]
 }
 
+# write_skip_marker <content> — atomic tmp+mv write of this tip's skip marker; rc!=0 on failure.
+# Shared by contention(), the pre-record, and mark_done's re-queue belt.
+write_skip_marker(){
+  local _t
+  _t="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s' "$1" > "$_t" 2>/dev/null && mv -f "$_t" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then return 0; fi
+  rm -f "$_t" 2>/dev/null || true; return 1
+}
+
 # dedupe ONLY a review that both delivered durably AND landed on the remote. Uses the push state
 # captured ONCE in the main flow (never re-calls confirm_pushed — a 2nd ls-remote under the held
 # lock can wedge all reviews). pre-push fires before git confirms acceptance, so a rejected push
 # must stay re-reviewable.
+# Marker CONTRACT (review r2 H-2/H-3): the skip marker predates the done marker structurally
+# (the pre-record writes it before any review work); done+skipped coexisting on one tip means
+# "own range delivered, deeper backlog remains" — coverage lives in the skip marker, delivery
+# in the done marker. The controller's cursor advance keys on DELIVERY (done), which is correct:
+# it never dispatches fallback-capable reviews (empty remote_url → no fold, no backlog).
 mark_done(){
   if [[ "${pushed:-0}" == "1" ]]; then
-    : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true
     if [[ -n "${backlog_base:-}" ]]; then
-      # over-cap fallback ran: RE-QUEUE the unreviewed backlog on this tip so the next push's
-      # walk reaches it and re-attempts the fold (loudly, every push) instead of orphaning it
-      # behind a reviewed tip. fold_walk keys on marker PRESENCE, so done+skipped coexisting
-      # on this tip means exactly "own range reviewed, deeper backlog remains".
-      if _bqt="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)"; then
-        if printf '%s' "$backlog_base" > "$_bqt" 2>/dev/null && mv -f "$_bqt" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then
-          :
-        else rm -f "$_bqt" 2>/dev/null || true; fi
-      fi
+      # over-cap fallback ran: the pre-recorded marker already carries this deep base (both are
+      # captured post-re-walk), so leaving it standing IS the backlog re-queue. The write below
+      # is a BELT for non-pre-recorded invocations (manual --worker with arg7) and is a no-op
+      # rewrite otherwise; a failure leaves the pre-record standing — never less coverage.
+      write_skip_marker "$backlog_base" || note requeue "backlog re-queue write FAILED (pre-record may still cover it)"
     else
-      rm -f "$STATE/skipped-$marker_slug-$tip" 2>/dev/null || true   # a reviewed tip's skip record is spent
+      rm -f "$STATE/skipped-$marker_slug-$tip" 2>/dev/null || true   # a delivered tip's skip record is spent
     fi
+    : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true          # done LAST — after coverage is settled
   fi
 }
 
@@ -374,11 +384,7 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   # would land in the refs/heads/main slug that hook pushes walk. SUCCESS IS TRACKED — the
   # notice must never claim a range was recorded when the write failed (review HIGH-2).
   _skrec=0
-  if _skt="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)"; then
-    if printf '%s' "$base" > "$_skt" 2>/dev/null && mv -f "$_skt" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then
-      _skrec=1
-    else rm -f "$_skt" 2>/dev/null || true; fi
-  fi
+  if write_skip_marker "$base"; then _skrec=1; fi
   # lock contention is TRANSIENT by definition (the lock stale-reaps at the RCT-derived floor,
   # ~75 min at the 1200s default; the streak alert
   # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
@@ -464,6 +470,13 @@ if ! gate && [[ "$n" -ge "$DAILY_CAP" ]]; then abort cap "daily review cap ($DAI
 # never in gate mode (automerge validates the exact {base,head} it asked for).
 if ! gate && [[ -n "$remote_url" && -n "$orig_base" ]]; then
   base="$(fold_walk "$repo" "$marker_slug" "$base" "$tip")"
+  # PRE-RECORD the range as skipped-until-DELIVERED (review r2 H-1/M-4): a crash, kill, or any
+  # abort between here and mark_done leaves this marker standing, so the NEXT push folds the
+  # range back in — no crash window can silently lose it. mark_done consumes the marker on a
+  # delivered verdict (or leaves it as the backlog re-queue after an over-cap fallback).
+  # Hook pushes only, same gates as the walk: the controller path has its own PENDING_STALE
+  # re-dispatch, and gate mode owns no push markers.
+  write_skip_marker "$base" || note prerecord "pre-record write FAILED — a crash before delivery would lose ${base}..${tip}"
 fi
 
 # --- pre-flight live canary (reach only; not a guarantee the big review beats 300s) ---
