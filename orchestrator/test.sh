@@ -120,8 +120,8 @@ echo "3b. canary abort marks transient (push mode); gate mode does NOT"; reset; 
   cknofile "$TMARKER" "gate-mode canary abort writes NO transient marker"
 echo "4. dedupe (2nd no-op)"; reset; STUB_TRIAGE="PLAY_PASS" run; before="$(ls "$INBOX" | wc -l)"; STUB_TRIAGE="PLAY_PASS" run; after="$(ls "$INBOX" | wc -l)"
   if [[ "$before" == "$after" ]]; then echo "  ok: 2nd run produced no new delivery"; PASS=$((PASS+1)); else echo "  FAIL: dedupe ($before -> $after)"; FAIL=$((FAIL+1)); fi
-echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"
-echo "6. corrupt counter (numeric guard)"; reset; mkdir -p "$STATE"; printf 'garbage' > "$STATE/count-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "survives corrupt counter" "review PASS"
+echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-repo-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"
+echo "6. corrupt counter (numeric guard)"; reset; mkdir -p "$STATE"; printf 'garbage' > "$STATE/count-repo-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "survives corrupt counter" "review PASS"
 echo "7. oversize diff FAILs fast (over the 256KB default cap)"; reset; head -c 300000 /dev/zero | tr '\0' 'x' > "$REPO/big.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm big; BIGTIP="$(git -C "$REPO" rev-parse HEAD)"
   env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$BIGTIP" refs/heads/main 2>/dev/null; ck "aborts oversize" "ABORTED — diff"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
@@ -142,26 +142,26 @@ echo "7g. leading-zero PLAY_MAX_DIFF_LINES is base-10, not octal (08 would crash
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 3000-line diff cleanly" "changed lines"
 echo "7h. leading-zero PLAY_MAX_DIFF is base-10 (08=8B, not octal); a normal diff aborts cleanly"; reset
   env HOME="$FAKE" PLAY_MAX_DIFF=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF '08' = 8B caps the diff (no octal crash)" "ABORTED — diff"
-echo "7i. leading-zero PLAY_DAILY_CAP is base-10 (09=9, not an octal [[ -ge ]] crash)"; reset; mkdir -p "$STATE"; printf 5 > "$STATE/count-$(date +%Y%m%d)"
+echo "7i. leading-zero PLAY_DAILY_CAP is base-10 (09=9, not an octal [[ -ge ]] crash)"; reset; mkdir -p "$STATE"; printf 5 > "$STATE/count-repo-$(date +%Y%m%d)"
   env HOME="$FAKE" PLAY_DAILY_CAP=09 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; ck "cap '09'=9 with count 5 still reviews (no octal crash)" "review PASS"
 echo "7j. deliver() strips control/ANSI (ESC) from the LLM verdict before it lands in the inbox file"; reset
   STUB_TRIAGE=$'1. \033[31mfake COMPLIANT\033[0m sneaky' run
   df="$(latest)"
   if [[ -n "$df" ]] && LC_ALL=C grep -q $'\033' "$df" 2>/dev/null; then echo "  FAIL: ESC survived into the verdict file"; FAIL=$((FAIL+1)); else echo "  ok: ESC stripped from delivered verdict"; PASS=$((PASS+1)); fi
-echo "8. contention records a slug-scoped skip marker (content = the skipped base)"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"
+echo "8. contention records a slug-scoped skip marker (content = the skipped base)"; reset; mkdir -p "$STATE/lock-repo"; STUB_TRIAGE="PLAY_PASS" run; ck "delivers SKIPPED" "review SKIPPED"
   SKMARKER="$STATE/skipped-repo-refs-heads-main-$TIP"   # same hardcoded bash<->front contract as TMARKER/DMARKER
   ckfile "$SKMARKER" "slug-scoped skipped marker written"
   got="$(cat "$SKMARKER" 2>/dev/null)"
   if [[ "$got" == "$EMPTY" ]]; then echo "  ok: marker content is the skipped range's base"; PASS=$((PASS+1)); else echo "  FAIL: marker content '$got' != $EMPTY"; FAIL=$((FAIL+1)); fi
   cknofile "$STATE/SKIPPED-$TIP" "legacy global SKIPPED sentinel no longer written"
   ck "notice: next review folds the range in" "folds it in" ; ck "notice offers the xreview manual option" "xreview.sh"
-echo "8b. contention marks transient (push mode); gate contention does NOT"; reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run
+echo "8b. contention marks transient (push mode); gate contention does NOT"; reset; mkdir -p "$STATE/lock-repo"; STUB_TRIAGE="PLAY_PASS" run
   ckfile "$TMARKER" "push-mode contention writes the scoped transient marker"
-  reset; mkdir -p "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
+  reset; mkdir -p "$STATE/lock-repo"; STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
   cknofile "$TMARKER" "gate-mode contention writes NO transient marker"
-echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock"; touch -t 202001010000 "$STATE/lock"; STUB_TRIAGE="PLAY_PASS" run; ck "reaps stale lock + reviews" "review PASS"
-echo "9b. raised PLAY_REVIEW_CALL_TIMEOUT raises the stale floor (77-min lock is LIVE, not reaped)"; reset; mkdir -p "$STATE/lock"
-  touch -t "$(date -v-77M +%Y%m%d%H%M.%S)" "$STATE/lock"   # 4620s old: > default 4500 STALE, < the raised floor (3*180+3*1500+360=5400)
+echo "9. stale lock reaped"; reset; mkdir -p "$STATE/lock-repo"; touch -t 202001010000 "$STATE/lock-repo"; STUB_TRIAGE="PLAY_PASS" run; ck "reaps stale lock + reviews" "review PASS"
+echo "9b. raised PLAY_REVIEW_CALL_TIMEOUT raises the stale floor (77-min lock is LIVE, not reaped)"; reset; mkdir -p "$STATE/lock-repo"
+  touch -t "$(date -v-77M +%Y%m%d%H%M.%S)" "$STATE/lock-repo"   # 4620s old: > default 4500 STALE, < the raised floor (3*180+3*1500+360=5400)
   env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
   ck "1500s call timeout -> 77-min lock survives (skipped, not reaped)" "review SKIPPED"
   STUB_TRIAGE="PLAY_PASS" run; ck "same lock IS reaped under the default 4500s budget" "review PASS"
@@ -170,11 +170,11 @@ echo "8c. oracle fast-skip: a dead oracle is skipped in SECONDS (reach-check), r
   rj="$(ls -t "$RUNS"/*/play.jsonl 2>/dev/null | head -1)"
   if grep -q "oracle-skipped-fast" "$rj" 2>/dev/null; then echo "  ok: fast-skip path taken (reach-check, not the 1200s wait)"; PASS=$((PASS+1)); else echo "  FAIL: oracle-skipped-fast not recorded"; FAIL=$((FAIL+1)); fi
   if grep -q $'^oracle\t1200\t' "$FAKE/.myndaix/mxr-argv.log" 2>/dev/null; then echo "  FAIL: full oracle review call still fired"; FAIL=$((FAIL+1)); else echo "  ok: no 1200s oracle review call after a failed reach-check"; PASS=$((PASS+1)); fi
-echo "9c. margin is ENFORCED for explicit PLAY_STALE + leading-zero RCT is base-10"; reset; mkdir -p "$STATE/lock"
-  touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock"   # 5100s old: > floor-sans-margin 5040, < enforced floor 5400
+echo "9c. margin is ENFORCED for explicit PLAY_STALE + leading-zero RCT is base-10"; reset; mkdir -p "$STATE/lock-repo"
+  touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock-repo"   # 5100s old: > floor-sans-margin 5040, < enforced floor 5400
   env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=1500 PLAY_STALE=5040 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
   ck "PLAY_STALE inside the margin window is rejected (lock survives)" "review SKIPPED"
-  reset; mkdir -p "$STATE/lock"; touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock"
+  reset; mkdir -p "$STATE/lock-repo"; touch -t "$(date -v-85M +%Y%m%d%H%M.%S)" "$STATE/lock-repo"
   env HOME="$FAKE" PLAY_REVIEW_CALL_TIMEOUT=01500 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "" 2>/dev/null
   ck "RCT '01500' is base-10 (floor 5400, not octal 3036 -> lock survives)" "review SKIPPED"
 echo "10. embedded-whitespace token is NOT a pass"; reset; STUB_TRIAGE="P L A Y _ P A S S" run; ck "spaced token -> NEEDS-FIX" "review NEEDS-FIX"
@@ -471,7 +471,7 @@ echo "51. over-cap fold falls back to the push's own range with a LOUD backlog b
   ck "banner names the manual xreview command" "xreview.sh"
   BQ="$STATE/skipped-$SKIPSLUG-$OWNTIP"
   ckfile "$BQ" "backlog RE-QUEUED on the reviewed tip (not banner-only recovery)"
-  if [[ "$(cat "$BQ" 2>/dev/null)" == "$EMPTY" ]]; then echo "  ok: re-queue marker content = the deep unfolded base"; PASS=$((PASS+1)); else echo "  FAIL: re-queue content '$(cat "$BQ" 2>/dev/null)' != $EMPTY"; FAIL=$((FAIL+1)); fi
+  if [[ "$(cat "$BQ" 2>/dev/null)" == "$FOLDTIP" ]]; then echo "  ok: re-queue content = the push's OWN base (own hop, r3 — deeper coverage lives in deeper markers)"; PASS=$((PASS+1)); else echo "  FAIL: re-queue content '$(cat "$BQ" 2>/dev/null)' want $FOLDTIP"; FAIL=$((FAIL+1)); fi
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 
 echo "51b. own range ALSO over-cap still aborts (no infinite fallback)"; reset
@@ -483,7 +483,7 @@ echo "52. mark_done clears the tip's skipped marker (confirmed push)"; reset; mk
   STUB_TRIAGE="PLAY_PASS" run
   cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "reviewed tip's skipped marker removed"
 
-echo "53. gate contention writes NO skip marker (gate retries itself; main slug stays clean)"; reset; mkdir -p "$STATE/lock"
+echo "53. gate contention writes NO skip marker (gate retries itself; main slug stays clean)"; reset; mkdir -p "$STATE/lock-repo"
   STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
   cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "gate-mode contention leaves no skipped marker"
 
@@ -499,13 +499,57 @@ echo "54. worker RE-walks under the lock (kilabz TOCTOU: marker written after th
   ck "still a completed review" "review PASS"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 
-echo "55. contention with an UNWRITABLE state dir delivers the honest NOT-recorded notice"; reset; mkdir -p "$STATE/lock"
+echo "55. contention with an UNWRITABLE state dir delivers the honest NOT-recorded notice"; reset; mkdir -p "$STATE/lock-repo"
   chmod a-w "$STATE"
   STUB_TRIAGE="PLAY_PASS" run
   chmod u+w "$STATE"
   ck "delivers SKIPPED" "review SKIPPED"
   ck "notice admits the range was NOT recorded" "NOT fold in automatically"
   cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "no marker written when the state dir is unwritable"
+
+# ====================== per-repo review locks (cross-repo parallelism) ======================
+echo "56. a FOREIGN repo's held lock does not block this repo's review"; reset; mkdir -p "$STATE/lock-otherrepo"
+  STUB_TRIAGE="PLAY_PASS" run
+  ck "review proceeds under a foreign repo's lock" "review PASS"
+
+echo "57. the LEGACY global lock dir is ignored (migration semantics; deploy tidies it)"; reset; mkdir -p "$STATE/lock"
+  STUB_TRIAGE="PLAY_PASS" run
+  ck "review proceeds despite an orphaned legacy \$STATE/lock" "review PASS"
+
+echo "58. the daily cap is PER-REPO — a foreign repo's spend never blocks this repo"; reset; mkdir -p "$STATE"
+  printf 9999 > "$STATE/count-otherrepo-$(date +%Y%m%d)"
+  STUB_TRIAGE="PLAY_PASS" run
+  ck "foreign repo's exhausted cap does not block" "review PASS"
+  reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-repo-$(date +%Y%m%d)"
+  STUB_TRIAGE="PLAY_PASS" run
+  ck "own repo's exhausted cap still aborts" "ABORTED — cap"
+
+
+# ====================== pre-record: skipped-until-DELIVERED (r2 H-1/H-3/M-4) ======================
+echo "59. an ABORTED hook review leaves its range QUEUED (crash/abort window closed)"; reset
+  bare59="$ROOT/bare59.git"; git init -q --bare "$bare59"; git -C "$REPO" push -q "$bare59" "$TIP:refs/heads/main" 2>/dev/null
+  env HOME="$FAKE" STUB_KILABZ_FAIL=1 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "$bare59" "$EMPTY" 2>/dev/null
+  ck "review aborted" "ABORTED"
+  PRM="$STATE/skipped-$SKIPSLUG-$TIP"
+  ckfile "$PRM" "pre-record survives the abort (range stays queued)"
+  if [[ "$(cat "$PRM" 2>/dev/null)" == "$EMPTY" ]]; then echo "  ok: pre-record content = the reviewed base"; PASS=$((PASS+1)); else echo "  FAIL: pre-record content '$(cat "$PRM" 2>/dev/null)'"; FAIL=$((FAIL+1)); fi
+
+echo "60. a DELIVERED hook review CONSUMES the pre-record (no stale marker)"; reset
+  env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "$bare59" "$EMPTY" 2>/dev/null
+  ck "review delivered" "review PASS"
+  cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "pre-record consumed on delivery"
+  ckfile "$DMARKER" "done marker written"
+
+echo "61. cap abort keeps the pre-record (r3 fail-open: capped ranges stay queued)"; reset; mkdir -p "$STATE"
+  printf 9999 > "$STATE/count-repo-$(date +%Y%m%d)"
+  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "$bare59" "$EMPTY" 2>/dev/null
+  ck "aborts on cap" "ABORTED — cap"
+  ckfile "$STATE/skipped-$SKIPSLUG-$TIP" "pre-record survives the cap abort (range stays queued)"
+
+echo "62. pre-record claims the OWN hop, not the folded base (r3 toctou)"; reset; mkdir -p "$STATE"
+  env HOME="$FAKE" STUB_KILABZ_FAIL=1 bash "$SCRIPT" --worker "$REPO" "$TIP" "$TIP3" refs/heads/main "$bare59" "$TIP2" 2>/dev/null || true
+  got="$(cat "$STATE/skipped-$SKIPSLUG-$TIP3" 2>/dev/null)"
+  if [[ "$got" == "$TIP2" ]]; then echo "  ok: marker content = orig_base (own hop), not the folded base"; PASS=$((PASS+1)); else echo "  FAIL: content '$got' want $TIP2 (own hop)"; FAIL=$((FAIL+1)); fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

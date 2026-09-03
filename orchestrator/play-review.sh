@@ -7,7 +7,7 @@
 #
 # On `git push` it DETACHES (never blocks/aborts the push), reviews the pushed
 # range with kilabz (codex) + oracle (Gemini, best-effort), triages with lobster, delivers the
-# verdict to ~/.myndaix/bridge/inbox/jefe/ + a desktop ping.
+# verdict to ~/.myndaix/bridge/inbox/jefe/.
 #
 # v0 CAVEATS:
 #  - The detached worker re-execs the WORKING-TREE copy of this script. Fine for
@@ -152,7 +152,11 @@ play="$(date +%Y%m%d%H%M%S)-$$"
 run="$RUNS/$play"
 mkdir -p "$run" "$STATE" "$INBOX"
 nonce="$(openssl rand -hex 16)"
-lock="$STATE/lock"
+# PER-REPO lock: reviews of DIFFERENT repos run in parallel (the pool underneath already
+# caps + queues per repo); reviews of the SAME repo — including the automerge gate, which
+# calls --worker directly for this repo — still serialize, so the daily-cap RMW and the
+# skip-marker fold stay race-free under it. Same repo_id sanitize as marker_slug's repo half.
+lock="$STATE/lock-${repo_id//[^A-Za-z0-9._-]/-}"
 
 # mxr SYNC-wait for the REVIEW calls (kilabz/oracle/lobster). The per-attempt exec cap is the
 # agent's PROFILE timeout (kilabz 900s for codex-xhigh; 300s default for the rest), but mxr's
@@ -272,26 +276,38 @@ confirm_pushed(){ # did THIS ref resolve to tip on the push remote? empty url = 
   [[ "$got" == "$tip" ]]
 }
 
+# write_skip_marker <content> — atomic tmp+mv write of this tip's skip marker; rc!=0 on failure.
+# Shared by contention(), the pre-record, and mark_done's re-queue belt.
+write_skip_marker(){
+  local _t
+  _t="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s' "$1" > "$_t" 2>/dev/null && mv -f "$_t" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then return 0; fi
+  rm -f "$_t" 2>/dev/null || true; return 1
+}
+
 # dedupe ONLY a review that both delivered durably AND landed on the remote. Uses the push state
 # captured ONCE in the main flow (never re-calls confirm_pushed — a 2nd ls-remote under the held
 # lock can wedge all reviews). pre-push fires before git confirms acceptance, so a rejected push
 # must stay re-reviewable.
+# Marker CONTRACT (review r2 H-2/H-3): the skip marker predates the done marker structurally
+# (the pre-record writes it before any review work); done+skipped coexisting on one tip means
+# "own range delivered, deeper backlog remains" — coverage lives in the skip marker, delivery
+# in the done marker. The controller's cursor advance keys on DELIVERY (done), which is correct:
+# it never dispatches fallback-capable reviews (empty remote_url → no fold, no backlog).
 mark_done(){
   if [[ "${pushed:-0}" == "1" ]]; then
-    : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true
     if [[ -n "${backlog_base:-}" ]]; then
-      # over-cap fallback ran: RE-QUEUE the unreviewed backlog on this tip so the next push's
-      # walk reaches it and re-attempts the fold (loudly, every push) instead of orphaning it
-      # behind a reviewed tip. fold_walk keys on marker PRESENCE, so done+skipped coexisting
-      # on this tip means exactly "own range reviewed, deeper backlog remains".
-      if _bqt="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)"; then
-        if printf '%s' "$backlog_base" > "$_bqt" 2>/dev/null && mv -f "$_bqt" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then
-          :
-        else rm -f "$_bqt" 2>/dev/null || true; fi
-      fi
+      # over-cap fallback ran: the pre-recorded marker already carries this OWN-hop base
+      # (backlog_base == orig_base == the pre-record content, r3), so leaving it standing IS
+      # the backlog re-queue — the folded portion deeper down stays covered by the deeper
+      # markers whose owners never delivered. The write below is a BELT for non-pre-recorded
+      # invocations (manual --worker with arg7) and a no-op rewrite otherwise; a failure
+      # leaves the pre-record standing — never less coverage.
+      write_skip_marker "$backlog_base" || note requeue "backlog re-queue write FAILED (pre-record may still cover it)"
     else
-      rm -f "$STATE/skipped-$marker_slug-$tip" 2>/dev/null || true   # a reviewed tip's skip record is spent
+      rm -f "$STATE/skipped-$marker_slug-$tip" 2>/dev/null || true   # a delivered tip's skip record is spent
     fi
+    : > "$STATE/done-$marker_slug-$tip" 2>/dev/null || true          # done LAST — after coverage is settled
   fi
 }
 
@@ -370,12 +386,9 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   # would land in the refs/heads/main slug that hook pushes walk. SUCCESS IS TRACKED — the
   # notice must never claim a range was recorded when the write failed (review HIGH-2).
   _skrec=0
-  if _skt="$(mktemp "$STATE/.skip.XXXXXX" 2>/dev/null)"; then
-    if printf '%s' "$base" > "$_skt" 2>/dev/null && mv -f "$_skt" "$STATE/skipped-$marker_slug-$tip" 2>/dev/null; then
-      _skrec=1
-    else rm -f "$_skt" 2>/dev/null || true; fi
-  fi
-  # lock contention is TRANSIENT by definition (the lock stale-reaps at 45 min; the streak alert
+  if write_skip_marker "$base"; then _skrec=1; fi
+  # lock contention is TRANSIENT by definition (the lock stale-reaps at the RCT-derived floor,
+  # ~75 min at the 1200s default; the streak alert
   # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
   # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
   # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
@@ -389,7 +402,7 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   exit 0
 }
 
-# --- acquire the global lock, reaping a STALE one; trap-release only once held ---
+# --- acquire THIS repo's lock, reaping a STALE one; trap-release only once held ---
 if ! mkdir "$lock" 2>/dev/null; then
   now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
   if (( now - mt > STALE )); then
@@ -431,8 +444,10 @@ find "$RUNS"  -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev
 find "$STATE" -maxdepth 1 -type f -mtime +"$PRUNE_DAYS" -delete 2>/dev/null || true
 # --- reap LEAKED review-* snapshots (a crashed/aborted worker's dir) — bounded + fail-OPEN;
 #     review-reap fails CLOSED in the runtime if the ledger is unreachable (never blind-reaps a
-#     live reviewer's cwd), so a DB hiccup just skips the reap. Under the held lock: one reaper
-#     at a time. cap_run bounds a hung DB connect so it can never wedge the review.
+#     live reviewer's cwd), so a DB hiccup just skips the reap. Per-repo locks mean CONCURRENT
+#     reapers are possible — safe: the reap is ledger-guarded + idempotent (in_use=None reaps
+#     nothing; duplicate-rm races are swallowed per-dir). cap_run bounds a hung DB connect so
+#     it can never wedge the review.
 if have_perl; then cap_run mxr review-reap >/dev/null 2>&1 || true
 else mxr review-reap >/dev/null 2>&1 || true; fi
 
@@ -440,21 +455,33 @@ else mxr review-reap >/dev/null 2>&1 || true; fi
 #     gate mode skips this: it needs a FRESH verdict for THIS run (automerge dedups itself).
 if ! gate && [[ -e "$STATE/done-$marker_slug-$tip" ]]; then note dedupe "already reviewed $tip"; exit 0; fi
 
-# --- daily cap: numeric-guarded check now; CHARGE only when a real review runs ---
-#     gate mode is decoupled from the push-review DAILY_CAP (automerge has its own caps).
-day="$STATE/count-$(date +%Y%m%d)"
-n="$(cat "$day" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
-if ! gate && [[ "$n" -ge "$DAILY_CAP" ]]; then abort cap "daily review cap ($DAILY_CAP) reached"; fi
-
 # --- re-adopt skip markers UNDER THE LOCK (kilabz TOCTOU close): the FRONT walk runs at push
 # time, but a competing worker writes its skip marker at contention time — a fast follow-up
 # push can walk before the marker lands, orphaning the skipped range forever. Re-walking here,
 # holding the lock and past dedupe, sees every marker any earlier worker wrote. Same gates as
 # the FRONT walk: hook pushes only (non-empty remote_url; orig_base proves a FRONT dispatch),
 # never in gate mode (automerge validates the exact {base,head} it asked for).
+# ORDER (r3 HIGH fail-open): this block runs BEFORE the daily-cap check below — a cap abort
+# must leave the pre-record standing like every other abort, or capped ranges drop silently.
 if ! gate && [[ -n "$remote_url" && -n "$orig_base" ]]; then
   base="$(fold_walk "$repo" "$marker_slug" "$base" "$tip")"
+  # PRE-RECORD this push as skipped-until-DELIVERED (r2 H-1/M-4): a crash, kill, or any abort
+  # between here and mark_done leaves the marker standing, so the NEXT push folds it back in.
+  # Content = orig_base, the push's OWN hop only (r3 MEDIUM toctou): deeper coverage lives in
+  # the still-standing deeper markers, and fold_walk composes the hops. Recording the FOLDED
+  # base would freeze a claim over ranges whose own workers may deliver (consuming their
+  # markers) later — that stale over-claim would re-queue forever through over-cap cycles.
+  write_skip_marker "$orig_base" || note prerecord "pre-record write FAILED — a crash before delivery would lose ${orig_base}..${tip}"
 fi
+
+# --- daily cap: numeric-guarded check now; CHARGE only when a real review runs ---
+#     gate mode is decoupled from the push-review DAILY_CAP (automerge has its own caps).
+# PER-REPO daily cap: the read-modify-write below is race-free only because THIS repo's lock
+# serializes it — a global count file would race across per-repo locks (lost increments, cap
+# breach). DAILY_CAP is therefore per-repo: a runaway brake, not a cross-repo budget.
+day="$STATE/count-${repo_id//[^A-Za-z0-9._-]/-}-$(date +%Y%m%d)"
+n="$(cat "$day" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
+if ! gate && [[ "$n" -ge "$DAILY_CAP" ]]; then abort cap "daily review cap ($DAILY_CAP) reached"; fi
 
 # --- pre-flight live canary (reach only; not a guarantee the big review beats 300s) ---
 canary_agents=(kilabz lobster)
@@ -494,7 +521,10 @@ while :; do
   if [[ -n "$orig_base" && "$base" != "$orig_base" ]]; then
     note foldback "folded range failed ($diff_fail); retrying with the push's own base"
     backlog_banner="⚠ skip-fold hit a limit ($diff_fail). Reviewed ONLY this push (${orig_base}..${tip}); the backlog ${base}..${orig_base} is STILL UNREVIEWED and stays QUEUED (the next push re-attempts the fold) — review it now: orchestrator/xreview.sh code $repo ${base}..${orig_base}"
-    backlog_base="$base"   # mark_done re-queues this instead of clearing the tip's marker (oracle MEDIUM: banner-only recovery orphaned the backlog)
+    # r3 MEDIUM (toctou): re-queue the push's OWN hop only — the folded portion below orig_base
+    # is covered by the deeper markers that are still standing (their owners never delivered);
+    # re-queuing the folded $base here would freeze a stale over-claim across delivered ranges.
+    backlog_base="$orig_base"
     base="$orig_base"
     continue
   fi
