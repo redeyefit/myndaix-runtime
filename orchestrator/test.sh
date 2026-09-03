@@ -464,14 +464,22 @@ echo "50b. controller shape (EMPTY remote_url) never walks — ledger cursor sta
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
   seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"
   printf 'x=1\n' > "$REPO/own.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm own; OWNTIP="$(git -C "$REPO" rev-parse HEAD)"   # own range = a REAL small diff
-  # worker invoked as the FRONT would after a walk: base=$EMPTY (folded, over-cap), arg7=$FOLDTIP (own base, tiny diff)
+  # MANUAL shape (empty remote_url, arg7 set): no pre-record chain exists, so the re-queue must
+  # carry the DEEP base — own-hop would silently drop base..orig_base (r4 fail-open).
   env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$OWNTIP" refs/heads/main "" "$FOLDTIP" 2>/dev/null
   ck "fallback still reviews (PASS delivered)" "review PASS"
   ck "verdict leads with the unreviewed-backlog banner" "STILL UNREVIEWED"
   ck "banner names the manual xreview command" "xreview.sh"
   BQ="$STATE/skipped-$SKIPSLUG-$OWNTIP"
   ckfile "$BQ" "backlog RE-QUEUED on the reviewed tip (not banner-only recovery)"
-  if [[ "$(cat "$BQ" 2>/dev/null)" == "$FOLDTIP" ]]; then echo "  ok: re-queue content = the push's OWN base (own hop, r3 — deeper coverage lives in deeper markers)"; PASS=$((PASS+1)); else echo "  FAIL: re-queue content '$(cat "$BQ" 2>/dev/null)' want $FOLDTIP"; FAIL=$((FAIL+1)); fi
+  if [[ "$(cat "$BQ" 2>/dev/null)" == "$EMPTY" ]]; then echo "  ok: MANUAL re-queue content = the DEEP base (no chain to lean on, r4)"; PASS=$((PASS+1)); else echo "  FAIL: manual re-queue content '$(cat "$BQ" 2>/dev/null)' want $EMPTY"; FAIL=$((FAIL+1)); fi
+
+echo "51h. HOOK-shape fallback re-queues the OWN hop (chain carries the deep coverage, r3)"; reset
+  bare51="$ROOT/bare51.git"; git init -q --bare "$bare51"; git -C "$REPO" push -q "$bare51" "$OWNTIP:refs/heads/main" 2>/dev/null
+  env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$OWNTIP" refs/heads/main "$bare51" "$FOLDTIP" 2>/dev/null
+  ck "hook fallback still reviews" "review PASS"
+  got51="$(cat "$STATE/skipped-$SKIPSLUG-$OWNTIP" 2>/dev/null)"
+  if [[ "$got51" == "$FOLDTIP" ]]; then echo "  ok: HOOK re-queue content = own hop (orig_base)"; PASS=$((PASS+1)); else echo "  FAIL: hook re-queue content '$got51' want $FOLDTIP"; FAIL=$((FAIL+1)); fi
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 
 echo "51b. own range ALSO over-cap still aborts (no infinite fallback)"; reset
