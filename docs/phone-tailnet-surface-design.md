@@ -1,23 +1,30 @@
-# Phone → Tailnet Surface — design v0.1
+# Phone → Tailnet Surface — design v0.2
 
-**Status:** DESIGN — pre cross-family review. Build gated on review + activation P0/P1
+**Status:** DESIGN — v0.2 folds the full cross-family round (oracle lead + kilabz
+trust-boundaries; all B/H/M/L items addressed below). Build gated on activation P0/P1
 (merged review stack deployed, Mini pool re-canaried).
 **What:** the vendor-free phone grip on the runtime — iPhone Shortcuts → tailnet SSH →
 a forced-command wrapper on the Mini → allowlisted `mxr` verbs. Chosen over Claude
-Remote Control as the PRIMARY phone surface (Jefe 2026-09-03: less vendor tie; RC
-demoted to optional conversational bonus).
+Remote Control as the PRIMARY phone surface (Jefe 2026-09-03; RC = optional bonus).
+**Changelog:** v0.2 — TCB stated honestly (B1); env scrub spec (B2); `ask` made
+async-capable for the iOS SSH timeout + new `get` verb (H1); exact grammar (H2);
+leading-dash rejection (H3); `from=` key pinning + host-scoped ACL (H4); locked caps
++ status cap + concurrency cap (H5); perl-alarm OS timeout (H6); real-sshd test leg
+(H7); reject-not-strip controls (M1); log policy (M2); partial-state table (M3); key
+lifecycle (M4); verbatim-payload parse spec (L1); answer-first truncation (L2).
 
 ## 1. What it does & why
 
-One tap or one dictation on the iPhone runs exactly one of three allowlisted actions
-on the factory, from anywhere, with no AI vendor in the transport:
+One tap or one dictation on the iPhone runs exactly one allowlisted action on the
+factory, from anywhere, with no AI vendor in the transport:
 
-- `ask <scope> <question>` → `mxr ask --scope <scope> "<question>"` → cited answer back
-  to the Shortcut. Scopes: `research|fitness|company` (mirror of the librarian fence;
-  `personal` stays off by standing decision).
-- `reel <topic>` → `mxr mx-engine "<topic>"` → narrated reel renders on the Mini;
-  the Shortcut gets the submit/job line back (result lands in the jefe drop as usual).
-- `status` → a bounded one-screen health summary (pool canary + liveness one-liners).
+- `ask <scope> <question>` → `mxr ask --scope <scope> -- "<question>"` → cited answer.
+  Scopes: `research|fitness|company` (mirror of the librarian fence; `personal` stays
+  off by standing decision). Bounded to the iOS window (§5); overflow returns a job id.
+- `get <jid>` → fetch a completed answer the iOS timeout abandoned (`mxr get <jid>`).
+- `reel <topic>` → `mxr mx-engine -- "<topic>"` → submit-and-return; render lands in
+  the jefe drop as usual.
+- `status` → bounded one-screen health summary.
 
 Transport: iPhone Tailscale app (WireGuard node on the existing tailnet) → SSH to the
 Mini. Nothing public, no new daemon — sshd and the tailnet already exist.
@@ -25,94 +32,112 @@ Mini. Nothing public, no new daemon — sshd and the tailnet already exist.
 ## 2. Data flow
 
 ```
-iPhone Shortcut (dictation/tap)
-  └─ Run Script Over SSH  (Shortcuts' own ed25519 key)
-       └─ tailnet (WireGuard, ACL: phone → mini:22 ONLY)
-            └─ sshd on Mini → authorized_keys forced command
-                 └─ ~/.myndaix/bin/mxr-phone   (THE trust boundary)
-                      ├─ parse SSH_ORIGINAL_COMMAND strictly (verb + payload)
-                      ├─ enforce caps + allowlist, log the call
-                      └─ exec mxr <verb-mapped argv>   (payload as ONE argv, never shell)
-                           └─ runtime pool → librarian / mx-engine / canary
+iPhone Shortcut (dictation/tap; per-scope Shortcuts hardcode the scope word)
+  └─ Run Script Over SSH  (Shortcuts' own ed25519 key; iOS kills the call ~60-120s)
+       └─ tailnet (WireGuard; ACL pins phone → THE MINI HOST:22, not a tag)
+            └─ sshd on Mini → authorized_keys restrict,from=<phone-ts-ip>,command=
+                 └─ ~/.myndaix/bin/mxr-phone   (command-restriction layer — see TCB §3)
+                      ├─ scrub env; fixed PATH; absolute /usr/local/bin-style mxr path
+                      ├─ parse SSH_ORIGINAL_COMMAND per the GRAMMAR (§4); deny-by-default
+                      ├─ flock'd cap check+increment BEFORE dispatch; concurrency cap
+                      └─ perl-alarm-bounded exec of mxr with payload as ONE argv after `--`
 ```
 
-## 3. Security surface (what's untrusted, what contains it)
+## 3. Trust model (stated honestly — review B1)
+
+This is a **command-restriction boundary, not privilege isolation**. The trusted
+computing base is: sshd + its config (AcceptEnv must stay empty, PermitUserEnvironment
+no — asserted by the test suite), the jefe login shell machinery, the wrapper itself,
+the absolute-path `mxr` + its Python runtime, the state dir, and the downstream
+engines (librarian, mx-engine). A wrapper or mxr bug is a bug in a jefe-owned process.
+What the design buys: a phone key that cannot open a shell, run non-allowlisted verbs,
+or reach any other host — NOT root/jefe separation. A dedicated low-priv user was
+rejected (needs DB grants + secrets anyway; complexity without a boundary gain);
+this trade is accepted and documented.
 
 | Threat | Containment |
 |---|---|
-| Lost/stolen phone | Key is `restrict,command=` — no shell, no pty, no forwarding; verbs are ask/reel/status with caps. Revoke = delete one authorized_keys line + remove the device in the Tailscale admin. |
-| Dictated text = untrusted input | Payload is parsed, control-stripped, length-capped (≤2000 chars), then passed as a SINGLE argv to `mxr` — never interpolated, never eval'd, no shell metacharacter ever interpreted (same argv discipline as the librarian fence + mx-engine's topic-as-COPY precedent). Downstream, `ask` hits the tool-less librarian (worst case = wrong answer) and `reel` reaches an LLM as copy text, never shell. |
-| Flooding / cost abuse | Per-verb daily caps in the wrapper (`reel` is PAID: default 5/day; `ask` 50/day; `status` uncapped), atomic count files under the wrapper's own state dir. Tailnet ACL bounds reach to one port on one host. |
-| Wrapper bug | Fail-closed: any parse anomaly, unknown verb, bad scope, over-cap, or missing dependency → exit 2 with a one-line reason; nothing dispatched. Every call logged (ts, verb, payload first-80, rc) before AND after dispatch. |
-| Mini compromise via this path | The forced command IS the boundary; sshd's `restrict` option set denies everything else regardless of what the client requests. |
+| Lost/stolen phone or copied key | `restrict,from=<phone tailnet IP>,command=` — no shell/pty/forwarding, wrong source IP denied even inside the tailnet (H4); verbs+caps bound the blast; revocation drill §7. |
+| Dictated text = untrusted | GRAMMAR deny-by-default (§4); payload extracted VERBATIM via parameter expansion, passed as ONE argv after `--` (option-injection stop, H3); control chars REJECT the request outright — never stripped (M1). Downstream: `ask` hits the tool-less librarian (worst case wrong answer); `reel` topic reaches an LLM as copy, never shell. |
+| Env-channel abuse | Wrapper first line of defense: `unset BASH_ENV ENV PYTHONPATH NODE_OPTIONS RUBYOPT PERL5LIB; unset $(compgen -v MXR_)`; fixed PATH literal; absolute mxr path (B2). sshd side asserted: AcceptEnv none. |
+| Flooding / cost abuse | flock-guarded check+increment BEFORE dispatch (H5): reel 5/day (paid), ask 50/day, status 60/hour, `get` 100/day; global concurrency cap 2 (mkdir lock, stale-reaped). A failed dispatch after a paid increment wastes one slot — bounded, favors safety (M3). |
+| Hung downstream | perl alarm+exec (the `cap_run` house pattern — macOS has no timeout(1)) bounds every dispatch; ask 50s, status 30s, get 30s, reel submit 60s; child killed on expiry (H6). |
+| Log leakage | Logs record ts/verb/rc/payload-sha256-prefix+length — NEVER payload text (company/fitness content is sensitive, M2). 0600 perms, self-rotated (keep last 1000 lines on write). Log-write failure ⇒ DENY (fail-closed, consistent with caps). Output + logs escape ANSI/controls. |
 
-**Account decision:** runs as `jefe` (mxr needs the ledger + pool socket). A dedicated
-low-priv user was considered and rejected: it would need DB grants + secret access
-anyway, buying nothing — the forced command is the privilege boundary, one layer
-down from the librarian's hook fence and the same philosophy. RESIDUAL (accepted):
-a bug in the ~100-line wrapper is a bug in a jefe-owned process; mitigated by the
-hostile-input test suite and the verb allowlist's small surface.
+## 4. Command grammar (exact — review H2; everything else denies)
 
-## 4. Components
+```
+status                                        # no args allowed
+ask (research|fitness|company) <payload>      # scope REQUIRED; per-scope Shortcuts hardcode it
+get <jid>                                     # jid =~ ^[0-9a-f-]{6,36}$
+reel <payload>
+payload := 1..2000 bytes, valid UTF-8, no control chars (reject, don't strip),
+           not whitespace-only, first char != '-'
+```
+Parse spec (L1): verb/scope by exact-match on the first one/two words; the payload is
+the VERBATIM remainder via parameter expansion (`${SSH_ORIGINAL_COMMAND#"$prefix"}`),
+never word-split, never eval'd — quotes, `$()`, backticks, doubled spaces all travel
+untouched into one argv. test.sh asserts byte-for-byte verbatim delivery of hostile
+payloads (`$(rm -rf /)`, quotes, consecutive spaces) into the stub's recorded argv.
 
-1. `orchestrator/phone/mxr-phone` — the forced-command wrapper (bash, ≤~120 lines,
-   house rules: set -euo pipefail, argv-only, base-10 guards, atomic count writes,
-   bounded `MXR_TIMEOUT_S` per verb — ask 240s, reel returns after submit, status 60s;
-   output truncated to 4KB for the Shortcut display; over-truncation marked loudly).
-2. `orchestrator/phone/authorized_keys.example` — one line:
-   `restrict,command="/Users/jefe/.myndaix/bin/mxr-phone" ssh-ed25519 <SHORTCUTS-PUBKEY> iphone`
-   (Shortcuts generates and holds its own key; only the pubkey leaves the phone.)
-3. Tailnet ACL snippet (Tailscale admin, Jefe click): phone device → `tag:factory:22` only.
-4. `orchestrator/phone/test.sh` — fixture suite driving the wrapper via
-   `SSH_ORIGINAL_COMMAND` env: happy paths; injection attempts (`;`, `$()`,
-   backticks, newlines, NULs, unicode confusables, 100KB payload); bad scope
-   (`personal` MUST deny); unknown verb; over-cap; missing mxr (fail-closed);
-   count-file corruption (octal trap).
-5. Shortcuts (phone-side, no repo code): "Ask my brain" (dictate → `ask research …`),
-   "Make a reel" (dictate → `reel …`), "Factory status" (tap → `status`).
+## 5. The iOS timeout reality (review H1 — oracle)
 
-## 5. Failure modes
+iOS Shortcuts' SSH action has a hardcoded ~60–120s kill. Design consequence: **no verb
+may wait past ~50s.** `ask` waits ≤50s; if the answer isn't back, the wrapper returns
+`still thinking — job <jid>; run Get Answer` and the `get` verb (or the "Get Answer"
+Shortcut) fetches it. `reel` was already submit-and-return. `status`/`get` are fast.
+Truncation (L2): 4KB cap keeps the ANSWER body first, drops citations from the end,
+and always appends `…[truncated]` when cut.
 
-- Pool down → wrapper's mxr call fails → clear one-liner back to the Shortcut
-  ("factory unreachable — check liveness"), exit nonzero, nothing charged.
-- Slow ask (> wait) → mxr's own timeout text incl. job id returns; answer stays
-  recoverable in the ledger (`mxr get <jid>`).
-- Tailnet down on either end → SSH fails at connect; Shortcut shows the error; no
-  partial state anywhere.
-- Wrapper state dir unwritable → caps unenforceable → FAIL CLOSED (deny, log to stderr).
+## 6. Partial-state behaviors (review M3)
 
-## 6. What this deliberately does NOT build
+| State | Behavior |
+|---|---|
+| Cap incremented, dispatch fails | Slot wasted (bounded by caps); error returned; logged. |
+| Wrapper killed after submit, before reply | Job completes in the ledger; `get <jid>` recovers (ask) / drop delivers (reel). |
+| Shortcut auto-retry duplicates a reel | Two submits possible; bounded by the 5/day cap; mx-produce's single-holder lock rejects concurrent renders; residual accepted. |
+| Reel submits, render fails later | Existing mx-engine semantics (non-retried, dead-lettered, drop notice). |
+| Ask times out after tokens spent | Answer persists in ledger; `get` recovers it — cost not wasted. |
+| No jid parseable from mxr output | Return raw (escaped) mxr output + error note; nothing hidden. |
 
-- No new daemon, queue, or transport (sshd + tailnet already run; Telegram transport
-  stays a separate deferred design; RC untouched as optional bonus).
-- No team→phone direction (standing rule: supervised mirror sessions only).
-- No push notifications; replies are synchronous to the Shortcut, artifacts land in
-  the existing jefe drop.
-- No new secrets: the phone key is an authorized_keys line, not a bearer token in
-  `.secrets`; nothing added to the env allowlists.
+## 7. Phone key lifecycle (review M4)
 
-## 7. Borrowed patterns / prior art
+Shortcuts generates and holds its own ed25519 key (iOS keychain; never leaves the
+device; only the pubkey is registered). One key per device, comment-tagged
+`iphone-<date>`. Registration is ONE line in authorized_keys; the test suite asserts
+no duplicate phone entries. Rotation = generate new in Shortcuts, swap the line.
+Revocation drill (practiced at deploy): delete the line + remove the device in the
+Tailscale admin — two actions, both work independently. Residual: a lost UNLOCKED
+phone can ask/reel within caps until revoked — accepted (same class as the RC session).
 
-SSH forced-command + `restrict` = the standard scoped-automation substrate (passes
-both substrate-check questions: official OpenSSH mechanism, stable for decades,
-scoping is exactly its job). Librarian recall-gate = the allowlist philosophy and the
-`personal`-deny precedent. mx-engine dispatch = paid-verb caps + topic-as-argv.
-Rejected: HTTP endpoint on the Mini (new auth surface + daemon for no gain),
-Tailscale Funnel (public exposure), dedicated Unix user (see §3).
+## 8. Components
 
-## 8. Test & deploy plan
+1. `orchestrator/phone/mxr-phone` — the wrapper (bash, house rules; §3-§6 behaviors).
+2. `orchestrator/phone/authorized_keys.example` —
+   `restrict,from="<PHONE-TS-IP>",command="/Users/jefe/.myndaix/bin/mxr-phone" ssh-ed25519 <PUBKEY> iphone-<date>`
+3. Tailnet ACL: phone device → the Mini HOST (by IP/name, NOT `tag:factory` — the tag
+   may widen later, H4) port 22 only.
+4. `orchestrator/phone/test.sh` — two legs: (a) fixture leg via SSH_ORIGINAL_COMMAND
+   (grammar, hostile payloads verbatim, caps incl. a concurrent double-tap race, env
+   scrub, control-char rejection, octal-trap counts, log redaction); (b) **real-sshd
+   leg** (H7, run at deploy on the Mini against sshd on localhost): forced-command
+   enforced, shell/pty/forwarding denied, AcceptEnv empty, env abuse inert, bad
+   commands denied, duplicate-key absence, and the Shortcuts command-vs-stdin shape.
+5. Shortcuts (phone, config not code): "Ask Research" / "Ask Company" / "Ask Fitness"
+   (scope hardcoded per Shortcut — dictating the scope word was bad UX; wrapper still
+   REQUIRES it), "Get Answer", "Make a Reel", "Factory Status".
 
-- `orchestrator/phone/test.sh` green locally (hostile suite above) + shellcheck/
-  bash-check + review rounds before any install.
-- Deploy (Mini, after activation P0/P1): install wrapper to `~/.myndaix/bin` via the
-  reconcile-synced checkout + hand-add the authorized_keys line (secrets-adjacent =
-  hand step, like all key material); ACL edit in the Tailscale admin (Jefe);
-  Shortcuts built on the phone against the live wrapper.
-- Live smoke: `status` from cellular (not wifi), one `ask`, one capped `reel`;
-  then attempt an injection from a scratch Shortcut and watch it deny.
+## 9. What this deliberately does NOT build
 
-## 9. Open questions for review
+No new daemon/queue/transport (sshd + tailnet exist; Telegram stays a separate
+deferred design; RC untouched as bonus). No team→phone direction. No push
+notifications. No new `.secrets` entries — but note honestly (M4): the phone key IS
+a new credential; its lifecycle is §7, its registry is authorized_keys.
 
-1. Reel daily-cap default (5?) and whether `status` should require a cap too.
-2. Should `ask` scope default to `research` when omitted, or hard-require the scope?
-3. Wrapper log location: own file under `~/.myndaix/state/` vs syslog.
+## 10. Decisions locked (was §9 open questions)
+
+1. Caps: reel 5/day; status 60/hour (uncapped authenticated endpoint = DoS vector);
+   ask 50/day; get 100/day; concurrency 2.
+2. Scope: hard-required by the wrapper; UX solved by per-scope Shortcuts.
+3. Log: `~/.myndaix/state/mxr-phone.log`, 0600, last-1000-lines self-rotation,
+   sha-only payload references, write-failure = deny.
