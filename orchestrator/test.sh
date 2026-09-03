@@ -425,15 +425,17 @@ echo "49. FRONT folds a skipped range: remotesha == skipped tip -> worker gets t
     if [[ "$(sed -n 7p "$FRONT_ARGV")" == "$TIP2" ]]; then echo "  ok: arg7 carries the push's own base (over-cap fallback)"; PASS=$((PASS+1)); else echo "  FAIL: arg7=$(sed -n 7p "$FRONT_ARGV") want $TIP2"; FAIL=$((FAIL+1)); fi
   else echo "  FAIL: front never dispatched a worker"; FAIL=$((FAIL+3)); fi
 
-echo "49b. chain fold (skip-of-skip walks 2 hops) + done-marker stops the walk"; reset; install_front_recorder
+echo "49b. chain fold (skip-of-skip walks 2 hops) + a reviewed sha (marker consumed) stops the walk"; reset; install_front_recorder
   mkdir -p "$STATE"; printf '%s' "$TIP" > "$STATE/skipped-$SKIPSLUG-$TIP2"; printf '%s' "$TIP2" > "$STATE/skipped-$SKIPSLUG-$TIP3"
   front_push "$TIP3" "$TIP3" >/dev/null 2>&1 || true   # remotesha=TIP3 (its marker points to TIP2, whose marker points to TIP)
   b="$(front_base)"
   if [[ "$b" == "$TIP" ]]; then echo "  ok: 2-hop chain walked to the deepest recorded base"; PASS=$((PASS+1)); else echo "  FAIL: chain base=$b want $TIP"; FAIL=$((FAIL+1)); fi
-  : > "$STATE/done-$SKIPSLUG-$TIP2"                    # TIP2 got reviewed after all -> walk must stop AT it
+  # TIP2 got reviewed after all: mark_done writes done- AND consumes its skip marker — the
+  # walk keys on marker PRESENCE (done+skipped coexist only on a deliberate backlog re-queue).
+  : > "$STATE/done-$SKIPSLUG-$TIP2"; rm -f "$STATE/skipped-$SKIPSLUG-$TIP2"
   front_push "$TIP3" "$TIP3" >/dev/null 2>&1 || true
   b="$(front_base)"
-  if [[ "$b" == "$TIP2" ]]; then echo "  ok: done marker stops the walk"; PASS=$((PASS+1)); else echo "  FAIL: done-stop base=$b want $TIP2"; FAIL=$((FAIL+1)); fi
+  if [[ "$b" == "$TIP2" ]]; then echo "  ok: reviewed sha (no marker) stops the walk"; PASS=$((PASS+1)); else echo "  FAIL: reviewed-stop base=$b want $TIP2"; FAIL=$((FAIL+1)); fi
 
 echo "50. fail-safe: bad markers fall back to base=remotesha (and the push is never aborted)"; reset; install_front_recorder; mkdir -p "$STATE"
   printf 'not-a-sha\n' > "$STATE/skipped-$SKIPSLUG-$TIP2"
@@ -467,6 +469,9 @@ echo "51. over-cap fold falls back to the push's own range with a LOUD backlog b
   ck "fallback still reviews (PASS delivered)" "review PASS"
   ck "verdict leads with the unreviewed-backlog banner" "STILL UNREVIEWED"
   ck "banner names the manual xreview command" "xreview.sh"
+  BQ="$STATE/skipped-$SKIPSLUG-$OWNTIP"
+  ckfile "$BQ" "backlog RE-QUEUED on the reviewed tip (not banner-only recovery)"
+  if [[ "$(cat "$BQ" 2>/dev/null)" == "$EMPTY" ]]; then echo "  ok: re-queue marker content = the deep unfolded base"; PASS=$((PASS+1)); else echo "  FAIL: re-queue content '$(cat "$BQ" 2>/dev/null)' != $EMPTY"; FAIL=$((FAIL+1)); fi
   git -C "$REPO" reset -q --hard "$TIP"   # restore
 
 echo "51b. own range ALSO over-cap still aborts (no infinite fallback)"; reset
@@ -481,6 +486,26 @@ echo "52. mark_done clears the tip's skipped marker (confirmed push)"; reset; mk
 echo "53. gate contention writes NO skip marker (gate retries itself; main slug stays clean)"; reset; mkdir -p "$STATE/lock"
   STUB_TRIAGE="PLAY_PASS" gate_run >/dev/null 2>&1 || true
   cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "gate-mode contention leaves no skipped marker"
+
+echo "54. worker RE-walks under the lock (kilabz TOCTOU: marker written after the FRONT walked)"; reset
+  # real-content commits so the folded diff is non-empty: TIPB (skipped push), TIPC (this push)
+  printf 'def add(a,b): return a+b\n' > "$REPO/m.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm fixadd; TIPB="$(git -C "$REPO" rev-parse HEAD)"
+  printf 'y=2\n' > "$REPO/n.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm more; TIPC="$(git -C "$REPO" rev-parse HEAD)"
+  BARE54="$ROOT/bare54.git"; git init -q --bare "$BARE54"; git -C "$REPO" push -q "$BARE54" "$TIPC:refs/heads/main" 2>/dev/null
+  mkdir -p "$STATE"; printf '%s' "$TIP" > "$STATE/skipped-$SKIPSLUG-$TIPB"
+  # worker gets base=TIPB (the FRONT missed the marker — it did NOT walk); the worker must re-walk
+  env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$TIPB" "$TIPC" refs/heads/main "$BARE54" "$TIPB" 2>/dev/null
+  ck "verdict range shows the RE-walked base (marker adopted under the lock)" "range: $TIP"
+  ck "still a completed review" "review PASS"
+  git -C "$REPO" reset -q --hard "$TIP"   # restore
+
+echo "55. contention with an UNWRITABLE state dir delivers the honest NOT-recorded notice"; reset; mkdir -p "$STATE/lock"
+  chmod a-w "$STATE"
+  STUB_TRIAGE="PLAY_PASS" run
+  chmod u+w "$STATE"
+  ck "delivers SKIPPED" "review SKIPPED"
+  ck "notice admits the range was NOT recorded" "NOT fold in automatically"
+  cknofile "$STATE/skipped-$SKIPSLUG-$TIP" "no marker written when the state dir is unwritable"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
