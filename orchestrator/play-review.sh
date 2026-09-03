@@ -7,7 +7,7 @@
 #
 # On `git push` it DETACHES (never blocks/aborts the push), reviews the pushed
 # range with kilabz (codex) + oracle (Gemini, best-effort), triages with lobster, delivers the
-# verdict to ~/.myndaix/bridge/inbox/jefe/ + a desktop ping.
+# verdict to ~/.myndaix/bridge/inbox/jefe/.
 #
 # v0 CAVEATS:
 #  - The detached worker re-execs the WORKING-TREE copy of this script. Fine for
@@ -152,7 +152,11 @@ play="$(date +%Y%m%d%H%M%S)-$$"
 run="$RUNS/$play"
 mkdir -p "$run" "$STATE" "$INBOX"
 nonce="$(openssl rand -hex 16)"
-lock="$STATE/lock"
+# PER-REPO lock: reviews of DIFFERENT repos run in parallel (the pool underneath already
+# caps + queues per repo); reviews of the SAME repo — including the automerge gate, which
+# calls --worker directly for this repo — still serialize, so the daily-cap RMW and the
+# skip-marker fold stay race-free under it. Same repo_id sanitize as marker_slug's repo half.
+lock="$STATE/lock-${repo_id//[^A-Za-z0-9._-]/-}"
 
 # mxr SYNC-wait for the REVIEW calls (kilabz/oracle/lobster). The per-attempt exec cap is the
 # agent's PROFILE timeout (kilabz 900s for codex-xhigh; 300s default for the rest), but mxr's
@@ -375,7 +379,8 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
       _skrec=1
     else rm -f "$_skt" 2>/dev/null || true; fi
   fi
-  # lock contention is TRANSIENT by definition (the lock stale-reaps at 45 min; the streak alert
+  # lock contention is TRANSIENT by definition (the lock stale-reaps at the RCT-derived floor,
+  # ~75 min at the 1200s default; the streak alert
   # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
   # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
   # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
@@ -389,7 +394,7 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   exit 0
 }
 
-# --- acquire the global lock, reaping a STALE one; trap-release only once held ---
+# --- acquire THIS repo's lock, reaping a STALE one; trap-release only once held ---
 if ! mkdir "$lock" 2>/dev/null; then
   now="$(date +%s)"; mt="$(stat -f %m "$lock" 2>/dev/null || echo "$now")"
   if (( now - mt > STALE )); then
@@ -431,8 +436,10 @@ find "$RUNS"  -maxdepth 1 -type d -mtime +"$PRUNE_DAYS" -exec rm -rf {} + 2>/dev
 find "$STATE" -maxdepth 1 -type f -mtime +"$PRUNE_DAYS" -delete 2>/dev/null || true
 # --- reap LEAKED review-* snapshots (a crashed/aborted worker's dir) — bounded + fail-OPEN;
 #     review-reap fails CLOSED in the runtime if the ledger is unreachable (never blind-reaps a
-#     live reviewer's cwd), so a DB hiccup just skips the reap. Under the held lock: one reaper
-#     at a time. cap_run bounds a hung DB connect so it can never wedge the review.
+#     live reviewer's cwd), so a DB hiccup just skips the reap. Per-repo locks mean CONCURRENT
+#     reapers are possible — safe: the reap is ledger-guarded + idempotent (in_use=None reaps
+#     nothing; duplicate-rm races are swallowed per-dir). cap_run bounds a hung DB connect so
+#     it can never wedge the review.
 if have_perl; then cap_run mxr review-reap >/dev/null 2>&1 || true
 else mxr review-reap >/dev/null 2>&1 || true; fi
 
@@ -442,7 +449,10 @@ if ! gate && [[ -e "$STATE/done-$marker_slug-$tip" ]]; then note dedupe "already
 
 # --- daily cap: numeric-guarded check now; CHARGE only when a real review runs ---
 #     gate mode is decoupled from the push-review DAILY_CAP (automerge has its own caps).
-day="$STATE/count-$(date +%Y%m%d)"
+# PER-REPO daily cap: the read-modify-write below is race-free only because THIS repo's lock
+# serializes it — a global count file would race across per-repo locks (lost increments, cap
+# breach). DAILY_CAP is therefore per-repo: a runaway brake, not a cross-repo budget.
+day="$STATE/count-${repo_id//[^A-Za-z0-9._-]/-}-$(date +%Y%m%d)"
 n="$(cat "$day" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
 if ! gate && [[ "$n" -ge "$DAILY_CAP" ]]; then abort cap "daily review cap ($DAILY_CAP) reached"; fi
 
