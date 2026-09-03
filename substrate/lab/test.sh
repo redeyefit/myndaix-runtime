@@ -142,9 +142,10 @@ grep -q 'downtime unknown' "$NOTES" && ok "unknown-duration guard" || bad "absur
 echo "13a. misconfig guard — missing TW_HOST alerts loudly and exits 1"
 : > "$NOTES"
 rc=0
-MYNDAIX_HOME="$SCRATCH/home" \
+TW_HOST="" \
+  MYNDAIX_HOME="$SCRATCH/home" \
   TW_TS_BIN="$SCRATCH/bin/ts" TW_NC_BIN="$SCRATCH/bin/nc" TW_OSA_BIN="$SCRATCH/bin/osascript" \
-  TW_TEST_NOTIFY_LOG="$NOTES" bash "$SCRIPT" || rc=$?
+  TW_TEST_NOTIFY_LOG="$NOTES" bash "$SCRIPT" || rc=$?   # TW_HOST="": hermetic under a caller shell that exports one (guard treats empty as unset)
 [ "$rc" -eq 1 ] && ok "missing TW_HOST exits 1" || bad "missing TW_HOST rc=$rc"
 grep -q 'misconfigured' "$NOTES" && ok "missing TW_HOST raises the misconfigured alert" || bad "no misconfigured alert"
 
