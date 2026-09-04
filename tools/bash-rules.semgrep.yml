@@ -66,3 +66,16 @@ rules:
       `date -jf` is macOS/BSD-specific and parses differently (or fails) on GNU date. For date parsing
       prefer python3, which is portable across the MacBook/Mini. (rules/bash-scripts.md macOS compat.)
     pattern-regex: '\bdate\s+-jf\b'
+
+  - id: bash-base10-missing-dollar
+    languages: [generic]
+    paths: {include: ['*.sh', '*.bash']}
+    severity: ERROR
+    message: >-
+      `10#name` without `$` is the base-10 guard typo: inside $(( )), the token after `10#` must be
+      DIGITS, so `10#n` crashes with "value too great for base" — the guard then breaks the very
+      script it was protecting. Write `$((10#$n))`. (Shipped this exact bug 2026-09-03 in mxr-phone
+      cap_take; caught by the test suite, encoded here so it fails at check time instead.)
+    # `10#` followed by an identifier char (not a digit, not `$`). Zero legitimate occurrences
+    # repo-wide at rule-add time; comments citing the idiom use the correct `10#$v` form.
+    pattern-regex: '10#[A-Za-z_]'
