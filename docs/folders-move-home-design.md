@@ -1,7 +1,11 @@
-# Folders Move Home — design v0.2
+# Folders Move Home — design v0.3
 
-**Status:** DESIGN v0.2 — full cross-family round folded (oracle lead + kilabz trust
-boundaries; every H/M/L addressed below, none disputed). Awaiting Jefe's runbook GO.
+**Status:** DESIGN v0.3 — two rounds folded (r1 cross-family; r2 kilabz via the push
+hook, 4 findings, all confirmed). Awaiting Jefe's runbook GO.
+**Changelog v0.3 (r2):** quiescence HELD and re-verified, not spot-checked (newest-mtime
+recheck adjacent to the mv + again pre-unpause); hash gate under pipefail with a
+non-empty-manifest assertion; symlink/dir manifest gains the exclusions + readlink
+targets; manifests are per-run mktemp paths, never a shared /tmp file.
 **What:** folder TRUTH moves from the MacBook (lab) to the Mac Mini (factory, always-on).
 MacBook becomes a full two-way Syncthing peer. Phone gets ONE file grip (Files.app → SMB
 over tailnet) beside the ONE agent grip (PR #124 verbs). Executes the north-star jump;
@@ -51,19 +55,32 @@ b. **Clean cluster state (kilabz H):** the folder shows Up to Date on BOTH sides
 c. **`~/X` preflight (kilabz M):** on the Mini, `~/X` must be exactly one of: the known
    symlink (research/fitness/company — remove it) or ABSENT. Anything else → archive
    aside by hand and re-run preflight. Prevents `mv` creating `~/X/X`.
-d. **Writer quiescence (kilabz H):** Syncthing pause does not freeze local writers. Take
-   the per-folder maintenance window: pause the folder on BOTH sides, stop/hold agents
-   that touch it (curator/index runs for corpus folders; SMB not yet enabled in rollout
-   order — §5 comes after flips), confirm no open editors. Only then hash.
-e. **Hash-manifest gate (oracle H — relative, exclusion-aware, NUL-safe):**
+d. **Writer quiescence — HELD, not spot-checked (kilabz r1 H + r2 H-1):** Syncthing pause
+   does not freeze local writers, and a hash-time check alone leaves a window open until
+   the mv. Enforcement: pause the folder BOTH sides; stop/hold agents that touch it
+   (curator/index for corpus folders; SMB not yet enabled — §5 comes after all flips);
+   confirm no open editors; capture the tree's NEWEST mtime at hash time
+   (`find <root> -not -path '*/.stversions/*' -exec stat -f %m {} + | sort -rn | head -1`)
+   — then RE-VERIFY it unchanged immediately before the `mv` AND again before unpause.
+   Any change → abort this folder's window, restart from (b).
+e. **Hash-manifest gate (oracle r1 H; kilabz r2 H-2/M-4 — pipefail + per-run paths):**
    ```
-   cd <root> && find . -type f \
+   m="$(mktemp /tmp/fmh-manifest.XXXXXX)"     # per-run path — concurrent/resumed gates must not cross-read
+   ( cd <root> && set -o pipefail && find . -type f \
        -not -path './.stversions/*' -not -path './.stfolder*' -not -name '.DS_Store' \
-       -print0 | sort -z | xargs -0 shasum -a 256 > /tmp/manifest
+       -print0 | sort -z | xargs -0 shasum -a 256 ) > "$m"
+   [ -s "$m" ] || abort    # a traversal/sort failure must NEVER read as "identical"
    ```
    on MacBook `~/X` and Mini `~/MacBookMirror/X`; diff must be EMPTY. Also compare a
-   symlink/dir manifest (`find . \( -type l -o -type d \) -print | sort`) — content hash
-   alone misses symlinks/empty dirs (kilabz H). Divergence → resume sync, re-gate.
+   symlink/dir manifest with the SAME exclusions and with symlink TARGETS recorded
+   (kilabz r2 M-3 — same-named links to different destinations must diverge):
+   ```
+   ( cd <root> && find . \( -type l -o -type d \) \
+       -not -path './.stversions/*' -not -path './.stfolder*' -print | sort ;
+     find . -type l -not -path './.stversions/*' -exec sh -c \
+       'printf "%s -> %s\n" "$1" "$(readlink "$1")"' _ {} \; | sort )
+   ```
+   Divergence → resume sync, re-gate.
 
 **Flip:**
 1. Mini: resolve `~/X` per preflight-c, then `mv ~/MacBookMirror/X ~/X`.
