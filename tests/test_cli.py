@@ -79,8 +79,9 @@ def test_cli_get_routes_to_get_job():
     # `mxr get <id>` is special-cased above the flat submit parser (D1 artifact read)
     captured = {}
 
-    async def fake_get(job_id):
+    async def fake_get(job_id, reply=False):
         captured["job_id"] = job_id
+        captured["reply"] = reply
         return 0
 
     orig = cli.get_job
@@ -89,6 +90,10 @@ def test_cli_get_routes_to_get_job():
         rc = cli.main(["get", "11111111-2222-3333-4444-555555555555"])
         assert rc == 0
         assert captured["job_id"] == "11111111-2222-3333-4444-555555555555"
+        assert captured["reply"] is False                    # default: status JSON
+        rc = cli.main(["get", "--reply", "11111111-2222-3333-4444-555555555555"])
+        assert rc == 0
+        assert captured["reply"] is True
     finally:
         cli.get_job = orig
 
@@ -209,6 +214,48 @@ def test_cli_get_full_uuid_skips_resolver():
         assert fake.status_asked == full
     finally:
         restore()
+
+
+# ---- `mxr get --reply` (phone-tailnet surface: recover a late reply) --------
+
+class _FakeLedgerReply(_FakeLedger):
+    def __init__(self, ids, outbound):
+        super().__init__(ids)
+        self.outbound = outbound
+
+    async def get_status(self, jid):
+        self.status_asked = str(jid)
+        return {"id": str(jid), "status": "done", "to_agent": "librarian",
+                "outbound": self.outbound}
+
+
+def test_cli_get_reply_prints_latest_body():
+    import asyncio, contextlib, io
+    full = "11111111-2222-3333-4444-555555555555"
+    fake = _FakeLedgerReply([full], [{"body": "first"}, {"body": "the cited answer"}])
+    restore = _patch_ledger(fake)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = asyncio.run(cli.get_job(full, reply=True))
+        assert rc == 0
+        assert buf.getvalue().strip() == "the cited answer"   # LATEST outbound wins
+    finally:
+        restore()
+
+
+def test_cli_get_reply_none_yet_exits_3():
+    # job known, no outbound body yet -> exit 3 (distinct from 1 unknown / 2 malformed),
+    # so the phone wrapper can say "still thinking" instead of lying or erroring
+    import asyncio
+    full = "11111111-2222-3333-4444-555555555555"
+    for empty in ([], None, [{"body": None}]):
+        fake = _FakeLedgerReply([full], empty)
+        restore = _patch_ledger(fake)
+        try:
+            assert asyncio.run(cli.get_job(full, reply=True)) == 3
+        finally:
+            restore()
 
 
 # ---- --staged-workdir + `mxr review` routing (mxr-review-context PR-1) ------

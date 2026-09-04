@@ -1,0 +1,13 @@
+# mxr-phone authorized_keys entry — SITE CONFIG, one line per device.
+# Paste into ~/.ssh/authorized_keys on the Mini (as jefe), replacing:
+#   * <PHONE-TAILNET-IP>: the phone's tailnet address (Tailscale admin / `tailscale status`
+#     — e.g. iphone171 = 100.73.71.78). `from=` makes a COPIED key useless from any other
+#     device, even inside the tailnet (design H4).
+#   * <SHORTCUTS-ED25519-PUBKEY>: from the iPhone — Shortcuts app > any "Run Script Over
+#     SSH" action > Authentication: SSH Key > tap the key > Copy Public Key. The private
+#     key never leaves the phone.
+# `restrict` denies pty/port-forwarding/agent-forwarding/X11/user-rc wholesale; the forced
+# command means EVERY session runs mxr-phone regardless of what the client requests.
+# ONE key per device, comment-tagged with the date; revocation = delete the line
+# (+ remove the device in the Tailscale admin — two independent locks, design §7).
+restrict,from="<PHONE-TAILNET-IP>",command="/Users/jefe/.myndaix/bin/mxr-phone" ssh-ed25519 <SHORTCUTS-ED25519-PUBKEY> iphone-2026-09

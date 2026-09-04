@@ -147,7 +147,7 @@ def _build_context(args: argparse.Namespace) -> dict:
     return ctx
 
 
-async def get_job(job_id: str) -> int:
+async def get_job(job_id: str, reply: bool = False) -> int:
     """`mxr get <job_id>` -> structured JSON of the job's status, including
     artifact_ref + base_sha. The fix stage (orchestrator/play-fix.sh) reads the
     diff artifact from HERE - via the ledger, parsed as JSON - NEVER by grepping a
@@ -185,6 +185,15 @@ async def get_job(job_id: str) -> int:
         if not st:
             print(f"no such job: {job_id}", file=sys.stderr)
             return 1
+        if reply:
+            # latest outbound body = the agent's reply. json_agg rows arrive decoded like
+            # `attempts` below (same codec path); a done job with no body is "no reply yet".
+            bodies = [o.get("body") for o in (st.get("outbound") or []) if o.get("body")]
+            if bodies:
+                print(bodies[-1])
+                return 0
+            print(f"no reply yet (job status: {st.get('status')})", file=sys.stderr)
+            return 3
         out = {
             "job": str(st.get("id")),
             "status": st.get("status"),
@@ -212,8 +221,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                                      description="print a job's status as JSON")
         gp.add_argument("job_id", help="the job uuid, or an id prefix of >=8 hex chars "
                                        "(from a prior `mxr` submit; hyphens optional)")
+        # --reply: print the job's REPLY BODY (latest outbound) instead of the status JSON —
+        # the documented recover-a-late-reply flow ("verdict then only in the ledger") without
+        # hand-rolled python. Exit 3 = job known but no reply yet (distinct from 1 = unknown
+        # job, 2 = malformed id) so callers like the phone wrapper can say "still thinking".
+        gp.add_argument("--reply", action="store_true",
+                        help="print the reply body of a completed job (exit 3 if none yet)")
         gargs = gp.parse_args(raw[1:])
-        return asyncio.run(get_job(gargs.job_id))
+        return asyncio.run(get_job(gargs.job_id, reply=gargs.reply))
 
     # `mxr skillselect <repo_id> <changed-path>...` — the +learning rung READ path (build
     # plan Step 4). Routed through mxr so it inherits the runtime venv + PYTHONPATH +
