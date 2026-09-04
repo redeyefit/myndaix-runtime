@@ -85,7 +85,8 @@ CREATE TABLE outbound (
     status          text NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','leased','sent','failed')),
     provider_msg_id text UNIQUE,                -- dedupe delivery (exactly-once send)
-    tries           int  NOT NULL DEFAULT 0
+    tries           int  NOT NULL DEFAULT 0,
+    created_at      timestamptz NOT NULL DEFAULT now()  -- deterministic latest-reply order (0015)
 );
 CREATE INDEX outbound_pending_idx ON outbound (status) WHERE status = 'pending';
 

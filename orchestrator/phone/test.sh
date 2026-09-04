@@ -26,6 +26,7 @@ cat > "$STUB" <<'STUBEOF'
 case "${STUB_MODE:-answer}" in
   answer)  printf 'ANSWER: the launch color is teal\n[1] greeting.md\n';;
   timeout) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\ntimed out (is the pool running?)\n' >&2; exit 1;;
+  jobfailed) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nagent exploded\n(job failed)\n' >&2; exit 1;;
   reply)   printf 'RECOVERED ANSWER BODY\n';;
   noreply) printf 'no reply yet (job status: pending)\n' >&2; exit 3;;
   nojob)   printf 'no such job\n' >&2; exit 1;;
@@ -55,12 +56,21 @@ if [[ "${1:-}" == "--sshd" ]]; then
   if sudo -n true 2>/dev/null; then AE="$(sudo sshd -T 2>/dev/null | grep -ci '^acceptenv' || true)"
   else AE="$(grep -rci '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"; fi
   [ "${AE:-0}" -eq 0 ] && ok "AcceptEnv empty" || bad "AcceptEnv configured ($AE) — env channel open"
-  # temp key wired to the wrapper via a forced command, loopback
+  # temp key wired to the wrapper via a forced command, loopback. Trap installed BEFORE
+  # the append (r1 L-14): an interrupt can never strand the temp key; cleanup is
+  # temp-file + atomic mv.
   K="$ROOT/k"; ssh-keygen -q -t ed25519 -N '' -f "$K"
   AK="$HOME/.ssh/authorized_keys"; touch "$AK"
+  _ak_cleanup(){ # cleanup as a FUNCTION (deploy-sync precedent: never interpolate into a trap string)
+    local t
+    if [ -f "$K.pub" ] && t="$(mktemp "$HOME/.ssh/.ak.XXXXXX" 2>/dev/null)"; then
+      grep -vF "$(cat "$K.pub")" "$AK" > "$t" 2>/dev/null && mv -f "$t" "$AK" || rm -f "$t" 2>/dev/null
+    fi
+    rm -rf "$ROOT"
+  }
+  trap '_ak_cleanup' EXIT
   LINE="restrict,command=\"$HOME/.myndaix/bin/mxr-phone\" $(cat "$K.pub")"
   printf '%s\n' "$LINE" >> "$AK"
-  trap 'grep -vF "$(cat "$K.pub")" "$AK" > "$AK.t" && mv "$AK.t" "$AK"; rm -rf "$ROOT"' EXIT
   SSHOPTS=(-i "$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
   out="$(ssh "${SSHOPTS[@]}" localhost 'status' 2>/dev/null || true)"
   printf '%s' "$out" | grep -q 'factory status' && ok "forced command answers status" || bad "status via ssh: $out"
@@ -109,19 +119,28 @@ reset; out="$(run "$(printf 'ask research bad\tchar')")"; printf '%s' "$out" | g
 reset; out="$(run "ask research $(head -c 2100 /dev/zero | tr '\0' 'x')")"; printf '%s' "$out" | grep -q 'denied: payload over' && ok "oversize denied" || bad "oversize: $out"
 no_dispatch && ok "no denied case reached mxr" || bad "a denied case dispatched: $(cat "$ARGV")"
 
-echo "5. ask timeout -> JOB_ID handoff to get"
+echo "5. ask timeout -> JOB_ID handoff to get (+ jid recorded; r1 H-3/M-8)"
 reset; out="$(run 'ask research a slow deep question' STUB_MODE=timeout)"
 printf '%s' "$out" | grep -q 'still thinking — job deadbeef-0000' && ok "timeout returns job id" || bad "timeout: $out"
 printf '%s' "$out" | grep -q 'get deadbeef-0000-4000-8000-000000000001' && ok "full jid for Get Answer" || bad "no full jid"
+grep -qx 'deadbeef-0000-4000-8000-000000000001' "$STATE/phone-jids" 2>/dev/null && ok "jid recorded in the phone registry" || bad "jid not recorded"
+reset; out="$(run 'ask research doomed question' STUB_MODE=jobfailed)"
+printf '%s' "$out" | grep -q 'factory error' && ok "terminal job failure reported as ERROR, not still-thinking (M-8)" || bad "jobfailed: $out"
+[ ! -s "$STATE/phone-jids" ] && ok "failed job NOT recorded as fetchable" || bad "dead jid recorded"
 
-echo "6. get verb"
-reset; out="$(run 'get deadbeef-0000-4000-8000-000000000001' STUB_MODE=reply)"
+echo "6. get verb — full-uuid grammar + phone-jid ownership (r1 H-3)"
+JID='deadbeef-0000-4000-8000-000000000001'
+seed_jid(){ mkdir -p "$STATE"; printf '%s\n' "$JID" > "$STATE/phone-jids"; }
+reset; seed_jid; out="$(run "get $JID" STUB_MODE=reply)"
 printf '%s' "$out" | grep -q 'RECOVERED ANSWER BODY' && ok "reply relayed" || bad "get: $out"
 grep -q '^--reply$' "$ARGV" && ok "wrapper passes --reply" || bad "argv: $(cat "$ARGV")"
-reset; out="$(run 'get deadbeef00' STUB_MODE=noreply)"; printf '%s' "$out" | grep -q 'still thinking' && ok "rc=3 -> still thinking" || bad "noreply: $out"
-reset; out="$(run 'get deadbeef00' STUB_MODE=nojob)";  printf '%s' "$out" | grep -q 'no such job' && ok "rc=1 -> no such job" || bad "nojob: $out"
-reset; out="$(run 'get zznothex')";                     printf '%s' "$out" | grep -q 'denied: not a job id' && ok "bad jid denied pre-dispatch" || bad "jid: $out"
-reset; out="$(run 'get $(reboot)')";                    printf '%s' "$out" | grep -q 'denied: not a job id' && ok "hostile jid denied" || bad "jid2: $out"
+reset; seed_jid; out="$(run "get $JID" STUB_MODE=noreply)"; printf '%s' "$out" | grep -q 'still thinking' && ok "rc=3 -> still thinking" || bad "noreply: $out"
+reset; seed_jid; out="$(run "get $JID" STUB_MODE=nojob)";  printf '%s' "$out" | grep -q 'no such job' && ok "rc=1 -> no such job" || bad "nojob: $out"
+reset; out="$(run "get $JID")";                             printf '%s' "$out" | grep -q 'denied: not a phone-issued job' && ok "FOREIGN jid denied (ownership)" || bad "foreign: $out"
+no_dispatch && ok "foreign jid never reached mxr" || bad "foreign dispatched"
+reset; out="$(run 'get deadbeef00')";                       printf '%s' "$out" | grep -q 'denied: not a job id' && ok "prefix jid denied (full uuid only)" || bad "prefix: $out"
+reset; out="$(run 'get zznothex')";                         printf '%s' "$out" | grep -q 'denied: not a job id' && ok "bad jid denied pre-dispatch" || bad "jid: $out"
+reset; out="$(run 'get $(reboot)')";                        printf '%s' "$out" | grep -q 'denied: not a job id' && ok "hostile jid denied" || bad "jid2: $out"
 
 echo "7. reel stub — no dispatch, cap still charges"
 reset; out="$(run 'reel gym motivation monday')"
@@ -138,6 +157,9 @@ reset; printf '60' > "$STATE/.phonecap-status-$(date +%Y%m%d%H)"
 out="$(run status)"; printf '%s' "$out" | grep -q 'denied: status cap' && ok "status hourly cap enforced" || bad "statuscap: $out"
 reset; printf '08' > "$STATE/.phonecap-ask-$(date +%Y%m%d)"   # octal trap
 out="$(run 'ask research q')"; printf '%s' "$out" | grep -q 'ANSWER' && ok "leading-zero count read base-10 (8<50 -> allowed)" || bad "octal: $out"
+reset; printf '3' > "$STATE/.phonecap-ask-$(date +%Y%m%d)"; chmod 000 "$STATE/.phonecap-ask-$(date +%Y%m%d)"
+out="$(run 'ask research q')"; chmod 600 "$STATE/.phonecap-ask-$(date +%Y%m%d)" 2>/dev/null
+printf '%s' "$out" | grep -q 'denied: ask cap' && ok "UNREADABLE counter fails CLOSED (M-7)" || bad "unreadable-cap: $out"
 
 echo "9. concurrency slots"
 reset; mkdir -p "$STATE/.phone-conc1" "$STATE/.phone-conc2"; printf '99999' > "$STATE/.phone-conc1/pid"; printf '99999' > "$STATE/.phone-conc2/pid"

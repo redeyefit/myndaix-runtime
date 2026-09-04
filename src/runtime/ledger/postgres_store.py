@@ -864,7 +864,8 @@ class PostgresLedger:
                              FROM attempt a WHERE a.job_id = j.id) AS attempts,
                           (SELECT json_agg(json_build_object(
                                 'id', o.id, 'status', o.status, 'reply_target', o.reply_target,
-                                'body', o.body, 'provider_msg_id', o.provider_msg_id))
+                                'body', o.body, 'provider_msg_id', o.provider_msg_id)
+                                ORDER BY o.created_at, o.id)
                              FROM outbound o WHERE o.job_id = j.id) AS outbound
                      FROM job j WHERE j.id = $1""", job_id)
         if row is None:

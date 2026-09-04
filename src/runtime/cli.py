@@ -26,6 +26,14 @@ from runtime.registry import REGISTRY
 DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 
+def _clean_reply(s: str) -> str:
+    """Terminal-injection belt (phone r1 M-10): agent reply bodies are untrusted output —
+    strip C0 controls + DEL (keep \\t \\n \\r) before they hit an operator's terminal, the
+    same range play-review's clean() strips before the inbox. Applied to BOTH reply
+    prints (submit sync-reply and `get --reply`) so no caller receives raw ESC sequences."""
+    return "".join(ch for ch in s if ch in "\t\n\r" or (ch >= " " and ch != "\x7f"))
+
+
 def _resolve_sync_wait(agent: str) -> float:
     """The SYNC wait for a submitted job to finish: MXR_TIMEOUT_S when set (env ALWAYS
     wins — play-review exports it for slow reviews), else the agent's profile-derived
@@ -96,7 +104,7 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
         if st["status"] == "done":
             reply = next((o["body"] for o in (st.get("outbound") or [])), None)
             if reply is not None:
-                print(reply)
+                print(_clean_reply(reply))
             for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
                 if o["status"] == "pending":
                     await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
@@ -186,11 +194,12 @@ async def get_job(job_id: str, reply: bool = False) -> int:
             print(f"no such job: {job_id}", file=sys.stderr)
             return 1
         if reply:
-            # latest outbound body = the agent's reply. json_agg rows arrive decoded like
-            # `attempts` below (same codec path); a done job with no body is "no reply yet".
+            # latest outbound body = the agent's reply. Ordering is GUARANTEED by the store
+            # (json_agg ... ORDER BY o.created_at, o.id — migration 0015; phone r1 M-9), so
+            # [-1] is genuinely the newest. A done job with no body is "no reply yet".
             bodies = [o.get("body") for o in (st.get("outbound") or []) if o.get("body")]
             if bodies:
-                print(bodies[-1])
+                print(_clean_reply(bodies[-1]))
                 return 0
             print(f"no reply yet (job status: {st.get('status')})", file=sys.stderr)
             return 3
