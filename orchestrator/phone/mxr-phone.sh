@@ -116,7 +116,9 @@ emit(){ # stdin -> stdout, control/ANSI-stripped (keep \t\n), capped at MAX_OUT 
   # headroom keeps the >MAX_OUT truncation marker honest for any real reply; a reply that is
   # mostly stripped garbage may lose the marker, which costs nothing but the ellipsis. A
   # pre-cap cut mid-multibyte-char decodes to U+FFFD, which the filter strips.
-  body="$(head -c $((MAX_OUT * 4 + 8)) | perl -MEncode=decode,encode,FB_DEFAULT -0777 -ne '$s=decode("UTF-8",$_,FB_DEFAULT);$s=~s/[\x{0}-\x{8}\x{b}\x{c}\x{e}-\x{1f}\x{7f}-\x{9f}\x{fffd}]//g;print encode("UTF-8",$s)' | head -c $((MAX_OUT + 1)))"
+  # Strip class also covers \r (line-rewrite spoofing) and the bidi overrides
+  # U+202A-202E / U+2066-2069 (RTL display reordering) — audit item 15. Keep \t\n.
+  body="$(head -c $((MAX_OUT * 4 + 8)) | perl -MEncode=decode,encode,FB_DEFAULT -0777 -ne '$s=decode("UTF-8",$_,FB_DEFAULT);$s=~s/[\x{0}-\x{8}\x{b}-\x{d}\x{e}-\x{1f}\x{7f}-\x{9f}\x{fffd}\x{202a}-\x{202e}\x{2066}-\x{2069}]//g;print encode("UTF-8",$s)' | head -c $((MAX_OUT + 1)))"
   if [ "$(printf '%s' "$body" | wc -c)" -gt "$MAX_OUT" ]; then
     printf '%s' "$body" | head -c "$MAX_OUT"; printf '\n…[truncated]\n'
   else
@@ -137,11 +139,21 @@ run_bounded(){ perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
 # Children (run_bounded mxr calls) inherit fd 8, so a slot spans the session AND its
 # in-flight work — exactly what the cap is bounding.
 release_conc(){ exec 8>&- 2>/dev/null || true; return 0; }
-trap 'release_conc' EXIT INT TERM
+# _o/_e are the per-verb reply-capture temps (audit item 10: a dropped SSH session used
+# to strand them — full reply bodies — in $STATE forever). Empty until a verb sets them.
+_o=""; _e=""
+_cleanup(){ release_conc; rm -f ${_o:+"$_o"} ${_e:+"$_e"} 2>/dev/null || true; }
+# INT/TERM must EXIT after cleanup (audit item 12): a non-exiting signal trap resumes
+# the interrupted command, leaving the session unkillable by TERM.
+trap '_cleanup' EXIT
+trap '_cleanup; exit 130' INT
+trap '_cleanup; exit 143' TERM
 conc_acquire(){
   local s
   for s in 1 2; do
-    exec 8>>"$STATE/.phone-conc$s" 2>/dev/null || continue
+    # brace-scope the silencer: a bare `exec 8>>f 2>/dev/null` permanently nulls the
+    # SESSION's stderr on success, eating every later diagnostic (audit item 14)
+    { exec 8>>"$STATE/.phone-conc$s"; } 2>/dev/null || continue
     if perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 1; flock($f, LOCK_EX|LOCK_NB) or exit 1; exit 0'; then
       return 0
     fi
@@ -159,7 +171,7 @@ cap_take(){ # cap_take <verb> <limit> <day|hour> ; rc!=0 = over cap / lock troub
   cf="$STATE/.phonecap-$verb-$stamp"
   _locked "$STATE/.phonecap-$verb.lockf" 5 /bin/bash -c '
     set -uo pipefail
-    cf="$1"; limit="$2"; STATE="$3"
+    cf="$1"; limit="$2"; STATE="$3"; verb="$4"
     if [ -e "$cf" ]; then
       n="$(cat "$cf" 2>/dev/null)" || exit 1
     else
@@ -169,7 +181,20 @@ cap_take(){ # cap_take <verb> <limit> <day|hour> ; rc!=0 = over cap / lock troub
     [ "$n" -ge "$limit" ] && exit 1
     _t="$(mktemp "$STATE/.phcap.XXXXXX" 2>/dev/null)" || exit 1
     printf "%s" "$((n + 1))" > "$_t" 2>/dev/null && mv -f "$_t" "$cf" 2>/dev/null || { rm -f "$_t" 2>/dev/null || true; exit 1; }
-    exit 0' _ "$cf" "$limit" "$STATE"
+    for _old in "$STATE/.phonecap-$verb-"*; do   # expired-window stamps rot forever otherwise (audit item 10)
+      { [ -e "$_old" ] && [ "$_old" != "$cf" ] && rm -f "$_old" 2>/dev/null; } || true
+    done
+    exit 0' _ "$cf" "$limit" "$STATE" "$verb"
+}
+cap_or_deny(){ # cap_or_deny <verb> <limit> <day|hour> <over-cap message> — rc 5/6 from the
+  # lock layer is STORAGE trouble, not an exhausted cap; saying "cap reached" would send
+  # the user away for a day instead of retrying (audit item 11).
+  local _r=0; cap_take "$1" "$2" "$3" || _r=$?
+  case "$_r" in
+    0) return 0;;
+    5|6) deny "cap-$1-lock" "factory storage trouble — try again shortly";;
+    *) deny "cap-$1" "$4";;
+  esac
 }
 
 # ---- phone-jid registry (r1 H-3): `get` may only fetch jobs THIS surface issued — job
@@ -193,12 +218,18 @@ cmd="${SSH_ORIGINAL_COMMAND:-}"
 # r1 H-1: the control filter FAILS CLOSED — only "grep ran and counted zero" proceeds; a
 # missing/broken grep (rc not in {0,1}) denies rather than waving the payload through.
 set +e
-_cn="$(printf '%s' "$cmd" | LC_ALL=C grep -c '[[:cntrl:]]' 2>/dev/null)"; _crc=$?
+# The C0 check is BYTEWISE, not grep (audit item 3): grep is line-oriented, so an
+# embedded LF — the one control byte that IS the line separator — sailed through a
+# grep -c gate. tr-strip [:cntrl:] and compare byte counts; any difference means a
+# control byte was present. Non-numeric counts (broken tr/wc) fail CLOSED.
+_blen="$(printf '%s' "$cmd" | wc -c | tr -d ' ')"
+_clen="$(printf '%s' "$cmd" | LC_ALL=C tr -d '[:cntrl:]' | wc -c | tr -d ' ')"
 _c1_pat="$(printf '\302[\200-\237]')"
 _c1="$(printf '%s' "$cmd" | LC_ALL=C grep -c "$_c1_pat" 2>/dev/null)"; _c1rc=$?
 printf '%s' "$cmd" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; _utf8rc=$?
 set -e
-if [ "$_crc" -gt 1 ] || [ "$_c1rc" -gt 1 ] || [ "$_utf8rc" -ne 0 ] || [ "$_cn" != "0" ] || [ "$_c1" != "0" ]; then
+[[ "$_blen" =~ ^[0-9]+$ && "$_clen" =~ ^[0-9]+$ ]] || deny "cntrl" "control characters are not accepted"
+if [ "$_blen" != "$_clen" ] || [ "$_c1rc" -gt 1 ] || [ "$_utf8rc" -ne 0 ] || [ "$_c1" != "0" ]; then
   deny "cntrl" "control characters are not accepted"
 fi
 verb="${cmd%% *}"
@@ -222,8 +253,12 @@ p_meta(){ printf 'sha=%s len=%s' "$(printf '%s' "$payload" | shasum -a 256 | cut
 case "$verb" in
   status)
     [ -z "$rest" ] || deny "status-args" "status takes no arguments"
-    cap_take status "$CAP_STATUS" hour || deny "cap-status" "status cap reached this hour"
+    cap_or_deny status "$CAP_STATUS" hour "status cap reached this hour"
     log_or_deny "RUN status"
+    # Assemble in a temp file, not a pipe into emit: emit's head cap closing early sends
+    # the block SIGPIPE (rc=141) on an oversized canary line (audit item 16). The temp
+    # rides the _o trap slot so a dropped session can't strand it.
+    _o="$(mktemp "$STATE/.pho.XXXXXX" 2>/dev/null)" || deny "tmp" "factory storage trouble — try again shortly"
     {
       printf 'factory status @ %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
       printf 'liveness: %s\n' "$(tail -n 1 "$STATE/liveness-canary.out" 2>/dev/null || echo 'no data')"
@@ -233,7 +268,9 @@ case "$verb" in
       _a="$(cat "$STATE/.phonecap-ask-$(date +%Y%m%d)" 2>/dev/null || echo 0)"
       _r="$(cat "$STATE/.phonecap-reel-$(date +%Y%m%d)" 2>/dev/null || echo 0)"
       printf 'phone today: ask %s/%s · reel %s/%s\n' "$_a" "$CAP_ASK" "$_r" "$CAP_REEL"
-    } | emit
+    } > "$_o"
+    emit < "$_o"
+    rm -f "$_o" 2>/dev/null || true; _o=""
     log_or_deny "OK status rc=0"
     ;;
 
@@ -243,9 +280,10 @@ case "$verb" in
     case "$scope" in research|fitness|company) : ;; *) deny "scope" "scope must be research|fitness|company";; esac
     validate_payload "${rest#"$scope" }"
     conc_acquire || deny "busy" "factory line busy (2 concurrent max) — try again in a moment"
-    cap_take ask "$CAP_ASK" day || deny "cap-ask" "ask cap reached today"
+    cap_or_deny ask "$CAP_ASK" day "ask cap reached today"
     log_or_deny "RUN ask scope=$scope $(p_meta)"
-    _o="$(mktemp "$STATE/.pho.XXXXXX")" ; _e="$(mktemp "$STATE/.phe.XXXXXX")"
+    _o="$(mktemp "$STATE/.pho.XXXXXX" 2>/dev/null)" || deny "tmp" "factory storage trouble — try again shortly"
+    _e="$(mktemp "$STATE/.phe.XXXXXX" 2>/dev/null)" || deny "tmp" "factory storage trouble — try again shortly"
     rc=0
     MXR_TIMEOUT_S=45 run_bounded 50 "$MXR_BIN" ask --scope "$scope" -- "$payload" >"$_o" 2>"$_e" || rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -283,9 +321,10 @@ case "$verb" in
     [[ "$jid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || deny "jid" "not a job id (use the full id from the still-thinking message)"
     jid_known "$jid" || deny "jid-foreign" "not a phone-issued job"
     conc_acquire || deny "busy" "factory line busy (2 concurrent max) — try again in a moment"
-    cap_take get "$CAP_GET" day || deny "cap-get" "get cap reached today"
+    cap_or_deny get "$CAP_GET" day "get cap reached today"
     log_or_deny "RUN get jid=${jid:0:13}"
-    _o="$(mktemp "$STATE/.pho.XXXXXX")" ; _e="$(mktemp "$STATE/.phe.XXXXXX")"
+    _o="$(mktemp "$STATE/.pho.XXXXXX" 2>/dev/null)" || deny "tmp" "factory storage trouble — try again shortly"
+    _e="$(mktemp "$STATE/.phe.XXXXXX" 2>/dev/null)" || deny "tmp" "factory storage trouble — try again shortly"
     rc=0
     run_bounded 30 "$MXR_BIN" get --reply "$jid" >"$_o" 2>"$_e" || rc=$?
     case "$rc" in
@@ -319,7 +358,7 @@ case "$verb" in
 
   reel)
     validate_payload "$rest"
-    cap_take reel "$CAP_REEL" day || deny "cap-reel" "reel cap reached today (5 paid renders/day)"
+    cap_or_deny reel "$CAP_REEL" day "reel cap reached today (5 paid renders/day)"
     # HONEST STUB (P2 plan): mx-engine is not deployed on the factory yet. No dispatch —
     # no ledger dead-jobs, no paid spend. Flip: bounded submit-and-return per the README
     # (and jid_record the submitted id so Get Answer can fetch it).

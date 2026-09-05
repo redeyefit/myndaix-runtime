@@ -125,6 +125,10 @@ reset; out="$(run 'ask research')";                   printf '%s' "$out" | grep 
 reset; out="$(run 'ask research    ')";               printf '%s' "$out" | grep -q 'denied' && ok "whitespace payload denied" || bad "ws: $out"
 reset; out="$(run 'ask research --version')";         printf '%s' "$out" | grep -q "denied: payload must not start with '-'" && ok "leading dash denied" || bad "dash: $out"
 reset; out="$(run "$(printf 'ask research bad\tchar')")"; printf '%s' "$out" | grep -q 'denied: control' && ok "control char REJECTED (not stripped)" || bad "cntrl: $out"
+# LF is the one control byte a line-oriented grep can NEVER see (it IS the separator) —
+# the gate is bytewise now (audit item 3)
+reset; out="$(run "$(printf 'ask research line\nsmuggled second line')")"; printf '%s' "$out" | grep -q 'denied: control' && ok "embedded LF REJECTED (bytewise gate)" || bad "LF: $out"
+reset; out="$(run "$(printf 'ask research trailing\r')")"; printf '%s' "$out" | grep -q 'denied: control' && ok "embedded CR REJECTED" || bad "CR: $out"
 reset; out="$(run "ask research $(head -c 2100 /dev/zero | tr '\0' 'x')")"; printf '%s' "$out" | grep -q 'denied: payload over' && ok "oversize denied" || bad "oversize: $out"
 no_dispatch && ok "no denied case reached mxr" || bad "a denied case dispatched: $(cat "$ARGV")"
 
