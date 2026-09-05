@@ -114,26 +114,30 @@ def test_repo_has_no_space_bearing_tracked_paths():
     # -z + quotePath=false (r4 #1): default git C-quotes non-ASCII bytes into pure-ASCII
     # octal escapes, which would make the isspace() guard a no-op for the exact NBSP-class
     # paths it exists to reject. NUL-split output carries the REAL bytes.
+    import os
     try:
-        # encoding pinned (r5 #2): text=True alone decodes via the locale — a C/POSIX CI
-        # locale would UnicodeDecodeError on exactly the non-ASCII bytes this test hunts
+        # BYTES mode (r6 #1: text + errors='replace' folds bad bytes to U+FFFD — not a
+        # space — corrupting exactly the data under test); LC_ALL=C (r6 #3) pins git's
+        # stderr to English so the skip condition below is locale-proof.
         res = subprocess.run(
             ["git", "-c", "core.quotePath=false", "-C", str(root), "ls-files", "-z"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
-    except OSError:                            # r4 #3 + r5 #3: no git, or git not executable
-        ok(True, "skipped: git unavailable")
+            capture_output=True, env={**os.environ, "LC_ALL": "C"})
+    except (FileNotFoundError, PermissionError):   # r6 #2: ONLY the git-unavailable shapes
+        ok(True, "skipped: git unavailable")       # skip; ENOMEM/EMFILE etc. propagate loudly
         return
     if res.returncode != 0:
-        # skip ONLY the expected de-linked-snapshot shape — BOTH conditions (r5 #1: git
-        # exits 128 for dubious-ownership/corrupt-index too; `or` was fail-open); any
-        # other git failure is a real environment problem and must fail loudly
-        if res.returncode == 128 and "not a git repository" in (res.stderr or ""):
+        # skip ONLY the de-linked-snapshot shape — rc 128 AND the (now locale-stable)
+        # message (r5 #1: rc 128 alone also covers dubious-ownership/corrupt-index)
+        if res.returncode == 128 and b"not a git repository" in (res.stderr or b""):
             ok(True, "skipped: not a git working tree (de-linked snapshot)")
             return
-        ok(False, f"git ls-files failed unexpectedly (rc={res.returncode}): {(res.stderr or '').strip()[:120]}")
+        ok(False, f"git ls-files failed unexpectedly (rc={res.returncode}): {(res.stderr or b'').decode('utf-8', 'replace').strip()[:120]}")
         return
-    # any Unicode whitespace, matching str.split()'s delimiter set exactly (r3 #1)
-    spaced = [p for p in res.stdout.split("\0") if p and any(ch.isspace() for ch in p)]
+    # surrogateescape: undecodable bytes survive as lone surrogates (isspace False) instead
+    # of folding to U+FFFD; a real UTF-8 NBSP still decodes to U+00A0 and is caught.
+    # Delimiter set = str.split()'s exactly (r3 #1).
+    paths = [b.decode("utf-8", "surrogateescape") for b in res.stdout.split(b"\0") if b]
+    spaced = [p for p in paths if any(ch.isspace() for ch in p)]
     ok(spaced == [], f"whitespace-bearing tracked paths break trigger alternatives: {spaced[:3]}")
 
 
