@@ -36,6 +36,8 @@ DSN = os.environ.get("MYNDAIX_DSN") or "postgresql://localhost/runtime"
 #   MXR_JOB_DEAD        job reached terminal 'dead'
 #   MXR_NO_SUCH_JOB     unknown job id / prefix
 #   MXR_DONE_EMPTY      job done but produced no reply body (terminal, not pending)
+#   MXR_DELIVERY_ERR    reply exists but the delivery bookkeeping hit an anomaly —
+#                       the body stays retrievable via `mxr get --reply`
 # Removing or renaming one is a CONTRACT change: update the wrapper + its tests first.
 
 
@@ -162,20 +164,32 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
                 # (the CAS fails, the in-memory status stays 'pending'). Re-read the DB
                 # truth ONCE for the authoritative row: sent -> idempotent re-display;
                 # leased -> genuinely in-flight, the sender's to deliver.
+                # Anomalies here exit MARKER + rc 1 like every other terminal path
+                # (r14 #2: a raw traceback carries no marker and no actionable message)
+                # — the reply itself stays retrievable via `mxr get --reply`.
+                def _delivery_err(msg: str) -> tuple[int, bool]:
+                    print("MXR_DELIVERY_ERR", file=sys.stderr)
+                    print(f"{msg} — reply retrievable via `mxr get --reply {jid}`",
+                          file=sys.stderr)
+                    return 1, True
                 st2 = await led.get_status(jid)
                 if not st2:
                     # r12 #3 / r13 #1: get_status returns {} (not None) for an unknown id
                     # — a vanished job mid-call is anomalous; fail loudly, never dress a
                     # DB failure up as "row leased"
-                    raise RuntimeError(f"re-read of job {jid} came back empty mid-delivery")
+                    return _delivery_err(f"re-read of job {jid} came back empty mid-delivery")
                 nid = newest.get("id")
+                if nid is None:
+                    # r14 #1: a snapshot row without an id is its OWN anomaly — not the
+                    # misleading "row None vanished"
+                    return _delivery_err(f"outbound snapshot row has no id for job {jid}")
                 # r12 #2: never let two missing ids stringify into a 'None'=='None' match
                 cur = next((o2 for o2 in (st2.get("outbound") or [])
-                            if nid is not None and str(o2.get("id")) == str(nid)), None)
+                            if str(o2.get("id")) == str(nid)), None)
                 if cur is None:
                     # r13 #2: job present but the authoritative row GONE is the same
                     # anomaly class — same loud failure, never silently-stale state
-                    raise RuntimeError(f"outbound row {nid} vanished from job {jid} mid-delivery")
+                    return _delivery_err(f"outbound row {nid} vanished from job {jid} mid-delivery")
                 newest = {**newest, **cur}   # full row (r12 #4): a sender may have
                 # written body alongside status — never fresh status over a stale body
             if newest["status"] == "sent":
