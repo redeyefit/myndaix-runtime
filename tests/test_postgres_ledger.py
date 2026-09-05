@@ -175,6 +175,33 @@ async def test_outbound_send_exactly_once(led: PostgresLedger) -> None:
     assert n == 1, f"provider_msg_id appears {n} times (double delivery)"
 
 
+# -- invariant 4c: inline (sync) delivery tombstones pending WITHOUT a lease ----
+# phone r7 #1: the CLI's sync-reply print IS the delivery, but it used to call the
+# transport verb mark_outbound_sent, whose leased-only CAS silently no-opped — the row
+# sat pending forever (latent duplicate delivery the day a cli sender ships).
+async def test_outbound_inline_sent_tombstones_pending(led: PostgresLedger) -> None:
+    await _truncate(led)
+    ev = await led.ingest_inbound(_env("ob-3"), "hi")
+    jid = await led.submit_job(to_agent="kilabz", prompt="hi", inbound_event_id=ev)
+    ob = await led.enqueue_outbound(jid, "reply")
+    await led.mark_outbound_sent_inline(ob, f"cli-{ob}")
+    async with led._pool.acquire() as con:
+        st = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob)
+    assert st == "sent", f"inline tombstone missed: status={st}"
+    assert await led.claim_outbound("terminal") is None, \
+        "tombstoned row must be invisible to senders"
+
+    # and the inline verb must NOT touch a row a transport already LEASED — delivery
+    # belongs to the sender; the inline call is a benign no-op there
+    ob2 = await led.enqueue_outbound(jid, "reply-2")
+    claimed = await led.claim_outbound("terminal")   # rows inherit the envelope's transport
+    assert claimed is not None and str(claimed["id"]) == str(ob2)
+    await led.mark_outbound_sent_inline(ob2, f"cli-{ob2}")
+    async with led._pool.acquire() as con:
+        st2 = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob2)
+    assert st2 == "leased", f"inline verb must no-op on a leased row, got {st2}"
+
+
 # -- invariant 5: a workspace_actor is NEVER auto-retried ----------------------
 async def test_workspace_actor_never_requeued(led: PostgresLedger) -> None:
     for trial in range(50):

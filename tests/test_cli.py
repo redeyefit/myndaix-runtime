@@ -449,8 +449,8 @@ def test_run_job_empty_body_is_done_empty():
             return {"status": "done",
                     "outbound": [{"id": "o1", "body": "", "status": "pending"}]}
 
-        async def mark_outbound_sent(self, oid, pid):
-            pass
+        async def mark_outbound_sent_inline(self, oid, pid):
+            self.tombstoned = getattr(self, "tombstoned", []) + [str(oid)]
 
         async def close(self):
             pass

@@ -134,9 +134,11 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
             # no-answer state as a missing row, not a silent rc-0 success.
             if reply:
                 print(_clean_reply(reply))
-            for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
+            for o in (st.get("outbound") or []):       # tombstone: the sync print above IS delivery
                 if o["status"] == "pending":
-                    await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
+                    # inline verb, not the transport one (r7 #1): mark_outbound_sent's
+                    # leased-only CAS silently no-opped on these pending rows forever
+                    await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}")
             if not reply:
                 # done-with-no-body is TERMINAL no-answer, not success-with-silence — the
                 # same state get --reply marks; both paths share one contract (review r5 #4).

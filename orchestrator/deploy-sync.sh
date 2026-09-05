@@ -111,7 +111,11 @@ do_apply(){
   # refresh the tracking ref when deploying from a remote. Fetch failure is FATAL in --apply (review
   # r4): silently deploying a stale/rolled-back local origin/main is the exact silent-non-deploy this
   # tool exists to prevent. (--preflight tolerates it — it's advisory.)
-  case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref" ;; esac
+  # explicit DESTINATION refspec (r7 #2): a bare `fetch origin main` lands only in
+  # FETCH_HEAD under non-wildcard fetch configs, leaving refs/remotes/origin/main stale —
+  # the resolve below would then bless old code. No stderr suppression: fetch warnings
+  # are exactly the signal this guard wants. Non-ff (rolled-back origin) fails -> die.
+  case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin "main:refs/remotes/origin/main" || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
   # version-skew guard (review r5 #2, hardened r6 P1): the phone wrapper's marker contract
   # runs against the CHECKED-OUT tree's cli.py — deploying a ref that advanced past the
