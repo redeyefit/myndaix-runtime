@@ -1,7 +1,7 @@
 ---
 name: bash-env-trampoline
 description: An in-script env scrub cannot protect its own interpreter
-path_trigger: "tools/*.sh substrate/*.sh orchestrator/*.sh orchestrator/phone/*.sh"
+path_trigger: "tools/*.sh substrate/*.sh substrate/lab/*.sh orchestrator/*.sh orchestrator/phone/*.sh orchestrator/librarian/*.sh orchestrator/librarian/hooks/*.sh orchestrator/librarian/keepalive/*.sh"
 ---
 
 bash sources `$BASH_ENV` (non-interactive) and `$ENV` (POSIX mode) during INTERPRETER

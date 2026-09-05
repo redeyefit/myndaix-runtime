@@ -64,6 +64,10 @@ def test_path_to_glob_and_candidate():
     ok(C.candidate_glob("a/\r/b.py") is None, "carriage-return segment -> None")
     ok(C.candidate_glob("a/x\ty/b.py") is None, "tab in a segment -> None (raw-path C0 check)")
     ok(C.candidate_glob("\nsrc/a.py") is None, "leading newline -> None (checked before .strip())")
+    # #125 r2 #3: whitespace is the trigger-ALTERNATIVES delimiter — a space-bearing path
+    # is unrepresentable in the format and must never be proposed
+    ok(C.candidate_glob("docs/release notes/x.md") is None, "space in dir segment -> None (alt-delimiter)")
+    ok(C.candidate_glob("docs/my file.md") is None, "space in filename -> None (alt-delimiter)")
     for p in ["x.py", "a/b/c.sql", "Dockerfile"]:
         g = C.candidate_glob(p)
         ok(g is None or not M.is_banned_trigger(g), f"candidate_glob({p!r}) None or non-banned")

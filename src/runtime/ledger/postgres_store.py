@@ -1243,17 +1243,21 @@ class PostgresLedger:
             trig = r["path_trigger"]
             if skillmatch.is_banned_trigger(trig):
                 continue  # belt: a banned trigger should never have been indexed
-            if not any(skillmatch.seg_match(trig, p) for p in changed_paths):
+            # rank by the alternative that MATCHED, never the whole trigger (#125 r2
+            # HIGH-1: a decorative specific alternative must not inflate a broad match)
+            ms = skillmatch.match_specificity(trig, changed_paths)
+            if ms is None:
                 continue
             if hashlib.sha256(r["body"].encode()).hexdigest() != r["body_sha"]:
                 drift.append(r["name"])
                 continue
-            cand.append(r)
-        cand.sort(key=lambda r: (
-            r["last_used_at"] is not None,                      # NULL (new) sorts first
-            -skillmatch.specificity(r["path_trigger"]),         # more specific first
-            -(r["last_used_at"].timestamp() if r["last_used_at"] else 0.0),  # more recent first
+            cand.append((r, ms))
+        cand.sort(key=lambda rm: (
+            rm[0]["last_used_at"] is not None,                  # NULL (new) sorts first
+            -rm[1],                                             # more specific MATCH first
+            -(rm[0]["last_used_at"].timestamp() if rm[0]["last_used_at"] else 0.0),  # recent first
         ))
+        cand = [r for r, _ in cand]
         return {"skills": [{"name": r["name"], "body": r["body"]} for r in cand[:2]],
                 "drift": drift}
 

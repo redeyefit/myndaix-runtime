@@ -1,7 +1,7 @@
 ---
 name: atomic-stale-eviction
 description: Prefer kernel flock; mv-evict stale locks, never rm-recreate
-path_trigger: "tools/*.sh substrate/*.sh orchestrator/*.sh orchestrator/phone/*.sh"
+path_trigger: "tools/*.sh substrate/*.sh substrate/lab/*.sh orchestrator/*.sh orchestrator/phone/*.sh orchestrator/librarian/*.sh orchestrator/librarian/hooks/*.sh orchestrator/librarian/keepalive/*.sh"
 ---
 
 Shell advisory locks come in three strengths — the phone surface walked all three in
@@ -18,12 +18,17 @@ one PR, so pin the ladder:
 3. kernel flock on a permanent lock FILE: ELIMINATES the class. A crashed holder's fd
    dies with its process, so there is no stale state to evict — no reaper, no eviction
    threshold to tune or drift. macOS has no flock(1); perl (always present) is the
-   house route: a session-held lock lives on a bash-held fd (`exec 8>>file` + perl
-   fdopen ">>&=" + LOCK_NB); a scoped critical section execs the child from perl while
-   HOLDING the locked fd — and must CLEAR FD_CLOEXEC first, or perl closes the fd (and
-   releases the lock) at execve and the section runs unlocked (r4 MAJOR-1, probe-proven).
+   house route. The lock lives on the OPEN FILE DESCRIPTION and releases only when the
+   LAST fd referencing it closes — which cuts both ways:
+   - bash-held session lock (`exec 8>>file` + perl fdopen ">>&=" + LOCK_NB): bash keeps
+     a reference, so children exec-closing THEIR copies never releases it. Safe.
+   - perl-opens-then-execs wrapper (perl is the ONLY holder): execve closes perl's
+     CLOEXEC'd fd = the last reference = lock RELEASED, section runs unlocked
+     (mxr-phone r4 MAJOR-1, probe-proven both directions). Must CLEAR FD_CLOEXEC so
+     the exec'd child inherits the fd and carries the lock.
 
 Flag: any `rm -rf <lockpath>` on a staleness branch; mv-eviction presented as fully
-atomic; NEW lock code choosing mkdir+reaper where flock fits; a perl flock wrapper that
-execs without clearing FD_CLOEXEC; pid files written with `|| true` where write failure
-still counts as acquisition.
+atomic; NEW lock code choosing mkdir+reaper where flock fits; a perl flock wrapper
+where perl is the SOLE fd holder execing without clearing FD_CLOEXEC (a second live
+holder makes the clear unnecessary — check who holds the description before flagging);
+pid files written with `|| true` where write failure still counts as acquisition.

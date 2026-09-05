@@ -89,6 +89,34 @@ def test_trigger_alternatives():
        "an all-literal alternative dominates a broad sibling")
 
 
+# -- match_specificity: rank by the alternative that MATCHED (#125 r2 HIGH-1) ---------
+def test_match_specificity_no_decorative_inflation():
+    # the gaming vector: broad alt matches, decorative specific alt does not — the rank
+    # must be the BROAD alt's (0), not the decoration's (3)
+    ok(M.match_specificity("*.md decorative/very/specific.md", ["README.md"]) == 0,
+       "decorative specific alternative cannot inflate a broad match")
+    ok(M.match_specificity("*.md docs/plan.md", ["docs/plan.md"]) == 2,
+       "when the specific alternative genuinely matches, it ranks")
+    ok(M.match_specificity("*.md docs/plan.md", ["README.md", "docs/plan.md"]) == 2,
+       "multi-path: best MATCHING alternative wins")
+    ok(M.match_specificity("tools/*.sh", ["docs/x.md"]) is None,
+       "no alternative matches -> None (caller skips the skill)")
+    ok(M.match_specificity("src/*.py src/runtime/*.py", ["src/runtime/cli.py"]) == 2,
+       "deeper matching alternative outranks the shallower one")
+
+
+# -- format constraint: whitespace-delimited alternatives cannot represent spaced paths;
+# -- pin that the TRACKED TREE has none (if this ever fails, the format needs a
+# -- structured delimiter BEFORE such a path lands — #125 r2 #3) -----------------------
+def test_repo_has_no_space_bearing_tracked_paths():
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    out = subprocess.run(["git", "-C", str(root), "ls-files"],
+                         capture_output=True, text=True, check=True).stdout
+    spaced = [p for p in out.splitlines() if " " in p]
+    ok(spaced == [], f"space-bearing tracked paths break trigger alternatives: {spaced[:3]}")
+
+
 # -- scan_injection: the FALSE-POSITIVE guard (descriptive review skills stay CLEAN) --
 def test_descriptive_review_skills_are_clean():
     # These are realistic REVIEW-skill bodies — they describe what to check, using words
