@@ -128,7 +128,7 @@ def test_repo_has_no_space_bearing_tracked_paths():
     if res.returncode != 0:
         # skip ONLY the de-linked-snapshot shape — rc 128 AND the (now locale-stable)
         # message (r5 #1: rc 128 alone also covers dubious-ownership/corrupt-index)
-        if res.returncode == 128 and b"not a git repository" in (res.stderr or b""):
+        if res.returncode == 128 and (res.stderr or b"").lstrip().startswith(b"fatal: not a git repository"):
             ok(True, "skipped: not a git working tree (de-linked snapshot)")
             return
         ok(False, f"git ls-files failed unexpectedly (rc={res.returncode}): {(res.stderr or b'').decode('utf-8', 'replace').strip()[:120]}")
