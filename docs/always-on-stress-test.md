@@ -38,16 +38,23 @@ the acceptance gate for the whole "Mini is home" thesis.
       no DIVERGENT while evaluating nothing. Failures accumulate into ONE final assert
       (a mid-block `false` doesn't halt a pasted interactive block):
       ```
-      rc=0; out="$(bash substrate/liveness-canary.sh 2>&1)" || rc=$?
-      printf '%s\n' "$out"
-      fail=0
-      [ "$rc" -eq 0 ] || { echo "PREFLIGHT FAIL: canary exited rc=$rc (config/env problem — not a pass)"; fail=1; }
-      printf '%s\n' "$out" | grep -q "liveness: all declared jobs alive" \
-        || { echo "PREFLIGHT FAIL: no all-alive signal (divergence, sleep/wake grace-skip, or aborted run — read the output above; re-run after a grace-skip)"; fail=1; }
-      # plus the ONE long-lived daemon, where 'running' IS the healthy state:
-      launchctl print "gui/$(id -u)/ai.myndaix.runtime" | grep -q "state = running" \
-        || { echo "PREFLIGHT FAIL: serve pool not running"; fail=1; }
-      [ "$fail" -eq 0 ]   # THE gate — last line, real exit status even when pasted interactively
+      (
+        fail=0
+        # reconcile-grace pre-gate: the canary SILENTLY grace-skips any job whose plist
+        # changed within its max gap (~30min) and still prints all-alive — a pass right
+        # after a deploy proves nothing. Refuse to run inside the window:
+        recent="$(find "$HOME/Library/LaunchAgents" -name 'ai.myndaix.*.plist' -mmin -30 2>/dev/null)"
+        [ -z "$recent" ] || { echo "PREFLIGHT FAIL: plists changed <30min ago (grace window — wait it out):"; printf '%s\n' "$recent"; fail=1; }
+        rc=0; out="$(bash substrate/liveness-canary.sh 2>&1)" || rc=$?
+        printf '%s\n' "$out"
+        [ "$rc" -eq 0 ] || { echo "PREFLIGHT FAIL: canary exited rc=$rc (config/env problem — not a pass)"; fail=1; }
+        printf '%s\n' "$out" | grep -q "liveness: all declared jobs alive" \
+          || { echo "PREFLIGHT FAIL: no all-alive signal (divergence, sleep/wake grace-skip, or aborted run — read above; re-run after a grace-skip)"; fail=1; }
+        # plus the ONE long-lived daemon, where 'running' IS the healthy state:
+        launchctl print "gui/$(id -u)/ai.myndaix.runtime" | grep -q "state = running" \
+          || { echo "PREFLIGHT FAIL: serve pool not running"; fail=1; }
+        [ "$fail" -eq 0 ]   # THE gate — last line, real exit status even when pasted interactively
+      )   # subshell: rc/out/fail/recent never leak into the operator's shell
       ```
 
 Record each cell PASS/FAIL + the observed number/behavior. A FAIL is a finding, not a
