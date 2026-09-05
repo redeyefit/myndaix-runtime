@@ -9,6 +9,7 @@ SYNC="$DIR/deploy-sync.sh"
 REF="HEAD"                                            # committed content, branch-independent
 SCRATCH="$(mktemp -d)"
 export DEPLOY_SYNC_DEST="$SCRATCH"
+export DEPLOY_SYNC_BIN="$SCRATCH/bin"                 # the phone wrapper's forced-command home
 trap 'rm -rf "$SCRATCH"' EXIT
 
 PASS=0; FAIL=0
@@ -21,6 +22,12 @@ echo "== --apply into an empty dest =="
 [[ -x "$SCRATCH/play-fix.sh" ]] && ok "deployed file is executable" || bad "not executable"
 [[ ! -L "$SCRATCH/play-fix.sh" ]] && ok "play-fix.sh is a REGULAR file (not symlink)" || bad "symlink!"
 [[ -s "$SCRATCH/.deployed-sha" ]] && ok "stamp .deployed-sha written" || bad "no stamp"
+# the phone wrapper deploys under a DIFFERENT dest dir + basename (phone-audit item 7)
+[[ -f "$SCRATCH/bin/mxr-phone" && -x "$SCRATCH/bin/mxr-phone" && ! -L "$SCRATCH/bin/mxr-phone" ]] \
+  && ok "mxr-phone deployed to bin/ as an executable regular file" || bad "mxr-phone missing/irregular"
+want_ph="$(git -C "$DIR/.." rev-parse "$REF:orchestrator/phone/mxr-phone.sh")"
+have_ph="$(git -C "$DIR/.." hash-object "$SCRATCH/bin/mxr-phone")"
+[[ "$want_ph" == "$have_ph" ]] && ok "mxr-phone hash matches HEAD blob" || bad "mxr-phone hash mismatch"
 
 echo "== deployed content == committed blob =="
 want="$(git -C "$DIR/.." rev-parse "$REF:orchestrator/play-fix.sh")"
@@ -33,6 +40,11 @@ echo "== --check on a clean deploy =="
 echo "== --check DETECTS drift (exit 1) =="
 printf '\n# tampered\n' >> "$SCRATCH/play-fix.sh"
 if "$SYNC" --check "$REF" >/dev/null 2>&1; then bad "check must fail on drift"; else ok "check exits non-zero on drift"; fi
+
+echo "== --check DETECTS phone-wrapper drift too =="
+"$SYNC" --apply "$REF" >/dev/null 2>&1
+printf '\n# tampered\n' >> "$SCRATCH/bin/mxr-phone"
+if "$SYNC" --check "$REF" >/dev/null 2>&1; then bad "check must flag a drifted mxr-phone"; else ok "drifted mxr-phone -> check exits non-zero"; fi
 
 echo "== --apply HEALS drift + backs up =="
 "$SYNC" --apply "$REF" >/dev/null 2>&1 && ok "re-apply exits 0" || bad "re-apply failed"

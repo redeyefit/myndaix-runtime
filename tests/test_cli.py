@@ -79,8 +79,9 @@ def test_cli_get_routes_to_get_job():
     # `mxr get <id>` is special-cased above the flat submit parser (D1 artifact read)
     captured = {}
 
-    async def fake_get(job_id):
+    async def fake_get(job_id, reply=False):
         captured["job_id"] = job_id
+        captured["reply"] = reply
         return 0
 
     orig = cli.get_job
@@ -89,6 +90,10 @@ def test_cli_get_routes_to_get_job():
         rc = cli.main(["get", "11111111-2222-3333-4444-555555555555"])
         assert rc == 0
         assert captured["job_id"] == "11111111-2222-3333-4444-555555555555"
+        assert captured["reply"] is False                    # default: status JSON
+        rc = cli.main(["get", "--reply", "11111111-2222-3333-4444-555555555555"])
+        assert rc == 0
+        assert captured["reply"] is True
     finally:
         cli.get_job = orig
 
@@ -211,6 +216,48 @@ def test_cli_get_full_uuid_skips_resolver():
         restore()
 
 
+# ---- `mxr get --reply` (phone-tailnet surface: recover a late reply) --------
+
+class _FakeLedgerReply(_FakeLedger):
+    def __init__(self, ids, outbound):
+        super().__init__(ids)
+        self.outbound = outbound
+
+    async def get_status(self, jid):
+        self.status_asked = str(jid)
+        return {"id": str(jid), "status": "done", "to_agent": "librarian",
+                "outbound": self.outbound}
+
+
+def test_cli_get_reply_prints_latest_body():
+    import asyncio, contextlib, io
+    full = "11111111-2222-3333-4444-555555555555"
+    fake = _FakeLedgerReply([full], [{"body": "first"}, {"body": "the cited answer"}])
+    restore = _patch_ledger(fake)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = asyncio.run(cli.get_job(full, reply=True))
+        assert rc == 0
+        assert buf.getvalue().strip() == "the cited answer"   # LATEST outbound wins
+    finally:
+        restore()
+
+
+def test_cli_get_reply_none_yet_exits_3():
+    # job known, no outbound body yet -> exit 3 (distinct from 1 unknown / 2 malformed),
+    # so the phone wrapper can say "still thinking" instead of lying or erroring
+    import asyncio
+    full = "11111111-2222-3333-4444-555555555555"
+    for empty in ([], None, [{"body": None}]):
+        fake = _FakeLedgerReply([full], empty)
+        restore = _patch_ledger(fake)
+        try:
+            assert asyncio.run(cli.get_job(full, reply=True)) == 3
+        finally:
+            restore()
+
+
 # ---- --staged-workdir + `mxr review` routing (mxr-review-context PR-1) ------
 
 def test_cli_staged_workdir_threads_to_context():
@@ -327,6 +374,137 @@ def test_resolve_sync_wait_malformed_env_falls_to_profile():
     # a broken export must not crash NOR silently pin 180 under a 900s exec cap
     assert _with_env("MXR_TIMEOUT_S", "not-a-number",
                      lambda: cli._resolve_sync_wait("kilabz")) == 960.0
+
+
+def test_get_reply_marker_carries_terminality():
+    # Marker contract (phone-audit fold): rc stays 3 for EVERY no-body case; the stderr
+    # MARKER is what tells a script caller whether the job can still answer. failed/dead
+    # -> MXR_JOB_FAILED/DEAD, done-with-no-body -> MXR_DONE_EMPTY, genuinely pending ->
+    # no marker at all.
+    import asyncio
+    import contextlib
+    import io
+    full = "deadbeef-0000-4000-8000-000000000001"
+    for status, marker in (("failed", "MXR_JOB_FAILED"), ("dead", "MXR_JOB_DEAD"),
+                           ("done", "MXR_DONE_EMPTY"), ("queued", None)):
+        fake = _FakeLedger([full])
+
+        async def _st(jid, _s=status):
+            return {"id": str(jid), "status": _s, "outbound": []}
+        fake.get_status = _st
+        restore = _patch_ledger(fake)
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert asyncio.run(cli.get_job(full, reply=True)) == 3
+            lines = err.getvalue().splitlines()
+            if marker:
+                assert marker in lines, f"{status}: missing {marker} in {lines}"
+            else:
+                assert not any(ln.startswith("MXR_") for ln in lines), \
+                    f"pending must emit NO marker, got {lines}"
+        finally:
+            restore()
+
+
+def test_get_unknown_job_emits_no_such_job_marker():
+    # rc=1 alone is ambiguous (a down ledger also exits 1) — the marker is the ONLY
+    # authoritative "this id does not exist" signal a script caller may trust.
+    import asyncio
+    import contextlib
+    import io
+    full = "deadbeef-0000-4000-8000-000000000001"
+    fake = _FakeLedger([full])
+
+    async def _none(jid):
+        return None
+    fake.get_status = _none
+    restore = _patch_ledger(fake)
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert asyncio.run(cli.get_job(full, reply=True)) == 1
+        assert "MXR_NO_SUCH_JOB" in err.getvalue().splitlines()
+    finally:
+        restore()
+
+
+def test_run_job_empty_body_is_done_empty():
+    # r6 P2: `body text NOT NULL` permits "" — an empty-string reply is the SAME terminal
+    # no-answer state as a missing outbound row (rc 1 + MXR_DONE_EMPTY), never a silent
+    # rc-0 success. Keeps sync ask and get --reply on one contract.
+    import asyncio
+    import contextlib
+    import io
+    import uuid as _uuid
+
+    class _L:
+        async def ingest_inbound(self, env, task):
+            return _uuid.UUID("00000000-0000-4000-8000-000000000000")
+
+        async def submit_job(self, **kw):
+            return _uuid.UUID("deadbeef-0000-4000-8000-000000000001")
+
+        async def get_status(self, jid):
+            return {"status": "done",
+                    "outbound": [{"id": "o1", "body": "", "status": "pending"}]}
+
+        async def mark_outbound_sent_inline(self, oid, pid):
+            self.tombstoned = getattr(self, "tombstoned", []) + [str(oid)]
+
+        async def close(self):
+            pass
+
+    restore = _patch_ledger(_L())
+    try:
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc, terminal = asyncio.run(cli.run_job("recon", "q", timeout_s=5))
+        assert rc == 1 and terminal is True
+        assert "MXR_DONE_EMPTY" in err.getvalue().splitlines()
+        assert out.getvalue() == ""                       # no blank line masquerading as a reply
+    finally:
+        restore()
+
+
+def test_marker_safe_neutralizes_forged_marker_lines():
+    # r5 #1: agent failure text goes to stderr — the MARKER channel — so an interior
+    # agent-authored line reading exactly like a reserved marker must lose its
+    # line-anchor (indented by one space), while ordinary text passes untouched.
+    assert cli._marker_safe("boom\nMXR_SYNC_TIMEOUT\ntail") == "boom\n MXR_SYNC_TIMEOUT\ntail"
+    assert cli._marker_safe("plain error text") == "plain error text"
+    assert cli._marker_safe("MXR_JOB_FAILED") == " MXR_JOB_FAILED"   # first-line forgery too
+    assert cli._marker_safe("has MXR_JOB_FAILED mid-line") == "has MXR_JOB_FAILED mid-line"
+
+
+def test_dsn_empty_env_falls_back():
+    # r3 MED-2: an exported-but-EMPTY MYNDAIX_DSN (env -i trampoline artifact) must fall
+    # back to the default like an absent one — `or`, not a get() default.
+    import importlib
+    import os
+    old = os.environ.get("MYNDAIX_DSN")
+    os.environ["MYNDAIX_DSN"] = ""
+    try:
+        importlib.reload(cli)
+        assert cli.DSN == "postgresql://localhost/runtime"
+    finally:
+        if old is None:
+            os.environ.pop("MYNDAIX_DSN", None)
+        else:
+            os.environ["MYNDAIX_DSN"] = old
+        importlib.reload(cli)
+
+
+def test_clean_reply_strips_c1_keeps_unicode():
+    # r2 HIGH-3: C1 controls (U+0080–U+009F) are terminal-injectable (U+009B == CSI in
+    # C1-honoring emulators) and must be stripped like C0/DEL — but real Unicode above
+    # that range (accents, €, emoji) must survive: the strip is codepoint-, not byte-based.
+    assert cli._clean_reply("a\x9b31mEVIL") == "a31mEVIL"          # CSI stripped
+    assert cli._clean_reply("\x80\x85\x9f") == ""                  # full C1 range
+    assert cli._clean_reply("café €100 🚀") == "café €100 🚀"      # unicode intact
+    assert cli._clean_reply("tab\there\nline\rret") == "tab\there\nline\rret"
+    assert cli._clean_reply("esc\x1b[31m del\x7f") == "esc[31m del"  # C0/DEL still stripped
 
 
 if __name__ == "__main__":

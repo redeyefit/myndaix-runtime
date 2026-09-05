@@ -175,6 +175,35 @@ async def test_outbound_send_exactly_once(led: PostgresLedger) -> None:
     assert n == 1, f"provider_msg_id appears {n} times (double delivery)"
 
 
+# -- invariant 4c: inline (sync) delivery tombstones pending WITHOUT a lease ----
+# phone r7 #1: the CLI's sync-reply print IS the delivery, but it used to call the
+# transport verb mark_outbound_sent, whose leased-only CAS silently no-opped — the row
+# sat pending forever (latent duplicate delivery the day a cli sender ships).
+async def test_outbound_inline_sent_tombstones_pending(led: PostgresLedger) -> None:
+    await _truncate(led)
+    ev = await led.ingest_inbound(_env("ob-3"), "hi")
+    jid = await led.submit_job(to_agent="kilabz", prompt="hi", inbound_event_id=ev)
+    ob = await led.enqueue_outbound(jid, "reply")
+    n = await led.mark_outbound_sent_inline(ob, f"cli-{ob}")
+    assert n == 1, f"inline verb must report the transition (got {n})"   # r8 P3
+    async with led._pool.acquire() as con:
+        st = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob)
+    assert st == "sent", f"inline tombstone missed: status={st}"
+    assert await led.claim_outbound("terminal") is None, \
+        "tombstoned row must be invisible to senders"
+
+    # and the inline verb must NOT touch a row a transport already LEASED — delivery
+    # belongs to the sender; the inline call is a benign no-op there
+    ob2 = await led.enqueue_outbound(jid, "reply-2")
+    claimed = await led.claim_outbound("terminal")   # rows inherit the envelope's transport
+    assert claimed is not None and str(claimed["id"]) == str(ob2)
+    n2 = await led.mark_outbound_sent_inline(ob2, f"cli-{ob2}")
+    assert n2 == 0, f"leased-race must report 0 so the caller skips its print (got {n2})"  # r8 P3
+    async with led._pool.acquire() as con:
+        st2 = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob2)
+    assert st2 == "leased", f"inline verb must no-op on a leased row, got {st2}"
+
+
 # -- invariant 5: a workspace_actor is NEVER auto-retried ----------------------
 async def test_workspace_actor_never_requeued(led: PostgresLedger) -> None:
     for trial in range(50):
@@ -394,6 +423,39 @@ async def test_zz_migrate_heals_stale_schema(led: PostgresLedger) -> None:
     # idempotent: a second run against the now-current schema must be a clean no-op
     await led.migrate()
     assert await _has_context() == 1
+
+
+# -- regression: 0015 — outbound.created_at + its head-check index -------------
+# Named test_zz_* to run last: it drops outbound.created_at (and the index that
+# rides on it) mid-flight; migrate() restores both, so later tests never see the
+# hole. The index is also the substrate migration_head object — reconcile's
+# health gate probes it via to_regclass, so its absence after migrate() would
+# mean every deploy false-fails the gate.
+async def test_zz_migrate_restores_outbound_created_at(led: PostgresLedger) -> None:
+    async def _col() -> int:
+        async with led._pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name='outbound' AND column_name='created_at'")
+
+    async def _idx() -> bool:
+        async with led._pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT to_regclass('public.outbound_created_at_idx') IS NOT NULL")
+
+    async with led._pool.acquire() as con:
+        await con.execute("ALTER TABLE outbound DROP COLUMN IF EXISTS created_at CASCADE")
+    assert await _col() == 0, "precondition: created_at dropped"
+    assert not await _idx(), "precondition: index dropped with its column"
+
+    applied = await led.migrate()
+    assert "0015_outbound_created_at.sql" in applied, f"0015 not applied: {applied}"
+    assert await _col() == 1, "migrate() should restore outbound.created_at"
+    assert await _idx(), "migrate() should restore outbound_created_at_idx (the head-check object)"
+
+    # idempotent: second run is a clean no-op
+    await led.migrate()
+    assert await _col() == 1 and await _idx()
 
 
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------

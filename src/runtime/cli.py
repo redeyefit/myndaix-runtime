@@ -23,7 +23,42 @@ from runtime.contracts import TransportEnvelope
 from runtime.ledger.postgres_store import PostgresLedger
 from runtime.registry import REGISTRY
 
-DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
+# `or`, not a get() default: an exported-but-EMPTY MYNDAIX_DSN (an env -i trampoline
+# passing "${VAR:-}" through) must fall back too, not connect with "" (phone r3 MED-2).
+DSN = os.environ.get("MYNDAIX_DSN") or "postgresql://localhost/runtime"
+
+# ---- stable stderr markers (the script-caller contract; phone-audit marker fold) ----
+# One per line, machine-parseable, emitted ALONGSIDE the human prose — the prose stays
+# free to change, the markers do not. Script callers (orchestrator/phone/mxr-phone.sh)
+# match ONLY these, never the prose:
+#   MXR_SYNC_TIMEOUT    submit's sync wait expired (the job still runs in the ledger)
+#   MXR_JOB_FAILED      job reached terminal 'failed'
+#   MXR_JOB_DEAD        job reached terminal 'dead'
+#   MXR_NO_SUCH_JOB     unknown job id / prefix
+#   MXR_DONE_EMPTY      job done but produced no reply body (terminal, not pending)
+#   MXR_DELIVERY_ERR    reply exists but the delivery bookkeeping hit an anomaly —
+#                       the body stays retrievable via `mxr get --reply`
+# Removing or renaming one is a CONTRACT change: update the wrapper + its tests first.
+
+
+def _clean_reply(s: str) -> str:
+    """Terminal-injection belt (phone r1 M-10): agent reply bodies are untrusted output —
+    strip C0/C1 controls + DEL (keep \\t \\n \\r) before they hit an operator's terminal, the
+    same range play-review's clean() strips before the inbox. Applied to BOTH reply
+    prints (submit sync-reply and `get --reply`) so no caller receives raw ESC sequences."""
+    return "".join(
+        ch for ch in s
+        if ch in "\t\n\r" or (ch >= " " and ch != "\x7f" and not "\x80" <= ch <= "\x9f")
+    )
+
+
+def _marker_safe(s: str) -> str:
+    """Neutralize marker forgery in AGENT-CONTROLLED text bound for stderr (review r5 #1):
+    stderr is the marker channel, and script callers match markers line-anchored
+    (`^MXR_...$`), so an interior agent-authored line reading exactly like a reserved
+    marker would forge the contract. Indent any MXR_-leading line by one space — content
+    preserved for the human, the anchored match can no longer fire."""
+    return "\n".join((" " + ln) if ln.startswith("MXR_") else ln for ln in s.splitlines())
 
 
 def _resolve_sync_wait(agent: str) -> float:
@@ -90,23 +125,89 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
                 break
             await asyncio.sleep(0.3)
         else:
+            print("MXR_SYNC_TIMEOUT", file=sys.stderr)
             print("timed out (is the pool running? `python3 -m runtime.serve`)", file=sys.stderr)
             return 1, False
 
         if st["status"] == "done":
-            reply = next((o["body"] for o in (st.get("outbound") or [])), None)
-            if reply is not None:
-                print(reply)
-            for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
+            outs = st.get("outbound") or []
+            # CAS BEFORE print (r8 P1a), updating the IN-MEMORY status on each win
+            # (r10 #4 — a stale 'pending' in the snapshot made every later status check
+            # lie). flush=True (r8 P1b) so the reply never sits in a userspace buffer
+            # past the commit. ACCEPTED residual: a kill between CAS-commit and flush
+            # loses the terminal copy — but not the reply: `mxr get --reply` reads
+            # bodies status-independently, so the answer stays retrievable.
+            for o in outs:
                 if o["status"] == "pending":
-                    await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
+                    # inline verb, not the transport one (r7 #1): mark_outbound_sent's
+                    # leased-only CAS silently no-opped on these pending rows forever
+                    if await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}"):
+                        o["status"] = "sent"
+            # TRUTHY bodies only (r6 P2): `body text NOT NULL` permits "" — an empty
+            # string is the SAME terminal no-answer state as a missing row.
+            bodies = [o.get("body") for o in outs if o.get("body")]
+            if not bodies:
+                # done-with-no-body is TERMINAL no-answer, not success-with-silence — the
+                # same state get --reply marks; both paths share one contract (review r5 #4).
+                print("MXR_DONE_EMPTY", file=sys.stderr)
+                print("job done but produced no reply body", file=sys.stderr)
+                return 1, True
+            # THE reply is the NEWEST truthy body (the get --reply contract; outs is
+            # oldest->newest per migration 0015). Print it iff its row is now SENT —
+            # either this process won its CAS just above, or it was delivered before we
+            # looked (idempotent re-display). A leased/lost newest row is the sender's:
+            # printing an OLDER won body instead would hand the user a stale answer
+            # (r9 #3 + r10 #5 collapse into this one newest-row-authority rule).
+            newest = next(o for o in reversed(outs) if o.get("body"))
+            if newest["status"] != "sent":
+                # r11 #2: a sender can complete the row between our snapshot and the CAS
+                # (the CAS fails, the in-memory status stays 'pending'). Re-read the DB
+                # truth ONCE for the authoritative row: sent -> idempotent re-display;
+                # leased -> genuinely in-flight, the sender's to deliver.
+                # Anomalies here exit MARKER + rc 1 like every other terminal path
+                # (r14 #2: a raw traceback carries no marker and no actionable message)
+                # — the reply itself stays retrievable via `mxr get --reply`.
+                def _delivery_err(msg: str) -> tuple[int, bool]:
+                    print("MXR_DELIVERY_ERR", file=sys.stderr)
+                    print(f"{msg} — reply retrievable via `mxr get --reply {jid}`",
+                          file=sys.stderr)
+                    return 1, True
+                st2 = await led.get_status(jid)
+                if not st2:
+                    # r12 #3 / r13 #1: get_status returns {} (not None) for an unknown id
+                    # — a vanished job mid-call is anomalous; fail loudly, never dress a
+                    # DB failure up as "row leased"
+                    return _delivery_err(f"re-read of job {jid} came back empty mid-delivery")
+                nid = newest.get("id")
+                if nid is None:
+                    # r14 #1: a snapshot row without an id is its OWN anomaly — not the
+                    # misleading "row None vanished"
+                    return _delivery_err(f"outbound snapshot row has no id for job {jid}")
+                # r12 #2: never let two missing ids stringify into a 'None'=='None' match
+                cur = next((o2 for o2 in (st2.get("outbound") or [])
+                            if str(o2.get("id")) == str(nid)), None)
+                if cur is None:
+                    # r13 #2: job present but the authoritative row GONE is the same
+                    # anomaly class — same loud failure, never silently-stale state
+                    return _delivery_err(f"outbound row {nid} vanished from job {jid} mid-delivery")
+                newest = {**newest, **cur}   # full row (r12 #4): a sender may have
+                # written body alongside status — never fresh status over a stale body
+            if newest["status"] == "sent":
+                print(_clean_reply(newest["body"]), flush=True)
+            else:
+                print("the newest reply is owned by a transport sender (row leased) — "
+                      "body retrievable via `mxr get --reply`", file=sys.stderr)
             return 0, True
 
-        # failed/dead: surface WHY (the agent's error output, from the attempt)
+        # failed/dead: surface WHY (the agent's error output, from the attempt).
+        # _marker_safe: the marker channel is stderr, and this text is AGENT-CONTROLLED —
+        # an interior line reading exactly "MXR_SYNC_TIMEOUT" would satisfy a caller's
+        # line-anchored marker grep and flip a dead job back to pending (review r5 #1).
         err = next((a.get("text") for a in (st.get("attempts") or [])
                     if a.get("status") == "failed" and a.get("text")), None)
         if err:
-            print(err.strip(), file=sys.stderr)
+            print(_marker_safe(err.strip()), file=sys.stderr)
+        print(f"MXR_JOB_{st['status'].upper()}", file=sys.stderr)  # MXR_JOB_FAILED / MXR_JOB_DEAD
         print(f"(job {st['status']})", file=sys.stderr)
         return 1, True
     finally:
@@ -147,7 +248,7 @@ def _build_context(args: argparse.Namespace) -> dict:
     return ctx
 
 
-async def get_job(job_id: str) -> int:
+async def get_job(job_id: str, reply: bool = False) -> int:
     """`mxr get <job_id>` -> structured JSON of the job's status, including
     artifact_ref + base_sha. The fix stage (orchestrator/play-fix.sh) reads the
     diff artifact from HERE - via the ledger, parsed as JSON - NEVER by grepping a
@@ -173,6 +274,7 @@ async def get_job(job_id: str) -> int:
         if jid is None:
             matches = await led.resolve_job_prefix(prefix)
             if not matches:
+                print("MXR_NO_SUCH_JOB", file=sys.stderr)
                 print(f"no such job: {job_id}", file=sys.stderr)
                 return 1
             if len(matches) > 1:
@@ -183,8 +285,27 @@ async def get_job(job_id: str) -> int:
             jid = uuid.UUID(matches[0])
         st = await led.get_status(jid)
         if not st:
+            print("MXR_NO_SUCH_JOB", file=sys.stderr)
             print(f"no such job: {job_id}", file=sys.stderr)
             return 1
+        if reply:
+            # latest outbound body = the agent's reply. Ordering is GUARANTEED by the store
+            # (json_agg ... ORDER BY o.created_at, o.id — migration 0015; phone r1 M-9), so
+            # [-1] is genuinely the newest. A done job with no body is "no reply yet".
+            bodies = [o.get("body") for o in (st.get("outbound") or []) if o.get("body")]
+            if bodies:
+                print(_clean_reply(bodies[-1]))
+                return 0
+            # rc stays 3 for every no-body case (callers branch on the MARKER, not the
+            # rc): failed/dead will never produce a body, and done-with-no-body is a
+            # finished job that wrote nothing — both are terminal, not "keep polling".
+            status = st.get("status")
+            if status in ("failed", "dead"):
+                print(f"MXR_JOB_{status.upper()}", file=sys.stderr)
+            elif status == "done":
+                print("MXR_DONE_EMPTY", file=sys.stderr)
+            print(f"no reply yet (job status: {status})", file=sys.stderr)
+            return 3
         out = {
             "job": str(st.get("id")),
             "status": st.get("status"),
@@ -212,8 +333,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                                      description="print a job's status as JSON")
         gp.add_argument("job_id", help="the job uuid, or an id prefix of >=8 hex chars "
                                        "(from a prior `mxr` submit; hyphens optional)")
+        # --reply: print the job's REPLY BODY (latest outbound) instead of the status JSON —
+        # the documented recover-a-late-reply flow ("verdict then only in the ledger") without
+        # hand-rolled python. Exit 3 = job known but no reply yet (distinct from 1 = unknown
+        # job, 2 = malformed id) so callers like the phone wrapper can say "still thinking".
+        gp.add_argument("--reply", action="store_true",
+                        help="print the reply body of a completed job (exit 3 if none yet)")
         gargs = gp.parse_args(raw[1:])
-        return asyncio.run(get_job(gargs.job_id))
+        return asyncio.run(get_job(gargs.job_id, reply=gargs.reply))
 
     # `mxr skillselect <repo_id> <changed-path>...` — the +learning rung READ path (build
     # plan Step 4). Routed through mxr so it inherits the runtime venv + PYTHONPATH +

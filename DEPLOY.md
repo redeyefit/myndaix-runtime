@@ -75,6 +75,39 @@ the repo `src/runtime/controller.py` AND in BOTH installed workers (`$ORCH/play-
 pid`). A claimed deploy that skipped the `cp` runs the OLD worker(s); one that skipped the branch/pull
 runs the OLD controller.
 
+## Phone surface deploy (`mxr-phone`)
+
+The sshd forced-command wrapper is the THIRD entry in `orchestrator/deploy-sync.sh`'s guarded
+surface: repo `orchestrator/phone/mxr-phone.sh` → installed `~/.myndaix/bin/mxr-phone`. It is a
+hand-copied regular file for the same reason as the play workers (an attacker who can edit the
+repo tree must not be able to edit the forced-command target), and deploy-sync's `--check` flags
+its drift like the others.
+
+**Order matters** — the wrapper's marker contract greps `mxr`'s stderr, and its reply path needs
+migration `0015` applied, so the code it talks to must land FIRST:
+
+```bash
+cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
+  && launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime \
+  && orchestrator/deploy-sync.sh --apply HEAD \
+  && bash orchestrator/phone/test.sh && bash orchestrator/phone/test.sh --sshd
+```
+
+(`--apply HEAD`, not the default `origin/main`: apply re-fetches, and a remote that
+advanced between your pull and the apply would deploy a NEWER wrapper against the OLDER
+running serve — the exact skew the marker rule forbids. HEAD pins wrapper-and-tree to
+one commit; deploy-sync warns loudly when the applied ref differs from HEAD.)
+
+1. pull + kickstart: serve auto-applies migrations (0015 `outbound.created_at`) and the tree's
+   `cli.py` now emits the `MXR_*` stderr markers the wrapper matches.
+2. `deploy-sync.sh --apply`: installs/heals all three guarded copies, including `mxr-phone`.
+3. both test legs ON the target box; `--sshd` asserts the real boundary (forced command, no
+   pty, AcceptEnv carries nothing beyond Apple's stock `LANG LC_*`, env abuse inert).
+
+Version-skew rule: never copy a NEWER `mxr-phone` against an OLDER tree (the wrapper would grep
+markers the installed `cli.py` doesn't emit yet — every reply degrades to "factory error").
+`deploy-sync.sh --apply` deploys tree-and-wrapper from the same commit, which is the point.
+
 ## Why this exists
 
 On 2026-06-24 a deploy took dispatch down: `serve` was restarted onto code that read
