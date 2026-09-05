@@ -157,6 +157,16 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
             # printing an OLDER won body instead would hand the user a stale answer
             # (r9 #3 + r10 #5 collapse into this one newest-row-authority rule).
             newest = next(o for o in reversed(outs) if o.get("body"))
+            if newest["status"] != "sent":
+                # r11 #2: a sender can complete the row between our snapshot and the CAS
+                # (the CAS fails, the in-memory status stays 'pending'). Re-read the DB
+                # truth ONCE for the authoritative row: sent -> idempotent re-display;
+                # leased -> genuinely in-flight, the sender's to deliver.
+                st2 = await led.get_status(jid)
+                cur = next((o2 for o2 in ((st2 or {}).get("outbound") or [])
+                            if str(o2.get("id")) == str(newest.get("id"))), None)
+                if cur is not None:
+                    newest = {**newest, "status": cur.get("status")}
             if newest["status"] == "sent":
                 print(_clean_reply(newest["body"]), flush=True)
             else:

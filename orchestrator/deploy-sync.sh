@@ -116,6 +116,9 @@ do_apply(){
   # the stale local tracking ref — the exact silent-non-deploy this tool prevents). A bare
   # `fetch origin <branch>` lands only in FETCH_HEAD under non-wildcard fetch configs.
   # No stderr suppression: fetch warnings are signal. Non-ff (rolled-back origin) -> die.
+  # normalize the fully-qualified spelling FIRST (r11 #1: refs/remotes/origin/<x> matched
+  # no case arm and skipped the fetch entirely — same stale-ref fail-open, different door)
+  case "$ref" in refs/remotes/origin/*) ref="origin/${ref#refs/remotes/origin/}" ;; esac
   case "$ref" in
     origin/*)
       _branch="${ref#origin/}"
