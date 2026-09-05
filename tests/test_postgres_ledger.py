@@ -396,6 +396,39 @@ async def test_zz_migrate_heals_stale_schema(led: PostgresLedger) -> None:
     assert await _has_context() == 1
 
 
+# -- regression: 0015 — outbound.created_at + its head-check index -------------
+# Named test_zz_* to run last: it drops outbound.created_at (and the index that
+# rides on it) mid-flight; migrate() restores both, so later tests never see the
+# hole. The index is also the substrate migration_head object — reconcile's
+# health gate probes it via to_regclass, so its absence after migrate() would
+# mean every deploy false-fails the gate.
+async def test_zz_migrate_restores_outbound_created_at(led: PostgresLedger) -> None:
+    async def _col() -> int:
+        async with led._pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name='outbound' AND column_name='created_at'")
+
+    async def _idx() -> bool:
+        async with led._pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT to_regclass('public.outbound_created_at_idx') IS NOT NULL")
+
+    async with led._pool.acquire() as con:
+        await con.execute("ALTER TABLE outbound DROP COLUMN IF EXISTS created_at CASCADE")
+    assert await _col() == 0, "precondition: created_at dropped"
+    assert not await _idx(), "precondition: index dropped with its column"
+
+    applied = await led.migrate()
+    assert "0015_outbound_created_at.sql" in applied, f"0015 not applied: {applied}"
+    assert await _col() == 1, "migrate() should restore outbound.created_at"
+    assert await _idx(), "migrate() should restore outbound_created_at_idx (the head-check object)"
+
+    # idempotent: second run is a clean no-op
+    await led.migrate()
+    assert await _col() == 1 and await _idx()
+
+
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------
 # Before the lock-order fix this failed ~99% of trials with DeadlockDetectedError;
 # it is the test the green suite was missing (cancel had zero coverage).

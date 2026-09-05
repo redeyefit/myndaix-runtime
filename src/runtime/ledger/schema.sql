@@ -89,6 +89,7 @@ CREATE TABLE outbound (
     created_at      timestamptz NOT NULL DEFAULT now()  -- deterministic latest-reply order (0015)
 );
 CREATE INDEX outbound_pending_idx ON outbound (status) WHERE status = 'pending';
+CREATE INDEX outbound_created_at_idx ON outbound (job_id, created_at);  -- reply ordering (0015)
 
 CREATE TABLE dead_letter (
     id         uuid PRIMARY KEY,

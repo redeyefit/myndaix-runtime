@@ -5,3 +5,7 @@
 -- current flows has at most one outbound row, so the backfill is inert in practice.
 -- Idempotent: serve re-runs all migrations on every boot.
 ALTER TABLE outbound ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+-- The reply read path aggregates per job ORDER BY (created_at, id); this index serves it and
+-- gives the migration a to_regclass-checkable object (substrate migration_head verification
+-- can't see columns, only relations).
+CREATE INDEX IF NOT EXISTS outbound_created_at_idx ON outbound (job_id, created_at);
