@@ -148,6 +148,25 @@ _PRIVATE_NETS = [
 async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     adapter = spec.adapter
     argv = list(adapter["argv"])
+    # structured-output contract (kilabz-sr): the adapter may declare
+    #   "output_schema": a path RELATIVE TO THIS PACKAGE (ships in the repo, so it resolves on
+    #       every host without a baked-in absolute path) — appended as `--output-schema <abs>` so
+    #       the CLI validates the agent's FINAL message against the JSON Schema;
+    #   "output_last_message": True — a per-invocation temp file appended as `-o <path>`; the
+    #       file (the final assistant message ALONE) becomes Result.text, because codex exec's
+    #       stdout carries transcript/progress noise around the final message.
+    # Both are no-ops for adapters that don't declare them. A declared-but-missing schema file is
+    # TERMINAL (fail-closed): running the structured reviewer without its contract would hand the
+    # synthesis stage free-form prose it no longer expects.
+    out_msg_path: Optional[str] = None
+    last_msg: Optional[str] = None
+    schema_rel = adapter.get("output_schema")
+    if isinstance(schema_rel, str) and schema_rel:
+        schema_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), schema_rel)
+        if not os.path.isfile(schema_abs):
+            return Result(status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                          text=f"adapter output_schema not found: {schema_abs}")
+        argv += ["--output-schema", schema_abs]
     channel = adapter.get("prompt_channel", "stdin")
     stdin_data: Optional[bytes] = None
     if channel == "arg":
@@ -213,6 +232,12 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
             # clean TERMINAL Result instead of a bubbled crash, and the finally still frees scratch.
             if cwd is None:
                 scratch_cwd = tempfile.mkdtemp(prefix="mdx-cli-cwd.")
+            # last-message file INSIDE the try for the same reason: every exit path (timeout,
+            # cancel, spawn failure) runs the finally, which harvests + removes it.
+            if adapter.get("output_last_message"):
+                _fd, out_msg_path = tempfile.mkstemp(prefix="mdx-lastmsg-", suffix=".txt")
+                os.close(_fd)
+                argv += ["-o", out_msg_path]
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
@@ -265,10 +290,23 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
             shutil.rmtree(scratch, ignore_errors=True)
         if scratch_cwd:                  # the empty scratch cwd is per-invocation — always remove it
             shutil.rmtree(scratch_cwd, ignore_errors=True)
+        if out_msg_path is not None:     # harvest THEN remove the `-o` last-message file on
+            try:                         # every exit path (timeout/cancel leave it unread — fine)
+                with open(out_msg_path, encoding="utf-8", errors="replace") as _f:
+                    last_msg = _f.read().strip() or None
+            except OSError:
+                last_msg = None
+            try:
+                os.unlink(out_msg_path)
+            except OSError:
+                pass
 
     code = proc.returncode
     if code == 0:
-        return Result(status=ResultStatus.OK, text=_decode(out).strip(),
+        # prefer the `-o` final-message file over stdout: codex exec's stdout carries
+        # transcript/progress noise around the final message. Empty/unreadable file falls
+        # back to stdout (never a hard failure — the caller's JSON validation is the gate).
+        return Result(status=ResultStatus.OK, text=(last_msg or _decode(out).strip()),
                       exit_code=0, ms=_ms(started))
     return Result(
         status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
