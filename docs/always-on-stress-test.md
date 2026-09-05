@@ -33,12 +33,21 @@ the acceptance gate for the whole "Mini is home" thesis.
       labels, the declared set derives from `substrate/plists/` WITH sentinel gating, and
       health = last exit code + execution freshness, not a state string.) Run ON the
       Mini from the deploy clone:
+      The gate requires the canary's POSITIVE clean line — "no DIVERGENT seen" is not
+      health: a config-die, an ALARM early-exit, and the sleep/wake grace-skip all print
+      no DIVERGENT while evaluating nothing. Failures accumulate into ONE final assert
+      (a mid-block `false` doesn't halt a pasted interactive block):
       ```
-      out="$(bash substrate/liveness-canary.sh 2>&1)"; printf '%s\n' "$out"
-      ! printf '%s\n' "$out" | grep -q "DIVERGENT" || { echo "PREFLIGHT FAIL: divergence above"; false; }
+      rc=0; out="$(bash substrate/liveness-canary.sh 2>&1)" || rc=$?
+      printf '%s\n' "$out"
+      fail=0
+      [ "$rc" -eq 0 ] || { echo "PREFLIGHT FAIL: canary exited rc=$rc (config/env problem — not a pass)"; fail=1; }
+      printf '%s\n' "$out" | grep -q "liveness: all declared jobs alive" \
+        || { echo "PREFLIGHT FAIL: no all-alive signal (divergence, sleep/wake grace-skip, or aborted run — read the output above; re-run after a grace-skip)"; fail=1; }
       # plus the ONE long-lived daemon, where 'running' IS the healthy state:
       launchctl print "gui/$(id -u)/ai.myndaix.runtime" | grep -q "state = running" \
-        || { echo "PREFLIGHT FAIL: serve pool not running"; false; }
+        || { echo "PREFLIGHT FAIL: serve pool not running"; fail=1; }
+      [ "$fail" -eq 0 ]   # THE gate — last line, real exit status even when pasted interactively
       ```
 
 Record each cell PASS/FAIL + the observed number/behavior. A FAIL is a finding, not a
