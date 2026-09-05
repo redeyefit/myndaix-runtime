@@ -163,10 +163,17 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
                 # truth ONCE for the authoritative row: sent -> idempotent re-display;
                 # leased -> genuinely in-flight, the sender's to deliver.
                 st2 = await led.get_status(jid)
-                cur = next((o2 for o2 in ((st2 or {}).get("outbound") or [])
-                            if str(o2.get("id")) == str(newest.get("id"))), None)
+                if st2 is None:
+                    # r12 #3: a vanished job mid-call is anomalous — fail loudly, never
+                    # dress a DB failure up as "row leased"
+                    raise RuntimeError(f"re-read of job {jid} returned None mid-delivery")
+                nid = newest.get("id")
+                # r12 #2: never let two missing ids stringify into a 'None'=='None' match
+                cur = next((o2 for o2 in (st2.get("outbound") or [])
+                            if nid is not None and str(o2.get("id")) == str(nid)), None)
                 if cur is not None:
-                    newest = {**newest, "status": cur.get("status")}
+                    newest = {**newest, **cur}   # full row (r12 #4): a sender may have
+                    # written body alongside status — never fresh status over a stale body
             if newest["status"] == "sent":
                 print(_clean_reply(newest["body"]), flush=True)
             else:

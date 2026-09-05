@@ -133,6 +133,10 @@ do_apply(){
         || die "unsupported ref '$ref' for --apply: use origin/<branch>, HEAD, or a full sha (resolve revision expressions like ~1 to a sha first)"
       git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
         || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
+      # resolve the FULLY-QUALIFIED name we just fetched (r12 #1): shorthand origin/<b>
+      # goes through git's disambiguation, where a local branch/tag literally named
+      # 'origin/<b>' would shadow the tracking ref we refreshed
+      ref="refs/remotes/origin/${_branch}"
       ;;
   esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
