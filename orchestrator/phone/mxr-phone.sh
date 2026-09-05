@@ -54,6 +54,16 @@ MAX_OUT=4096
 
 mkdir -p "$STATE" 2>/dev/null || { printf 'denied: state dir unavailable\n'; exit 2; }
 
+# legacy residue guard (r4 MAJOR-2/MED-3): pre-flock revisions used mkdir DIRECTORIES at
+# these paths; a leftover dir would brick a conc slot forever (">>" cannot open a dir) or
+# sit dead beside the new .lockf files. This surface has never been deployed, so there is
+# no live old process to race — this is residue cleanup (crashed test runs, future
+# half-copies), not online migration. rm failure = loud exit (set -e), never a silent skip.
+for _legacy in "$STATE/.phone-conc1" "$STATE/.phone-conc2" "$STATE/.phonelog.lock" \
+               "$STATE/.phjid.lock" "$STATE"/.phonecap-*.lock; do
+  if [ -d "$_legacy" ]; then rm -rf "$_legacy"; fi
+done
+
 # ---- kernel locks (r3 HIGH-1): flock(2) via perl (already a hard dependency — see the
 # run_bounded guard). The mkdir-lock + mv-eviction design was a TOCTOU class (r1 M-4/M-5,
 # r2 MED-4, r3 HIGH-1 — every round found a narrower race in check-then-rename): a kernel
@@ -63,12 +73,19 @@ mkdir -p "$STATE" 2>/dev/null || { printf 'denied: state dir unavailable\n'; exi
 # critical section and vanishes on ANY exit path, including SIGKILL.
 _locked(){ # _locked <lockfile> <timeout_s> <argv...> ; child's rc, 5=lock io, 6=lock timeout
   local lf="$1" to="$2"; shift 2
-  perl -MFcntl=:flock -e '
+  # FD_CLOEXEC must be CLEARED before the exec (r4 MAJOR-1): perl close-on-execs every fd
+  # above $^F (=2), so without the fcntl the kernel would close the fd — and release the
+  # flock — the instant exec fires, leaving the critical section unlocked. Probed both
+  # ways on the target /bin/bash+perl: default = contender acquires inside the child;
+  # with the clear = contender blocks until the child exits.
+  perl -MFcntl=:flock,F_GETFD,F_SETFD,FD_CLOEXEC -e '
     my ($lf, $to) = (shift @ARGV, shift @ARGV);
     open(my $f, ">>", $lf) or exit 5;
     $SIG{ALRM} = sub { exit 6 }; alarm($to);
     flock($f, LOCK_EX) or exit 5;
     alarm(0);
+    my $fl = fcntl($f, F_GETFD, 0); defined $fl or exit 5;
+    fcntl($f, F_SETFD, $fl & ~FD_CLOEXEC) or exit 5;
     exec @ARGV; exit 5;' "$lf" "$to" "$@"
 }
 

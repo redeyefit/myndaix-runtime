@@ -165,6 +165,16 @@ reset; printf '3' > "$STATE/.phonecap-ask-$(date +%Y%m%d)"; chmod 000 "$STATE/.p
 out="$(run 'ask research q')"; chmod 600 "$STATE/.phonecap-ask-$(date +%Y%m%d)" 2>/dev/null
 printf '%s' "$out" | grep -q 'denied: ask cap' && ok "UNREADABLE counter fails CLOSED (M-7)" || bad "unreadable-cap: $out"
 
+echo "8b. cap RMW under real concurrency (r4 MAJOR-1: the flock must HOLD across the exec)"
+# 12 parallel sessions increment the status counter; a lock that releases at exec (the
+# perl FD_CLOEXEC default) loses increments to the racy read-modify-write and this reads
+# short. status takes no conc slot, so all 12 run truly concurrently.
+reset; _stamp="$(date +%Y%m%d%H)"
+for i in $(seq 1 12); do run status >/dev/null 2>&1 & done
+wait
+_c="$(cat "$STATE/.phonecap-status-$_stamp" 2>/dev/null || echo 0)"
+[ "$_c" = "12" ] && ok "12 concurrent sessions -> counter exactly 12 (no lost increments)" || bad "lost increments: counter=$_c (want 12)"
+
 echo "9. concurrency slots"
 # slots are kernel flocks on permanent slot FILES (r3 HIGH-1) — a holder is a live process
 # holding the lock, and a DEAD holder's slot frees itself (no reaper, nothing to backdate).

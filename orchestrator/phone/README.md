@@ -21,7 +21,7 @@ never payload text.
 
 ```
 cp orchestrator/phone/mxr-phone.sh ~/.myndaix/bin/mxr-phone && chmod 755 ~/.myndaix/bin/mxr-phone
-bash orchestrator/phone/test.sh            # fixture leg: 48 checks
+bash orchestrator/phone/test.sh            # fixture leg — must end "0 failed" (count grows with folds; don't pin it here)
 bash orchestrator/phone/test.sh --sshd     # REAL boundary leg (loopback sshd) — must pass before wiring the phone
 ```
 
