@@ -1252,6 +1252,12 @@ class PostgresLedger:
                 drift.append(r["name"])
                 continue
             cand.append((r, ms))
+        # ORDER: new-first, THEN match-specificity, THEN recency. New-first over specificity
+        # is DELIBERATE learning-rung design (kept over a #125 r3 reviewer proposal to invert):
+        # a never-used skill must surface to accrue the usage/outcome data the self-learning
+        # loop feeds on — specificity-first would starve every new skill behind established
+        # ones. The 'flood of broad new skills' risk is bounded upstream: skills enter only
+        # via the reviewed promotion gate, and bare-* alternatives are banned at lint.
         cand.sort(key=lambda rm: (
             rm[0]["last_used_at"] is not None,                  # NULL (new) sorts first
             -rm[1],                                             # more specific MATCH first

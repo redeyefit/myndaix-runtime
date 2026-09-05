@@ -111,10 +111,16 @@ def test_match_specificity_no_decorative_inflation():
 def test_repo_has_no_space_bearing_tracked_paths():
     import subprocess
     root = Path(__file__).resolve().parent.parent
-    out = subprocess.run(["git", "-C", str(root), "ls-files"],
-                         capture_output=True, text=True, check=True).stdout
-    spaced = [p for p in out.splitlines() if " " in p]
-    ok(spaced == [], f"space-bearing tracked paths break trigger alternatives: {spaced[:3]}")
+    # no check=True: a de-linked snapshot (review staging, source export) has no .git —
+    # that is a SKIP, not a crash that hides every other assertion (r3 #3)
+    res = subprocess.run(["git", "-C", str(root), "ls-files"],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        ok(True, "skipped: not a git working tree (de-linked snapshot)")
+        return
+    # any Unicode whitespace, matching str.split()'s delimiter set exactly (r3 #1)
+    spaced = [p for p in res.stdout.splitlines() if any(ch.isspace() for ch in p)]
+    ok(spaced == [], f"whitespace-bearing tracked paths break trigger alternatives: {spaced[:3]}")
 
 
 # -- scan_injection: the FALSE-POSITIVE guard (descriptive review skills stay CLEAN) --
