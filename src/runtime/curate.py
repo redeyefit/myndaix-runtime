@@ -492,7 +492,9 @@ async def _dispatch_pool(led: PostgresLedger, prompt: str, staging: Path) -> tup
     reply = next((o["body"] for o in (st.get("outbound") or [])), "") or ""
     for o in (st.get("outbound") or []):
         if o["status"] == "pending":
-            await led.mark_outbound_sent(o["id"], f"curate-{o['id']}")
+            # inline verb (r8 P2): the transport verb's leased-only CAS silently no-ops
+            # on these pending rows — same latent-duplicate bug the cli path had
+            await led.mark_outbound_sent_inline(o["id"], f"curate-{o['id']}")
     return True, reply
 
 

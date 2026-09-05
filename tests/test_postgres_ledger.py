@@ -184,7 +184,8 @@ async def test_outbound_inline_sent_tombstones_pending(led: PostgresLedger) -> N
     ev = await led.ingest_inbound(_env("ob-3"), "hi")
     jid = await led.submit_job(to_agent="kilabz", prompt="hi", inbound_event_id=ev)
     ob = await led.enqueue_outbound(jid, "reply")
-    await led.mark_outbound_sent_inline(ob, f"cli-{ob}")
+    n = await led.mark_outbound_sent_inline(ob, f"cli-{ob}")
+    assert n == 1, f"inline verb must report the transition (got {n})"   # r8 P3
     async with led._pool.acquire() as con:
         st = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob)
     assert st == "sent", f"inline tombstone missed: status={st}"
@@ -196,7 +197,8 @@ async def test_outbound_inline_sent_tombstones_pending(led: PostgresLedger) -> N
     ob2 = await led.enqueue_outbound(jid, "reply-2")
     claimed = await led.claim_outbound("terminal")   # rows inherit the envelope's transport
     assert claimed is not None and str(claimed["id"]) == str(ob2)
-    await led.mark_outbound_sent_inline(ob2, f"cli-{ob2}")
+    n2 = await led.mark_outbound_sent_inline(ob2, f"cli-{ob2}")
+    assert n2 == 0, f"leased-race must report 0 so the caller skips its print (got {n2})"  # r8 P3
     async with led._pool.acquire() as con:
         st2 = await con.fetchval("SELECT status FROM outbound WHERE id=$1", ob2)
     assert st2 == "leased", f"inline verb must no-op on a leased row, got {st2}"

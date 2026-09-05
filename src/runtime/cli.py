@@ -128,23 +128,40 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
             return 1, False
 
         if st["status"] == "done":
-            reply = next((o["body"] for o in (st.get("outbound") or [])), None)
-            # TRUTHY guard (r6 P2): the ledger's `body text NOT NULL` permits "", and get
-            # --reply already filters falsy bodies — an empty string is the SAME terminal
-            # no-answer state as a missing row, not a silent rc-0 success.
-            if reply:
-                print(_clean_reply(reply))
-            for o in (st.get("outbound") or []):       # tombstone: the sync print above IS delivery
+            outs = st.get("outbound") or []
+            reply = next((o["body"] for o in outs), None)
+            # CAS BEFORE print (r8 P1a): tombstone first, print only what this process now
+            # OWNS delivery of — a row a transport sender leased mid-poll is the sender's
+            # to deliver, so printing it here would be the double. flush=True (r8 P1b) so
+            # the reply never sits in a userspace buffer past the commit. ACCEPTED
+            # residual: a kill between CAS-commit and flush loses the terminal copy — but
+            # not the reply: `mxr get --reply` reads bodies status-independently, so the
+            # answer stays retrievable.
+            delivered_here = False
+            had_pending = False
+            for o in outs:
                 if o["status"] == "pending":
                     # inline verb, not the transport one (r7 #1): mark_outbound_sent's
                     # leased-only CAS silently no-opped on these pending rows forever
-                    await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}")
+                    had_pending = True
+                    if await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}"):
+                        delivered_here = True
+            # TRUTHY guard (r6 P2): the ledger's `body text NOT NULL` permits "", and get
+            # --reply already filters falsy bodies — an empty string is the SAME terminal
+            # no-answer state as a missing row, not a silent rc-0 success.
             if not reply:
                 # done-with-no-body is TERMINAL no-answer, not success-with-silence — the
                 # same state get --reply marks; both paths share one contract (review r5 #4).
                 print("MXR_DONE_EMPTY", file=sys.stderr)
                 print("job done but produced no reply body", file=sys.stderr)
                 return 1, True
+            if delivered_here or not had_pending:
+                # not had_pending: every row was already sent (e.g. a prior inline pass)
+                # — re-display is idempotent and the sync caller still needs the answer
+                print(_clean_reply(reply), flush=True)
+            else:
+                print("reply delivery raced to a transport sender — body retrievable via "
+                      "`mxr get --reply`", file=sys.stderr)
             return 0, True
 
         # failed/dead: surface WHY (the agent's error output, from the attempt).

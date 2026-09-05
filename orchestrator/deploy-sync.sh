@@ -94,7 +94,7 @@ do_check(){
 do_apply(){
   # _LOCK stays SCRIPT-scope on purpose (top-of-file comment: the EXIT trap must see it) —
   # r6 P5's "make it local" would strand the lock at trap time. _head_now IS local.
-  local pair src dst ddir f want tmp bak deployed_sha _head_now
+  local pair src dst ddir f want tmp bak deployed_sha _head_now _branch
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
@@ -111,11 +111,18 @@ do_apply(){
   # refresh the tracking ref when deploying from a remote. Fetch failure is FATAL in --apply (review
   # r4): silently deploying a stale/rolled-back local origin/main is the exact silent-non-deploy this
   # tool exists to prevent. (--preflight tolerates it — it's advisory.)
-  # explicit DESTINATION refspec (r7 #2): a bare `fetch origin main` lands only in
-  # FETCH_HEAD under non-wildcard fetch configs, leaving refs/remotes/origin/main stale —
-  # the resolve below would then bless old code. No stderr suppression: fetch warnings
-  # are exactly the signal this guard wants. Non-ff (rolled-back origin) fails -> die.
-  case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin "main:refs/remotes/origin/main" || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref" ;; esac
+  # explicit DESTINATION refspec (r7 #2), DERIVED from the requested ref (r8 P1: a
+  # hardcoded main would refresh the wrong ref for --apply origin/<other> and then bless
+  # the stale local tracking ref — the exact silent-non-deploy this tool prevents). A bare
+  # `fetch origin <branch>` lands only in FETCH_HEAD under non-wildcard fetch configs.
+  # No stderr suppression: fetch warnings are signal. Non-ff (rolled-back origin) -> die.
+  case "$ref" in
+    origin/*)
+      _branch="${ref#origin/}"
+      git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
+        || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
+      ;;
+  esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
   # version-skew guard (review r5 #2, hardened r6 P1): the phone wrapper's marker contract
   # runs against the CHECKED-OUT tree's cli.py — deploying a ref that advanced past the

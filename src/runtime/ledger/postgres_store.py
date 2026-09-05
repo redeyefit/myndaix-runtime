@@ -594,24 +594,26 @@ class PostgresLedger:
                         _new_id(), outbound_id,
                         f"duplicate provider_msg_id {provider_msg_id} (already delivered)")
 
-    async def mark_outbound_sent_inline(self, outbound_id: UUID, provider_msg_id: str) -> None:
-        """pending->sent for INLINE (sync) delivery — the caller already handed the body to
-        the user in the same process (mxr's sync reply print), so there is no lease step.
-        Distinct verb on purpose (phone r7 #1): the CLI used to call the transport verb
-        mark_outbound_sent, whose leased-only CAS silently no-opped on pending rows — the
-        tombstone never landed and rows sat pending forever (latent duplicate delivery the
-        day a cli-transport sender ships). Widening the transport CAS instead would let a
-        buggy sender skip the claim step unnoticed; a separate pending-only verb keeps both
-        state machines honest. Races are benign: a row a sender just LEASED no-ops here
-        (delivery is the sender's); a row marked sent here is invisible to claim_outbound."""
+    async def mark_outbound_sent_inline(self, outbound_id: UUID, provider_msg_id: str) -> int:
+        """pending->sent for INLINE (sync) delivery, returning the ROW COUNT (0 or 1) so
+        the caller can gate its print on actually owning delivery (r8 P3 — a discarded
+        count made the leased-race undetectable). Distinct verb on purpose (phone r7 #1):
+        the CLI used to call the transport verb mark_outbound_sent, whose leased-only CAS
+        silently no-opped on pending rows — the tombstone never landed and rows sat
+        pending forever (latent duplicate delivery the day a cli-transport sender ships).
+        Widening the transport CAS instead would let a buggy sender skip the claim step
+        unnoticed; a separate pending-only verb keeps both state machines honest. A row a
+        sender just LEASED returns 0 (delivery is the sender's); a row marked sent here is
+        invisible to claim_outbound."""
         async with self._pool.acquire() as con:
             async with con.transaction():
                 try:
                     async with con.transaction():  # savepoint
-                        await con.execute(
+                        tag = await con.execute(
                             """UPDATE outbound SET status='sent', provider_msg_id=$2
                                 WHERE id = $1 AND status = 'pending'""",
                             outbound_id, provider_msg_id)
+                        return int(tag.split()[-1])          # "UPDATE N"
                 except asyncpg.UniqueViolationError:
                     await con.execute(
                         "UPDATE outbound SET status='failed' WHERE id=$1 AND status='pending'",
@@ -620,6 +622,7 @@ class PostgresLedger:
                         "INSERT INTO dead_letter (id, source_id, reason) VALUES ($1,$2,$3)",
                         _new_id(), outbound_id,
                         f"duplicate provider_msg_id {provider_msg_id} (already delivered)")
+                    return 0
 
     async def mark_outbound_failed(self, outbound_id: UUID) -> None:
         """leased->pending (retry) until tries exhaust, then leased->failed + dead_letter."""
