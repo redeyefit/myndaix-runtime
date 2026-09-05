@@ -521,10 +521,14 @@ while :; do
   if [[ -n "$orig_base" && "$base" != "$orig_base" ]]; then
     note foldback "folded range failed ($diff_fail); retrying with the push's own base"
     backlog_banner="⚠ skip-fold hit a limit ($diff_fail). Reviewed ONLY this push (${orig_base}..${tip}); the backlog ${base}..${orig_base} is STILL UNREVIEWED and stays QUEUED (the next push re-attempts the fold) — review it now: orchestrator/xreview.sh code $repo ${base}..${orig_base}"
-    # r3 MEDIUM (toctou): re-queue the push's OWN hop only — the folded portion below orig_base
-    # is covered by the deeper markers that are still standing (their owners never delivered);
-    # re-queuing the folded $base here would freeze a stale over-claim across delivered ranges.
-    backlog_base="$orig_base"
+    # r3 (toctou): on HOOK pushes re-queue the push's OWN hop only — the folded portion below
+    # orig_base is covered by the deeper markers still standing (their owners never delivered);
+    # re-queuing the folded $base would freeze a stale over-claim across delivered ranges.
+    # r4 (fail-open): a MANUAL --worker invocation (empty remote_url, arg7 set) has NO pre-record
+    # chain — no deeper markers exist, so the own-hop rule would silently drop base..orig_base
+    # while the banner claims it stays queued. There, re-queue the DEEP base: nothing else covers
+    # it, and the operator chose the fold, so the over-claim risk is theirs and visible.
+    if [[ -n "$remote_url" ]]; then backlog_base="$orig_base"; else backlog_base="$base"; fi
     base="$orig_base"
     continue
   fi
