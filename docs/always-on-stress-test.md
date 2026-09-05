@@ -26,15 +26,22 @@ the acceptance gate for the whole "Mini is home" thesis.
       forced-command wrapper — NOT Claude Remote Control.
 - [ ] Mini `pmset -g | grep autorestart` = 1 AND `fdesetup status` = Off (FileVault back
       ON — e.g. re-enabled by a macOS-update prompt — silently breaks §4 cold start).
-- [ ] every required launchd unit verified PER LABEL (substring-grepping `launchctl list`
-      can false-green on partially-loaded units), with a REAL exit code — a bare
-      `|| echo MISSING` coerces every failure to rc 0 and silently clears an automated gate:
+- [ ] every required launchd unit verified PER LABEL and per STATE — `launchctl print`
+      exits 0 for any loaded label even when the service is crashed/stopped, so the check
+      greps `state = running`; stderr goes to the terminal (not `2>&1`-swallowed) so a
+      failure explains itself; and the loop carries a REAL exit code. The unit list is
+      DERIVED from what is actually loaded for the role, checked against the substrate
+      manifest (`substrate/plists/`) — a hardcoded list both misses factory-role units
+      (e.g. `inbox-assistant`) and false-flags sentinel-gated ones (e.g. `reconcile`
+      when its poll sentinel is off):
       ```
       fail=0
-      for u in runtime controller liveness drift-canary reconcile automerge fix-sweep ledger-backup; do
-        launchctl print "gui/$(id -u)/ai.myndaix.$u" >/dev/null 2>&1 || { echo "MISSING $u"; fail=1; }
+      units="runtime $(ls substrate/plists/ 2>/dev/null | sed -n 's/^ai\.myndaix\.\(.*\)\.json$/\1/p')"
+      for u in $units; do
+        launchctl print "gui/$(id -u)/ai.myndaix.$u" 2>/dev/null | grep -q "state = running" \
+          || { echo "NOT RUNNING (or not loaded): $u" >&2; fail=1; }
       done
-      [ "$fail" -eq 0 ]
+      [ "$fail" -eq 0 ]   # sentinel-gated units (reconcile poll off) are EXPECTED misses — note them, don't fail the run on them alone
       ```
 
 Record each cell PASS/FAIL + the observed number/behavior. A FAIL is a finding, not a
@@ -89,7 +96,7 @@ the tracked walk-under-lock follow-up.
 
 | # | Procedure | PASS criteria |
 |---|---|---|
-| C1 | SCRIPTED parallel `ask`s — a human double-tap is orders of magnitude too slow for a TOCTOU window: `for i in 1 2 3; do ssh -i <phone-key> mini 'ask research q' & done; wait` | all answered and/or clean "factory line busy" (2-slot cap) — never a corrupted/interleaved reply; the cap counter advanced EXACTLY once per accepted call (the suite's 12-parallel test 8b is the code-level twin of this live check) |
+| C1 | SCRIPTED parallel `ask`s — a human double-tap is orders of magnitude too slow for a TOCTOU window: `for i in 1 2 3; do ssh -n -i <phone-key> mini 'ask research q' & done; wait` (`-n` is load-bearing: backgrounded ssh without it competes for terminal stdin and SIGTTIN-stalls — the test would hang instead of exercising the cap) | all answered and/or clean "factory line busy" (2-slot cap) — never a corrupted/interleaved reply; the cap counter advanced EXACTLY once per accepted call (the suite's 12-parallel test 8b is the code-level twin of this live check) |
 | C2 | Phone `ask` WHILE the Mini's controller is mid-review (push something to a watched repo, then ask). | both complete; the pool serves both (per-repo locks + 8 workers) |
 | C3 | Burn a daily cap (script N `ask`s to the limit), then ask once more. | the cap holds; the over-limit call denies cleanly; the count is correct (no lost increments under C1's parallel fire) |
 | C4 | Via the PHONE PATH (Shortcut or ssh with the phone key — the boundary lives in the wrapper's jid registry, deliberately NOT in operator-side `mxr get`): `get` a foreign job id the phone never issued. | denied "not a phone-issued job" — the ownership boundary holds live |
@@ -118,19 +125,28 @@ off rather than accommodating it.
 | # | Procedure | PASS criteria |
 |---|---|---|
 | I1 | Drop the tailnet mid-`ask` (toggle the phone's Tailscale off during a slow ask). | Shortcut shows a connection error — no partial/garbled state; retry after re-enabling works |
-| I2 | Stop the Mini's pool: `launchctl bootout gui/$(id -u)/ai.myndaix.runtime` (re-bootstrap after the test; `kickstart` cannot stop — it only (re)starts), then phone `ask`. | the wrapper reports a factory error honestly (a down ledger must NOT read as "no such job" — the marker contract) — never a hang, never a false answer |
+| I2a | Stop the Mini's POOL only: `launchctl bootout gui/$(id -u)/ai.myndaix.runtime` (re-bootstrap after; `kickstart` cannot stop). Postgres stays up. Phone `ask`. | the job SUBMITS but never runs → the wrapper's sync wait expires → "still thinking" + a job id handed to Get Answer (`MXR_SYNC_TIMEOUT` path) — never a hang, never a false answer; after re-bootstrap, `get <id>` returns the late reply |
+| I2b | Stop the LEDGER: `brew services stop postgresql@16` (or the Mini's PG service name; restart after), pool still up. Phone `get <known-good id>`. | a factory error — NOT "no such job" (the marker contract: rc 1 without `MXR_NO_SUCH_JOB` must never claim the id is unknown; a down ledger once produced exactly that lie) |
 | I3 | Interrupt an SMB write mid-transfer (kill wifi during a large phone save). | truncated file syncs to the MacBook; the intact prior version is in the MacBook's `.stversions` (the documented recovery path holds) |
-| I4 | Force an oracle flake during a review (or observe one). | the round degrades to kilabz-solo and SAYS SO in the verdict — never silently drops a reviewer without announcing it |
+| I4 | Force an oracle flake during a review (or observe one). | the round degrades to kilabz-solo and SAYS SO in the verdict. KNOWN GAP at doc time (review-confirmed): play-review feeds the oracle-unavailable notice only to TRIAGE — a clean PASS verdict can ship without naming the missing reviewer; this row FAILS until the verdict-tagging follow-up lands, and it stays because forcing that fix is its job |
 | I5 | Adversarial phone inputs, one per call: a payload containing `$(id)` and backticks; an embedded newline (smuggled second verb); a C1/CSI byte; an oversized (>MAX) payload; a `get` with a path instead of a uuid. | every one DENIED cleanly by the wrapper's gates (grammar/bytewise-control/UTF-8/size) — nothing reaches `mxr`, nothing executes, the deny is logged. The fixture suite covers these exhaustively; these live rows prove the DEPLOYED copy enforces them |
 
 ## 6. Delete-restore (references the migration drills)
 
-The per-folder delete-restore drills from `folders-move-home-design.md` §6 (on branch
-`design/folders-move-home` — not on main until the migration lands; v0.4 corrections
-pending) are part of this acceptance run — a delete on either machine/phone is
-recoverable from the receiver's `.stversions` or Time Machine, per the
-directional-protection statement (§4 there). Do at least one from the PHONE (SMB
-delete → restore from the MacBook side) here.
+**BLOCKED until the folders-move-home migration lands** (its design doc lives on branch
+`design/folders-move-home`, v0.4 corrections pending — not reachable from this tip; mark
+these cells BLOCKED, not FAIL, until then). The MINIMUM drill is inlined here so the run
+is reproducible from this artifact alone:
+
+1. Create a disposable test file in a synced folder on the Mini; wait for it to appear
+   on the MacBook.
+2. From the PHONE, delete it via the SMB share (Files.app).
+3. On the MacBook: the file disappears via sync; recover it from the MacBook's
+   `.stversions/` (Syncthing trash) — or Time Machine as the second lock.
+4. PASS = the recovered file is byte-identical and re-syncs cleanly to the Mini.
+
+The full per-folder matrix (all 9 folders, both directions) is the migration design's
+§6 and runs when that lands.
 
 ---
 
