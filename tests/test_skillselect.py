@@ -111,15 +111,26 @@ def test_match_specificity_no_decorative_inflation():
 def test_repo_has_no_space_bearing_tracked_paths():
     import subprocess
     root = Path(__file__).resolve().parent.parent
-    # no check=True: a de-linked snapshot (review staging, source export) has no .git —
-    # that is a SKIP, not a crash that hides every other assertion (r3 #3)
-    res = subprocess.run(["git", "-C", str(root), "ls-files"],
-                         capture_output=True, text=True)
+    # -z + quotePath=false (r4 #1): default git C-quotes non-ASCII bytes into pure-ASCII
+    # octal escapes, which would make the isspace() guard a no-op for the exact NBSP-class
+    # paths it exists to reject. NUL-split output carries the REAL bytes.
+    try:
+        res = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "-C", str(root), "ls-files", "-z"],
+            capture_output=True, text=True)
+    except FileNotFoundError:                                    # r4 #3: no git binary
+        ok(True, "skipped: git not on PATH")
+        return
     if res.returncode != 0:
-        ok(True, "skipped: not a git working tree (de-linked snapshot)")
+        # skip ONLY the expected de-linked-snapshot shape; any other git failure is a real
+        # environment problem and must fail loudly, not masquerade as a skip (r4 #2)
+        if res.returncode == 128 or "not a git repository" in (res.stderr or ""):
+            ok(True, "skipped: not a git working tree (de-linked snapshot)")
+            return
+        ok(False, f"git ls-files failed unexpectedly (rc={res.returncode}): {(res.stderr or '').strip()[:120]}")
         return
     # any Unicode whitespace, matching str.split()'s delimiter set exactly (r3 #1)
-    spaced = [p for p in res.stdout.splitlines() if any(ch.isspace() for ch in p)]
+    spaced = [p for p in res.stdout.split("\0") if p and any(ch.isspace() for ch in p)]
     ok(spaced == [], f"whitespace-bearing tracked paths break trigger alternatives: {spaced[:3]}")
 
 
