@@ -26,22 +26,19 @@ the acceptance gate for the whole "Mini is home" thesis.
       forced-command wrapper — NOT Claude Remote Control.
 - [ ] Mini `pmset -g | grep autorestart` = 1 AND `fdesetup status` = Off (FileVault back
       ON — e.g. re-enabled by a macOS-update prompt — silently breaks §4 cold start).
-- [ ] every required launchd unit verified PER LABEL and per STATE — `launchctl print`
-      exits 0 for any loaded label even when the service is crashed/stopped, so the check
-      greps `state = running`; stderr goes to the terminal (not `2>&1`-swallowed) so a
-      failure explains itself; and the loop carries a REAL exit code. The unit list is
-      DERIVED from what is actually loaded for the role, checked against the substrate
-      manifest (`substrate/plists/`) — a hardcoded list both misses factory-role units
-      (e.g. `inbox-assistant`) and false-flags sentinel-gated ones (e.g. `reconcile`
-      when its poll sentinel is off):
+- [ ] every required launchd unit verified by the AUDITED health check — run the liveness
+      canary once, not a bespoke predicate. (A hand-rolled gate here went through two
+      review rounds re-learning what the canary already knows: healthy tick jobs sit at
+      `state = waiting` between runs, `launchctl print` exits 0 for crashed-but-loaded
+      labels, the declared set derives from `substrate/plists/` WITH sentinel gating, and
+      health = last exit code + execution freshness, not a state string.) Run ON the
+      Mini from the deploy clone:
       ```
-      fail=0
-      units="runtime $(ls substrate/plists/ 2>/dev/null | sed -n 's/^ai\.myndaix\.\(.*\)\.json$/\1/p')"
-      for u in $units; do
-        launchctl print "gui/$(id -u)/ai.myndaix.$u" 2>/dev/null | grep -q "state = running" \
-          || { echo "NOT RUNNING (or not loaded): $u" >&2; fail=1; }
-      done
-      [ "$fail" -eq 0 ]   # sentinel-gated units (reconcile poll off) are EXPECTED misses — note them, don't fail the run on them alone
+      out="$(bash substrate/liveness-canary.sh 2>&1)"; printf '%s\n' "$out"
+      ! printf '%s\n' "$out" | grep -q "DIVERGENT" || { echo "PREFLIGHT FAIL: divergence above"; false; }
+      # plus the ONE long-lived daemon, where 'running' IS the healthy state:
+      launchctl print "gui/$(id -u)/ai.myndaix.runtime" | grep -q "state = running" \
+        || { echo "PREFLIGHT FAIL: serve pool not running"; false; }
       ```
 
 Record each cell PASS/FAIL + the observed number/behavior. A FAIL is a finding, not a
