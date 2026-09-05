@@ -492,9 +492,13 @@ async def _dispatch_pool(led: PostgresLedger, prompt: str, staging: Path) -> tup
     reply = next((o["body"] for o in (st.get("outbound") or [])), "") or ""
     for o in (st.get("outbound") or []):
         if o["status"] == "pending":
-            # inline verb (r8 P2): the transport verb's leased-only CAS silently no-ops
-            # on these pending rows — same latent-duplicate bug the cli path had
-            await led.mark_outbound_sent_inline(o["id"], f"curate-{o['id']}")
+            # inline verb (r8 P2) with the row count CAPTURED (r9 #2): 0 = a transport
+            # sender won the row first, so DELIVERY belongs to the sender. Curate only
+            # READS the body as pipeline input — reading is not delivering, so the reply
+            # stays usable either way; the race is logged, never silently discarded.
+            if not await led.mark_outbound_sent_inline(o["id"], f"curate-{o['id']}"):
+                log(f"outbound tombstone raced to a transport sender (row {o['id']}; "
+                    "benign — body used as pipeline input only, delivery is the sender's)")
     return True, reply
 
 

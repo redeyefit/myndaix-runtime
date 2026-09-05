@@ -119,8 +119,16 @@ do_apply(){
   case "$ref" in
     origin/*)
       _branch="${ref#origin/}"
-      git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
-        || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
+      # plain BRANCH names only feed the refspec (r9 #4): 'origin/main~1' is a revision
+      # EXPRESSION — using it as a refspec errors/misbehaves. Expressions refresh the
+      # underlying branch tip via a bare fetch, then rev-parse resolves them as before.
+      if [[ "$_branch" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+        git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
+          || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
+      else
+        git -C "$REPO" fetch --quiet origin \
+          || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
+      fi
       ;;
   esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
