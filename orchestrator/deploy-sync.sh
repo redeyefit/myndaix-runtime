@@ -9,9 +9,11 @@
 # sat on the pre-flock version for 3 days, caught by luck not signal (see the runtime-deploy
 # topology audit). This turns that silent, luck-dependent failure into a loud, deterministic one.
 #
-# Surface (audited — exactly these two files, everything else runs repo-direct):
+# Surface (audited — exactly these three files, everything else runs repo-direct):
 #   ~/.myndaix/orchestrator/play-fix.sh      (autofix worker — anti-symlink security boundary)
 #   ~/.myndaix/orchestrator/play-review.sh   (review worker, re-exec'd by the pre-push dispatcher)
+#   ~/.myndaix/bin/mxr-phone                 (sshd forced-command target — the phone surface; joined
+#                                             the guarded set per the phone runtime audit, item 7)
 #
 # Modes:
 #   --check       read-only: report SAME/DRIFT of each deployed copy vs <ref>; exit 1 on any drift.
@@ -28,8 +30,15 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DEST="${DEPLOY_SYNC_DEST:-$HOME/.myndaix/orchestrator}"   # overridable for tests
+BIN="${DEPLOY_SYNC_BIN:-$HOME/.myndaix/bin}"              # forced-command home (overridable for tests)
 STAMP="$DEST/.deployed-sha"
-FILES=(play-fix.sh play-review.sh)                        # the audited copied surface
+# the audited copied surface: "<repo-relative src>:<absolute dest>" (basenames differ now
+# that the phone wrapper joined — split on the FIRST ':' only)
+FILES=(
+  "orchestrator/play-fix.sh:$DEST/play-fix.sh"
+  "orchestrator/play-review.sh:$DEST/play-review.sh"
+  "orchestrator/phone/mxr-phone.sh:$BIN/mxr-phone"
+)
 
 mode="${1:-}"
 ref="${2:-origin/main}"
@@ -45,8 +54,8 @@ _release_lock(){ [[ -n "${_LOCK:-}" ]] && rmdir "$_LOCK" 2>/dev/null; return 0; 
 [[ -d "$REPO/.git" ]] || die "repo not a git dir: $REPO"
 [[ -d "$DEST" ]]      || die "deploy dest missing: $DEST"
 
-# blob sha of a path AT a git ref (the intended/committed content)
-ref_blob(){ git -C "$REPO" rev-parse --verify --quiet "$ref:orchestrator/$1"; }
+# blob sha of a path AT a git ref (the intended/committed content); arg = repo-relative path
+ref_blob(){ git -C "$REPO" rev-parse --verify --quiet "$ref:$1"; }
 # blob sha of a file's CURRENT content on disk (git's own content hash — comparable to ref_blob).
 # NEVER follow a symlink (review r2): git hash-object dereferences, which both hides a symlink
 # security-boundary violation AND can hang forever on a symlink-to-FIFO/device. A non-regular or
@@ -61,17 +70,18 @@ ref_blob(){ git -C "$REPO" rev-parse --verify --quiet "$ref:orchestrator/$1"; }
 disk_blob(){ [[ -f "$1" && ! -L "$1" ]] || { echo "MISSING"; return; }; git -C "$REPO" hash-object "$1" 2>/dev/null || echo "MISSING"; }
 
 do_check(){
-  local drift=0 f want have
+  local drift=0 pair src dst f want have
   ref="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"  # pin (r4): one commit for all files
-  for f in "${FILES[@]}"; do
+  for pair in "${FILES[@]}"; do
+    src="${pair%%:*}"; dst="${pair#*:}"; f="$(basename "$dst")"
     # SECURITY-boundary invariant (review MED-2): git hash-object follows symlinks, so a symlinked
     # deployed copy pointing at matching content would hash SAME and hide the violation. Check the
     # link-ness FIRST — a symlink is drift regardless of what it points at.
-    if [[ -L "$DEST/$f" ]]; then
+    if [[ -L "$dst" ]]; then
       log "DRIFT $f  SECURITY: deployed copy is a SYMLINK (must be a real regular file)"; drift=1; continue
     fi
-    want="$(ref_blob "$f")" || die "path not found at $ref: orchestrator/$f"
-    have="$(disk_blob "$DEST/$f")"
+    want="$(ref_blob "$src")" || die "path not found at $ref: $src"
+    have="$(disk_blob "$dst")"
     if [[ "$want" == "$have" ]]; then
       log "SAME  $f  ($want)"
     else
@@ -82,7 +92,7 @@ do_check(){
 }
 
 do_apply(){
-  local f want tmp bak deployed_sha
+  local pair src dst ddir f want tmp bak deployed_sha
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
@@ -106,31 +116,36 @@ do_apply(){
   # ref advances mid-loop, then stamp the earlier sha — a silent mixed-commit deploy. All subsequent
   # blob reads use $deployed_sha, so the two files + the stamp always describe ONE commit.
   ref="$deployed_sha"
-  for f in "${FILES[@]}"; do
-    want="$(ref_blob "$f")" || die "path not found at $deployed_sha: orchestrator/$f"
+  for pair in "${FILES[@]}"; do
+    src="${pair%%:*}"; dst="${pair#*:}"; f="$(basename "$dst")"
+    # the phone wrapper's home may not exist on a fresh box — create it, never a symlinked one
+    ddir="$(dirname "$dst")"
+    [[ -L "$ddir" ]] && die "SECURITY: dest dir $ddir is a symlink — refusing"
+    mkdir -p "$ddir" || die "cannot create dest dir $ddir"
+    want="$(ref_blob "$src")" || die "path not found at $deployed_sha: $src"
     # unpredictable, O_EXCL temp (review HIGH-1): a PID-named ($$) temp with '>' follows a
     # pre-planted same-user symlink; mktemp uses O_EXCL + random suffix, closing that vector on the
     # very files that ARE the security boundary.
-    tmp="$(mktemp "$DEST/.$f.tmp.XXXXXX")" || die "mktemp failed in $DEST"
+    tmp="$(mktemp "$ddir/.$f.tmp.XXXXXX")" || die "mktemp failed in $ddir"
     # materialize the EXACT committed blob (not the working tree — avoids dirty-tree bleed)
-    git -C "$REPO" show "$ref:orchestrator/$f" > "$tmp" || { rm -f "$tmp"; die "git show failed for $f"; }
+    git -C "$REPO" show "$ref:$src" > "$tmp" || { rm -f "$tmp"; die "git show failed for $src"; }
     chmod +x "$tmp"
     # verify BEFORE install — never place a mismatched file
     [[ "$(disk_blob "$tmp")" == "$want" ]] || { rm -f "$tmp"; die "hash mismatch building $f (refusing)"; }
     # backup any existing REGULAR deployed copy (reversible). SKIP a symlinked source (review r3
     # MAJOR-2): cp -p follows the link and would hang forever on a symlink-to-FIFO/device — and
     # backing up a planted symlink is pointless anyway. The mv below heals it to a regular file.
-    if [[ -f "$DEST/$f" && ! -L "$DEST/$f" ]]; then
-      bak="$DEST/$f.bak-$(date '+%Y%m%d%H%M%S')"; cp -Pp "$DEST/$f" "$bak"   # -P: never deref (belt)
-    elif [[ -e "$DEST/$f" ]]; then
+    if [[ -f "$dst" && ! -L "$dst" ]]; then
+      bak="$dst.bak-$(date '+%Y%m%d%H%M%S')"; cp -Pp "$dst" "$bak"   # -P: never deref (belt)
+    elif [[ -e "$dst" ]]; then
       # a SYMLINK or a special file (FIFO/device) sits where a real script should — do NOT cp it
       # (cp would hang forever on a FIFO; review r4), just log and let the mv below heal it.
       log "SECURITY: $f is not a regular file (symlink/FIFO/device) — not backing up; healing"
     fi
-    mv -f "$tmp" "$DEST/$f"                                # atomic rename (same fs); replaces a symlink
-    [[ ! -L "$DEST/$f" ]] || die "SECURITY: $f became a symlink — refusing"   # regular-file invariant
-    [[ "$(disk_blob "$DEST/$f")" == "$want" ]] || die "post-install hash mismatch $f"
-    log "APPLIED $f  ($want)"
+    mv -f "$tmp" "$dst"                                    # atomic rename (same fs); replaces a symlink
+    [[ ! -L "$dst" ]] || die "SECURITY: $f became a symlink — refusing"   # regular-file invariant
+    [[ "$(disk_blob "$dst")" == "$want" ]] || die "post-install hash mismatch $f"
+    log "APPLIED $f -> $dst  ($want)"
   done
   printf '%s\n' "$deployed_sha" > "$STAMP"
   log "stamped .deployed-sha = $deployed_sha"
@@ -140,13 +155,15 @@ do_preflight(){
   # ADVISORY only — never fails the caller (pool start must not be bricked by this guard).
   local f want have head_sha stamped
   ref="$(git -C "$REPO" rev-parse --verify "$ref" 2>/dev/null || printf '%s' "$ref")"  # best-effort pin (r4); never dies
-  for f in "${FILES[@]}"; do
+  local pair src dst
+  for pair in "${FILES[@]}"; do
+    src="${pair%%:*}"; dst="${pair#*:}"; f="$(basename "$dst")"
     # continue BEFORE hashing (review r2 MED): never call git hash-object on a symlink — it would
     # hang forever on a symlink-to-FIFO/device, and this advisory must never stall pool start.
-    if [[ -L "$DEST/$f" ]]; then
+    if [[ -L "$dst" ]]; then
       log "PREFLIGHT WARN: $f is a SYMLINK — security-boundary violation (must be a real file)"; continue
     fi
-    want="$(ref_blob "$f" 2>/dev/null || echo '?')"; have="$(disk_blob "$DEST/$f")"
+    want="$(ref_blob "$src" 2>/dev/null || echo '?')"; have="$(disk_blob "$dst")"
     [[ "$want" == "$have" ]] || log "PREFLIGHT WARN: deployed $f drifts from $ref (deployed=$have want=$want)"
   done
   if [[ -f "$STAMP" ]]; then

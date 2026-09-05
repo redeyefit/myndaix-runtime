@@ -57,10 +57,15 @@ if [[ "${1:-}" == "--sshd" ]]; then
   # ================= deploy-time REAL-SSHD leg (design §8.4b) — run ON the Mini =========
   echo "sshd leg: asserting the real boundary on $(hostname)"
   command -v ssh >/dev/null || { echo "FAIL: no ssh"; exit 1; }
-  # AcceptEnv must be EMPTY (env-channel abuse inert at the sshd layer)
-  if sudo -n true 2>/dev/null; then AE="$(sudo sshd -T 2>/dev/null | grep -ci '^acceptenv' || true)"
-  else AE="$(grep -rci '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"; fi
-  [ "${AE:-0}" -eq 0 ] && ok "AcceptEnv empty" || bad "AcceptEnv configured ($AE) — env channel open"
+  # AcceptEnv: stock macOS ships 'AcceptEnv LANG LC_*' (/etc/ssh/sshd_config.d/100-macos.conf)
+  # — locale-only passthrough, and inert against the wrapper's env -i trampoline anyway. A
+  # strict empty-AcceptEnv gate dead-ended every fresh box on Apple's default (audit item 2),
+  # so the gate flags any NON-locale pattern (a real env channel) instead. NOTE: an OS update
+  # can rewrite 100-macos.conf — this gate re-checks the truth on every --sshd run.
+  if sudo -n true 2>/dev/null; then _ae_lines="$(sudo sshd -T 2>/dev/null | grep -i '^acceptenv' || true)"
+  else _ae_lines="$(grep -rhi '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null || true)"; fi
+  AE="$(printf '%s\n' "$_ae_lines" | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(LANG|LC_)' | grep -c . || true)"
+  [ "${AE:-0}" -eq 0 ] && ok "AcceptEnv carries no non-locale patterns (LANG/LC_* tolerated; env -i makes them inert)" || bad "AcceptEnv has $AE non-locale pattern(s) — real env channel open"
   # temp key wired to the wrapper via a forced command, loopback. Trap installed BEFORE
   # the append (r1 L-14): an interrupt can never strand the temp key; cleanup is
   # temp-file + atomic mv.
