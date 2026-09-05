@@ -28,10 +28,13 @@ DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
 
 def _clean_reply(s: str) -> str:
     """Terminal-injection belt (phone r1 M-10): agent reply bodies are untrusted output —
-    strip C0 controls + DEL (keep \\t \\n \\r) before they hit an operator's terminal, the
+    strip C0/C1 controls + DEL (keep \\t \\n \\r) before they hit an operator's terminal, the
     same range play-review's clean() strips before the inbox. Applied to BOTH reply
     prints (submit sync-reply and `get --reply`) so no caller receives raw ESC sequences."""
-    return "".join(ch for ch in s if ch in "\t\n\r" or (ch >= " " and ch != "\x7f"))
+    return "".join(
+        ch for ch in s
+        if ch in "\t\n\r" or (ch >= " " and ch != "\x7f" and not "\x80" <= ch <= "\x9f")
+    )
 
 
 def _resolve_sync_wait(agent: str) -> float:

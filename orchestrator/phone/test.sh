@@ -62,9 +62,13 @@ if [[ "${1:-}" == "--sshd" ]]; then
   K="$ROOT/k"; ssh-keygen -q -t ed25519 -N '' -f "$K"
   AK="$HOME/.ssh/authorized_keys"; touch "$AK"
   _ak_cleanup(){ # cleanup as a FUNCTION (deploy-sync precedent: never interpolate into a trap string)
-    local t
+    local t grc
     if [ -f "$K.pub" ] && t="$(mktemp "$HOME/.ssh/.ak.XXXXXX" 2>/dev/null)"; then
-      grep -vF "$(cat "$K.pub")" "$AK" > "$t" 2>/dev/null && mv -f "$t" "$AK" || rm -f "$t" 2>/dev/null
+      # grep -v exits 1 when it selects ZERO lines (temp key was the only entry) — that is a
+      # VALID filter result, not a failure; only rc>1 (real error) may skip the mv, else the
+      # forced-command key would survive the test run (r2 LOW-7).
+      grep -vF "$(cat "$K.pub")" "$AK" > "$t" 2>/dev/null; grc=$?
+      if [ "$grc" -le 1 ]; then mv -f "$t" "$AK"; else rm -f "$t" 2>/dev/null; fi
     fi
     rm -rf "$ROOT"
   }

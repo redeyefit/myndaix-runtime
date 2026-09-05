@@ -23,6 +23,7 @@ if [ -z "${MXRPHONE_CLEAN:-}" ]; then
     HOME="${HOME:-}" \
     PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     SSH_ORIGINAL_COMMAND="${SSH_ORIGINAL_COMMAND:-}" \
+    MYNDAIX_DSN="${MYNDAIX_DSN:-}" \
     MXRPHONE_MXR="${MXRPHONE_MXR:-}" MXRPHONE_STATE="${MXRPHONE_STATE:-}" \
     MXRPHONE_CAP_ASK="${MXRPHONE_CAP_ASK:-}" MXRPHONE_CAP_GET="${MXRPHONE_CAP_GET:-}" \
     MXRPHONE_CAP_REEL="${MXRPHONE_CAP_REEL:-}" MXRPHONE_CAP_STATUS="${MXRPHONE_CAP_STATUS:-}" \
@@ -49,15 +50,20 @@ MAX_OUT=4096
 
 mkdir -p "$STATE" 2>/dev/null || { printf 'denied: state dir unavailable\n'; exit 2; }
 
-# ---- atomic stale eviction (r1 M-4/M-5): mv is the ONE-WINNER op — a racing reaper's mv
-# fails, so nobody ever deletes a rival's FRESH lock (mtime is re-checked here, atomically
-# close to the mv; a recreated dir has a fresh mtime and simply fails the staleness gate).
+# ---- atomic stale eviction (r1 M-4/M-5): mv is the ONE-WINNER op. After the rename,
+# verify the moved dir still has the stale mtime read above before deleting it; if a
+# fresh lock was recreated in the race window, put it back best-effort and report no reap.
 _reap_dir(){ # _reap_dir <dir> <stale_s> ; rc0 = this caller evicted it
-  local d="$1" now mt g
+  local d="$1" now mt g moved_mt
   now="$(date +%s)"; mt="$(stat -f %m "$d" 2>/dev/null || printf '%s' "$now")"
   [ $((now - mt)) -gt "$2" ] || return 1
   g="$d.reaped.$$"
   mv "$d" "$g" 2>/dev/null || return 1
+  moved_mt="$(stat -f %m "$g" 2>/dev/null || printf '')"
+  if [ "$moved_mt" != "$mt" ]; then
+    [ ! -e "$d" ] && mv "$g" "$d" 2>/dev/null || true
+    return 1
+  fi
   rm -rf "$g" 2>/dev/null || true
   return 0
 }
@@ -90,7 +96,7 @@ deny(){ log_or_deny "DENY $1"; printf 'denied: %s\n' "$2"; exit 2; }
 # ---- output escape + answer-first truncation (design M1/L2) ----
 emit(){ # stdin -> stdout, control/ANSI-stripped (keep \t\n), capped at MAX_OUT bytes
   local body
-  body="$(LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | head -c $((MAX_OUT + 1)))"
+  body="$(perl -MEncode=decode,encode,FB_DEFAULT -0777 -ne '$s=decode("UTF-8",$_,FB_DEFAULT);$s=~s/[\x{0}-\x{8}\x{b}\x{c}\x{e}-\x{1f}\x{7f}-\x{9f}\x{fffd}]//g;print encode("UTF-8",$s)' | head -c $((MAX_OUT + 1)))"
   if [ "$(printf '%s' "$body" | wc -c)" -gt "$MAX_OUT" ]; then
     printf '%s' "$body" | head -c "$MAX_OUT"; printf '\n…[truncated]\n'
   else
@@ -151,11 +157,19 @@ cap_take(){ # cap_take <verb> <limit> <day|hour> ; rc!=0 = over cap / lock starv
 # ---- phone-jid registry (r1 H-3): `get` may only fetch jobs THIS surface issued — job
 # ids are NOT an authorization boundary. Recorded on the ask-timeout path; 200-line cap.
 jid_record(){ # jid_record <full-uuid>
-  ( umask 077; printf '%s\n' "$1" >> "$JIDS" ) 2>/dev/null || true
+  local i lockd _t
+  lockd="$STATE/.phjid.lock"
+  for i in $(seq 1 20); do
+    if mkdir "$lockd" 2>/dev/null; then break; fi
+    _reap_dir "$lockd" 10 || sleep 0.02
+    [ "$i" -eq 20 ] && return 1
+  done
+  if ! ( umask 077; printf '%s\n' "$1" >> "$JIDS" ) 2>/dev/null; then rmdir "$lockd" 2>/dev/null || true; return 1; fi
   if [ "$(wc -l < "$JIDS" 2>/dev/null || echo 0)" -gt 200 ]; then
-    local _t; _t="$(mktemp "$STATE/.phjid.XXXXXX" 2>/dev/null)" || return 0
+    _t="$(mktemp "$STATE/.phjid.XXXXXX" 2>/dev/null)" || { rmdir "$lockd" 2>/dev/null || true; return 0; }
     tail -n 200 "$JIDS" > "$_t" 2>/dev/null && chmod 600 "$_t" 2>/dev/null && mv -f "$_t" "$JIDS" 2>/dev/null || rm -f "$_t" 2>/dev/null || true
   fi
+  rmdir "$lockd" 2>/dev/null || true
   return 0
 }
 jid_known(){ grep -qx "$1" "$JIDS" 2>/dev/null; }
@@ -167,8 +181,13 @@ cmd="${SSH_ORIGINAL_COMMAND:-}"
 # missing/broken grep (rc not in {0,1}) denies rather than waving the payload through.
 set +e
 _cn="$(printf '%s' "$cmd" | LC_ALL=C grep -c '[[:cntrl:]]' 2>/dev/null)"; _crc=$?
+_c1_pat="$(printf '\302[\200-\237]')"
+_c1="$(printf '%s' "$cmd" | LC_ALL=C grep -c "$_c1_pat" 2>/dev/null)"; _c1rc=$?
+printf '%s' "$cmd" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; _utf8rc=$?
 set -e
-if [ "$_crc" -ne 1 ] || [ "$_cn" != "0" ]; then deny "cntrl" "control characters are not accepted"; fi
+if [ "$_crc" -gt 1 ] || [ "$_c1rc" -gt 1 ] || [ "$_utf8rc" -ne 0 ] || [ "$_cn" != "0" ] || [ "$_c1" != "0" ]; then
+  deny "cntrl" "control characters are not accepted"
+fi
 verb="${cmd%% *}"
 rest=""; [ "$cmd" != "$verb" ] && rest="${cmd#"$verb" }"
 
@@ -224,8 +243,12 @@ case "$verb" in
       # must say so, or `get` polls a dead job forever.
       _jid="$(grep -o 'JOB_ID=[0-9a-f-]*' "$_e" 2>/dev/null | head -1 | cut -d= -f2 || true)"
       if [ -n "$_jid" ] && grep -q 'timed out' "$_e" 2>/dev/null; then
-        jid_record "$_jid"                                # r1 H-3: only phone-issued jobs are get-able
-        printf 'still thinking — job %s\nrun Get Answer with: get %s\n' "${_jid:0:13}…" "$_jid"
+        if jid_record "$_jid"; then
+          printf 'still thinking — job %s\nrun Get Answer with: get %s\n' "${_jid:0:13}…" "$_jid"
+        else
+          rc=1
+          printf 'factory error: could not record job id for later retrieval\n' | emit
+        fi
       else
         { printf 'factory error (rc=%s):\n' "$rc"; tail -c 500 "$_e"; } | emit
       fi
@@ -248,7 +271,13 @@ case "$verb" in
     run_bounded 30 "$MXR_BIN" get --reply "$jid" >"$_o" 2>"$_e" || rc=$?
     case "$rc" in
       0) emit < "$_o";;
-      3) printf 'still thinking — no reply yet; try again in a minute\n';;
+      3)
+        if grep -Eq 'job status: (failed|dead)' "$_e" 2>/dev/null; then
+          { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit
+        else
+          printf 'still thinking — no reply yet; try again in a minute\n'
+        fi
+        ;;
       1) printf 'no such job\n';;
       *) { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit;;
     esac

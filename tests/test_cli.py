@@ -376,6 +376,17 @@ def test_resolve_sync_wait_malformed_env_falls_to_profile():
                      lambda: cli._resolve_sync_wait("kilabz")) == 960.0
 
 
+def test_clean_reply_strips_c1_keeps_unicode():
+    # r2 HIGH-3: C1 controls (U+0080–U+009F) are terminal-injectable (U+009B == CSI in
+    # C1-honoring emulators) and must be stripped like C0/DEL — but real Unicode above
+    # that range (accents, €, emoji) must survive: the strip is codepoint-, not byte-based.
+    assert cli._clean_reply("a\x9b31mEVIL") == "a31mEVIL"          # CSI stripped
+    assert cli._clean_reply("\x80\x85\x9f") == ""                  # full C1 range
+    assert cli._clean_reply("café €100 🚀") == "café €100 🚀"      # unicode intact
+    assert cli._clean_reply("tab\there\nline\rret") == "tab\there\nline\rret"
+    assert cli._clean_reply("esc\x1b[31m del\x7f") == "esc[31m del"  # C0/DEL still stripped
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
