@@ -1,7 +1,7 @@
 ---
 name: fail-closed-filter
 description: A guard whose checking tool can fail must deny, not proceed
-path_trigger: "*.sh"
+path_trigger: "tools/*.sh substrate/*.sh orchestrator/*.sh orchestrator/phone/*.sh"
 ---
 
 `if printf '%s' "$input" | grep -q BAD; then deny; fi` is fail-OPEN: when grep itself

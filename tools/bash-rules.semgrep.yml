@@ -74,8 +74,13 @@ rules:
     message: >-
       `10#name` without `$` is the base-10 guard typo: inside $(( )), the token after `10#` must be
       DIGITS, so `10#n` crashes with "value too great for base" — the guard then breaks the very
-      script it was protecting. Write `$((10#$n))`. (Shipped this exact bug 2026-09-03 in mxr-phone
-      cap_take; caught by the test suite, encoded here so it fails at check time instead.)
+      script it was protecting. Write `$((10#$n))`. NOTE: this is a whole-file TEXT match (generic
+      mode has no arithmetic-context awareness), so it also fires on the typo form quoted in a
+      comment or string — cite the idiom only in its correct `10#$v` form. (Shipped this exact bug
+      2026-09-03 in mxr-phone cap_take; caught by the test suite, encoded here for check time.)
     # `10#` followed by an identifier char (not a digit, not `$`). Zero legitimate occurrences
-    # repo-wide at rule-add time; comments citing the idiom use the correct `10#$v` form.
+    # repo-wide at rule-add time. Deliberately UNSCOPED text-level regex: generic mode cannot see
+    # $(( )) structure, and a comment/string citing the broken form is itself worth flagging (it
+    # teaches the typo). The message states the scope, so the FP mode is understood, not implied
+    # away (review #125 finding 5).
     pattern-regex: '10#[A-Za-z_]'

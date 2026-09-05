@@ -1,7 +1,7 @@
 ---
 name: negative-claims-scope
-description: A "no X anywhere" claim requires exhaustive search or a stated scope
-path_trigger: "docs/*.md"
+description: Negative claims need a stated search scope or exhaustiveness
+path_trigger: "docs/*.md docs/reviews/*.md docs/research/*.md"
 ---
 
 Positive claims verify cheap (one observation proves them). Negative claims verify

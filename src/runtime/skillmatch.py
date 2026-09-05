@@ -23,36 +23,63 @@ __all__ = ["is_banned_trigger", "seg_match", "specificity", "scan_injection", "I
 # A path_trigger matches a changed path by SEGMENT, never fnmatch-across-"/": split both on
 # "/", require EQUAL segment count, fnmatch each segment. So `src/*.py` matches `src/a.py`
 # but NOT `src/sub/a.py` (plain fnmatch's "*" would otherwise cross "/" and over-match).
+#
+# A trigger may carry MULTIPLE whitespace-separated alternatives ("tools/*.sh substrate/*.sh")
+# — equal-depth matching means one pattern covers exactly one directory depth, so a skill
+# aimed at "shell scripts wherever they live" needs one alternative per real location
+# (guardrails review #125 finding 4: `*.sh` fired on nothing — every script is nested — and
+# the obvious `**/*.sh` is deliberately banned). Each alternative obeys the same ban rules;
+# `/` cannot appear in filenames, so whitespace-splitting is unambiguous for git paths.
+
+def trigger_alternatives(trigger: str) -> list[str]:
+    """Split a path_trigger into its whitespace-separated alternatives (may be one)."""
+    return trigger.split()
+
 
 def is_banned_trigger(trigger: str) -> bool:
     """A trigger too broad to allow — it would attach to ~every review and starve specific
     skills under the LIMIT 2 selection (Oracle/codex). Banned: empty; any `**` segment
     (cross-segment wildcard has no place in segment matching); and any BARE `*` segment, so
     `*`, `*/*`, `dir/*`, `src/*` are all rejected — every segment must carry a literal. A
-    pattern like `src/*.py` (segment `*.py`) is allowed."""
-    t = trigger.strip()
-    if not t:
+    pattern like `src/*.py` (segment `*.py`) is allowed. A multi-alternative trigger is
+    banned if ANY alternative is banned (fail-closed — one broad alternative would starve
+    exactly like a broad single trigger)."""
+    alts = trigger_alternatives(trigger)
+    if not alts:
         return True
-    segs = t.split("/")
-    return any(s == "*" or s == "**" for s in segs)
+    for alt in alts:
+        segs = alt.split("/")
+        if any(s == "*" or s == "**" for s in segs):
+            return True
+    return False
 
 
 def seg_match(trigger: str, path: str) -> bool:
-    """True iff `trigger` matches `path` by path-SEGMENT (equal depth, per-segment
-    case-sensitive fnmatch, `*` never crossing "/"). Caller should have rejected the
-    trigger via is_banned_trigger() first."""
-    tsegs = trigger.strip().split("/")
+    """True iff ANY alternative of `trigger` matches `path` by path-SEGMENT (equal depth,
+    per-segment case-sensitive fnmatch, `*` never crossing "/"). Caller should have
+    rejected the trigger via is_banned_trigger() first."""
     psegs = path.strip().split("/")
-    if len(tsegs) != len(psegs):
-        return False
-    return all(fnmatchcase(p, t) for t, p in zip(tsegs, psegs))
+    for alt in trigger_alternatives(trigger):
+        tsegs = alt.split("/")
+        if len(tsegs) == len(psegs) and all(fnmatchcase(p, t) for t, p in zip(tsegs, psegs)):
+            return True
+    return False
+
+
+def _alt_specificity(alt: str) -> int:
+    return sum(0 if any(c in s for c in "*?[") else 1 for s in alt.split("/"))
 
 
 def specificity(trigger: str) -> int:
     """A trigger's specificity = count of segments with NO wildcard char (more literal
     segments = more specific). The middle ORDER BY key (after new-first, before recency)
-    so specific triggers beat broad ones at LIMIT 2 (Oracle fairness fold)."""
-    return sum(0 if any(c in s for c in "*?[") else 1 for s in trigger.strip().split("/"))
+    so specific triggers beat broad ones at LIMIT 2 (Oracle fairness fold). For a
+    multi-alternative trigger this is the MOST SPECIFIC alternative — ranking a skill by
+    its best-aimed pattern, never inflated by summing alternatives."""
+    alts = trigger_alternatives(trigger)
+    if not alts:
+        return 0
+    return max(_alt_specificity(a) for a in alts)
 
 
 # ---- injection tripwire (design v0.3.2, from openclaw — NARROWED for our context) -------

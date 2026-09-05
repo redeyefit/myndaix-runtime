@@ -63,6 +63,32 @@ def test_specificity():
        "deeper-literal trigger is more specific (beats broader at LIMIT 2)")
 
 
+# -- multi-alternative triggers (guardrails #125 finding 4: equal-depth matching means
+# -- one pattern = one directory depth; skills that target nested trees need alternatives,
+# -- because ** is banned by design) --------------------------------------------------
+def test_trigger_alternatives():
+    ok(M.seg_match("tools/*.sh substrate/*.sh", "tools/bash-check.sh"),
+       "first alternative matches")
+    ok(M.seg_match("tools/*.sh substrate/*.sh", "substrate/reconcile.sh"),
+       "second alternative matches")
+    ok(M.seg_match("tools/*.sh orchestrator/phone/*.sh", "orchestrator/phone/mxr-phone.sh"),
+       "alternatives may differ in depth")
+    ok(not M.seg_match("tools/*.sh substrate/*.sh", "orchestrator/play-fix.sh"),
+       "no alternative matches -> no match")
+    ok(not M.seg_match("tools/*.sh substrate/*.sh", "tools/sub/deep.sh"),
+       "alternatives still never cross / (equal depth per alternative)")
+    ok(M.is_banned_trigger("tools/*.sh */*"),
+       "one banned alternative bans the whole trigger (fail-closed)")
+    ok(M.is_banned_trigger("tools/*.sh **/x.sh"),
+       "a ** alternative bans the whole trigger")
+    ok(not M.is_banned_trigger("tools/*.sh substrate/*.sh orchestrator/*.sh"),
+       "all-literal-bearing alternatives allowed")
+    ok(M.specificity("docs/*.md docs/reviews/*.md") == 2,
+       "multi-alt specificity = MOST specific alternative (2), never a sum")
+    ok(M.specificity("*.md docs/plan.md") == 2,
+       "an all-literal alternative dominates a broad sibling")
+
+
 # -- scan_injection: the FALSE-POSITIVE guard (descriptive review skills stay CLEAN) --
 def test_descriptive_review_skills_are_clean():
     # These are realistic REVIEW-skill bodies — they describe what to check, using words
