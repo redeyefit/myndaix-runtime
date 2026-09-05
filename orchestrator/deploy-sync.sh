@@ -95,6 +95,9 @@ do_apply(){
   # _LOCK stays SCRIPT-scope on purpose (top-of-file comment: the EXIT trap must see it) —
   # r6 P5's "make it local" would strand the lock at trap time. _head_now IS local.
   local pair src dst ddir f want tmp bak deployed_sha _head_now _branch _branch_re
+  # scope this call's ref mutations (normalization, qualification, commit pin) — bash
+  # locals are dynamically scoped, so ref_blob() still reads this value (r13 #3)
+  local ref="$ref"
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
