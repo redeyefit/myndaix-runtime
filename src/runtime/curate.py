@@ -489,7 +489,11 @@ async def _dispatch_pool(led: PostgresLedger, prompt: str, staging: Path) -> tup
         err = next((a.get("text") for a in (st.get("attempts") or [])
                     if a.get("status") == "failed" and a.get("text")), "")
         return False, f"curator job {st['status']}: {(err or '').strip()[:400]}"
-    reply = next((o["body"] for o in (st.get("outbound") or [])), "") or ""
+    # NEWEST truthy body (r10 #6): outbound rows order oldest->newest (migration 0015) and
+    # the get --reply contract keys on the newest — next() on the forward iterator was
+    # returning the OLDEST and disagreeing with cli.py's authority rule.
+    _bodies = [o.get("body") for o in (st.get("outbound") or []) if o.get("body")]
+    reply = _bodies[-1] if _bodies else ""
     for o in (st.get("outbound") or []):
         if o["status"] == "pending":
             # inline verb (r8 P2) with the row count CAPTURED (r9 #2): 0 = a transport

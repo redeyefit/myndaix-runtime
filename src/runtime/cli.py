@@ -129,21 +129,18 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
 
         if st["status"] == "done":
             outs = st.get("outbound") or []
-            # CAS BEFORE print (r8 P1a): tombstone first, print only a body THIS process
-            # actually WON (r9 #3 — never print row A's body because we won row B; outs is
-            # oldest->newest per migration 0015, so won_body ends holding the newest win).
-            # flush=True (r8 P1b) so the reply never sits in a userspace buffer past the
-            # commit. ACCEPTED residual: a kill between CAS-commit and flush loses the
-            # terminal copy — but not the reply: `mxr get --reply` reads bodies
-            # status-independently, so the answer stays retrievable.
-            won_body = None
+            # CAS BEFORE print (r8 P1a), updating the IN-MEMORY status on each win
+            # (r10 #4 — a stale 'pending' in the snapshot made every later status check
+            # lie). flush=True (r8 P1b) so the reply never sits in a userspace buffer
+            # past the commit. ACCEPTED residual: a kill between CAS-commit and flush
+            # loses the terminal copy — but not the reply: `mxr get --reply` reads
+            # bodies status-independently, so the answer stays retrievable.
             for o in outs:
-                if o["status"] != "pending":
-                    continue
-                # inline verb, not the transport one (r7 #1): mark_outbound_sent's
-                # leased-only CAS silently no-opped on these pending rows forever
-                if await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}") and o.get("body"):
-                    won_body = o["body"]
+                if o["status"] == "pending":
+                    # inline verb, not the transport one (r7 #1): mark_outbound_sent's
+                    # leased-only CAS silently no-opped on these pending rows forever
+                    if await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}"):
+                        o["status"] = "sent"
             # TRUTHY bodies only (r6 P2): `body text NOT NULL` permits "" — an empty
             # string is the SAME terminal no-answer state as a missing row.
             bodies = [o.get("body") for o in outs if o.get("body")]
@@ -153,16 +150,17 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
                 print("MXR_DONE_EMPTY", file=sys.stderr)
                 print("job done but produced no reply body", file=sys.stderr)
                 return 1, True
-            if won_body:
-                print(_clean_reply(won_body), flush=True)
-            elif all(o["status"] == "sent" for o in outs):
-                # SENT only (r9 #1): a LEASED row is in-flight — the sender's to deliver,
-                # and printing it here would be the double. All-sent means every delivery
-                # already happened; re-display is idempotent and the sync caller still
-                # needs the answer on stdout.
-                print(_clean_reply(bodies[-1]), flush=True)
+            # THE reply is the NEWEST truthy body (the get --reply contract; outs is
+            # oldest->newest per migration 0015). Print it iff its row is now SENT —
+            # either this process won its CAS just above, or it was delivered before we
+            # looked (idempotent re-display). A leased/lost newest row is the sender's:
+            # printing an OLDER won body instead would hand the user a stale answer
+            # (r9 #3 + r10 #5 collapse into this one newest-row-authority rule).
+            newest = next(o for o in reversed(outs) if o.get("body"))
+            if newest["status"] == "sent":
+                print(_clean_reply(newest["body"]), flush=True)
             else:
-                print("reply delivery owned by a transport sender (row leased/raced) — "
+                print("the newest reply is owned by a transport sender (row leased) — "
                       "body retrievable via `mxr get --reply`", file=sys.stderr)
             return 0, True
 

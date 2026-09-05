@@ -94,7 +94,7 @@ do_check(){
 do_apply(){
   # _LOCK stays SCRIPT-scope on purpose (top-of-file comment: the EXIT trap must see it) —
   # r6 P5's "make it local" would strand the lock at trap time. _head_now IS local.
-  local pair src dst ddir f want tmp bak deployed_sha _head_now _branch
+  local pair src dst ddir f want tmp bak deployed_sha _head_now _branch _branch_re
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
@@ -119,16 +119,17 @@ do_apply(){
   case "$ref" in
     origin/*)
       _branch="${ref#origin/}"
-      # plain BRANCH names only feed the refspec (r9 #4): 'origin/main~1' is a revision
-      # EXPRESSION — using it as a refspec errors/misbehaves. Expressions refresh the
-      # underlying branch tip via a bare fetch, then rev-parse resolves them as before.
-      if [[ "$_branch" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
-        git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
-          || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
-      else
-        git -C "$REPO" fetch --quiet origin \
-          || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
-      fi
+      # PLAIN branch names only — anything else DIES (r10 #1: the bare-fetch fallback for
+      # revision expressions could no-op under a narrow remote.origin.fetch and bless a
+      # stale tracking ref — the exact fail-open this script prevents; expressions like
+      # origin/main~1 must be operator-resolved to a sha first). First char alphanumeric
+      # (r10 #3: a leading '-' would parse as a git OPTION, not a refspec). Regex in a
+      # var (house idiom; probed fine unquoted on 3.2.57, the var form is the belt).
+      _branch_re='^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)*$'
+      [[ "$_branch" =~ $_branch_re ]] \
+        || die "unsupported ref '$ref' for --apply: use origin/<branch>, HEAD, or a full sha (resolve revision expressions like ~1 to a sha first)"
+      git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
+        || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
       ;;
   esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
