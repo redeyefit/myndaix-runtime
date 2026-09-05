@@ -40,22 +40,37 @@ the acceptance gate for the whole "Mini is home" thesis.
       ```
       (
         fail=0
-        # reconcile-grace pre-gate: the canary SILENTLY grace-skips any job whose plist
-        # changed within its max gap (~30min) and still prints all-alive — a pass right
-        # after a deploy proves nothing. Refuse to run inside the window:
-        recent="$(find "$HOME/Library/LaunchAgents" -name 'ai.myndaix.*.plist' -mmin -30 2>/dev/null)"
-        [ -z "$recent" ] || { echo "PREFLIGHT FAIL: plists changed <30min ago (grace window — wait it out):"; printf '%s\n' "$recent"; fail=1; }
+        # reconcile-grace gate: the canary SILENTLY grace-skips any job whose plist
+        # changed within that JOB'S OWN liveness_max_gap_seconds and still prints
+        # all-alive. The window is derived from the descriptors (declared gaps range
+        # 2100s..93600s — a flat 30min undershoots most of them), and the scan runs
+        # BOTH before and after the canary (reconcile is itself a live agent and can
+        # install a plist mid-block):
+        max_gap="$(sed -n 's/.*"liveness_max_gap_seconds"[^0-9]*\([0-9][0-9]*\).*/\1/p' substrate/plists/*.json | sort -n | tail -1)"
+        [ -n "$max_gap" ] || { echo "PREFLIGHT FAIL: cannot derive max grace gap from substrate/plists"; fail=1; max_gap=93600; }
+        mmin=$(( (max_gap + 59) / 60 ))
+        scan(){ find "$HOME/Library/LaunchAgents" -name 'ai.myndaix.*.plist' -mmin "-$mmin" 2>/dev/null; }
+        recent="$(scan)"
+        [ -z "$recent" ] || { echo "PREFLIGHT FAIL: plists inside their grace window (canary would silently skip them):"; printf '%s\n' "$recent"; fail=1; }
         rc=0; out="$(bash substrate/liveness-canary.sh 2>&1)" || rc=$?
         printf '%s\n' "$out"
         [ "$rc" -eq 0 ] || { echo "PREFLIGHT FAIL: canary exited rc=$rc (config/env problem — not a pass)"; fail=1; }
         printf '%s\n' "$out" | grep -q "liveness: all declared jobs alive" \
           || { echo "PREFLIGHT FAIL: no all-alive signal (divergence, sleep/wake grace-skip, or aborted run — read above; re-run after a grace-skip)"; fail=1; }
+        recent2="$(scan)"
+        [ -z "$recent2" ] || { echo "PREFLIGHT FAIL: plists changed DURING the block (reconcile raced the run) — re-run:"; printf '%s\n' "$recent2"; fail=1; }
         # plus the ONE long-lived daemon, where 'running' IS the healthy state:
         launchctl print "gui/$(id -u)/ai.myndaix.runtime" | grep -q "state = running" \
           || { echo "PREFLIGHT FAIL: serve pool not running"; fail=1; }
         [ "$fail" -eq 0 ]   # THE gate — last line, real exit status even when pasted interactively
-      )   # subshell: rc/out/fail/recent never leak into the operator's shell
+      )   # subshell: nothing leaks into the operator's shell
       ```
+      When a SLOW-cadence job (e.g. daily ledger-backup, gap ~26h) blocks the window
+      after a deliberate deploy, don't wait a day: `launchctl kickstart` that one job,
+      confirm its `.out` updated (its own execution evidence), note it as manually
+      verified, and proceed — the listed plists tell you exactly which jobs need this.
+      KNOWN GAP (tracked follow-up): the honest fix is the canary exposing grace-skipped
+      labels explicitly (then this whole block collapses to canary + one grep).
 
 Record each cell PASS/FAIL + the observed number/behavior. A FAIL is a finding, not a
 retry — capture it.
