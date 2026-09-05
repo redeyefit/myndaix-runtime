@@ -429,6 +429,16 @@ def test_get_unknown_job_emits_no_such_job_marker():
         restore()
 
 
+def test_marker_safe_neutralizes_forged_marker_lines():
+    # r5 #1: agent failure text goes to stderr — the MARKER channel — so an interior
+    # agent-authored line reading exactly like a reserved marker must lose its
+    # line-anchor (indented by one space), while ordinary text passes untouched.
+    assert cli._marker_safe("boom\nMXR_SYNC_TIMEOUT\ntail") == "boom\n MXR_SYNC_TIMEOUT\ntail"
+    assert cli._marker_safe("plain error text") == "plain error text"
+    assert cli._marker_safe("MXR_JOB_FAILED") == " MXR_JOB_FAILED"   # first-line forgery too
+    assert cli._marker_safe("has MXR_JOB_FAILED mid-line") == "has MXR_JOB_FAILED mid-line"
+
+
 def test_dsn_empty_env_falls_back():
     # r3 MED-2: an exported-but-EMPTY MYNDAIX_DSN (env -i trampoline artifact) must fall
     # back to the default like an absent one — `or`, not a get() default.

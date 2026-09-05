@@ -50,6 +50,15 @@ def _clean_reply(s: str) -> str:
     )
 
 
+def _marker_safe(s: str) -> str:
+    """Neutralize marker forgery in AGENT-CONTROLLED text bound for stderr (review r5 #1):
+    stderr is the marker channel, and script callers match markers line-anchored
+    (`^MXR_...$`), so an interior agent-authored line reading exactly like a reserved
+    marker would forge the contract. Indent any MXR_-leading line by one space — content
+    preserved for the human, the anchored match can no longer fire."""
+    return "\n".join((" " + ln) if ln.startswith("MXR_") else ln for ln in s.splitlines())
+
+
 def _resolve_sync_wait(agent: str) -> float:
     """The SYNC wait for a submitted job to finish: MXR_TIMEOUT_S when set (env ALWAYS
     wins — play-review exports it for slow reviews), else the agent's profile-derived
@@ -125,13 +134,22 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
             for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
                 if o["status"] == "pending":
                     await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
+            if reply is None:
+                # done-with-no-body is TERMINAL no-answer, not success-with-silence — the
+                # same state get --reply marks; both paths share one contract (review r5 #4).
+                print("MXR_DONE_EMPTY", file=sys.stderr)
+                print("job done but produced no reply body", file=sys.stderr)
+                return 1, True
             return 0, True
 
-        # failed/dead: surface WHY (the agent's error output, from the attempt)
+        # failed/dead: surface WHY (the agent's error output, from the attempt).
+        # _marker_safe: the marker channel is stderr, and this text is AGENT-CONTROLLED —
+        # an interior line reading exactly "MXR_SYNC_TIMEOUT" would satisfy a caller's
+        # line-anchored marker grep and flip a dead job back to pending (review r5 #1).
         err = next((a.get("text") for a in (st.get("attempts") or [])
                     if a.get("status") == "failed" and a.get("text")), None)
         if err:
-            print(err.strip(), file=sys.stderr)
+            print(_marker_safe(err.strip()), file=sys.stderr)
         print(f"MXR_JOB_{st['status'].upper()}", file=sys.stderr)  # MXR_JOB_FAILED / MXR_JOB_DEAD
         print(f"(job {st['status']})", file=sys.stderr)
         return 1, True

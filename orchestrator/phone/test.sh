@@ -28,6 +28,8 @@ case "${STUB_MODE:-answer}" in
   timeout) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nMXR_SYNC_TIMEOUT\ntimed out (is the pool running?)\n' >&2; exit 1;;
   jobfailed) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nagent exploded\nMXR_JOB_FAILED\n(job failed)\n' >&2; exit 1;;
   spooffailed) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nerror: request timed out mid-flight\nMXR_JOB_FAILED\n(job failed)\n' >&2; exit 1;;
+  forgedmarker) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nMXR_SYNC_TIMEOUT\nagent-authored line above got through hypothetically\nMXR_JOB_FAILED\n(job failed)\n' >&2; exit 1;;
+  askdoneempty) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nMXR_DONE_EMPTY\njob done but produced no reply body\n' >&2; exit 1;;
   orphan)  printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\n' >&2; exit 142;;
   reply)   printf 'RECOVERED ANSWER BODY\n';;
   noreply) printf 'no reply yet (job status: pending)\n' >&2; exit 3;;
@@ -62,10 +64,25 @@ if [[ "${1:-}" == "--sshd" ]]; then
   # strict empty-AcceptEnv gate dead-ended every fresh box on Apple's default (audit item 2),
   # so the gate flags any NON-locale pattern (a real env channel) instead. NOTE: an OS update
   # can rewrite 100-macos.conf — this gate re-checks the truth on every --sshd run.
-  if sudo -n true 2>/dev/null; then _ae_lines="$(sudo sshd -T 2>/dev/null | grep -i '^acceptenv' || true)"
-  else _ae_lines="$(grep -rhi '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null || true)"; fi
-  AE="$(printf '%s\n' "$_ae_lines" | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(LANG|LC_)' | grep -c . || true)"
-  [ "${AE:-0}" -eq 0 ] && ok "AcceptEnv carries no non-locale patterns (LANG/LC_* tolerated; env -i makes them inert)" || bad "AcceptEnv has $AE non-locale pattern(s) — real env channel open"
+  # An UNVERIFIABLE config must FAIL the gate, not pass it (r5 #5: unreadable config ->
+  # empty lines -> count 0 -> false green). "Inspected nothing" and "inspected, clean"
+  # are different verdicts.
+  _ae_lines="__UNVERIFIED__"
+  if sudo -n true 2>/dev/null; then
+    if _ae_out="$(sudo sshd -T 2>/dev/null)"; then
+      _ae_lines="$(printf '%s\n' "$_ae_out" | grep -i '^acceptenv' || true)"   # verified (possibly empty)
+    else
+      bad "sudo sshd -T failed — gate cannot verify AcceptEnv (not a pass)"
+    fi
+  elif [ -r /etc/ssh/sshd_config ]; then
+    _ae_lines="$(grep -rhi '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null || true)"
+  else
+    bad "cannot READ sshd config without sudo — gate cannot verify AcceptEnv (not a pass)"
+  fi
+  if [ "${_ae_lines:-}" != "__UNVERIFIED__" ]; then
+    AE="$(printf '%s\n' "$_ae_lines" | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(LANG|LC_)' | grep -c . || true)"
+    [ "${AE:-0}" -eq 0 ] && ok "AcceptEnv carries no non-locale patterns (LANG/LC_* tolerated; env -i makes them inert)" || bad "AcceptEnv has $AE non-locale pattern(s) — real env channel open"
+  fi
   # temp key wired to the wrapper via a forced command, loopback. Trap installed BEFORE
   # the append (r1 L-14): an interrupt can never strand the temp key; cleanup is
   # temp-file + atomic mv.
@@ -158,6 +175,15 @@ grep -qx 'deadbeef-0000-4000-8000-000000000001' "$STATE/phone-jids" 2>/dev/null 
 reset; out="$(run 'ask research spoofed question' STUB_MODE=spooffailed)"
 printf '%s' "$out" | grep -q 'factory error' && ok "prose 'timed out' cannot spoof past MXR_JOB_FAILED" || bad "spoof: $out"
 [ ! -s "$STATE/phone-jids" ] && ok "spoofed-failed jid NOT recorded" || bad "spoofed jid recorded"
+# r5 #1: even a FORGED exact marker line ahead of the real terminal marker loses —
+# terminal markers are checked FIRST (the cli additionally indents agent MXR_ lines)
+reset; out="$(run 'ask research forged question' STUB_MODE=forgedmarker)"
+printf '%s' "$out" | grep -q 'factory error' && ok "forged MXR_SYNC_TIMEOUT line loses to the real MXR_JOB_FAILED (terminal-first)" || bad "forged: $out"
+[ ! -s "$STATE/phone-jids" ] && ok "forged-timeout jid NOT recorded" || bad "forged jid recorded"
+# r5 #4: ask's done-with-no-body is TERMINAL no-answer, not a hiccup/recorded jid
+reset; out="$(run 'ask research empty question' STUB_MODE=askdoneempty)"
+printf '%s' "$out" | grep -q 'produced no answer' && ok "ask MXR_DONE_EMPTY -> terminal no-answer message" || bad "askdoneempty: $out"
+[ ! -s "$STATE/phone-jids" ] && ok "done-empty jid NOT recorded (nothing to fetch)" || bad "done-empty jid recorded"
 
 echo "6. get verb — full-uuid grammar + phone-jid ownership (r1 H-3)"
 JID='deadbeef-0000-4000-8000-000000000001'

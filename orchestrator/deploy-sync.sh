@@ -111,6 +111,13 @@ do_apply(){
   # tool exists to prevent. (--preflight tolerates it — it's advisory.)
   case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
+  # version-skew guard (review r5 #2): the phone wrapper's marker contract runs against the
+  # CHECKED-OUT tree's cli.py — deploying a ref that advanced past the running checkout
+  # (remote moved between the pull/kickstart and this fetch) silently skews wrapper vs serve.
+  # Loud warn, not die: --apply HEAD (the DEPLOY.md phone path) never trips this.
+  _head_now="$(git -C "$REPO" rev-parse --verify --quiet HEAD || echo unknown)"
+  [[ "$_head_now" == "$deployed_sha" ]] || \
+    log "WARN: deploying $deployed_sha but working-tree HEAD is $_head_now — the running serve may SKEW vs the copied wrapper; pull first or use '--apply HEAD'"
   # PIN to the immutable commit for the rest of the loop (review r3 MAJOR-1): reading blobs through
   # the moving $ref (origin/main) could deploy file A from one commit and file B from another if the
   # ref advances mid-loop, then stamp the earlier sha — a silent mixed-commit deploy. All subsequent
@@ -118,10 +125,13 @@ do_apply(){
   ref="$deployed_sha"
   for pair in "${FILES[@]}"; do
     src="${pair%%:*}"; dst="${pair#*:}"; f="$(basename "$dst")"
-    # the phone wrapper's home may not exist on a fresh box — create it, never a symlinked one
+    # the phone wrapper's home may not exist on a fresh box — create it, then assert
+    # non-symlink ADJACENT to use (r5 #3: check-then-mkdir left a wider race window; the
+    # residual same-user swap between this assert and the mv below stays out of the threat
+    # model per the accepted-residuals note above — a same-user writer edits files directly).
     ddir="$(dirname "$dst")"
-    [[ -L "$ddir" ]] && die "SECURITY: dest dir $ddir is a symlink — refusing"
     mkdir -p "$ddir" || die "cannot create dest dir $ddir"
+    [[ -L "$ddir" ]] && die "SECURITY: dest dir $ddir is a symlink — refusing"
     want="$(ref_blob "$src")" || die "path not found at $deployed_sha: $src"
     # unpredictable, O_EXCL temp (review HIGH-1): a PID-named ($$) temp with '>' follows a
     # pre-planted same-user symlink; mktemp uses O_EXCL + random suffix, closing that vector on the

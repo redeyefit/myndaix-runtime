@@ -289,19 +289,23 @@ case "$verb" in
     if [ "$rc" -eq 0 ]; then
       emit < "$_o"
     else
-      # Branch on the cli's STABLE stderr markers only (marker fold): MXR_SYNC_TIMEOUT /
-      # MXR_JOB_FAILED / MXR_JOB_DEAD — the human prose beside them may change freely,
-      # and agent-controlled error text can't spoof a line-anchored marker match into
-      # flipping a dead job back to "still thinking".
+      # Branch on the cli's STABLE stderr markers only (marker fold). TERMINAL markers are
+      # checked FIRST (r5 #1 defense-in-depth): the cli indents agent-authored MXR_ lines
+      # (_marker_safe) so they can't line-match, and even if both a forged and a real
+      # marker appear, terminal wins — a dead job can never read as "still thinking".
       _jid="$(grep -o 'JOB_ID=[0-9a-f-]*' "$_e" 2>/dev/null | head -1 | cut -d= -f2 || true)"
-      if [ -n "$_jid" ] && grep -q '^MXR_SYNC_TIMEOUT$' "$_e" 2>/dev/null; then
+      if grep -Eq '^MXR_JOB_(FAILED|DEAD)$' "$_e" 2>/dev/null; then
+        { printf 'factory error (rc=%s):\n' "$rc"; tail -c 500 "$_e"; } | emit
+      elif grep -q '^MXR_DONE_EMPTY$' "$_e" 2>/dev/null; then
+        printf 'factory finished but produced no answer — ask again with more detail\n'
+      elif [ -n "$_jid" ] && grep -q '^MXR_SYNC_TIMEOUT$' "$_e" 2>/dev/null; then
         if jid_record "$_jid"; then
           printf 'still thinking — job %s\nrun Get Answer with: get %s\n' "${_jid:0:13}…" "$_jid"
         else
           rc=1
           printf 'factory error: could not record job id for later retrieval\n' | emit
         fi
-      elif [ -n "$_jid" ] && ! grep -Eq '^MXR_JOB_(FAILED|DEAD)$' "$_e" 2>/dev/null && jid_record "$_jid"; then
+      elif [ -n "$_jid" ] && jid_record "$_jid"; then
         # Killed AFTER submit with no terminal marker (SIGALRM rc=142, crash, OOM): the
         # job is alive in the ledger — record the id NOW or the reply is orphaned forever
         # (get denies foreign ids). Record failure falls through to the plain error.

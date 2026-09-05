@@ -89,9 +89,14 @@ migration `0015` applied, so the code it talks to must land FIRST:
 ```bash
 cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
   && launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime \
-  && orchestrator/deploy-sync.sh --apply \
+  && orchestrator/deploy-sync.sh --apply HEAD \
   && bash orchestrator/phone/test.sh && bash orchestrator/phone/test.sh --sshd
 ```
+
+(`--apply HEAD`, not the default `origin/main`: apply re-fetches, and a remote that
+advanced between your pull and the apply would deploy a NEWER wrapper against the OLDER
+running serve — the exact skew the marker rule forbids. HEAD pins wrapper-and-tree to
+one commit; deploy-sync warns loudly when the applied ref differs from HEAD.)
 
 1. pull + kickstart: serve auto-applies migrations (0015 `outbound.created_at`) and the tree's
    `cli.py` now emits the `MXR_*` stderr markers the wrapper matches.
