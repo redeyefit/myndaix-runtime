@@ -376,6 +376,24 @@ def test_resolve_sync_wait_malformed_env_falls_to_profile():
                      lambda: cli._resolve_sync_wait("kilabz")) == 960.0
 
 
+def test_dsn_empty_env_falls_back():
+    # r3 MED-2: an exported-but-EMPTY MYNDAIX_DSN (env -i trampoline artifact) must fall
+    # back to the default like an absent one — `or`, not a get() default.
+    import importlib
+    import os
+    old = os.environ.get("MYNDAIX_DSN")
+    os.environ["MYNDAIX_DSN"] = ""
+    try:
+        importlib.reload(cli)
+        assert cli.DSN == "postgresql://localhost/runtime"
+    finally:
+        if old is None:
+            os.environ.pop("MYNDAIX_DSN", None)
+        else:
+            os.environ["MYNDAIX_DSN"] = old
+        importlib.reload(cli)
+
+
 def test_clean_reply_strips_c1_keeps_unicode():
     # r2 HIGH-3: C1 controls (U+0080–U+009F) are terminal-injectable (U+009B == CSI in
     # C1-honoring emulators) and must be stripped like C0/DEL — but real Unicode above

@@ -166,11 +166,21 @@ out="$(run 'ask research q')"; chmod 600 "$STATE/.phonecap-ask-$(date +%Y%m%d)" 
 printf '%s' "$out" | grep -q 'denied: ask cap' && ok "UNREADABLE counter fails CLOSED (M-7)" || bad "unreadable-cap: $out"
 
 echo "9. concurrency slots"
-reset; mkdir -p "$STATE/.phone-conc1" "$STATE/.phone-conc2"; printf '99999' > "$STATE/.phone-conc1/pid"; printf '99999' > "$STATE/.phone-conc2/pid"
-touch "$STATE/.phone-conc1" "$STATE/.phone-conc2"
+# slots are kernel flocks on permanent slot FILES (r3 HIGH-1) — a holder is a live process
+# holding the lock, and a DEAD holder's slot frees itself (no reaper, nothing to backdate).
+_hold_slot(){ # flock the slot file in a background process until killed; pid in $! — NOT
+  # $(captured): the capture pipe would block on the bg holder's inherited stdout until
+  # its sleep ended, i.e. the holders would be dead before the assertion ran.
+  perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or exit 1; flock($f, LOCK_EX) or exit 1; sleep 60' "$1" >/dev/null 2>&1 &
+}
+reset
+_hold_slot "$STATE/.phone-conc1"; h1=$!
+_hold_slot "$STATE/.phone-conc2"; h2=$!
+sleep 0.3   # let both holders take their locks
 out="$(run 'ask research q')"; printf '%s' "$out" | grep -q 'denied: factory line busy' && ok "both slots held -> busy" || bad "conc: $out"
-touch -t 202001010000 "$STATE/.phone-conc1"
-out="$(run 'ask research q')"; printf '%s' "$out" | grep -q 'ANSWER' && ok "stale slot reaped" || bad "stale conc: $out"
+kill -9 "$h1" 2>/dev/null; wait "$h1" 2>/dev/null
+out="$(run 'ask research q')"; printf '%s' "$out" | grep -q 'ANSWER' && ok "SIGKILLed holder's slot immediately reusable (kernel lock, no stale state)" || bad "killed-holder conc: $out"
+kill "$h2" 2>/dev/null; wait "$h2" 2>/dev/null
 
 echo "10. log policy — sha-only, 0600, deny-on-unwritable"
 reset; run 'ask research super secret gym numbers' >/dev/null

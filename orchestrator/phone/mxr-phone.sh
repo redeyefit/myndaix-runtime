@@ -19,11 +19,15 @@
 # is empty — asserted by test.sh --sshd — so a CLIENT can never set any of these; the
 # MXRPHONE_*/STUB_* seams exist for test.sh only).
 if [ -z "${MXRPHONE_CLEAN:-}" ]; then
+  # r3 MED-2: pass MYNDAIX_DSN through ONLY when non-empty — an exported-but-empty value
+  # would override cli.py's absent-key default with "" (get() default fires on absence only).
+  _dsn=()
+  [ -n "${MYNDAIX_DSN:-}" ] && _dsn=(MYNDAIX_DSN="$MYNDAIX_DSN")
   exec /usr/bin/env -i MXRPHONE_CLEAN=1 \
     HOME="${HOME:-}" \
     PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     SSH_ORIGINAL_COMMAND="${SSH_ORIGINAL_COMMAND:-}" \
-    MYNDAIX_DSN="${MYNDAIX_DSN:-}" \
+    ${_dsn[@]+"${_dsn[@]}"} \
     MXRPHONE_MXR="${MXRPHONE_MXR:-}" MXRPHONE_STATE="${MXRPHONE_STATE:-}" \
     MXRPHONE_CAP_ASK="${MXRPHONE_CAP_ASK:-}" MXRPHONE_CAP_GET="${MXRPHONE_CAP_GET:-}" \
     MXRPHONE_CAP_REEL="${MXRPHONE_CAP_REEL:-}" MXRPHONE_CAP_STATUS="${MXRPHONE_CAP_STATUS:-}" \
@@ -50,44 +54,38 @@ MAX_OUT=4096
 
 mkdir -p "$STATE" 2>/dev/null || { printf 'denied: state dir unavailable\n'; exit 2; }
 
-# ---- atomic stale eviction (r1 M-4/M-5): mv is the ONE-WINNER op. After the rename,
-# verify the moved dir still has the stale mtime read above before deleting it; if a
-# fresh lock was recreated in the race window, put it back best-effort and report no reap.
-_reap_dir(){ # _reap_dir <dir> <stale_s> ; rc0 = this caller evicted it
-  local d="$1" now mt g moved_mt
-  now="$(date +%s)"; mt="$(stat -f %m "$d" 2>/dev/null || printf '%s' "$now")"
-  [ $((now - mt)) -gt "$2" ] || return 1
-  g="$d.reaped.$$"
-  mv "$d" "$g" 2>/dev/null || return 1
-  moved_mt="$(stat -f %m "$g" 2>/dev/null || printf '')"
-  if [ "$moved_mt" != "$mt" ]; then
-    [ ! -e "$d" ] && mv "$g" "$d" 2>/dev/null || true
-    return 1
-  fi
-  rm -rf "$g" 2>/dev/null || true
-  return 0
+# ---- kernel locks (r3 HIGH-1): flock(2) via perl (already a hard dependency — see the
+# run_bounded guard). The mkdir-lock + mv-eviction design was a TOCTOU class (r1 M-4/M-5,
+# r2 MED-4, r3 HIGH-1 — every round found a narrower race in check-then-rename): a kernel
+# lock has no stale state to evict — a crashed holder's fd dies with the process and the
+# kernel releases the lock. One timeout knob, no second eviction constant to drift
+# (r3 LOW-4). The exec'd child inherits the locked fd, so the lock spans exactly the
+# critical section and vanishes on ANY exit path, including SIGKILL.
+_locked(){ # _locked <lockfile> <timeout_s> <argv...> ; child's rc, 5=lock io, 6=lock timeout
+  local lf="$1" to="$2"; shift 2
+  perl -MFcntl=:flock -e '
+    my ($lf, $to) = (shift @ARGV, shift @ARGV);
+    open(my $f, ">>", $lf) or exit 5;
+    $SIG{ALRM} = sub { exit 6 }; alarm($to);
+    flock($f, LOCK_EX) or exit 5;
+    alarm(0);
+    exec @ARGV; exit 5;' "$lf" "$to" "$@"
 }
 
 # ---- logging (design M2; r1 L-13): sha-only, 0600, self-rotated, and SERIALIZED under a
-# tiny mkdir lock so concurrent sessions can't lose lines to a create/rotate race.
-# Log-write failure = DENY (fail closed).
+# kernel lock so concurrent sessions can't lose lines to a create/rotate race.
+# Log-write failure = DENY (fail closed). Snippet args are positional — never interpolated.
 _logwrite(){ # _logwrite <line> ; rc!=0 on failure
-  local i lockd _t
-  lockd="$STATE/.phonelog.lock"
-  for i in $(seq 1 20); do
-    if mkdir "$lockd" 2>/dev/null; then break; fi
-    _reap_dir "$lockd" 10 && continue
-    sleep 0.02
-    [ "$i" -eq 20 ] && return 1
-  done
-  if [ ! -e "$LOG" ]; then ( umask 077; : > "$LOG" ) 2>/dev/null || { rmdir "$lockd" 2>/dev/null || true; return 1; }; fi
-  if ! printf '%s\n' "$1" >> "$LOG" 2>/dev/null; then rmdir "$lockd" 2>/dev/null || true; return 1; fi
-  if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
-    _t="$(mktemp "$STATE/.phlog.XXXXXX" 2>/dev/null)" || { rmdir "$lockd" 2>/dev/null || true; return 0; }
-    tail -n 1000 "$LOG" > "$_t" 2>/dev/null && chmod 600 "$_t" 2>/dev/null && mv -f "$_t" "$LOG" 2>/dev/null || rm -f "$_t" 2>/dev/null || true
-  fi
-  rmdir "$lockd" 2>/dev/null || true
-  return 0
+  _locked "$STATE/.phonelog.lockf" 5 /bin/bash -c '
+    set -uo pipefail
+    LOG="$1"; STATE="$2"; line="$3"
+    if [ ! -e "$LOG" ]; then ( umask 077; : > "$LOG" ) 2>/dev/null || exit 1; fi
+    printf "%s\n" "$line" >> "$LOG" 2>/dev/null || exit 1
+    if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
+      _t="$(mktemp "$STATE/.phlog.XXXXXX" 2>/dev/null)" || exit 0
+      tail -n 1000 "$LOG" > "$_t" 2>/dev/null && chmod 600 "$_t" 2>/dev/null && mv -f "$_t" "$LOG" 2>/dev/null || rm -f "$_t" 2>/dev/null || true
+    fi
+    exit 0' _ "$LOG" "$STATE" "$1"
 }
 log_or_deny(){ _logwrite "[$(date '+%Y-%m-%d %H:%M:%S')] $1" || { printf 'denied: logging unavailable\n'; exit 2; }; }
 
@@ -96,7 +94,12 @@ deny(){ log_or_deny "DENY $1"; printf 'denied: %s\n' "$2"; exit 2; }
 # ---- output escape + answer-first truncation (design M1/L2) ----
 emit(){ # stdin -> stdout, control/ANSI-stripped (keep \t\n), capped at MAX_OUT bytes
   local body
-  body="$(perl -MEncode=decode,encode,FB_DEFAULT -0777 -ne '$s=decode("UTF-8",$_,FB_DEFAULT);$s=~s/[\x{0}-\x{8}\x{b}\x{c}\x{e}-\x{1f}\x{7f}-\x{9f}\x{fffd}]//g;print encode("UTF-8",$s)' | head -c $((MAX_OUT + 1)))"
+  # r3 MED-3: the input is capped BEFORE the whole-buffer decode (perl -0777 would otherwise
+  # slurp unbounded stdin into RAM). Stripping only ever REMOVES bytes, so 4x MAX_OUT of
+  # headroom keeps the >MAX_OUT truncation marker honest for any real reply; a reply that is
+  # mostly stripped garbage may lose the marker, which costs nothing but the ellipsis. A
+  # pre-cap cut mid-multibyte-char decodes to U+FFFD, which the filter strips.
+  body="$(head -c $((MAX_OUT * 4 + 8)) | perl -MEncode=decode,encode,FB_DEFAULT -0777 -ne '$s=decode("UTF-8",$_,FB_DEFAULT);$s=~s/[\x{0}-\x{8}\x{b}\x{c}\x{e}-\x{1f}\x{7f}-\x{9f}\x{fffd}]//g;print encode("UTF-8",$s)' | head -c $((MAX_OUT + 1)))"
   if [ "$(printf '%s' "$body" | wc -c)" -gt "$MAX_OUT" ]; then
     printf '%s' "$body" | head -c "$MAX_OUT"; printf '\n…[truncated]\n'
   else
@@ -109,68 +112,61 @@ emit(){ # stdin -> stdout, control/ANSI-stripped (keep \t\n), capped at MAX_OUT 
 command -v perl >/dev/null 2>&1 || { printf 'denied: perl missing (timeout guard unavailable)\n'; exit 2; }
 run_bounded(){ perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
 
-# ---- global concurrency cap 2 (design H5; r1 M-4/M-6): mkdir slots, pid-owned; a failed
-# pid write = failed acquisition (never hold a slot the trap can't release).
-CONC=""
-release_conc(){ if [ -n "$CONC" ] && [ "$(cat "$CONC/pid" 2>/dev/null || echo none)" = "$$" ]; then rm -rf "$CONC" 2>/dev/null; fi; return 0; }
+# ---- global concurrency cap 2 (design H5; r1 M-4/M-6; r3 HIGH-1): slot = kernel flock
+# on a permanent slot FILE, held on fd 8 for the session's lifetime. The perl helper
+# flocks the INHERITED fd (">>&=" = fdopen, no dup) and exits — the lock lives on the
+# open file description fd 8 keeps referencing, so it persists in THIS process and dies
+# with it (any exit path, incl. SIGKILL: no stale slots, no reaper, no pid files).
+# Children (run_bounded mxr calls) inherit fd 8, so a slot spans the session AND its
+# in-flight work — exactly what the cap is bounding.
+release_conc(){ exec 8>&- 2>/dev/null || true; return 0; }
 trap 'release_conc' EXIT INT TERM
 conc_acquire(){
-  local s d
+  local s
   for s in 1 2; do
-    d="$STATE/.phone-conc$s"
-    if ! mkdir "$d" 2>/dev/null; then
-      _reap_dir "$d" 300 || continue                     # fresh or contested: next slot
-      mkdir "$d" 2>/dev/null || continue                 # lost the recreate race: next slot
+    exec 8>>"$STATE/.phone-conc$s" 2>/dev/null || continue
+    if perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 1; flock($f, LOCK_EX|LOCK_NB) or exit 1; exit 0'; then
+      return 0
     fi
-    if printf '%s' "$$" > "$d/pid" 2>/dev/null; then CONC="$d"; return 0; fi
-    rm -rf "$d" 2>/dev/null || true                      # r1 M-6: unownable slot = not acquired
   done
+  exec 8>&- 2>/dev/null || true
   return 1
 }
 
-# ---- per-verb caps (design H5; r1 M-5/M-7/M-11): PER-VERB mkdir lock (no cross-verb
-# starvation), atomic stale eviction, check+increment BEFORE dispatch. An EXISTING but
-# UNREADABLE counter fails CLOSED — only a genuinely-absent file means zero.
-cap_take(){ # cap_take <verb> <limit> <day|hour> ; rc!=0 = over cap / lock starvation / read failure
-  local verb="$1" limit="$2" window="$3" stamp cf lockd n i _t
+# ---- per-verb caps (design H5; r1 M-5/M-7/M-11): PER-VERB kernel lock (no cross-verb
+# starvation), check+increment BEFORE dispatch. An EXISTING but UNREADABLE counter fails
+# CLOSED — only a genuinely-absent file means zero.
+cap_take(){ # cap_take <verb> <limit> <day|hour> ; rc!=0 = over cap / lock trouble / read failure
+  local verb="$1" limit="$2" window="$3" stamp cf
   case "$window" in hour) stamp="$(date +%Y%m%d%H)";; *) stamp="$(date +%Y%m%d)";; esac
-  cf="$STATE/.phonecap-$verb-$stamp"; lockd="$STATE/.phonecap-$verb.lock"
-  for i in $(seq 1 40); do
-    if mkdir "$lockd" 2>/dev/null; then break; fi
-    _reap_dir "$lockd" 60 && continue
-    sleep 0.05
-    [ "$i" -eq 40 ] && return 1
-  done
-  if [ -e "$cf" ]; then
-    if ! n="$(cat "$cf" 2>/dev/null)"; then rmdir "$lockd" 2>/dev/null || true; return 1; fi
-  else
-    n=0
-  fi
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$((10#$n))
-  if [ "$n" -ge "$limit" ]; then rmdir "$lockd" 2>/dev/null || true; return 1; fi
-  _t="$(mktemp "$STATE/.phcap.XXXXXX" 2>/dev/null)" || { rmdir "$lockd" 2>/dev/null || true; return 1; }
-  printf '%s' "$((n + 1))" > "$_t" 2>/dev/null && mv -f "$_t" "$cf" 2>/dev/null || { rm -f "$_t" 2>/dev/null || true; rmdir "$lockd" 2>/dev/null || true; return 1; }
-  rmdir "$lockd" 2>/dev/null || true
-  return 0
+  cf="$STATE/.phonecap-$verb-$stamp"
+  _locked "$STATE/.phonecap-$verb.lockf" 5 /bin/bash -c '
+    set -uo pipefail
+    cf="$1"; limit="$2"; STATE="$3"
+    if [ -e "$cf" ]; then
+      n="$(cat "$cf" 2>/dev/null)" || exit 1
+    else
+      n=0
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$((10#$n))
+    [ "$n" -ge "$limit" ] && exit 1
+    _t="$(mktemp "$STATE/.phcap.XXXXXX" 2>/dev/null)" || exit 1
+    printf "%s" "$((n + 1))" > "$_t" 2>/dev/null && mv -f "$_t" "$cf" 2>/dev/null || { rm -f "$_t" 2>/dev/null || true; exit 1; }
+    exit 0' _ "$cf" "$limit" "$STATE"
 }
 
 # ---- phone-jid registry (r1 H-3): `get` may only fetch jobs THIS surface issued — job
 # ids are NOT an authorization boundary. Recorded on the ask-timeout path; 200-line cap.
-jid_record(){ # jid_record <full-uuid>
-  local i lockd _t
-  lockd="$STATE/.phjid.lock"
-  for i in $(seq 1 20); do
-    if mkdir "$lockd" 2>/dev/null; then break; fi
-    _reap_dir "$lockd" 10 || sleep 0.02
-    [ "$i" -eq 20 ] && return 1
-  done
-  if ! ( umask 077; printf '%s\n' "$1" >> "$JIDS" ) 2>/dev/null; then rmdir "$lockd" 2>/dev/null || true; return 1; fi
-  if [ "$(wc -l < "$JIDS" 2>/dev/null || echo 0)" -gt 200 ]; then
-    _t="$(mktemp "$STATE/.phjid.XXXXXX" 2>/dev/null)" || { rmdir "$lockd" 2>/dev/null || true; return 0; }
-    tail -n 200 "$JIDS" > "$_t" 2>/dev/null && chmod 600 "$_t" 2>/dev/null && mv -f "$_t" "$JIDS" 2>/dev/null || rm -f "$_t" 2>/dev/null || true
-  fi
-  rmdir "$lockd" 2>/dev/null || true
-  return 0
+jid_record(){ # jid_record <full-uuid> ; rc!=0 = record not durable (caller surfaces it, r2 MED-5)
+  _locked "$STATE/.phjid.lockf" 5 /bin/bash -c '
+    set -uo pipefail
+    JIDS="$1"; STATE="$2"; jid="$3"
+    ( umask 077; printf "%s\n" "$jid" >> "$JIDS" ) 2>/dev/null || exit 1
+    if [ "$(wc -l < "$JIDS" 2>/dev/null || echo 0)" -gt 200 ]; then
+      _t="$(mktemp "$STATE/.phjid.XXXXXX" 2>/dev/null)" || exit 0
+      tail -n 200 "$JIDS" > "$_t" 2>/dev/null && chmod 600 "$_t" 2>/dev/null && mv -f "$_t" "$JIDS" 2>/dev/null || rm -f "$_t" 2>/dev/null || true
+    fi
+    exit 0' _ "$JIDS" "$STATE" "$1"
 }
 jid_known(){ grep -qx "$1" "$JIDS" 2>/dev/null; }
 

@@ -23,7 +23,9 @@ from runtime.contracts import TransportEnvelope
 from runtime.ledger.postgres_store import PostgresLedger
 from runtime.registry import REGISTRY
 
-DSN = os.environ.get("MYNDAIX_DSN", "postgresql://localhost/runtime")
+# `or`, not a get() default: an exported-but-EMPTY MYNDAIX_DSN (an env -i trampoline
+# passing "${VAR:-}" through) must fall back too, not connect with "" (phone r3 MED-2).
+DSN = os.environ.get("MYNDAIX_DSN") or "postgresql://localhost/runtime"
 
 
 def _clean_reply(s: str) -> str:
