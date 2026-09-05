@@ -63,6 +63,87 @@ def test_specificity():
        "deeper-literal trigger is more specific (beats broader at LIMIT 2)")
 
 
+# -- multi-alternative triggers (guardrails #125 finding 4: equal-depth matching means
+# -- one pattern = one directory depth; skills that target nested trees need alternatives,
+# -- because ** is banned by design) --------------------------------------------------
+def test_trigger_alternatives():
+    ok(M.seg_match("tools/*.sh substrate/*.sh", "tools/bash-check.sh"),
+       "first alternative matches")
+    ok(M.seg_match("tools/*.sh substrate/*.sh", "substrate/reconcile.sh"),
+       "second alternative matches")
+    ok(M.seg_match("tools/*.sh orchestrator/phone/*.sh", "orchestrator/phone/mxr-phone.sh"),
+       "alternatives may differ in depth")
+    ok(not M.seg_match("tools/*.sh substrate/*.sh", "orchestrator/play-fix.sh"),
+       "no alternative matches -> no match")
+    ok(not M.seg_match("tools/*.sh substrate/*.sh", "tools/sub/deep.sh"),
+       "alternatives still never cross / (equal depth per alternative)")
+    ok(M.is_banned_trigger("tools/*.sh */*"),
+       "one banned alternative bans the whole trigger (fail-closed)")
+    ok(M.is_banned_trigger("tools/*.sh **/x.sh"),
+       "a ** alternative bans the whole trigger")
+    ok(not M.is_banned_trigger("tools/*.sh substrate/*.sh orchestrator/*.sh"),
+       "all-literal-bearing alternatives allowed")
+    ok(M.specificity("docs/*.md docs/reviews/*.md") == 2,
+       "multi-alt specificity = MOST specific alternative (2), never a sum")
+    ok(M.specificity("*.md docs/plan.md") == 2,
+       "an all-literal alternative dominates a broad sibling")
+
+
+# -- match_specificity: rank by the alternative that MATCHED (#125 r2 HIGH-1) ---------
+def test_match_specificity_no_decorative_inflation():
+    # the gaming vector: broad alt matches, decorative specific alt does not — the rank
+    # must be the BROAD alt's (0), not the decoration's (3)
+    ok(M.match_specificity("*.md decorative/very/specific.md", ["README.md"]) == 0,
+       "decorative specific alternative cannot inflate a broad match")
+    ok(M.match_specificity("*.md docs/plan.md", ["docs/plan.md"]) == 2,
+       "when the specific alternative genuinely matches, it ranks")
+    ok(M.match_specificity("*.md docs/plan.md", ["README.md", "docs/plan.md"]) == 2,
+       "multi-path: best MATCHING alternative wins")
+    ok(M.match_specificity("tools/*.sh", ["docs/x.md"]) is None,
+       "no alternative matches -> None (caller skips the skill)")
+    ok(M.match_specificity("src/*.py src/runtime/*.py", ["src/runtime/cli.py"]) == 2,
+       "deeper matching alternative outranks the shallower one")
+
+
+# -- format constraint: whitespace-delimited alternatives cannot represent spaced paths;
+# -- pin that the TRACKED TREE has none (if this ever fails, the format needs a
+# -- structured delimiter BEFORE such a path lands — #125 r2 #3) -----------------------
+def test_repo_has_no_space_bearing_tracked_paths():
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    # -z + quotePath=false (r4 #1): default git C-quotes non-ASCII bytes into pure-ASCII
+    # octal escapes, which would make the isspace() guard a no-op for the exact NBSP-class
+    # paths it exists to reject. NUL-split output carries the REAL bytes.
+    import os
+    try:
+        # BYTES mode (r6 #1: text + errors='replace' folds bad bytes to U+FFFD — not a
+        # space — corrupting exactly the data under test); LC_ALL=C (r6 #3) pins git's
+        # stderr to English so the skip condition below is locale-proof.
+        res = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "-C", str(root), "ls-files", "-z"],
+            capture_output=True, env={**os.environ, "LC_ALL": "C"})
+    except (FileNotFoundError, PermissionError):   # r6 #2: ONLY the git-unavailable shapes
+        ok(True, "skipped: git unavailable")       # skip; ENOMEM/EMFILE etc. propagate loudly
+        return
+    if res.returncode != 0:
+        # skip ONLY the de-linked-snapshot shape — rc 128 AND the (now locale-stable)
+        # message (r5 #1: rc 128 alone also covers dubious-ownership/corrupt-index)
+        _no_gitdir = not (root / ".git").exists()          # de-linked snapshot has NO .git; a corrupt repo HAS one (r8 P2)
+        _fatal_nrepo = any(ln.strip().startswith(b"fatal: not a git repository")
+                           for ln in (res.stderr or b"").split(b"\n"))   # any line — git may prepend warnings (r8 P3)
+        if res.returncode == 128 and _no_gitdir and _fatal_nrepo:
+            ok(True, "skipped: not a git working tree (de-linked snapshot)")
+            return
+        ok(False, f"git ls-files failed unexpectedly (rc={res.returncode}): {(res.stderr or b'').decode('utf-8', 'replace').strip()[:120]}")
+        return
+    # surrogateescape: undecodable bytes survive as lone surrogates (isspace False) instead
+    # of folding to U+FFFD; a real UTF-8 NBSP still decodes to U+00A0 and is caught.
+    # Delimiter set = str.split()'s exactly (r3 #1).
+    paths = [b.decode("utf-8", "surrogateescape") for b in res.stdout.split(b"\0") if b]
+    spaced = [p for p in paths if any(ch.isspace() for ch in p)]
+    ok(spaced == [], f"whitespace-bearing tracked paths break trigger alternatives: {spaced[:3]}")
+
+
 # -- scan_injection: the FALSE-POSITIVE guard (descriptive review skills stay CLEAN) --
 def test_descriptive_review_skills_are_clean():
     # These are realistic REVIEW-skill bodies — they describe what to check, using words

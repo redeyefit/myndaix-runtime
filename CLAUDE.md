@@ -76,5 +76,11 @@ throwaway DB (`runtime_test`), NEVER the ops `runtime` database.
 
 - Design-first: new capability → design doc in `docs/` → cross-family review → build. Every
   shipped slice has a regression test that fails without its fix — keep it that way.
+- **Implementation attack pass (MANDATORY for lock/race/trust-boundary code):** between
+  design approval and first line of code, run an adversarial pass over the PLANNED
+  MECHANICS (agents attacking the lock protocol, failure ordering, crash windows, mixed
+  deploy states). Evidence 2026-09-03: per-repo locks got this pass → 2 blockers caught
+  pre-build, ~2 residual findings; the phone wrapper skipped it → 14 findings in r1.
+  Design review catches architecture; only the attack pass catches your mechanics.
 - Global rules apply: commit-before-review, `/feature` phases in order, bash rules
   (`tools/bash-check.sh` + semgrep rules exist — run them on script changes).

@@ -115,6 +115,13 @@ def candidate_glob(path: str) -> str | None:
     .strip() could normalize a leading/trailing control char away) and rejects tab too."""
     if not path or _RAW_CTRL.search(path):       # any C0/DEL incl. \t \n \r, on the raw input
         return None
+    if any(ch.isspace() for ch in path):
+        # whitespace is the trigger-ALTERNATIVES delimiter (#125 r2 #3): a space-bearing
+        # glob would silently shatter into nonsense alternatives at match time. The
+        # predicate mirrors the splitter EXACTLY — trigger_alternatives() uses str.split(),
+        # which splits on ALL Unicode whitespace (NBSP, ideographic space, ...), so an
+        # ASCII-only " " check would wave the non-ASCII shatter cases through (r3 #1).
+        return None
     g = path_to_glob(path)
     if not g or _RAW_CTRL.search(g) or skillmatch.is_banned_trigger(g):
         return None
