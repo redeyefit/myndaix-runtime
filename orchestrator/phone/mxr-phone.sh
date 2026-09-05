@@ -297,10 +297,10 @@ case "$verb" in
       if grep -Eq '^MXR_JOB_(FAILED|DEAD)$' "$_e" 2>/dev/null; then
         { printf 'factory error (rc=%s):\n' "$rc"; tail -c 500 "$_e"; } | emit
       elif grep -q '^MXR_DONE_EMPTY$' "$_e" 2>/dev/null; then
-        printf 'factory finished but produced no answer — ask again with more detail\n'
+        printf 'factory finished but produced no answer — ask again with more detail\n' | emit
       elif [ -n "$_jid" ] && grep -q '^MXR_SYNC_TIMEOUT$' "$_e" 2>/dev/null; then
         if jid_record "$_jid"; then
-          printf 'still thinking — job %s\nrun Get Answer with: get %s\n' "${_jid:0:13}…" "$_jid"
+          printf 'still thinking — job %s\nrun Get Answer with: get %s\n' "${_jid:0:13}…" "$_jid" | emit
         else
           rc=1
           printf 'factory error: could not record job id for later retrieval\n' | emit
@@ -309,7 +309,7 @@ case "$verb" in
         # Killed AFTER submit with no terminal marker (SIGALRM rc=142, crash, OOM): the
         # job is alive in the ledger — record the id NOW or the reply is orphaned forever
         # (get denies foreign ids). Record failure falls through to the plain error.
-        printf 'factory hiccup (rc=%s) — the job may still finish\nrun Get Answer with: get %s\n' "$rc" "$_jid"
+        printf 'factory hiccup (rc=%s) — the job may still finish\nrun Get Answer with: get %s\n' "$rc" "$_jid" | emit
       else
         { printf 'factory error (rc=%s):\n' "$rc"; tail -c 500 "$_e"; } | emit
       fi
@@ -340,16 +340,16 @@ case "$verb" in
         if grep -Eq '^MXR_JOB_(FAILED|DEAD)$' "$_e" 2>/dev/null; then
           { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit
         elif grep -q '^MXR_DONE_EMPTY$' "$_e" 2>/dev/null; then
-          printf 'factory finished but produced no answer — ask again with more detail\n'
+          printf 'factory finished but produced no answer — ask again with more detail\n' | emit
         else
-          printf 'still thinking — no reply yet; try again in a minute\n'
+          printf 'still thinking — no reply yet; try again in a minute\n' | emit
         fi
         ;;
       1)
         # rc=1 WITHOUT the marker is not "no such job" — an unreachable ledger exits 1
         # too, and the authoritative-sounding lie makes the user discard a valid id.
         if grep -q '^MXR_NO_SUCH_JOB$' "$_e" 2>/dev/null; then
-          printf 'no such job\n'
+          printf 'no such job\n' | emit
         else
           { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit
         fi

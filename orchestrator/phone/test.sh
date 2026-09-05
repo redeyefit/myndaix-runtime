@@ -71,17 +71,25 @@ if [[ "${1:-}" == "--sshd" ]]; then
   if sudo -n true 2>/dev/null; then
     if _ae_out="$(sudo sshd -T 2>/dev/null)"; then
       _ae_lines="$(printf '%s\n' "$_ae_out" | grep -i '^acceptenv' || true)"   # verified (possibly empty)
-    else
-      bad "sudo sshd -T failed — gate cannot verify AcceptEnv (not a pass)"
-    fi
+    fi   # sshd -T failure: _ae_lines stays __UNVERIFIED__ -> the explicit FAIL below (r6 P4-B)
   elif [ -r /etc/ssh/sshd_config ]; then
-    _ae_lines="$(grep -rhi '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null || true)"
-  else
-    bad "cannot READ sshd config without sudo — gate cannot verify AcceptEnv (not a pass)"
+    # NO stderr suppression (r6 P4-A): an unreadable include under sshd_config.d means the
+    # inspection was PARTIAL — a hostile AcceptEnv could hide there. grep rc>1 or any
+    # stderr output = unverifiable, never "clean".
+    _ae_err="$(mktemp "$ROOT/.ae.XXXXXX")"
+    _ae_raw="$(grep -rhi '^[[:space:]]*AcceptEnv' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>"$_ae_err")"; _ae_rc=$?
+    if [ "$_ae_rc" -le 1 ] && [ ! -s "$_ae_err" ]; then
+      _ae_lines="$_ae_raw"                                                     # verified (possibly empty)
+    fi
+    rm -f "$_ae_err" 2>/dev/null || true
   fi
   if [ "${_ae_lines:-}" != "__UNVERIFIED__" ]; then
     AE="$(printf '%s\n' "$_ae_lines" | awk '{for(i=2;i<=NF;i++) print $i}' | grep -vE '^(LANG|LC_)' | grep -c . || true)"
     [ "${AE:-0}" -eq 0 ] && ok "AcceptEnv carries no non-locale patterns (LANG/LC_* tolerated; env -i makes them inert)" || bad "AcceptEnv has $AE non-locale pattern(s) — real env channel open"
+  else
+    # ONE explicit rejection for every unverifiable shape (no sudo+unreadable, sshd -T
+    # failure, partial grep) — the gate always fires accept OR reject, never silence
+    bad "AcceptEnv UNVERIFIABLE (no/partial inspection) — failing the gate, not passing it"
   fi
   # temp key wired to the wrapper via a forced command, loopback. Trap installed BEFORE
   # the append (r1 L-14): an interrupt can never strand the temp key; cleanup is

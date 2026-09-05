@@ -129,12 +129,15 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
 
         if st["status"] == "done":
             reply = next((o["body"] for o in (st.get("outbound") or [])), None)
-            if reply is not None:
+            # TRUTHY guard (r6 P2): the ledger's `body text NOT NULL` permits "", and get
+            # --reply already filters falsy bodies — an empty string is the SAME terminal
+            # no-answer state as a missing row, not a silent rc-0 success.
+            if reply:
                 print(_clean_reply(reply))
             for o in (st.get("outbound") or []):       # mark delivered so it doesn't linger
                 if o["status"] == "pending":
                     await led.mark_outbound_sent(o["id"], f"cli-{o['id']}")
-            if reply is None:
+            if not reply:
                 # done-with-no-body is TERMINAL no-answer, not success-with-silence — the
                 # same state get --reply marks; both paths share one contract (review r5 #4).
                 print("MXR_DONE_EMPTY", file=sys.stderr)

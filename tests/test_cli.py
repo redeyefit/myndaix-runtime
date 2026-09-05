@@ -429,6 +429,45 @@ def test_get_unknown_job_emits_no_such_job_marker():
         restore()
 
 
+def test_run_job_empty_body_is_done_empty():
+    # r6 P2: `body text NOT NULL` permits "" — an empty-string reply is the SAME terminal
+    # no-answer state as a missing outbound row (rc 1 + MXR_DONE_EMPTY), never a silent
+    # rc-0 success. Keeps sync ask and get --reply on one contract.
+    import asyncio
+    import contextlib
+    import io
+    import uuid as _uuid
+
+    class _L:
+        async def ingest_inbound(self, env, task):
+            return _uuid.UUID("00000000-0000-4000-8000-000000000000")
+
+        async def submit_job(self, **kw):
+            return _uuid.UUID("deadbeef-0000-4000-8000-000000000001")
+
+        async def get_status(self, jid):
+            return {"status": "done",
+                    "outbound": [{"id": "o1", "body": "", "status": "pending"}]}
+
+        async def mark_outbound_sent(self, oid, pid):
+            pass
+
+        async def close(self):
+            pass
+
+    restore = _patch_ledger(_L())
+    try:
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc, terminal = asyncio.run(cli.run_job("recon", "q", timeout_s=5))
+        assert rc == 1 and terminal is True
+        assert "MXR_DONE_EMPTY" in err.getvalue().splitlines()
+        assert out.getvalue() == ""                       # no blank line masquerading as a reply
+    finally:
+        restore()
+
+
 def test_marker_safe_neutralizes_forged_marker_lines():
     # r5 #1: agent failure text goes to stderr — the MARKER channel — so an interior
     # agent-authored line reading exactly like a reserved marker must lose its

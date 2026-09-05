@@ -92,7 +92,9 @@ do_check(){
 }
 
 do_apply(){
-  local pair src dst ddir f want tmp bak deployed_sha
+  # _LOCK stays SCRIPT-scope on purpose (top-of-file comment: the EXIT trap must see it) —
+  # r6 P5's "make it local" would strand the lock at trap time. _head_now IS local.
+  local pair src dst ddir f want tmp bak deployed_sha _head_now
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
@@ -111,13 +113,19 @@ do_apply(){
   # tool exists to prevent. (--preflight tolerates it — it's advisory.)
   case "$ref" in origin/*) git -C "$REPO" fetch --quiet origin main 2>/dev/null || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref" ;; esac
   deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
-  # version-skew guard (review r5 #2): the phone wrapper's marker contract runs against the
-  # CHECKED-OUT tree's cli.py — deploying a ref that advanced past the running checkout
-  # (remote moved between the pull/kickstart and this fetch) silently skews wrapper vs serve.
-  # Loud warn, not die: --apply HEAD (the DEPLOY.md phone path) never trips this.
+  # version-skew guard (review r5 #2, hardened r6 P1): the phone wrapper's marker contract
+  # runs against the CHECKED-OUT tree's cli.py — deploying a ref that advanced past the
+  # running checkout silently skews wrapper vs serve. FAIL CLOSED: warn-and-continue was
+  # exactly the mixed-tree deploy this guard exists to stop. --apply HEAD never trips it;
+  # DEPLOY_SYNC_ALLOW_SKEW=1 is the deliberate operator override.
   _head_now="$(git -C "$REPO" rev-parse --verify --quiet HEAD || echo unknown)"
-  [[ "$_head_now" == "$deployed_sha" ]] || \
-    log "WARN: deploying $deployed_sha but working-tree HEAD is $_head_now — the running serve may SKEW vs the copied wrapper; pull first or use '--apply HEAD'"
+  if [[ "$_head_now" != "$deployed_sha" ]]; then
+    if [[ "${DEPLOY_SYNC_ALLOW_SKEW:-}" == "1" ]]; then
+      log "WARN: SKEW override — deploying $deployed_sha over working-tree HEAD $_head_now"
+    else
+      die "refusing skewed deploy: ref resolves to $deployed_sha but working-tree HEAD is $_head_now — pull first, use '--apply HEAD', or set DEPLOY_SYNC_ALLOW_SKEW=1"
+    fi
+  fi
   # PIN to the immutable commit for the rest of the loop (review r3 MAJOR-1): reading blobs through
   # the moving $ref (origin/main) could deploy file A from one commit and file B from another if the
   # ref advances mid-loop, then stamp the earlier sha — a silent mixed-commit deploy. All subsequent
