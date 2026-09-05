@@ -17,13 +17,16 @@ UTF-8-validated, and travels as ONE argv after `--` — never eval'd, never word
 Logs (`~/.myndaix/state/mxr-phone.log`, 0600, self-rotated) record sha256 prefixes,
 never payload text.
 
-## Install (Mini, as jefe — the wrapper joins the HAND-COPIED set; deploy-sync does not cover it)
+## Install (Mini, as jefe — the wrapper is in deploy-sync's GUARDED copied surface)
 
 ```
-cp orchestrator/phone/mxr-phone.sh ~/.myndaix/bin/mxr-phone && chmod 755 ~/.myndaix/bin/mxr-phone
+orchestrator/deploy-sync.sh --apply HEAD   # installs ~/.myndaix/bin/mxr-phone (+ the play workers) from THIS commit
 bash orchestrator/phone/test.sh            # fixture leg — must end "0 failed" (count grows with folds; don't pin it here)
 bash orchestrator/phone/test.sh --sshd     # REAL boundary leg (loopback sshd) — must pass before wiring the phone
 ```
+
+Full ordering (tree first — markers + migration 0015 — then the copy): DEPLOY.md → "Phone
+surface deploy". `deploy-sync.sh --check` flags a drifted installed copy from then on.
 
 Then wire the phone key: fill `authorized_keys.example` (phone tailnet IP + the pubkey
 copied from the Shortcuts SSH action) and append that ONE line to
