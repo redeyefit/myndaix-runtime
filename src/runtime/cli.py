@@ -27,6 +27,17 @@ from runtime.registry import REGISTRY
 # passing "${VAR:-}" through) must fall back too, not connect with "" (phone r3 MED-2).
 DSN = os.environ.get("MYNDAIX_DSN") or "postgresql://localhost/runtime"
 
+# ---- stable stderr markers (the script-caller contract; phone-audit marker fold) ----
+# One per line, machine-parseable, emitted ALONGSIDE the human prose — the prose stays
+# free to change, the markers do not. Script callers (orchestrator/phone/mxr-phone.sh)
+# match ONLY these, never the prose:
+#   MXR_SYNC_TIMEOUT    submit's sync wait expired (the job still runs in the ledger)
+#   MXR_JOB_FAILED      job reached terminal 'failed'
+#   MXR_JOB_DEAD        job reached terminal 'dead'
+#   MXR_NO_SUCH_JOB     unknown job id / prefix
+#   MXR_DONE_EMPTY      job done but produced no reply body (terminal, not pending)
+# Removing or renaming one is a CONTRACT change: update the wrapper + its tests first.
+
 
 def _clean_reply(s: str) -> str:
     """Terminal-injection belt (phone r1 M-10): agent reply bodies are untrusted output —
@@ -103,6 +114,7 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
                 break
             await asyncio.sleep(0.3)
         else:
+            print("MXR_SYNC_TIMEOUT", file=sys.stderr)
             print("timed out (is the pool running? `python3 -m runtime.serve`)", file=sys.stderr)
             return 1, False
 
@@ -120,6 +132,7 @@ async def run_job(agent: str, task: str, *, context: Optional[dict] = None,
                     if a.get("status") == "failed" and a.get("text")), None)
         if err:
             print(err.strip(), file=sys.stderr)
+        print(f"MXR_JOB_{st['status'].upper()}", file=sys.stderr)  # MXR_JOB_FAILED / MXR_JOB_DEAD
         print(f"(job {st['status']})", file=sys.stderr)
         return 1, True
     finally:
@@ -186,6 +199,7 @@ async def get_job(job_id: str, reply: bool = False) -> int:
         if jid is None:
             matches = await led.resolve_job_prefix(prefix)
             if not matches:
+                print("MXR_NO_SUCH_JOB", file=sys.stderr)
                 print(f"no such job: {job_id}", file=sys.stderr)
                 return 1
             if len(matches) > 1:
@@ -196,6 +210,7 @@ async def get_job(job_id: str, reply: bool = False) -> int:
             jid = uuid.UUID(matches[0])
         st = await led.get_status(jid)
         if not st:
+            print("MXR_NO_SUCH_JOB", file=sys.stderr)
             print(f"no such job: {job_id}", file=sys.stderr)
             return 1
         if reply:
@@ -206,7 +221,15 @@ async def get_job(job_id: str, reply: bool = False) -> int:
             if bodies:
                 print(_clean_reply(bodies[-1]))
                 return 0
-            print(f"no reply yet (job status: {st.get('status')})", file=sys.stderr)
+            # rc stays 3 for every no-body case (callers branch on the MARKER, not the
+            # rc): failed/dead will never produce a body, and done-with-no-body is a
+            # finished job that wrote nothing — both are terminal, not "keep polling".
+            status = st.get("status")
+            if status in ("failed", "dead"):
+                print(f"MXR_JOB_{status.upper()}", file=sys.stderr)
+            elif status == "done":
+                print("MXR_DONE_EMPTY", file=sys.stderr)
+            print(f"no reply yet (job status: {status})", file=sys.stderr)
             return 3
         out = {
             "job": str(st.get("id")),

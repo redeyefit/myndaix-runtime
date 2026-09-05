@@ -376,6 +376,59 @@ def test_resolve_sync_wait_malformed_env_falls_to_profile():
                      lambda: cli._resolve_sync_wait("kilabz")) == 960.0
 
 
+def test_get_reply_marker_carries_terminality():
+    # Marker contract (phone-audit fold): rc stays 3 for EVERY no-body case; the stderr
+    # MARKER is what tells a script caller whether the job can still answer. failed/dead
+    # -> MXR_JOB_FAILED/DEAD, done-with-no-body -> MXR_DONE_EMPTY, genuinely pending ->
+    # no marker at all.
+    import asyncio
+    import contextlib
+    import io
+    full = "deadbeef-0000-4000-8000-000000000001"
+    for status, marker in (("failed", "MXR_JOB_FAILED"), ("dead", "MXR_JOB_DEAD"),
+                           ("done", "MXR_DONE_EMPTY"), ("queued", None)):
+        fake = _FakeLedger([full])
+
+        async def _st(jid, _s=status):
+            return {"id": str(jid), "status": _s, "outbound": []}
+        fake.get_status = _st
+        restore = _patch_ledger(fake)
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert asyncio.run(cli.get_job(full, reply=True)) == 3
+            lines = err.getvalue().splitlines()
+            if marker:
+                assert marker in lines, f"{status}: missing {marker} in {lines}"
+            else:
+                assert not any(ln.startswith("MXR_") for ln in lines), \
+                    f"pending must emit NO marker, got {lines}"
+        finally:
+            restore()
+
+
+def test_get_unknown_job_emits_no_such_job_marker():
+    # rc=1 alone is ambiguous (a down ledger also exits 1) — the marker is the ONLY
+    # authoritative "this id does not exist" signal a script caller may trust.
+    import asyncio
+    import contextlib
+    import io
+    full = "deadbeef-0000-4000-8000-000000000001"
+    fake = _FakeLedger([full])
+
+    async def _none(jid):
+        return None
+    fake.get_status = _none
+    restore = _patch_ledger(fake)
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert asyncio.run(cli.get_job(full, reply=True)) == 1
+        assert "MXR_NO_SUCH_JOB" in err.getvalue().splitlines()
+    finally:
+        restore()
+
+
 def test_dsn_empty_env_falls_back():
     # r3 MED-2: an exported-but-EMPTY MYNDAIX_DSN (env -i trampoline artifact) must fall
     # back to the default like an absent one — `or`, not a get() default.

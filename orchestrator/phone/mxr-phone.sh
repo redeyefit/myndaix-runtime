@@ -251,17 +251,23 @@ case "$verb" in
     if [ "$rc" -eq 0 ]; then
       emit < "$_o"
     else
-      # r1 M-8: cli prints JOB_ID for EVERY submit and exits 1 for both sync-timeout and a
-      # terminal failed/dead job. Only the TIMEOUT is "still thinking" — a terminal failure
-      # must say so, or `get` polls a dead job forever.
+      # Branch on the cli's STABLE stderr markers only (marker fold): MXR_SYNC_TIMEOUT /
+      # MXR_JOB_FAILED / MXR_JOB_DEAD — the human prose beside them may change freely,
+      # and agent-controlled error text can't spoof a line-anchored marker match into
+      # flipping a dead job back to "still thinking".
       _jid="$(grep -o 'JOB_ID=[0-9a-f-]*' "$_e" 2>/dev/null | head -1 | cut -d= -f2 || true)"
-      if [ -n "$_jid" ] && grep -q 'timed out' "$_e" 2>/dev/null; then
+      if [ -n "$_jid" ] && grep -q '^MXR_SYNC_TIMEOUT$' "$_e" 2>/dev/null; then
         if jid_record "$_jid"; then
           printf 'still thinking — job %s\nrun Get Answer with: get %s\n' "${_jid:0:13}…" "$_jid"
         else
           rc=1
           printf 'factory error: could not record job id for later retrieval\n' | emit
         fi
+      elif [ -n "$_jid" ] && ! grep -Eq '^MXR_JOB_(FAILED|DEAD)$' "$_e" 2>/dev/null && jid_record "$_jid"; then
+        # Killed AFTER submit with no terminal marker (SIGALRM rc=142, crash, OOM): the
+        # job is alive in the ledger — record the id NOW or the reply is orphaned forever
+        # (get denies foreign ids). Record failure falls through to the plain error.
+        printf 'factory hiccup (rc=%s) — the job may still finish\nrun Get Answer with: get %s\n' "$rc" "$_jid"
       else
         { printf 'factory error (rc=%s):\n' "$rc"; tail -c 500 "$_e"; } | emit
       fi
@@ -285,13 +291,26 @@ case "$verb" in
     case "$rc" in
       0) emit < "$_o";;
       3)
-        if grep -Eq 'job status: (failed|dead)' "$_e" 2>/dev/null; then
+        # Stable-marker branch (marker fold): failed/dead and done-with-no-body are
+        # TERMINAL — "still thinking" forever would burn the get cap polling a job
+        # that can never answer.
+        if grep -Eq '^MXR_JOB_(FAILED|DEAD)$' "$_e" 2>/dev/null; then
           { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit
+        elif grep -q '^MXR_DONE_EMPTY$' "$_e" 2>/dev/null; then
+          printf 'factory finished but produced no answer — ask again with more detail\n'
         else
           printf 'still thinking — no reply yet; try again in a minute\n'
         fi
         ;;
-      1) printf 'no such job\n';;
+      1)
+        # rc=1 WITHOUT the marker is not "no such job" — an unreachable ledger exits 1
+        # too, and the authoritative-sounding lie makes the user discard a valid id.
+        if grep -q '^MXR_NO_SUCH_JOB$' "$_e" 2>/dev/null; then
+          printf 'no such job\n'
+        else
+          { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit
+        fi
+        ;;
       *) { printf 'factory error (rc=%s):\n' "$rc"; tail -c 300 "$_e"; } | emit;;
     esac
     rm -f "$_o" "$_e" 2>/dev/null || true

@@ -25,11 +25,16 @@ cat > "$STUB" <<'STUBEOF'
 { printf -- '--CALL--\n'; printf '%s\n' "$@"; printf 'ENV_MXR_TIMEOUT_S=%s\n' "${MXR_TIMEOUT_S:-unset}"; printf 'ENV_BASH_ENV=%s\n' "${BASH_ENV:-unset}"; printf 'ENV_PYTHONPATH=%s\n' "${PYTHONPATH:-unset}"; } >> "${STUB_ARGV:?}"
 case "${STUB_MODE:-answer}" in
   answer)  printf 'ANSWER: the launch color is teal\n[1] greeting.md\n';;
-  timeout) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\ntimed out (is the pool running?)\n' >&2; exit 1;;
-  jobfailed) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nagent exploded\n(job failed)\n' >&2; exit 1;;
+  timeout) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nMXR_SYNC_TIMEOUT\ntimed out (is the pool running?)\n' >&2; exit 1;;
+  jobfailed) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nagent exploded\nMXR_JOB_FAILED\n(job failed)\n' >&2; exit 1;;
+  spooffailed) printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\nerror: request timed out mid-flight\nMXR_JOB_FAILED\n(job failed)\n' >&2; exit 1;;
+  orphan)  printf -- '-> librarian  (job deadbeef)\nJOB_ID=deadbeef-0000-4000-8000-000000000001\n' >&2; exit 142;;
   reply)   printf 'RECOVERED ANSWER BODY\n';;
   noreply) printf 'no reply yet (job status: pending)\n' >&2; exit 3;;
-  nojob)   printf 'no such job\n' >&2; exit 1;;
+  getfailed) printf 'MXR_JOB_FAILED\nno reply yet (job status: failed)\n' >&2; exit 3;;
+  doneempty) printf 'MXR_DONE_EMPTY\nno reply yet (job status: done)\n' >&2; exit 3;;
+  nojob)   printf 'MXR_NO_SUCH_JOB\nno such job\n' >&2; exit 1;;
+  dbdown)  printf 'Traceback (most recent call last):\nConnectionRefusedError: [Errno 61] connect call failed\n' >&2; exit 1;;
   bigout)  head -c 9000 /dev/zero | tr '\0' 'A';;
   ansi)    printf 'clean \033[31mred\033[0m done\n';;
 esac
@@ -132,6 +137,19 @@ reset; out="$(run 'ask research doomed question' STUB_MODE=jobfailed)"
 printf '%s' "$out" | grep -q 'factory error' && ok "terminal job failure reported as ERROR, not still-thinking (M-8)" || bad "jobfailed: $out"
 [ ! -s "$STATE/phone-jids" ] && ok "failed job NOT recorded as fetchable" || bad "dead jid recorded"
 
+echo "5b. marker contract — ask lifecycle (audit marker fold)"
+# a kill AFTER submit (SIGALRM 142, no terminal marker): the live job's id must be
+# recorded and handed over, or the reply is orphaned forever (audit item 4)
+reset; out="$(run 'ask research interrupted question' STUB_MODE=orphan)"
+printf '%s' "$out" | grep -q 'factory hiccup' && ok "post-submit kill -> hiccup message with jid" || bad "orphan: $out"
+printf '%s' "$out" | grep -q 'get deadbeef-0000-4000-8000-000000000001' && ok "orphaned jid handed to Get Answer" || bad "orphan no jid: $out"
+grep -qx 'deadbeef-0000-4000-8000-000000000001' "$STATE/phone-jids" 2>/dev/null && ok "orphaned jid recorded (reply reachable)" || bad "orphan jid not recorded"
+# agent-controlled prose saying "timed out" must NOT flip a marker-terminal job back
+# to still-thinking/hiccup (audit item 9 — markers, not prose)
+reset; out="$(run 'ask research spoofed question' STUB_MODE=spooffailed)"
+printf '%s' "$out" | grep -q 'factory error' && ok "prose 'timed out' cannot spoof past MXR_JOB_FAILED" || bad "spoof: $out"
+[ ! -s "$STATE/phone-jids" ] && ok "spoofed-failed jid NOT recorded" || bad "spoofed jid recorded"
+
 echo "6. get verb — full-uuid grammar + phone-jid ownership (r1 H-3)"
 JID='deadbeef-0000-4000-8000-000000000001'
 seed_jid(){ mkdir -p "$STATE"; printf '%s\n' "$JID" > "$STATE/phone-jids"; }
@@ -140,6 +158,18 @@ printf '%s' "$out" | grep -q 'RECOVERED ANSWER BODY' && ok "reply relayed" || ba
 grep -q '^--reply$' "$ARGV" && ok "wrapper passes --reply" || bad "argv: $(cat "$ARGV")"
 reset; seed_jid; out="$(run "get $JID" STUB_MODE=noreply)"; printf '%s' "$out" | grep -q 'still thinking' && ok "rc=3 -> still thinking" || bad "noreply: $out"
 reset; seed_jid; out="$(run "get $JID" STUB_MODE=nojob)";  printf '%s' "$out" | grep -q 'no such job' && ok "rc=1 -> no such job" || bad "nojob: $out"
+
+echo "6b. marker contract — get terminal states (audit marker fold)"
+# failed/dead: rc=3 with a terminal marker is an ERROR, not eternal still-thinking
+reset; seed_jid; out="$(run "get $JID" STUB_MODE=getfailed)"
+printf '%s' "$out" | grep -q 'factory error' && ok "MXR_JOB_FAILED at get -> error, not still-thinking" || bad "getfailed: $out"
+# done with no body: terminal "no answer", never polls forever (audit item 6)
+reset; seed_jid; out="$(run "get $JID" STUB_MODE=doneempty)"
+printf '%s' "$out" | grep -q 'produced no answer' && ok "MXR_DONE_EMPTY -> terminal no-answer message" || bad "doneempty: $out"
+# ledger down: rc=1 WITHOUT MXR_NO_SUCH_JOB must NOT claim the id is unknown (audit item 5)
+reset; seed_jid; out="$(run "get $JID" STUB_MODE=dbdown)"
+printf '%s' "$out" | grep -q 'factory error' && ok "rc=1 sans marker -> factory error (not 'no such job' lie)" || bad "dbdown: $out"
+printf '%s' "$out" | grep -q 'no such job' && bad "dbdown claimed no-such-job" || ok "no-such-job lie suppressed while ledger down"
 reset; out="$(run "get $JID")";                             printf '%s' "$out" | grep -q 'denied: not a phone-issued job' && ok "FOREIGN jid denied (ownership)" || bad "foreign: $out"
 no_dispatch && ok "foreign jid never reached mxr" || bad "foreign dispatched"
 reset; out="$(run 'get deadbeef00')";                       printf '%s' "$out" | grep -q 'denied: not a job id' && ok "prefix jid denied (full uuid only)" || bad "prefix: $out"
