@@ -115,16 +115,19 @@ def test_repo_has_no_space_bearing_tracked_paths():
     # octal escapes, which would make the isspace() guard a no-op for the exact NBSP-class
     # paths it exists to reject. NUL-split output carries the REAL bytes.
     try:
+        # encoding pinned (r5 #2): text=True alone decodes via the locale — a C/POSIX CI
+        # locale would UnicodeDecodeError on exactly the non-ASCII bytes this test hunts
         res = subprocess.run(
             ["git", "-c", "core.quotePath=false", "-C", str(root), "ls-files", "-z"],
-            capture_output=True, text=True)
-    except FileNotFoundError:                                    # r4 #3: no git binary
-        ok(True, "skipped: git not on PATH")
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError:                            # r4 #3 + r5 #3: no git, or git not executable
+        ok(True, "skipped: git unavailable")
         return
     if res.returncode != 0:
-        # skip ONLY the expected de-linked-snapshot shape; any other git failure is a real
-        # environment problem and must fail loudly, not masquerade as a skip (r4 #2)
-        if res.returncode == 128 or "not a git repository" in (res.stderr or ""):
+        # skip ONLY the expected de-linked-snapshot shape — BOTH conditions (r5 #1: git
+        # exits 128 for dubious-ownership/corrupt-index too; `or` was fail-open); any
+        # other git failure is a real environment problem and must fail loudly
+        if res.returncode == 128 and "not a git repository" in (res.stderr or ""):
             ok(True, "skipped: not a git working tree (de-linked snapshot)")
             return
         ok(False, f"git ls-files failed unexpectedly (rc={res.returncode}): {(res.stderr or '').strip()[:120]}")
