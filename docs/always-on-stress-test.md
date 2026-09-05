@@ -27,9 +27,15 @@ the acceptance gate for the whole "Mini is home" thesis.
 - [ ] Mini `pmset -g | grep autorestart` = 1 AND `fdesetup status` = Off (FileVault back
       ON — e.g. re-enabled by a macOS-update prompt — silently breaks §4 cold start).
 - [ ] every required launchd unit verified PER LABEL (substring-grepping `launchctl list`
-      can false-green on partially-loaded units):
-      `for u in runtime controller liveness drift-canary reconcile automerge fix-sweep \
-         ledger-backup; do launchctl print "gui/$(id -u)/ai.myndaix.$u" >/dev/null || echo "MISSING $u"; done`
+      can false-green on partially-loaded units), with a REAL exit code — a bare
+      `|| echo MISSING` coerces every failure to rc 0 and silently clears an automated gate:
+      ```
+      fail=0
+      for u in runtime controller liveness drift-canary reconcile automerge fix-sweep ledger-backup; do
+        launchctl print "gui/$(id -u)/ai.myndaix.$u" >/dev/null 2>&1 || { echo "MISSING $u"; fail=1; }
+      done
+      [ "$fail" -eq 0 ]
+      ```
 
 Record each cell PASS/FAIL + the observed number/behavior. A FAIL is a finding, not a
 retry — capture it.
@@ -49,7 +55,7 @@ The core promise: your pocket reaches home regardless of the MacBook. Run the SA
 | R4 | phone on **home wifi** | ask | identical answer (tailnet routes either way) |
 | R5 | phone `status` verb, all above | run "Factory Status" | health summary returns; caps line increments |
 | R6 | **SMB** file open, MacBook asleep | Files.app → Mini share → open a doc | opens; edit + save; confirm it lands on the Mini |
-| R7 | **Syncthing conflict** | edit the SAME doc on both machines while the MacBook is asleep; wake it | a `.sync-conflict-*` file appears; `mxr ask` neither crashes nor cites the conflict copy; the indexer skipped it |
+| R7 | **Syncthing conflict** | edit the doc on the MINI while the MacBook sleeps; then wake the MacBook and edit the SAME doc there before sync catches up | a `.sync-conflict-*` file appears; `mxr ask` neither crashes nor cites the conflict copy; the indexer skipped it. KNOWN GAP at doc time: `_eligible_file` has no sync-conflict filter yet — this row FAILS until that follow-up ships; the row stays, because catching exactly this is its job |
 
 Any FAIL here is tailnet or Mini-side, never the feature. Note WHICH state failed —
 cellular-only failure points at Tailscale routing; all-states failure points at the Mini.
@@ -72,6 +78,12 @@ answer lags until the file REACHES the Mini. There is no reindex timer to wait o
 If F5 ever returns "not in corpus" for a known-good query during a refresh, the refresh
 is not atomic-swap — that is a P1 against the index-refresh design. (If a scheduled
 reindex unit ships later, re-measure F2 against its cadence.)
+
+KNOWN GAP at doc time (review-confirmed): `knowledgerecord._sync()` walks the corpus
+BEFORE taking the per-scope advisory lock, so two concurrent asks can commit snapshots
+in arrival order rather than walk order — a just-deleted doc can resurrect until the
+next ask (violates F4/F5 as written). These rows stay: they are the acceptance gate for
+the tracked walk-under-lock follow-up.
 
 ## 3. Concurrency — the caps and the shared pool
 
