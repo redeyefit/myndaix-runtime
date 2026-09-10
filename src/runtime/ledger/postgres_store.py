@@ -2062,17 +2062,41 @@ class PostgresLedger:
                 return False
             raise
 
+    async def knowledge_fence(self, scope: str) -> int:
+        """Read the scope's commit fence: max(seq) over its knowledge_doc events (0 = empty).
+        A walker stamps this BEFORE walking the corpus; knowledge_sync (given expect_fence)
+        then REJECTS the commit if any other sync landed in between — the walked snapshot is
+        stale and could resurrect a just-deleted doc (the walk-before-lock TOCTOU). The caller
+        re-walks and retries; a reject never mutates anything."""
+        async with self._pool.acquire() as con:
+            v = await con.fetchval(
+                "SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1", scope)
+            return int(v)
+
     async def knowledge_sync(self, scope: str, docs: list[dict],
-                             *, tombstone_missing: bool = True) -> dict:
+                             *, tombstone_missing: bool = True,
+                             expect_fence: Optional[int] = None) -> dict:
         """Bring the derived index in step with a walked corpus: INSERT a new event row per
         changed/new doc, tombstone rows for docs gone from disk, skip unchanged (idempotent —
         a re-run inserts nothing). `docs`: knowledge.DocRecord dicts. All appends, in ONE
-        transaction under the per-scope advisory xact lock."""
+        transaction under the per-scope advisory xact lock.
+
+        expect_fence: the knowledge_fence() value read BEFORE the corpus walk. If another
+        writer committed since (fence moved), returns {"conflict": True} WITHOUT writing —
+        arrival order can differ from walk order, and committing a stale walk can resurrect a
+        just-deleted doc. None preserves the unfenced behavior (single-writer callers)."""
         inserted = tombstoned = unchanged = 0
         async with self._pool.acquire() as con:
             async with con.transaction():
                 await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
                                   self._KNOWLEDGE_LOCK_KEY, scope)
+                if expect_fence is not None:
+                    cur_fence = await con.fetchval(
+                        "SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1",
+                        scope)
+                    if int(cur_fence) != int(expect_fence):
+                        return {"conflict": True, "inserted": 0, "tombstoned": 0,
+                                "unchanged": 0, "skipped_oversize": []}
                 cur = {r["path"]: (r["content_sha"], r["status"]) for r in await con.fetch(
                     "SELECT path, content_sha, status FROM knowledge_doc_current WHERE scope = $1",
                     scope)}
@@ -2110,15 +2134,24 @@ class PostgresLedger:
         return {"inserted": inserted, "tombstoned": tombstoned, "unchanged": unchanged,
                 "skipped_oversize": skipped}
 
-    async def knowledge_rebuild(self, scope: str, docs: list[dict]) -> dict:
+    async def knowledge_rebuild(self, scope: str, docs: list[dict],
+                                *, expect_fence: Optional[int] = None) -> dict:
         """The admin rebuild (mxr knowledge-rebuild): tombstone + re-ingest under ONE xact lock so
         recall never observes an empty active index between the phases (kilabz MINOR). All appends,
-        never TRUNCATE. `docs` are the freshly-walked knowledge.DocRecord dicts."""
+        never TRUNCATE. `docs` are the freshly-walked knowledge.DocRecord dicts. expect_fence:
+        same walk-staleness reject as knowledge_sync (rebuild walks before locking too)."""
         tombstoned = inserted = 0
         async with self._pool.acquire() as con:
             async with con.transaction():
                 await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
                                   self._KNOWLEDGE_LOCK_KEY, scope)
+                if expect_fence is not None:
+                    cur_fence = await con.fetchval(
+                        "SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1",
+                        scope)
+                    if int(cur_fence) != int(expect_fence):
+                        return {"conflict": True, "tombstoned": 0, "inserted": 0,
+                                "skipped_oversize": []}
                 for r in await con.fetch(
                         "SELECT path FROM knowledge_doc_active WHERE scope = $1", scope):
                     await con.execute(

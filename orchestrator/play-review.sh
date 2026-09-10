@@ -683,6 +683,8 @@ $armed}" "${scope[@]}" ${staged_flag[@]+"${staged_flag[@]}"})" \
 # seconds. Gate mode keeps the direct call: its canary already REQUIRES oracle (fail-closed),
 # so a second pre-check would only double the cost of the path that can't skip anyway.
 oracle_up=1
+oracle_note=""   # set on ANY oracle skip; folded into the delivered verdict banner so a
+                 # single-family round can never masquerade as cross-family (review 20260905164609 I4)
 if ! gate; then
   MXR_TIMEOUT_S=180 call oracle "reply with exactly: READY" >/dev/null || oracle_up=0
 fi
@@ -694,10 +696,12 @@ $(fence pushed-diff "$diff")${armed:+
 $armed}" "${scope[@]}")" || {
     if gate; then abort review "oracle REQUIRED for the merge gate but unavailable"; fi   # gate: fail-CLOSED (unreachable here; belt)
     oracle_review="(oracle/Gemini review unavailable — agent failed/empty/timeout; proceeding on the kilabz review alone)"
+    oracle_note="⚠ SINGLE-FAMILY review — oracle unavailable (failed/empty/timeout); this verdict is kilabz-only"
     note review oracle-skipped
   }
 else
   oracle_review="(oracle/Gemini review unavailable — reach-check failed; proceeding on the kilabz review alone)"
+  oracle_note="⚠ SINGLE-FAMILY review — oracle skipped (reach-check failed); this verdict is kilabz-only"
   note review oracle-skipped-fast
 fi
 
@@ -724,6 +728,10 @@ if confirm_pushed; then pushed=1; else pushed=0; fi
 # the whole body, so the reason (already control-stripped above) can't forge/erase the header.
 deg_banner=""
 [[ -n "$degraded" ]] && deg_banner="⚠ $degraded"$'\n\n'
+# oracle-skip banner (review 20260905164609 I4): the skip notice used to reach only lobster's
+# triage fence — a clean PASS could ship without naming the missing reviewer. Same clean()
+# guarantee as the rest of the body.
+[[ -n "$oracle_note" ]] && deg_banner="${deg_banner}${oracle_note}"$'\n\n'
 # fold fallback (over-cap): lead the verdict with the unreviewed-backlog banner — a fallback
 # review must never masquerade as having covered the folded range.
 [[ -n "$backlog_banner" ]] && deg_banner="${backlog_banner}"$'\n\n'"${deg_banner}"

@@ -58,13 +58,32 @@ def _fence(label: str, body: str, nonce: str) -> str:
             + f"\n===END UNTRUSTED nonce={nonce}===\n")
 
 
+_SYNC_CONFLICT_RETRIES = 3   # a fence reject means SOMEONE ELSE'S sync committed (progress
+                             # happened), so a re-walk converges; 3 bounds a pathological storm
+
 async def _sync(led: PostgresLedger, scope: str) -> dict:
-    """Walk + sync ONE scope. Raises on unknown scope / bad root (hard error, caller exits 2)."""
+    """Walk + sync ONE scope. Raises on unknown scope / bad root (hard error, caller exits 2).
+
+    Fence-and-reject closes the walk-before-lock TOCTOU: the fence (max seq) is stamped BEFORE
+    the walk; if any other writer commits in between, knowledge_sync rejects and we re-walk.
+    A stale snapshot can therefore never commit out of walk order — which could resurrect a
+    just-deleted doc (stress-matrix F4/F5). On persistent conflict we raise: ingest surfaces
+    the error, recall_hits degrades to its stale-index WARN (reads stay available)."""
     root = knowledge.resolve_scope(scope)
-    walk = knowledge.walk_corpus(root)
-    for w in walk.warnings:
-        log(f"{scope}: {w}")
-    res = await led.knowledge_sync(scope, [dataclasses.asdict(d) for d in walk.docs])
+    res: dict = {}
+    for _ in range(_SYNC_CONFLICT_RETRIES):
+        fence = await led.knowledge_fence(scope)
+        walk = knowledge.walk_corpus(root)
+        for w in walk.warnings:
+            log(f"{scope}: {w}")
+        res = await led.knowledge_sync(scope, [dataclasses.asdict(d) for d in walk.docs],
+                                       expect_fence=fence)
+        if not res.get("conflict"):
+            break
+        log(f"{scope}: sync conflict — another writer committed since the walk; re-walking")
+    else:
+        raise RuntimeError(f"{scope}: knowledge sync conflicted "
+                           f"{_SYNC_CONFLICT_RETRIES}x — index not refreshed this call")
     for p in res.get("skipped_oversize", []):
         log(f"{scope}: SKIPPED {p} — body too large to index (>1MB tsvector); not recallable until shrunk")
     res["md_docs"] = len(walk.docs)
@@ -90,11 +109,19 @@ async def rebuild(scope: str) -> int:
     led = await PostgresLedger.connect(DSN)
     try:
         root = knowledge.resolve_scope(scope)       # hard-error BEFORE tombstoning anything
-        walk = knowledge.walk_corpus(root)          # walk FIRST, then one-lock tombstone+reingest
-        for w in walk.warnings:
-            log(f"{scope}: {w}")
-        res = await led.knowledge_rebuild(
-            scope, [dataclasses.asdict(d) for d in walk.docs])
+        for _ in range(_SYNC_CONFLICT_RETRIES):     # same fence-reject as _sync: rebuild walks first too
+            fence = await led.knowledge_fence(scope)
+            walk = knowledge.walk_corpus(root)      # walk FIRST, then one-lock tombstone+reingest
+            for w in walk.warnings:
+                log(f"{scope}: {w}")
+            res = await led.knowledge_rebuild(
+                scope, [dataclasses.asdict(d) for d in walk.docs], expect_fence=fence)
+            if not res.get("conflict"):
+                break
+            log(f"{scope}: rebuild conflict — another writer committed since the walk; re-walking")
+        else:
+            raise RuntimeError(f"{scope}: knowledge rebuild conflicted "
+                               f"{_SYNC_CONFLICT_RETRIES}x — aborted, index unchanged")
         for p in res.get("skipped_oversize", []):
             log(f"{scope}: SKIPPED {p} — body too large to index (>1MB tsvector)")
     finally:
