@@ -84,3 +84,6 @@ throwaway DB (`runtime_test`), NEVER the ops `runtime` database.
   Design review catches architecture; only the attack pass catches your mechanics.
 - Global rules apply: commit-before-review, `/feature` phases in order, bash rules
   (`tools/bash-check.sh` + semgrep rules exist — run them on script changes).
+- Outcome labels are ground truth for future acting rungs: label from the FINDING TEXT,
+  never the tag (`mxr outcome <key> real|fp|wontfix` — fp = reviewer wrong, wontfix =
+  right-but-declining). Mislabeled ground truth poisons the dials.
