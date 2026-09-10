@@ -91,13 +91,17 @@ answer lags until the file REACHES the Mini. There is no reindex timer to wait o
 `mxr ask` refreshes the index on every call — so the lag being measured here is
 **Syncthing propagation**, end to end.
 
+All §2 rows: a refresh FAILURE is invisible on the phone (`recall_hits` degrades to a
+stale-index WARN on stderr — and the phone wrapper DISCARDS stderr entirely, so the
+warning survives NOWHERE on that surface). After any F-row that looks like sync lag,
+re-run the same ask from a TERMINAL on the Mini (`mxr ask --scope … "…"`), where the
+`freshness refresh failed` stderr line is visible, before recording the number as a
+sync SLA. A refresh failure is a FAIL of that row, not lag. TRACKED FOLLOW-UP (xreview
+2026-09-10 finding 2): the wrapper should persist a refresh-failure marker so the phone
+path can self-report; until then the terminal re-run is the only diagnostic.
+
 | # | Procedure | PASS criteria |
 |---|---|---|
-All §2 rows: a refresh FAILURE is invisible on the phone (`recall_hits` degrades to a
-stale-index WARN on stderr; the wrapper emits stdout only) — after any F-row that looks
-like sync lag, check the wrapper log on the Mini for `freshness refresh failed` before
-recording the number as a sync SLA. A refresh failure is a FAIL of that row, not lag.
-
 | F1 | Add a note with a unique token to `~/research` on the MacBook. `ask research <token>` from the phone IMMEDIATELY. | Either (a) found — sync already delivered; or (b) not found — EXPECTED, proceed to F2 |
 | F2 | Watch Syncthing report the file delivered to the Mini, then ask again. | found on the first ask after delivery (the ask itself refreshes). **Record wall-clock from save to found** — that IS the freshness SLA, and it is a SYNC number |
 | F3 | Edit an existing doc on the MacBook (change a fact). After sync delivery, ask the changed fact. | new answer reflects the edit (not the stale one) |
