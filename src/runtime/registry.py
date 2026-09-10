@@ -103,14 +103,18 @@ V1_ROSTER: list[AgentSpec] = [
               # timeout_s=7200: see mack above — the 2026-07-12 dead build was THIS agent.
               profile=Profile(timeout_s=7200)),
     AgentSpec(agent_id="kilabz", reach=Reach.CLI, authority=Authority.RESPONDER,
-              model="gpt-5.5", role="code reviewer (read-only)",
+              model="gpt-6-astra", role="code reviewer (read-only)",
               # PIN model + reasoning effort: without `-c model=...` codex runs the HOST's
               # ~/.codex/config.toml model — true-by-luck on one machine, unverified on the
               # other. The reviewer family must be deterministic from the REPO on every host.
-              # gpt-5.5 stays (NOT the brief's 5.3-codex cost swap: codex auth is a flat-rate
-              # ChatGPT subscription — Pro since 2026-07-03 (it sat on the FREE tier before,
-              # which is what drained mid-cycle) — so the API-price argument is moot and a
-              # downgrade would be a pure review-quality loss).
+              # gpt-6-astra (2026-09-10): gpt-5.5 was DECOMMISSIONED server-side mid-day —
+              # every kilabz call 404'd ("model does not exist") and the push-review gate
+              # hard-aborted; a pinned model is a LIVE external dependency that can vanish
+              # between two reviews an hour apart. astra = the account's current flagship
+              # ("most capable for complex, demanding work" — the right tier for the
+              # adversarial gate; codex auth is a flat-rate ChatGPT subscription, so the
+              # API-price argument stays moot). If kilabz 404s again, re-derive the pin from
+              # ~/.codex/models_cache.json, not from memory.
               # timeout_s=900: xhigh on a real review diff regularly exceeds the dead 300s
               # per-attempt default (2026-07-03: two killed attempts + one ok stranded a DONE
               # reply in the ledger while play-review's wait expired). invoke_cli uses THIS
@@ -125,12 +129,16 @@ V1_ROSTER: list[AgentSpec] = [
               # accepted §5 residual — read-only exec of snapshot entry points — is
               # capability-identical to its existing un-path-scoped Read.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
-                       "-c", "model=gpt-5.5", "-c", "model_reasoning_effort=xhigh",
+                       "-c", "model=gpt-6-astra", "-c", "model_reasoning_effort=xhigh",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "staging_cwd": "optional",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
-              model="gpt-5.5", role="builder/debugger",
+              model="gpt-6-astra", role="builder/debugger",
+              # PIN the model here too (2026-09-10): this agent ran the CLI default under its
+              # scratch HOME, which silently changed when gpt-5.5 was decommissioned — same
+              # incident class as kilabz's 404, just latent. Deterministic-from-the-repo
+              # applies to the FIXER as much as the reviewer (its diffs face the human gate).
               # --sandbox workspace-write: codex's own seatbelt (P2) — writes scoped to the
               # worktree cwd (+ tmp); executed-command network egress is restricted ONLY if the
               # host ~/.codex config hasn't re-enabled it, so treat egress as best-effort, NOT
@@ -150,6 +158,7 @@ V1_ROSTER: list[AgentSpec] = [
               # (Profile.sync_wait), so play-fix's un-enved `mxr codex` submit waits long enough too.
               profile=Profile(timeout_s=1800),
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "workspace-write",
+                       "-c", "model=gpt-6-astra",
                        "-c", "sandbox_workspace_write.network_access=false",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "env_passthrough": ["OPENAI_API_KEY"], "scratch_home": True}),
