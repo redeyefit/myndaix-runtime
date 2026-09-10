@@ -923,7 +923,12 @@ for d in "$SUB"/plists/*.json; do
   touch "$LV/fakehome/Library/LaunchAgents/$l.plist"
 done
 lv4="$(LV_MODE=clean lvrun)"
-ok 'printf "%s" "$lv4" | grep -q "all declared jobs alive"' "fresh plist mtimes -> unconditional reconcile-grace PASS"
+# review 20260905164609 follow-up: grace-skips are EMITTED, and the strong all-alive line is
+# reserved for runs where every declared job actually got a verdict — a fresh deploy can no
+# longer produce a false "all alive" that vouches for the very jobs it just touched.
+ok 'printf "%s" "$lv4" | grep -q "GRACE-SKIPPED (recent install, no verdict this tick):"' "fresh plist mtimes -> grace-skipped labels emitted explicitly"
+ok 'printf "%s" "$lv4" | grep -qE "grace-skipped, UNVERIFIED this tick"' "grace run passes WEAKLY (checked-jobs line, count included)"
+ok '! printf "%s" "$lv4" | grep -q "all declared jobs alive"' "the strong all-alive signal never appears on a grace-skipped run"
 ok '[[ ! -e "$LVH/state/liveness-streak" && ! -e "$LVH/state/liveness-alerted" ]]' "clean run resets streak + latch"
 # run 5 — grace expired, loaded, but NO .out ever -> never-ran divergence
 find "$LV/fakehome/Library/LaunchAgents" -name "*.plist" -exec touch -t 202601010000 {} +
@@ -951,6 +956,7 @@ ok 'printf "%s" "$lv7" | grep -q "ai.myndaix.controller: exited nonzero (78) on 
 touch "$LVH/orchestrator/controller.out"                          # fresh exit 0 resets the memory
 lv7c="$(LV_MODE=clean lvrun)"
 ok '! printf "%s" "$lv7c" | grep -q "controller: exited nonzero" && [[ ! -e "$LVH/state/liveness-ec-ai.myndaix.controller" ]]' "#3: a fresh exit 0 clears the consecutive-fail memory (recovered)"
+ok 'printf "%s" "$lv7c" | grep -q "all declared jobs alive"' "past grace + fresh evidence -> the strong all-alive line still fires (no grace-skips)"
 # run 8 — rogue sweep: an undeclared loaded ai.myndaix.* label flags; declared + known-handmanaged don't.
 # ai.myndaix.librarian-rc = the librarian keepalive (hand-managed outside substrate) — the LIVE deploy
 # caught the canary flagging it rogue; it must be excluded (allowlist), never a bootout remedy.

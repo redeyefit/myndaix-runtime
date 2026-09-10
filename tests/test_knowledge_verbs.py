@@ -211,6 +211,46 @@ async def test_rebuild_single_lock(led):
     ok(total == 2 + 2 + 2, "all appends — full history retained, never TRUNCATE")
 
 
+# ---- fence (walk-before-lock TOCTOU reject) ---------------------------------------------------
+async def test_fence_reject_on_concurrent_commit(led):
+    await _truncate(led)
+    ok(await led.knowledge_fence("research") == 0, "empty scope fence = 0")
+    await led.knowledge_sync("research", [_doc("a.md", "# A")])
+    f1 = await led.knowledge_fence("research")
+    ok(f1 > 0, "fence advances after a commit")
+    # walker W stamped f1 and walked (its snapshot has a.md + b.md); MEANWHILE another sync
+    # commits a deletion of a.md — the exact out-of-arrival-order window that resurrects docs
+    await led.knowledge_sync("research", [])          # tombstones a.md; fence moves
+    stale = await led.knowledge_sync(
+        "research", [_doc("a.md", "# A"), _doc("b.md", "# B")], expect_fence=f1)
+    ok(stale.get("conflict") is True, "stale walk (fence moved) is REJECTED")
+    row = await _current(led, "research", "a.md")
+    ok(row["status"] == "archived", "reject wrote NOTHING — the deleted doc did not resurrect")
+    b_active = await led._pool.fetchval(
+        "SELECT count(*) FROM knowledge_doc_active WHERE scope='research' AND path='b.md'")
+    ok(b_active == 0, "reject wrote NOTHING — no partial insert either")
+    # the retry path: fresh fence + fresh walk (no deleted doc) commits cleanly
+    f2 = await led.knowledge_fence("research")
+    r = await led.knowledge_sync("research", [_doc("b.md", "# B")], expect_fence=f2)
+    ok(not r.get("conflict") and r["inserted"] == 1, "fresh fence + fresh walk commits")
+    r2 = await led.knowledge_sync("research", [_doc("b.md", "# B")])
+    ok(r2["unchanged"] == 1, "expect_fence=None keeps the unfenced path working")
+
+
+async def test_fence_reject_rebuild(led):
+    await _truncate(led)
+    await led.knowledge_sync("research", [_doc("a.md", "# A")])
+    f = await led.knowledge_fence("research")
+    # a.md stays in the walked set (tombstone_missing would archive it otherwise); c.md is new
+    await led.knowledge_sync("research", [_doc("a.md", "# A"), _doc("c.md", "# C")])   # fence moves
+    res = await led.knowledge_rebuild("research", [_doc("a.md", "# A2")], expect_fence=f)
+    ok(res.get("conflict") is True and res["tombstoned"] == 0,
+       "stale rebuild rejected — nothing tombstoned")
+    active = await led._pool.fetchval(
+        "SELECT count(*) FROM knowledge_doc_active WHERE scope='research'")
+    ok(active == 2, "index untouched by the rejected rebuild")
+
+
 async def main():
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

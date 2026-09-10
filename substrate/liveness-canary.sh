@@ -61,6 +61,7 @@ if [[ "$last_run" -ne 0 ]] && (( now - last_run > 2 * INTERVAL )); then
 fi
 
 div=""; div_n=0; div_keys=$'\n'
+grace=""; grace_n=0   # reconcile-grace skips: alive-UNVERIFIED this tick, reported by label
 # diverge KEY MESSAGE — KEY is the stable per-divergence identity (the label, or a synthetic
 # key for non-label problems) used by the grow-only latch to decide what's NEW; MESSAGE is the
 # human line in the alert body. Multiple sub-problems of one job share the label KEY (grouped).
@@ -106,9 +107,13 @@ while IFS=$'\t' read -r label max_gap sentinel out_path; do
   # Sentinel-gated + unarmed => the job is LEGITIMATELY unloaded — skip, not divergence.
   if [[ "$sentinel" != "-" && ! -e "$MYNDAIX_HOME/$sentinel" ]]; then continue; fi
   # Reconcile-grace, UNCONDITIONAL (not gated on a missing .out): a plist fresher than the
-  # job's max gap was just (re)installed — the job hasn't had a full cycle yet.
+  # job's max gap was just (re)installed — the job hasn't had a full cycle yet. The skip is
+  # COLLECTED, never silent: a grace-skipped job got NO verdict this tick, and the all-alive
+  # pass line below must not vouch for it (the stress-matrix preflight gate rejects on this).
   plist_m="$(mtime "$LA_DIR/$label.plist")"; plist_m=$((10#$plist_m))
-  if [[ "$plist_m" -ne 0 ]] && (( now - plist_m <= max_gap )); then continue; fi
+  if [[ "$plist_m" -ne 0 ]] && (( now - plist_m <= max_gap )); then
+    grace="${grace}${label} "; grace_n=$((grace_n + 1)); continue
+  fi
   # Loaded? Targeted print on the validated label only; a nonzero exit (incl. permission/SIP
   # quirks) = "not loaded" divergence, never a crash.
   if ! pr="$("$LCTL" print "$LA_DOMAIN/$label" 2>/dev/null)"; then
@@ -207,9 +212,19 @@ fi
 # only when a NEW key appears (grow-only). Partial healing does not re-alert; a fully-clean run
 # clears the set. THRESHOLD debounces the FIRST divergence (2 consecutive ticks); a new key
 # arriving mid-incident alerts on sight, which is correct — we're already in an alerting state.
+# Grace visibility (tracked follow-up, review 20260905164609): emit the skipped labels on EVERY
+# run they exist, so no consumer has to infer them from silence.
+[[ -n "$grace" ]] && log "liveness: GRACE-SKIPPED (recent install, no verdict this tick): ${grace% }"
+
 if [[ "$div_n" -eq 0 ]]; then
   rm -f "$STREAK_FILE" "$ALERTED_FILE" || log "liveness: WARN could not clear streak/latch"
-  log "liveness: all declared jobs alive"
+  # "all declared jobs alive" is the strong pass signal external gates grep for — it must now
+  # appear ONLY when every declared job actually got a verdict. Grace-skips get the weaker line.
+  if [[ -n "$grace" ]]; then
+    log "liveness: checked jobs alive — ${grace_n} grace-skipped, UNVERIFIED this tick"
+  else
+    log "liveness: all declared jobs alive"
+  fi
   exit 0
 fi
 
