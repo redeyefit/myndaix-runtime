@@ -330,7 +330,14 @@ autofix_fire(){
   # loop guard (apply rung — docs/autofix-apply-rung-design.md): play-fix can now push
   # fix/auto/* branches, so a review OF such a branch must never fire another fix — the
   # original loop-immunity rationale ("play-fix never commits/pushes") no longer holds.
-  [[ "${ref:-}" == *"fix/auto/"* ]] && { note autofix "skip: autofix-authored ref (loop guard)"; return 0; }
+  # FAIL-CLOSED on ref shape (r1 P1 #4): only a plain refs/heads/* ref may fire; empty,
+  # refs/pull/*, tags, or anything else skips — a non-branch ref can't name a base branch
+  # and must never start a fix chain.
+  case "${ref:-}" in
+    refs/heads/*) : ;;
+    *) note autofix "skip: non-branch or missing ref '${ref:-<empty>}' (fail-closed)"; return 0 ;;
+  esac
+  [[ "$ref" == *"fix/auto/"* ]] && { note autofix "skip: autofix-authored ref (loop guard)"; return 0; }
   [[ "${pushed:-0}" == "1" ]]       || { note autofix "skip: push not confirmed"; return 0; }
   [[ -s "$run/fixlist.txt" ]]       || { note autofix "skip: empty fixlist"; return 0; }
   # repo MUST be configured fail_to_pass:null, else a 3-arg auto-fire could exceed the UNVERIFIED
@@ -376,7 +383,12 @@ autofix_fire(){
   # autofix (controller.py + automerge.py set PLAY_DISABLE_AUTOFIX=1), so autofix_fire never runs
   # there. A future launchd dispatcher that ARMS autofix MUST set AbandonProcessGroup=true on its
   # plist, or launchd will reap this fixer when the short-lived job exits (same bug the controller hit).
-  nohup env -i PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" HOME="$HOME" "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
+  # MYNDAIX_FIX_BASE_BRANCH: the ORIGINATING branch (r1 P2 #7) so play-fix can open the fix PR
+  # against the right base instead of gh's default-branch fallback. Ref shape already enforced
+  # refs/heads/* above; play-fix re-validates fail-closed.
+  nohup env -i PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" HOME="$HOME" \
+    MYNDAIX_FIX_BASE_BRANCH="${ref#refs/heads/}" \
+    "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
   return 0
 }
 

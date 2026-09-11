@@ -421,15 +421,41 @@ fi
 #    paths exited via finish/fail_closed long before this point.
 # ----------------------------------------------------------------------------
 apply_note=""
+NET_TIMEOUT="${MYNDAIX_FIX_NET_TIMEOUT:-120}"           # bound on push / gh pr create (r1 P2 #6)
+[[ "$NET_TIMEOUT" =~ ^[0-9]{1,4}$ ]] || NET_TIMEOUT=120
+NET_TIMEOUT=$((10#$NET_TIMEOUT))
+net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a stalled
+  # transport/credential helper can never hold the fd-held fix lock forever (r1 P2 #6).
+  # Same pattern as run_sandboxed; 9>&- so no descendant pins the lock either.
+  set -m 2>/dev/null || true
+  ( exec "$@" ) >/dev/null 2>&1 9>&- &
+  local pid=$!
+  ( sleep "$NET_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
+  local wd=$!
+  local rc=0; wait "$pid" 2>/dev/null || rc=$?
+  kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
+  set +m 2>/dev/null || true
+  return "$rc"
+}
 apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<play> and pushes
   [[ -f "$ORCH/AUTOFIX_APPLY_ENABLED" ]] || return 0
   local branch="fix/auto/$play" awt="$EXEC/apply-wt"
+  # secret gate BEFORE any publication (r1 P1 #1): finish()'s scan only withholds the inbox
+  # diff — by then a commit/push would already be remote history. Never publish a secret hit.
+  if LC_ALL=C grep -aE "$SECRET_RE" "$patch" >/dev/null 2>&1; then
+    flags="$flags secrets-hit"
+    apply_note="apply SKIPPED: secret signature in the patch — nothing committed or pushed"
+    return 0
+  fi
   # commit ONLY the hash-verified immutable patch in a PRISTINE worktree from base — NEVER the
   # verify worktree: it executed untrusted patched code (integrity-checked, but not commit-grade).
   [[ "$(shasum -a 256 "$patch" | awk '{print $1}')" == "$patch_sha" ]] \
     || { apply_note="apply SKIPPED: patch integrity check failed"; return 0; }
-  git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" \
-    && { apply_note="apply SKIPPED: branch $branch already exists"; return 0; }
+  # branch-exists probe must distinguish "absent" (rc=1, proceed) from git ERRORS (rc>=128 —
+  # corrupt/locked repo): any non-1 nonzero is a hard skip, never a fall-through (r1 P2 #5).
+  local sr=0
+  git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" || sr=$?
+  [[ "$sr" -eq 1 ]] || { apply_note="apply SKIPPED: branch exists or git probe error (rc=$sr)"; return 0; }
   git -C "$repo_path" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
     || { apply_note="apply SKIPPED: could not create apply worktree"; return 0; }
   git -C "$awt" apply "$patch" >/dev/null 2>&1 \
@@ -437,24 +463,46 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   git -C "$awt" checkout -q -b "$branch" 2>/dev/null \
     || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
   git -C "$awt" add -A >/dev/null 2>&1
+  # hooks OFF for commit construction (r1 P1 #2): a repo whose core.hooksPath points at TRACKED
+  # hooks would execute patch-rewritten hook code UNSANDBOXED here. --no-verify + an empty
+  # hooksPath cover pre-commit/commit-msg AND any configured hook dir.
+  mkdir -p "$EXEC/nohooks"
   git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
-      commit -q -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
+      -c core.hooksPath="$EXEC/nohooks" \
+      commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
     || { apply_note="apply SKIPPED: commit failed"; return 0; }
   flags="$flags applied-branch:$branch"
-  # 9>&- on push/gh: the pre-push hook detaches a review worker — it must not pin the fix lock.
-  if git -C "$awt" push -q -u origin "$branch" >/dev/null 2>&1 9>&-; then
+  # push from the DURABLE repo, not the ephemeral worktree (r1 P1 #3): the pre-push hook
+  # detaches a review worker whose repo path must outlive this process — cleanup() removes
+  # $awt on exit, but the branch ref lives in the shared .git, so repo_path can push it.
+  # A repo with core.hooksPath set gets NO push (r1 P1 #2's push half): its pre-push would
+  # run tracked (patchable) hook code; our trusted hook lives at the default .git/hooks path.
+  if [[ -n "$(git -C "$repo_path" config --get core.hooksPath 2>/dev/null || true)" ]]; then
+    apply_note="APPLIED locally as $branch — push withheld: repo sets core.hooksPath (tracked-hook execution risk); push by hand after inspecting hooks"
+    return 0
+  fi
+  if net_bounded git -C "$repo_path" push -q -u origin "$branch"; then
     flags="$flags pushed"
     apply_note="APPLIED + PUSHED as $branch ($1) — the push-review loop reviews it; merge stays gated."
     if [[ "${MYNDAIX_FIX_TEST_MODE:-}" != "1" ]] && command -v gh >/dev/null 2>&1; then
-      local pr
-      pr="$( (cd "$awt" && gh pr create --head "$branch" \
+      # PR base = the ORIGINATING branch (r1 P2 #7), passed by autofix_fire via env; validated
+      # here, fail-CLOSED: no/invalid base -> branch-only (never let gh default to main for a
+      # fix whose base commit sits on an unmerged feature branch).
+      local pr_base="${MYNDAIX_FIX_BASE_BRANCH:-}"
+      if [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
+        if ( cd "$repo_path" && net_bounded gh pr create --head "$branch" --base "$pr_base" \
               --title "autofix($play): $repo_id @ ${base_sha:0:8}" \
-              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated." \
-              2>/dev/null | tail -1) 9>&- || true)"
-      [[ -n "$pr" ]] && apply_note="$apply_note PR: $pr"
+              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated." ); then
+          apply_note="$apply_note PR opened against $pr_base."
+        else
+          apply_note="$apply_note (gh pr create failed or timed out — open the PR by hand; base=$pr_base)"
+        fi
+      else
+        apply_note="$apply_note No PR opened: originating branch unknown/invalid — open by hand against the right base."
+      fi
     fi
   else
-    apply_note="APPLIED locally as $branch — PUSH FAILED (no ssh credentials in detached context?); push by hand: git push -u origin $branch"
+    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push -u origin $branch"
   fi
   return 0
 }

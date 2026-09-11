@@ -249,6 +249,20 @@ echo "33. ARMED: REGRESSION_CHECK_ONLY applies too (full-proof tier)"
 run fixture "$TMP/good.patch"; check "armed full proof" REGRESSION_CHECK_ONLY
 [[ "$(auto_branches)" == "2" ]] && { echo "  ok: full-proof fix pushed"; pass=$((pass+1)); } \
   || { echo "  FAIL: expected 2 fix/auto branches, got $(auto_branches)"; fail=$((fail+1)); }
+echo "34. ARMED: secret-bearing patch is NEVER published (r1 P1: scan precedes commit/push)"
+run fixture "$TMP/secret.patch"; check "armed secret" REGRESSION_CHECK_ONLY
+[[ "$(auto_branches)" == "2" ]] && { echo "  ok: secret patch not committed/pushed"; pass=$((pass+1)); } \
+  || { echo "  FAIL: secret patch was published"; fail=$((fail+1)); }
+echo "35. ARMED: repo hooks do NOT run during apply-commit (r1 P1: --no-verify + empty hooksPath)"
+printf '#!/bin/sh\ntouch "%s/hookfired"\n' "$TMP" > "$REPO/.git/hooks/pre-commit"
+chmod +x "$REPO/.git/hooks/pre-commit"
+run fixture_nof2p "$TMP/good.patch"; check "armed hook suppression" SUITE_GREEN
+if [[ ! -e "$TMP/hookfired" && "$(auto_branches)" == "3" ]]; then
+  echo "  ok: pre-commit hook suppressed, fix still pushed"; pass=$((pass+1))
+else
+  echo "  FAIL: hookfired=$([[ -e "$TMP/hookfired" ]] && echo yes || echo no) branches=$(auto_branches)"; fail=$((fail+1))
+fi
+rm -f "$REPO/.git/hooks/pre-commit"
 rm -f "$ORCH/AUTOFIX_APPLY_ENABLED"
 
 echo
