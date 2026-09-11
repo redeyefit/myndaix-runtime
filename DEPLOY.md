@@ -57,17 +57,32 @@ them is a **half-deploy** — it looks done but runs a mix of old and new code. 
    `registry.py`/`runner.py` into the long-lived pool (e.g. an agent profile-timeout or adapter
    change). Skipped only if the deploy touched nothing serve imports.
 
-**The full Mini deploy, one line** (covers all three surfaces):
+**⚠ MINI SERVE IS GITOPS — the one-liner below does NOT ship serve code there (live-verified
+2026-09-11):** on the Mini, `runtime-serve.sh` execs from the DEPLOY CLONE
+(`~/.myndaix/deploy/myndaix-runtime/.venv`), which only `ai.myndaix.reconcile` advances (fetch →
+health-gate on `to_regclass(migration_head.txt)` → kickstart). A hand `kickstart` restarts serve
+on whatever the clone already has. To force a Mini serve deploy NOW:
+`launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile` (proved: advanced the clone + applied a
+new migration in one tick). The `~/code/active` tree on the Mini still matters for the
+CONTROLLER (PYTHONPATH import each tick) and as the `cp` source for the `$ORCH` scripts.
+
+**The full Mini deploy, one line** (controller tree + trusted scripts; serve rides reconcile):
 
 ```bash
 cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
   && cp orchestrator/play-review.sh orchestrator/play-fix.sh ~/.myndaix/orchestrator/ \
-  && launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime
+  && launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 ```
 
 Both worker scripts ship because the trusted installed surface is `$ORCH/play-review.sh` AND
 `$ORCH/play-fix.sh` — copying only the review script leaves a `play-fix.sh` change live-stale on the
 autofix host (the half-deploy this doc exists to prevent).
+
+**Autofix apply rung (2026-09-11, docs/autofix-apply-rung-design.md):** verified fixes
+(`SUITE_GREEN` / `REGRESSION_CHECK_ONLY`) commit + push `fix/auto/*` branches and open PRs when
+`$ORCH/AUTOFIX_APPLY_ENABLED` exists. The flag is PER-MACHINE and DELIBERATE (currently armed:
+MacBook only; the Mini's launchd callers hard-disable autofix). Arm `touch` / disarm `rm` —
+after any play-script deploy, re-check the flag state matches intent.
 
 **Verify the deploy landed** (read-only): `git log -1` (the merge sha), a `grep` for the new code in
 the repo `src/runtime/controller.py` AND in BOTH installed workers (`$ORCH/play-review.sh` and
