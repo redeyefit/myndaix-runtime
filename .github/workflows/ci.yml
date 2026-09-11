@@ -30,6 +30,11 @@ jobs:
     runs-on: [self-hosted, mini]
 
     env:
+      # runtime_ci is safe as a SHARED static DB only because ONE runner is registered —
+      # a single runner executes one job at a time, so runs serialize (review 20260911131140
+      # Medium, declined as machinery-for-a-topology-we-don't-have). REGISTERING A SECOND
+      # RUNNER breaks this: scope the DB per run (runtime_ci_${{ github.run_id }} + create/
+      # drop in the job) before ever doing that.
       LEDGER_TEST_DSN: postgresql://localhost:5432/runtime_ci
       PYTHONPATH: src
 
