@@ -2040,6 +2040,11 @@ class PostgresLedger:
     # strictly increases the sum and a stamped fence can never recur. gen starts at 0 (no seed),
     # making the fence VALUE numerically continuous with the old MAX(seq) fence across the
     # upgrade in both directions.
+    # ASYMMETRY (r2 oracle LOW): the protection is one-way. A PRE-0016 walker checks MAX(seq)
+    # only, so it is blind to a new-code TRUE NO-OP commit (gen bump, no row) and can still
+    # commit a stale snapshot — that is exactly the original bug, alive in old code until the
+    # old processes exit. Nothing new-side can widen an old binary's check; keep the mixed
+    # window short (deploys kickstart serve, so the residual is in-flight pre-pull CLI calls).
     _KNOWLEDGE_GEN_SQL = (
         "SELECT COALESCE((SELECT gen FROM knowledge_scope_gen WHERE scope = $1), 0)"
         " + (SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1)")
