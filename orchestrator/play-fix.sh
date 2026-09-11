@@ -334,7 +334,10 @@ note "patch sha256=$patch_sha"
 # 3. patch-policy gate (BEFORE any execution) — NUL-safe exact paths
 # ----------------------------------------------------------------------------
 vwt="$EXEC/verify-wt"
-git -C "$repo_path" worktree add --detach "$vwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create verify worktree"
+# hook-free worktree ops throughout (r2 fold, depth): post-checkout fires on worktree add —
+# a hooksPath repo must never execute hook code from any of our throwaway trees.
+mkdir -p "$EXEC/nohooks"
+git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$vwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create verify worktree"
 git -C "$vwt" clean -fdx >/dev/null 2>&1 || true
 
 summary="$(git -C "$vwt" apply --summary "$patch" 2>/dev/null || true)"
@@ -376,7 +379,7 @@ fi
 if [[ "$suite_green_mode" == "0" ]]; then
   # clean-base precheck in a SEPARATE pristine worktree: target must FAIL on clean base
   pwt="$EXEC/precheck-wt"
-  git -C "$repo_path" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
+  git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
   if run_sandboxed "$pwt" "${F2P[@]}" >/dev/null 2>&1; then
     finish "UNVERIFIED" "fail_to_pass already passes on the clean base (flake or no real bug)" "$patch"
   fi
@@ -427,14 +430,26 @@ NET_TIMEOUT=$((10#$NET_TIMEOUT))
 net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a stalled
   # transport/credential helper can never hold the fd-held fix lock forever (r1 P2 #6).
   # Same pattern as run_sandboxed; 9>&- so no descendant pins the lock either.
+  # r2 fold: (a) restore the caller's monitor-mode state instead of hardcoding set +m;
+  # (b) the TIMEOUT path must reap the whole pgroup even when git exited on SIGTERM while a
+  # helper ignored it — but the SUCCESS path must NOT touch the pgroup (a successful push's
+  # pre-push hook nohup-detaches the review worker INTO this pgroup; killing it would abort
+  # the promised review). The watchdog stamps a marker when it fires; we reap iff it did.
+  local had_m=0; [[ "$-" == *m* ]] && had_m=1
   set -m 2>/dev/null || true
   ( exec "$@" ) >/dev/null 2>&1 9>&- &
   local pid=$!
-  ( sleep "$NET_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
+  local mark="$run/net-fired.$pid"
+  ( sleep "$NET_TIMEOUT"; touch "$mark" 2>/dev/null; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
+  if [[ -e "$mark" ]]; then                              # timeout fired: finish the escalation ourselves
+    kill -KILL -"$pid" 2>/dev/null || true               # (the wd may still be in its grace sleep)
+    rc=124
+  fi
   kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
-  set +m 2>/dev/null || true
+  rm -f "$mark" 2>/dev/null || true
+  [[ "$had_m" -eq 1 ]] || set +m 2>/dev/null || true
   return "$rc"
 }
 apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<play> and pushes
@@ -442,9 +457,13 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   local branch="fix/auto/$play" awt="$EXEC/apply-wt"
   # secret gate BEFORE any publication (r1 P1 #1): finish()'s scan only withholds the inbox
   # diff — by then a commit/push would already be remote history. Never publish a secret hit.
-  if LC_ALL=C grep -aE "$SECRET_RE" "$patch" >/dev/null 2>&1; then
-    flags="$flags secrets-hit"
-    apply_note="apply SKIPPED: secret signature in the patch — nothing committed or pushed"
+  # rc-EXACT (r2 P1): grep 0 = match, 1 = clean, >=2 = scanner ERROR — only exactly 1 may
+  # proceed; an errored scan proves nothing about absence of secrets.
+  local sec=0
+  LC_ALL=C grep -aE "$SECRET_RE" "$patch" >/dev/null 2>&1 || sec=$?
+  if [[ "$sec" -ne 1 ]]; then
+    [[ "$sec" -eq 0 ]] && flags="$flags secrets-hit"
+    apply_note="apply SKIPPED: secret scan $([[ "$sec" -eq 0 ]] && echo "matched a signature" || echo "errored (rc=$sec)") — nothing committed or pushed"
     return 0
   fi
   # commit ONLY the hash-verified immutable patch in a PRISTINE worktree from base — NEVER the
@@ -456,17 +475,18 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   local sr=0
   git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" || sr=$?
   [[ "$sr" -eq 1 ]] || { apply_note="apply SKIPPED: branch exists or git probe error (rc=$sr)"; return 0; }
-  git -C "$repo_path" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
+  # hooks OFF for the ENTIRE commit construction (r1 P1 #2 + r2 P1: worktree add and
+  # checkout -b fire post-checkout too — the checkout runs AFTER the patch is applied, so a
+  # tracked-hooksPath repo would execute patch-rewritten hook code UNSANDBOXED). Every git op
+  # that can trigger a hook gets -c core.hooksPath=<empty dir>; commit adds --no-verify.
+  mkdir -p "$EXEC/nohooks"
+  git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
     || { apply_note="apply SKIPPED: could not create apply worktree"; return 0; }
   git -C "$awt" apply "$patch" >/dev/null 2>&1 \
     || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
-  git -C "$awt" checkout -q -b "$branch" 2>/dev/null \
+  git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>/dev/null \
     || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
   git -C "$awt" add -A >/dev/null 2>&1
-  # hooks OFF for commit construction (r1 P1 #2): a repo whose core.hooksPath points at TRACKED
-  # hooks would execute patch-rewritten hook code UNSANDBOXED here. --no-verify + an empty
-  # hooksPath cover pre-commit/commit-msg AND any configured hook dir.
-  mkdir -p "$EXEC/nohooks"
   git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
       -c core.hooksPath="$EXEC/nohooks" \
       commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
@@ -477,8 +497,12 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   # $awt on exit, but the branch ref lives in the shared .git, so repo_path can push it.
   # A repo with core.hooksPath set gets NO push (r1 P1 #2's push half): its pre-push would
   # run tracked (patchable) hook code; our trusted hook lives at the default .git/hooks path.
-  if [[ -n "$(git -C "$repo_path" config --get core.hooksPath 2>/dev/null || true)" ]]; then
-    apply_note="APPLIED locally as $branch — push withheld: repo sets core.hooksPath (tracked-hook execution risk); push by hand after inspecting hooks"
+  # rc-EXACT probe (r2 P1): config --get is 0 = set, 1 = unset, >=2 = config unreadable —
+  # only exactly 1 (provably unset) may push; an errored probe is an unknown hook config.
+  local hp=0
+  git -C "$repo_path" config --get core.hooksPath >/dev/null 2>&1 || hp=$?
+  if [[ "$hp" -ne 1 ]]; then
+    apply_note="APPLIED locally as $branch — push withheld: core.hooksPath $([[ "$hp" -eq 0 ]] && echo "is set (tracked-hook execution risk)" || echo "probe errored (rc=$hp)"); push by hand after inspecting hooks"
     return 0
   fi
   if net_bounded git -C "$repo_path" push -q -u origin "$branch"; then

@@ -253,16 +253,27 @@ echo "34. ARMED: secret-bearing patch is NEVER published (r1 P1: scan precedes c
 run fixture "$TMP/secret.patch"; check "armed secret" REGRESSION_CHECK_ONLY
 [[ "$(auto_branches)" == "2" ]] && { echo "  ok: secret patch not committed/pushed"; pass=$((pass+1)); } \
   || { echo "  FAIL: secret patch was published"; fail=$((fail+1)); }
-echo "35. ARMED: repo hooks do NOT run during apply-commit (r1 P1: --no-verify + empty hooksPath)"
-printf '#!/bin/sh\ntouch "%s/hookfired"\n' "$TMP" > "$REPO/.git/hooks/pre-commit"
-chmod +x "$REPO/.git/hooks/pre-commit"
+echo "35. ARMED: repo hooks do NOT run during apply (r1/r2 P1: worktree add + checkout + commit all suppressed)"
+for h in pre-commit post-checkout; do
+  printf '#!/bin/sh\ntouch "%s/hookfired-%s"\n' "$TMP" "$h" > "$REPO/.git/hooks/$h"
+  chmod +x "$REPO/.git/hooks/$h"
+done
 run fixture_nof2p "$TMP/good.patch"; check "armed hook suppression" SUITE_GREEN
-if [[ ! -e "$TMP/hookfired" && "$(auto_branches)" == "3" ]]; then
-  echo "  ok: pre-commit hook suppressed, fix still pushed"; pass=$((pass+1))
+if [[ ! -e "$TMP/hookfired-pre-commit" && ! -e "$TMP/hookfired-post-checkout" && "$(auto_branches)" == "3" ]]; then
+  echo "  ok: pre-commit + post-checkout suppressed, fix still pushed"; pass=$((pass+1))
 else
-  echo "  FAIL: hookfired=$([[ -e "$TMP/hookfired" ]] && echo yes || echo no) branches=$(auto_branches)"; fail=$((fail+1))
+  echo "  FAIL: pc=$([[ -e "$TMP/hookfired-pre-commit" ]] && echo yes || echo no) pco=$([[ -e "$TMP/hookfired-post-checkout" ]] && echo yes || echo no) branches=$(auto_branches)"; fail=$((fail+1))
 fi
-rm -f "$REPO/.git/hooks/pre-commit"
+rm -f "$REPO/.git/hooks/pre-commit" "$REPO/.git/hooks/post-checkout"
+echo "36. ARMED: repo with core.hooksPath set -> APPLIED locally, push WITHHELD (r1/r2 P1 push half)"
+git -C "$REPO" config core.hooksPath .githooks
+run fixture_nof2p "$TMP/good.patch"; check "armed hooksPath withhold" SUITE_GREEN
+if [[ "$(auto_branches)" == "3" ]] && grep -q "push withheld" "$INBOX"/*.md 2>/dev/null; then
+  echo "  ok: hooksPath repo not pushed, note explains"; pass=$((pass+1))
+else
+  echo "  FAIL: branches=$(auto_branches) (expected 3, no push)"; fail=$((fail+1))
+fi
+git -C "$REPO" config --unset core.hooksPath
 rm -f "$ORCH/AUTOFIX_APPLY_ENABLED"
 
 echo
