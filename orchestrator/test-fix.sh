@@ -33,8 +33,13 @@ BASE="$(git -C "$REPO" rev-parse HEAD)"
 # test that writes /dev/null (sandbox-hardening regression) and has NO template (missing-template test)
 jq -n --arg repo "$REPO" --arg py "$PY" '{
   fixture: { path: $repo, verify: [$py, "test_other.py"], fail_to_pass: [$py, "test_add.py"], fail_to_pass_template: [$py, "{TEST}"] },
-  fixture_devnull: { path: $repo, verify: [$py, "test_devnull.py"], fail_to_pass: [$py, "test_add.py"] }
+  fixture_devnull: { path: $repo, verify: [$py, "test_devnull.py"], fail_to_pass: [$py, "test_add.py"] },
+  fixture_nof2p: { path: $repo, verify: [$py, "test_other.py"], fail_to_pass: null },
+  fixture_nof2p_add: { path: $repo, verify: [$py, "test_add.py"], fail_to_pass: null }
 }' > "$ORCH/repos.json"
+# bare origin for the apply-rung push cases (nothing pushes unless AUTOFIX_APPLY_ENABLED exists)
+git init -q --bare "$TMP/origin.git"
+git -C "$REPO" remote add origin "$TMP/origin.git"
 printf 'fix the add() bug so add(2,2)==4\n' > "$TMP/fixlist.txt"
 
 # ---- helpers to mint patches from the fixture working tree ----
@@ -92,6 +97,12 @@ import sys; p=sys.argv[1]
 open(p,"w").write('open("test_add.py","w").write("assert True\\n")\ndef add(a, b):\n    return a + b\n')
 PY
 mint "$TMP/runtime_tamper.patch"
+
+# comment-only change: does NOT fix the bug (suite-green verify-fail case)
+"$PY" - "$REPO/calc.py" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read().replace("# BUG","# bug"); open(p,"w").write(s)
+PY
+mint "$TMP/commentonly.patch"
 
 run(){ # run <repo_id> <patch>
   rm -f "$INBOX"/*.md 2>/dev/null || true
@@ -206,6 +217,65 @@ echo "26. selector is a TREE (directory) -> ABORTED (codex re-review: mode must 
 run_sel fixture "$TMP/good.patch" "pkg"; check "selector tree" ABORTED
 echo "27. selector with a trailing slash -> ABORTED (codex re-review: ls-tree child-row bypass)"
 run_sel fixture "$TMP/good.patch" "test_add.py/"; check "selector trailing slash" ABORTED
+
+auto_branches(){ git -C "$TMP/origin.git" for-each-ref refs/heads --format='%(refname:short)' 2>/dev/null | grep -c '^fix/auto/' || true; }
+
+echo "28. fail_to_pass:null + verify green -> SUITE_GREEN (apply rung disarmed: nothing pushed)"
+run fixture_nof2p "$TMP/good.patch"; check "suite-green tier" SUITE_GREEN
+[[ "$(auto_branches)" == "0" ]] && { echo "  ok: disarmed -> no fix/auto branch pushed"; pass=$((pass+1)); } \
+  || { echo "  FAIL: branch pushed while disarmed"; fail=$((fail+1)); }
+echo "29. fail_to_pass:null + verify FAILS -> UNVERIFIED (no free green)"
+run fixture_nof2p_add "$TMP/commentonly.patch"; check "suite-green verify fail" UNVERIFIED
+echo "30. fail_to_pass:null + runtime tamper -> TAMPERED (integrity gates run in suite-green mode)"
+run fixture_nof2p_add "$TMP/runtime_tamper.patch"; check "suite-green runtime tamper" TAMPERED
+echo "31. ARMED: SUITE_GREEN applies + pushes fix/auto/* with the exact patch content"
+touch "$ORCH/AUTOFIX_APPLY_ENABLED"
+run fixture_nof2p "$TMP/good.patch"; check "armed suite-green" SUITE_GREEN
+if [[ "$(auto_branches)" == "1" ]]; then
+  b="$(git -C "$TMP/origin.git" for-each-ref refs/heads --format='%(refname:short)' | grep '^fix/auto/' | head -1)"
+  if git -C "$TMP/origin.git" show "$b:calc.py" 2>/dev/null | grep -q 'a + b'; then
+    echo "  ok: pushed branch carries the verified fix"; pass=$((pass+1))
+  else
+    echo "  FAIL: pushed branch content wrong"; fail=$((fail+1))
+  fi
+else
+  echo "  FAIL: expected exactly 1 fix/auto branch, got $(auto_branches)"; fail=$((fail+1))
+fi
+echo "32. ARMED: TAMPERED never applies (branch count unchanged)"
+run fixture_nof2p_add "$TMP/runtime_tamper.patch"; check "armed tamper" TAMPERED
+[[ "$(auto_branches)" == "1" ]] && { echo "  ok: tampered patch not pushed"; pass=$((pass+1)); } \
+  || { echo "  FAIL: tampered patch pushed a branch"; fail=$((fail+1)); }
+echo "33. ARMED: REGRESSION_CHECK_ONLY applies too (full-proof tier)"
+run fixture "$TMP/good.patch"; check "armed full proof" REGRESSION_CHECK_ONLY
+[[ "$(auto_branches)" == "2" ]] && { echo "  ok: full-proof fix pushed"; pass=$((pass+1)); } \
+  || { echo "  FAIL: expected 2 fix/auto branches, got $(auto_branches)"; fail=$((fail+1)); }
+echo "34. ARMED: secret-bearing patch is NEVER published (r1 P1: scan precedes commit/push)"
+run fixture "$TMP/secret.patch"; check "armed secret" REGRESSION_CHECK_ONLY
+[[ "$(auto_branches)" == "2" ]] && { echo "  ok: secret patch not committed/pushed"; pass=$((pass+1)); } \
+  || { echo "  FAIL: secret patch was published"; fail=$((fail+1)); }
+echo "35. ARMED: repo hooks do NOT run during apply (r1/r2 P1: worktree add + checkout + commit all suppressed)"
+for h in pre-commit post-checkout post-index-change; do
+  printf '#!/bin/sh\ntouch "%s/hookfired-%s"\n' "$TMP" "$h" > "$REPO/.git/hooks/$h"
+  chmod +x "$REPO/.git/hooks/$h"
+done
+run fixture_nof2p "$TMP/good.patch"; check "armed hook suppression" SUITE_GREEN
+if [[ ! -e "$TMP/hookfired-pre-commit" && ! -e "$TMP/hookfired-post-checkout" \
+      && ! -e "$TMP/hookfired-post-index-change" && "$(auto_branches)" == "3" ]]; then
+  echo "  ok: pre-commit + post-checkout + post-index-change suppressed, fix still pushed"; pass=$((pass+1))
+else
+  echo "  FAIL: pc=$([[ -e "$TMP/hookfired-pre-commit" ]] && echo yes || echo no) pco=$([[ -e "$TMP/hookfired-post-checkout" ]] && echo yes || echo no) pic=$([[ -e "$TMP/hookfired-post-index-change" ]] && echo yes || echo no) branches=$(auto_branches)"; fail=$((fail+1))
+fi
+rm -f "$REPO/.git/hooks/pre-commit" "$REPO/.git/hooks/post-checkout" "$REPO/.git/hooks/post-index-change"
+echo "36. ARMED: repo with core.hooksPath set -> APPLIED locally, push WITHHELD (r1/r2 P1 push half)"
+git -C "$REPO" config core.hooksPath .githooks
+run fixture_nof2p "$TMP/good.patch"; check "armed hooksPath withhold" SUITE_GREEN
+if [[ "$(auto_branches)" == "3" ]] && grep -q "push withheld" "$INBOX"/*.md 2>/dev/null; then
+  echo "  ok: hooksPath repo not pushed, note explains"; pass=$((pass+1))
+else
+  echo "  FAIL: branches=$(auto_branches) (expected 3, no push)"; fail=$((fail+1))
+fi
+git -C "$REPO" config --unset core.hooksPath
+rm -f "$ORCH/AUTOFIX_APPLY_ENABLED"
 
 echo
 echo "=== $pass passed, $fail failed ==="

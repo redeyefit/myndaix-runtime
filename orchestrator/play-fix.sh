@@ -261,6 +261,7 @@ cleanup(){
     chflags -R nouchg "$EXEC" >/dev/null 2>&1 || true
     git -C "$repo_path" worktree remove --force "$EXEC/verify-wt" >/dev/null 2>&1 || true
     git -C "$repo_path" worktree remove --force "$EXEC/precheck-wt" >/dev/null 2>&1 || true
+    git -C "$repo_path" worktree remove --force "$EXEC/apply-wt" >/dev/null 2>&1 || true
     rm -rf "$EXEC" >/dev/null 2>&1 || true
   done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
@@ -333,7 +334,10 @@ note "patch sha256=$patch_sha"
 # 3. patch-policy gate (BEFORE any execution) — NUL-safe exact paths
 # ----------------------------------------------------------------------------
 vwt="$EXEC/verify-wt"
-git -C "$repo_path" worktree add --detach "$vwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create verify worktree"
+# hook-free worktree ops throughout (r2 fold, depth): post-checkout fires on worktree add —
+# a hooksPath repo must never execute hook code from any of our throwaway trees.
+mkdir -p "$EXEC/nohooks"
+git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$vwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create verify worktree"
 git -C "$vwt" clean -fdx >/dev/null 2>&1 || true
 
 summary="$(git -C "$vwt" apply --summary "$patch" 2>/dev/null || true)"
@@ -359,17 +363,28 @@ done < <(git -C "$vwt" apply --numstat -z "$patch" 2>/dev/null)
 # ----------------------------------------------------------------------------
 [[ -n "$verify_argv_json" ]] || finish "UNVERIFIED" "no verify command configured for $repo_id — cannot run a regression check; human review required" "$patch"
 abs_argv "$verify_argv_json" verify; VERIFY=("${JV[@]}")
-# REGRESSION_CHECK_ONLY requires a real fail_to_pass proof; otherwise cap at UNVERIFIED (codex M1)
-[[ -n "$f2p_argv_json" ]] || finish "UNVERIFIED" "no fail_to_pass configured — cannot prove the bug existed/was fixed; human review required" "$patch"
-abs_argv "$f2p_argv_json" fail_to_pass; F2P=("${JV[@]}")
-
-# clean-base precheck in a SEPARATE pristine worktree: target must FAIL on clean base
-pwt="$EXEC/precheck-wt"
-git -C "$repo_path" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
-if run_sandboxed "$pwt" "${F2P[@]}" >/dev/null 2>&1; then
-  finish "UNVERIFIED" "fail_to_pass already passes on the clean base (flake or no real bug)" "$patch"
+# Verdict tiers (autofix-apply rung — docs/autofix-apply-rung-design.md): with fail_to_pass the
+# full proof chain runs -> REGRESSION_CHECK_ONLY. Without it (fail_to_pass:null repos — exactly
+# the auto-fire class), the verify suite STILL runs sandboxed with every patch-policy, integrity
+# and tamper gate -> SUITE_GREEN, a weaker suite-level signal (no proof the bug existed).
+# Previously this path finished UNVERIFIED without executing anything (codex M1 kept: the
+# REGRESSION_CHECK_ONLY name stays reserved for a real fail_to_pass proof).
+suite_green_mode=0
+if [[ -n "$f2p_argv_json" ]]; then
+  abs_argv "$f2p_argv_json" fail_to_pass; F2P=("${JV[@]}")
+else
+  suite_green_mode=1
 fi
-git -C "$repo_path" worktree remove --force "$pwt" >/dev/null 2>&1 || rm -rf "$pwt"
+
+if [[ "$suite_green_mode" == "0" ]]; then
+  # clean-base precheck in a SEPARATE pristine worktree: target must FAIL on clean base
+  pwt="$EXEC/precheck-wt"
+  git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
+  if run_sandboxed "$pwt" "${F2P[@]}" >/dev/null 2>&1; then
+    finish "UNVERIFIED" "fail_to_pass already passes on the clean base (flake or no real bug)" "$patch"
+  fi
+  git -C "$repo_path" worktree remove --force "$pwt" >/dev/null 2>&1 || rm -rf "$pwt"
+fi
 
 # re-validate the immutable copy, then apply into the (separate) verify worktree
 [[ "$(shasum -a 256 "$patch" | awk '{print $1}')" == "$patch_sha" ]] || fail_closed "patch copy changed (integrity)"
@@ -382,7 +397,9 @@ if [[ -n "$build_argv_json" ]]; then
   run_sandboxed "$vwt" "${BUILD[@]}" >"$run/build.log" 2>&1 || finish "UNVERIFIED" "build failed after patch" "$patch"
 fi
 run_sandboxed "$vwt" "${VERIFY[@]}" >"$run/verify.log" 2>&1 || finish "UNVERIFIED" "regression: verify suite failed after applying the patch" "$patch"
-run_sandboxed "$vwt" "${F2P[@]}" >>"$run/verify.log" 2>&1 || finish "UNVERIFIED" "fix did not make the target test pass (or the target test was removed)" "$patch"
+if [[ "$suite_green_mode" == "0" ]]; then
+  run_sandboxed "$vwt" "${F2P[@]}" >>"$run/verify.log" 2>&1 || finish "UNVERIFIED" "fix did not make the target test pass (or the target test was removed)" "$patch"
+fi
 
 # POST-EXECUTION INTEGRITY (Oracle BLOCKER 1): the static policy only inspected the patch, but
 # the patched code ran with write access to the worktree and could have rewritten a test file
@@ -399,4 +416,153 @@ done < <(git -C "$vwt" ls-files --others -z 2>/dev/null)
 if [[ "$tamper" -eq 1 || "$flags" == *git-config-drift* ]]; then
   finish "TAMPERED" "verify passed, but the patch edits tests/config/manifests (or perturbed git config) — the green result is NOT trustworthy; review the diff carefully" "$patch"
 fi
-finish "REGRESSION_CHECK_ONLY" "verify suite + target test passed under a best-effort sandbox (a regression signal, NOT a guarantee — review the diff before applying)" "$patch"
+
+# ----------------------------------------------------------------------------
+# 5. apply rung (docs/autofix-apply-rung-design.md) — flag-gated branch+push
+#    Fires ONLY here, after EVERY gate above passed (policy, precheck, verify,
+#    post-execution integrity, tamper) — TAMPERED/UNVERIFIED/NO_FIX/ABORTED
+#    paths exited via finish/fail_closed long before this point.
+# ----------------------------------------------------------------------------
+apply_note=""
+NET_TIMEOUT="${MYNDAIX_FIX_NET_TIMEOUT:-120}"           # bound on push / gh pr create (r1 P2 #6)
+[[ "$NET_TIMEOUT" =~ ^[0-9]{1,4}$ ]] || NET_TIMEOUT=120
+NET_TIMEOUT=$((10#$NET_TIMEOUT))
+net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a stalled
+  # transport/credential helper can never hold the fd-held fix lock forever (r1 P2 #6).
+  # Same pattern as run_sandboxed; 9>&- so no descendant pins the lock either.
+  # r2 fold: (a) restore the caller's monitor-mode state instead of hardcoding set +m;
+  # (b) the TIMEOUT path must reap the whole pgroup even when git exited on SIGTERM while a
+  # helper ignored it — but the SUCCESS path must NOT touch the pgroup (a successful push's
+  # pre-push hook nohup-detaches the review worker INTO this pgroup; killing it would abort
+  # the promised review). The watchdog stamps a marker when it fires; we reap iff it did.
+  local had_m=0; [[ "$-" == *m* ]] && had_m=1
+  set -m 2>/dev/null || true
+  ( exec "$@" ) >/dev/null 2>&1 9>&- &
+  local pid=$!
+  local mark="$run/net-fired.$pid"
+  # marker + KILL both GATED on the TERM actually delivering (r6 #4, tightened r7 #1+#2): a
+  # target that exited naturally leaves kill ESRCH -> no marker (no false rc=124) and no blind
+  # follow-up SIGKILL at a possibly-recycled PGID. Residual (r7 #3, wontfix): the parent can
+  # freeze the wd between its TERM and touch at the exact timeout edge — kill+touch cannot be
+  # atomic in bash; single-digit-microsecond window, same sanctioned edge class as r4/r5.
+  ( sleep "$NET_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null && { touch "$mark" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null; }; true ) 9>&- &
+  local wd=$!
+  local rc=0; wait "$pid" 2>/dev/null || rc=$?
+  # r5 FINAL FORM (supersedes the r3 and r4 orderings, folds both reviewers' constraints):
+  # freeze the watchdog FIRST — after this kill it can signal nothing — then read the marker
+  # purely as evidence of a COMPLETED firing. The parent NEVER signals the target pgroup
+  # (post-wait the PGID is recyclable — r4), and freezing the wd before its KILL step closes
+  # the wd-side recycled-PGID window too (r5 #2). ACCEPTED RESIDUAL (r5-sanctioned trade):
+  # if the wd TERMed and froze here before its KILL, a TERM-ignoring transport helper can
+  # linger unreaped — it pins nothing (fd 9 is closed in that subtree) and the periodic
+  # sweep / OS reaps orphans; chosen over ANY post-reap pgroup KILL, which risks innocents.
+  kill -KILL -"$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  if [[ -e "$mark" ]]; then rc=124; fi
+  rm -f "$mark" 2>/dev/null || true
+  [[ "$had_m" -eq 1 ]] || set +m 2>/dev/null || true
+  return "$rc"
+}
+apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<play> and pushes
+  # CONTRACT (r6 #2): ALWAYS returns 0 — outcome travels ONLY via apply_note/flags. A policy
+  # skip and an operational failure are deliberately indistinguishable by rc; callers must
+  # read apply_note (finish() embeds it in the delivered reason), never gate on the return.
+  # even the disarmed skip speaks through apply_note (r7 #4 — the contract above forbids a
+  # silent 0-return): a green verdict on a disarmed host says WHY nothing was pushed.
+  [[ -f "$ORCH/AUTOFIX_APPLY_ENABLED" ]] \
+    || { apply_note="apply not attempted: AUTOFIX_APPLY_ENABLED absent (rung disarmed)"; return 0; }
+  local branch="fix/auto/$play" awt="$EXEC/apply-wt"
+  # secret gate BEFORE any publication (r1 P1 #1): finish()'s scan only withholds the inbox
+  # diff — by then a commit/push would already be remote history. Never publish a secret hit.
+  # rc-EXACT (r2 P1): grep 0 = match, 1 = clean, >=2 = scanner ERROR — only exactly 1 may
+  # proceed; an errored scan proves nothing about absence of secrets.
+  local sec=0
+  LC_ALL=C grep -aE "$SECRET_RE" "$patch" >/dev/null 2>&1 || sec=$?
+  if [[ "$sec" -ne 1 ]]; then
+    [[ "$sec" -eq 0 ]] && flags="$flags secrets-hit"
+    apply_note="apply SKIPPED: secret scan $([[ "$sec" -eq 0 ]] && echo "matched a signature" || echo "errored (rc=$sec)") — nothing committed or pushed"
+    return 0
+  fi
+  # commit ONLY the hash-verified immutable patch in a PRISTINE worktree from base — NEVER the
+  # verify worktree: it executed untrusted patched code (integrity-checked, but not commit-grade).
+  [[ "$(shasum -a 256 "$patch" | awk '{print $1}')" == "$patch_sha" ]] \
+    || { apply_note="apply SKIPPED: patch integrity check failed"; return 0; }
+  # branch-exists probe must distinguish "absent" (rc=1, proceed) from git ERRORS (rc>=128 —
+  # corrupt/locked repo): any non-1 nonzero is a hard skip, never a fall-through (r1 P2 #5).
+  local sr=0
+  git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" || sr=$?
+  [[ "$sr" -eq 1 ]] || { apply_note="apply SKIPPED: branch exists or git probe error (rc=$sr)"; return 0; }
+  # hooks OFF for the ENTIRE commit construction (r1 P1 #2 + r2 P1: worktree add and
+  # checkout -b fire post-checkout too — the checkout runs AFTER the patch is applied, so a
+  # tracked-hooksPath repo would execute patch-rewritten hook code UNSANDBOXED). Every git op
+  # that can trigger a hook gets -c core.hooksPath=<empty dir>; commit adds --no-verify.
+  mkdir -p "$EXEC/nohooks"
+  git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
+    || { apply_note="apply SKIPPED: could not create apply worktree"; return 0; }
+  git -C "$awt" apply "$patch" >/dev/null 2>&1 \
+    || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
+  git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>/dev/null \
+    || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
+  # r4 P1-B guard + r5 P3: keep git's real stderr (index lock, disk full) instead of a
+  # hardcoded guess — 2>&1 AFTER >/dev/null captures only stderr. Hook-free: post-index-change
+  # fires on add (r3 P1). Sanitized + truncated before it reaches the inbox note.
+  local add_rc=0 add_err=""
+  add_err="$(git -C "$awt" -c core.hooksPath="$EXEC/nohooks" add -A 2>&1 >/dev/null)" || add_rc=$?
+  if [[ "$add_rc" -ne 0 ]]; then
+    # bash CHARACTER slice, no pipeline (r6 #1 P1 + #6): `… | head -c 200` inside $() could
+    # SIGPIPE the upstream under pipefail — the assignment fails and set -e aborts the whole
+    # script before finish() (verdict lost); byte-truncation also severed UTF-8 mid-codepoint.
+    local add_trunc="${add_err:0:200}"
+    apply_note="apply SKIPPED: git add failed (rc=$add_rc): $(printf '%s' "$add_trunc" | clean)"
+    return 0
+  fi
+  git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
+      -c core.hooksPath="$EXEC/nohooks" \
+      commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
+    || { apply_note="apply SKIPPED: commit failed"; return 0; }
+  flags="$flags applied-branch:$branch"
+  # push from the DURABLE repo, not the ephemeral worktree (r1 P1 #3): the pre-push hook
+  # detaches a review worker whose repo path must outlive this process — cleanup() removes
+  # $awt on exit, but the branch ref lives in the shared .git, so repo_path can push it.
+  # A repo with core.hooksPath set gets NO push (r1 P1 #2's push half): its pre-push would
+  # run tracked (patchable) hook code; our trusted hook lives at the default .git/hooks path.
+  # rc-EXACT probe (r2 P1): config --get is 0 = set, 1 = unset, >=2 = config unreadable —
+  # only exactly 1 (provably unset) may push; an errored probe is an unknown hook config.
+  local hp=0
+  git -C "$repo_path" config --get core.hooksPath >/dev/null 2>&1 || hp=$?
+  if [[ "$hp" -ne 1 ]]; then
+    apply_note="APPLIED locally as $branch — push withheld: core.hooksPath $([[ "$hp" -eq 0 ]] && echo "is set (tracked-hook execution risk)" || echo "probe errored (rc=$hp)"); push by hand after inspecting hooks"
+    return 0
+  fi
+  if net_bounded git -C "$repo_path" push -q -u origin "$branch"; then
+    flags="$flags pushed"
+    apply_note="APPLIED + PUSHED as $branch ($1) — the push-review loop reviews it; merge stays gated."
+    if [[ "${MYNDAIX_FIX_TEST_MODE:-}" != "1" ]] && command -v gh >/dev/null 2>&1; then
+      # PR base = the ORIGINATING branch (r1 P2 #7), passed by autofix_fire via env; validated
+      # here, fail-CLOSED: no/invalid base -> branch-only (never let gh default to main for a
+      # fix whose base commit sits on an unmerged feature branch).
+      local pr_base="${MYNDAIX_FIX_BASE_BRANCH:-}"
+      if [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
+        if ( cd "$repo_path" && net_bounded gh pr create --head "$branch" --base "$pr_base" \
+              --title "autofix($play): $repo_id @ ${base_sha:0:8}" \
+              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated." ); then
+          apply_note="$apply_note PR opened against $pr_base."
+        else
+          apply_note="$apply_note (gh pr create failed or timed out — open the PR by hand; base=$pr_base)"
+        fi
+      else
+        apply_note="$apply_note No PR opened: originating branch unknown/invalid — open by hand against the right base."
+      fi
+    fi
+  else
+    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push -u origin $branch"
+  fi
+  return 0
+}
+
+if [[ "$suite_green_mode" == "1" ]]; then
+  apply_maybe "SUITE_GREEN"
+  finish "SUITE_GREEN" "verify suite passed under a best-effort sandbox on the patched tree — a SUITE-LEVEL signal only (no fail_to_pass proof that the bug existed).${apply_note:+ $apply_note}" "$patch"
+fi
+apply_maybe "REGRESSION_CHECK_ONLY"
+finish "REGRESSION_CHECK_ONLY" "verify suite + target test passed under a best-effort sandbox (a regression signal, NOT a guarantee — review the diff before applying).${apply_note:+ $apply_note}" "$patch"
