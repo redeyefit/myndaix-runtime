@@ -327,6 +327,10 @@ autofix_armed(){ [[ "${PLAY_DISABLE_AUTOFIX:-0}" == "1" ]] && return 1
                  [[ "${PLAY_AUTOFIX:-0}" == "1" || -f "$ORCH/AUTOFIX_ENABLED" ]]; }
 autofix_fire(){
   autofix_armed || return 0
+  # loop guard (apply rung — docs/autofix-apply-rung-design.md): play-fix can now push
+  # fix/auto/* branches, so a review OF such a branch must never fire another fix — the
+  # original loop-immunity rationale ("play-fix never commits/pushes") no longer holds.
+  [[ "${ref:-}" == *"fix/auto/"* ]] && { note autofix "skip: autofix-authored ref (loop guard)"; return 0; }
   [[ "${pushed:-0}" == "1" ]]       || { note autofix "skip: push not confirmed"; return 0; }
   [[ -s "$run/fixlist.txt" ]]       || { note autofix "skip: empty fixlist"; return 0; }
   # repo MUST be configured fail_to_pass:null, else a 3-arg auto-fire could exceed the UNVERIFIED

@@ -261,6 +261,7 @@ cleanup(){
     chflags -R nouchg "$EXEC" >/dev/null 2>&1 || true
     git -C "$repo_path" worktree remove --force "$EXEC/verify-wt" >/dev/null 2>&1 || true
     git -C "$repo_path" worktree remove --force "$EXEC/precheck-wt" >/dev/null 2>&1 || true
+    git -C "$repo_path" worktree remove --force "$EXEC/apply-wt" >/dev/null 2>&1 || true
     rm -rf "$EXEC" >/dev/null 2>&1 || true
   done
   git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
@@ -359,17 +360,28 @@ done < <(git -C "$vwt" apply --numstat -z "$patch" 2>/dev/null)
 # ----------------------------------------------------------------------------
 [[ -n "$verify_argv_json" ]] || finish "UNVERIFIED" "no verify command configured for $repo_id — cannot run a regression check; human review required" "$patch"
 abs_argv "$verify_argv_json" verify; VERIFY=("${JV[@]}")
-# REGRESSION_CHECK_ONLY requires a real fail_to_pass proof; otherwise cap at UNVERIFIED (codex M1)
-[[ -n "$f2p_argv_json" ]] || finish "UNVERIFIED" "no fail_to_pass configured — cannot prove the bug existed/was fixed; human review required" "$patch"
-abs_argv "$f2p_argv_json" fail_to_pass; F2P=("${JV[@]}")
-
-# clean-base precheck in a SEPARATE pristine worktree: target must FAIL on clean base
-pwt="$EXEC/precheck-wt"
-git -C "$repo_path" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
-if run_sandboxed "$pwt" "${F2P[@]}" >/dev/null 2>&1; then
-  finish "UNVERIFIED" "fail_to_pass already passes on the clean base (flake or no real bug)" "$patch"
+# Verdict tiers (autofix-apply rung — docs/autofix-apply-rung-design.md): with fail_to_pass the
+# full proof chain runs -> REGRESSION_CHECK_ONLY. Without it (fail_to_pass:null repos — exactly
+# the auto-fire class), the verify suite STILL runs sandboxed with every patch-policy, integrity
+# and tamper gate -> SUITE_GREEN, a weaker suite-level signal (no proof the bug existed).
+# Previously this path finished UNVERIFIED without executing anything (codex M1 kept: the
+# REGRESSION_CHECK_ONLY name stays reserved for a real fail_to_pass proof).
+suite_green_mode=0
+if [[ -n "$f2p_argv_json" ]]; then
+  abs_argv "$f2p_argv_json" fail_to_pass; F2P=("${JV[@]}")
+else
+  suite_green_mode=1
 fi
-git -C "$repo_path" worktree remove --force "$pwt" >/dev/null 2>&1 || rm -rf "$pwt"
+
+if [[ "$suite_green_mode" == "0" ]]; then
+  # clean-base precheck in a SEPARATE pristine worktree: target must FAIL on clean base
+  pwt="$EXEC/precheck-wt"
+  git -C "$repo_path" worktree add --detach "$pwt" "$base_sha" >/dev/null 2>&1 || fail_closed "could not create precheck worktree"
+  if run_sandboxed "$pwt" "${F2P[@]}" >/dev/null 2>&1; then
+    finish "UNVERIFIED" "fail_to_pass already passes on the clean base (flake or no real bug)" "$patch"
+  fi
+  git -C "$repo_path" worktree remove --force "$pwt" >/dev/null 2>&1 || rm -rf "$pwt"
+fi
 
 # re-validate the immutable copy, then apply into the (separate) verify worktree
 [[ "$(shasum -a 256 "$patch" | awk '{print $1}')" == "$patch_sha" ]] || fail_closed "patch copy changed (integrity)"
@@ -382,7 +394,9 @@ if [[ -n "$build_argv_json" ]]; then
   run_sandboxed "$vwt" "${BUILD[@]}" >"$run/build.log" 2>&1 || finish "UNVERIFIED" "build failed after patch" "$patch"
 fi
 run_sandboxed "$vwt" "${VERIFY[@]}" >"$run/verify.log" 2>&1 || finish "UNVERIFIED" "regression: verify suite failed after applying the patch" "$patch"
-run_sandboxed "$vwt" "${F2P[@]}" >>"$run/verify.log" 2>&1 || finish "UNVERIFIED" "fix did not make the target test pass (or the target test was removed)" "$patch"
+if [[ "$suite_green_mode" == "0" ]]; then
+  run_sandboxed "$vwt" "${F2P[@]}" >>"$run/verify.log" 2>&1 || finish "UNVERIFIED" "fix did not make the target test pass (or the target test was removed)" "$patch"
+fi
 
 # POST-EXECUTION INTEGRITY (Oracle BLOCKER 1): the static policy only inspected the patch, but
 # the patched code ran with write access to the worktree and could have rewritten a test file
@@ -399,4 +413,55 @@ done < <(git -C "$vwt" ls-files --others -z 2>/dev/null)
 if [[ "$tamper" -eq 1 || "$flags" == *git-config-drift* ]]; then
   finish "TAMPERED" "verify passed, but the patch edits tests/config/manifests (or perturbed git config) — the green result is NOT trustworthy; review the diff carefully" "$patch"
 fi
-finish "REGRESSION_CHECK_ONLY" "verify suite + target test passed under a best-effort sandbox (a regression signal, NOT a guarantee — review the diff before applying)" "$patch"
+
+# ----------------------------------------------------------------------------
+# 5. apply rung (docs/autofix-apply-rung-design.md) — flag-gated branch+push
+#    Fires ONLY here, after EVERY gate above passed (policy, precheck, verify,
+#    post-execution integrity, tamper) — TAMPERED/UNVERIFIED/NO_FIX/ABORTED
+#    paths exited via finish/fail_closed long before this point.
+# ----------------------------------------------------------------------------
+apply_note=""
+apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<play> and pushes
+  [[ -f "$ORCH/AUTOFIX_APPLY_ENABLED" ]] || return 0
+  local branch="fix/auto/$play" awt="$EXEC/apply-wt"
+  # commit ONLY the hash-verified immutable patch in a PRISTINE worktree from base — NEVER the
+  # verify worktree: it executed untrusted patched code (integrity-checked, but not commit-grade).
+  [[ "$(shasum -a 256 "$patch" | awk '{print $1}')" == "$patch_sha" ]] \
+    || { apply_note="apply SKIPPED: patch integrity check failed"; return 0; }
+  git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" \
+    && { apply_note="apply SKIPPED: branch $branch already exists"; return 0; }
+  git -C "$repo_path" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
+    || { apply_note="apply SKIPPED: could not create apply worktree"; return 0; }
+  git -C "$awt" apply "$patch" >/dev/null 2>&1 \
+    || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
+  git -C "$awt" checkout -q -b "$branch" 2>/dev/null \
+    || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
+  git -C "$awt" add -A >/dev/null 2>&1
+  git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
+      commit -q -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
+    || { apply_note="apply SKIPPED: commit failed"; return 0; }
+  flags="$flags applied-branch:$branch"
+  # 9>&- on push/gh: the pre-push hook detaches a review worker — it must not pin the fix lock.
+  if git -C "$awt" push -q -u origin "$branch" >/dev/null 2>&1 9>&-; then
+    flags="$flags pushed"
+    apply_note="APPLIED + PUSHED as $branch ($1) — the push-review loop reviews it; merge stays gated."
+    if [[ "${MYNDAIX_FIX_TEST_MODE:-}" != "1" ]] && command -v gh >/dev/null 2>&1; then
+      local pr
+      pr="$( (cd "$awt" && gh pr create --head "$branch" \
+              --title "autofix($play): $repo_id @ ${base_sha:0:8}" \
+              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated." \
+              2>/dev/null | tail -1) 9>&- || true)"
+      [[ -n "$pr" ]] && apply_note="$apply_note PR: $pr"
+    fi
+  else
+    apply_note="APPLIED locally as $branch — PUSH FAILED (no ssh credentials in detached context?); push by hand: git push -u origin $branch"
+  fi
+  return 0
+}
+
+if [[ "$suite_green_mode" == "1" ]]; then
+  apply_maybe "SUITE_GREEN"
+  finish "SUITE_GREEN" "verify suite passed under a best-effort sandbox on the patched tree — a SUITE-LEVEL signal only (no fail_to_pass proof that the bug existed).${apply_note:+ $apply_note}" "$patch"
+fi
+apply_maybe "REGRESSION_CHECK_ONLY"
+finish "REGRESSION_CHECK_ONLY" "verify suite + target test passed under a best-effort sandbox (a regression signal, NOT a guarantee — review the diff before applying).${apply_note:+ $apply_note}" "$patch"
