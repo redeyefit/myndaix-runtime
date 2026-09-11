@@ -5,37 +5,45 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same ref supersedes the running check — cancel it instead of paying
+# for a result nobody reads (fold loops push 5-8 times per PR; the autofix rung adds its
+# own). Main is exempt BOTH ways (review 20260911122807): cancel-in-progress false AND a
+# per-run group — a shared main group would let GitHub silently EVICT a queued pending
+# run (only one pending per group), dropping a merge receipt.
+#
+# ACCEPTED RISK (review 20260911124025 P1-A, documented not fixed): on the self-hosted
+# runner, PR-branch code executes UNSANDBOXED on the factory host as the operator user.
+# Accepted for this private, solo-author repo (pushers = Jefe + the policy-gated autofix
+# loop); revisit with an isolated runner user/VM if the repo ever gains outside authors.
+concurrency:
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
-    runs-on: ubuntu-latest
-
-    # The Postgres-backed suites drop/recreate their own schema each run
-    # (init_schema), so an empty database is all they need.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: runtime_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    # SELF-HOSTED (2026-09-11, cost-zero CI): runs on the Mini's registered runner — Actions
+    # minutes on self-hosted runners are unmetered. The suites hit the Mini's local Postgres
+    # against the DEDICATED throwaway `runtime_ci` DB (they DROP/recreate its schema each run
+    # — never point this at the ops `runtime` DB). FALLBACK to GitHub-hosted: restore
+    # `runs-on: ubuntu-latest` + the postgres:16 service container (git history has the
+    # exact block, removed in this commit) + the postgres:postgres@…/runtime_test DSN.
+    runs-on: [self-hosted, mini]
 
     env:
-      LEDGER_TEST_DSN: postgresql://postgres:postgres@localhost:5432/runtime_test
+      LEDGER_TEST_DSN: postgresql://localhost:5432/runtime_ci
       PYTHONPATH: src
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # Mini-local Python instead of setup-python: on self-hosted macOS the action insists
+      # on the GitHub-hosted toolcache path (/Users/runner — permission denied) and ignores
+      # the runner's AGENT_TOOLSDIRECTORY. A per-run venv from the box's brewed 3.12 is
+      # deterministic and ~20s with warm pip cache.
+      - name: Set up venv (Mini-local Python 3.12)
+        run: |
+          /opt/homebrew/bin/python3.12 -m venv .ci-venv
+          echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install
         run: pip install -e ".[dev]"          # dev extra brings pytest (+ pytest-asyncio)
@@ -61,7 +69,13 @@ jobs:
         run: |
           set -e
           pip install semgrep
-          sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+          if [ "$(uname)" = "Darwin" ]; then
+            # self-hosted Mini: install-if-missing, idempotent after the first run
+            command -v shellcheck >/dev/null || brew install -q shellcheck
+            command -v bats >/dev/null || brew install -q bats-core
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+          fi
           ./tools/bash-check.sh
           bats tests/bash/
 
