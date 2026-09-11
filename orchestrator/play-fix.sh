@@ -443,19 +443,17 @@ net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a
   ( sleep "$NET_TIMEOUT"; touch "$mark" 2>/dev/null; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
-  # r4 P1-A (supersedes the r3 ordering): the parent NEVER signals the target pgroup after
-  # reaping — post-wait the PGID may be recycled, so a parent-side kill could hit innocent
-  # processes. If the watchdog fired (marker), its own TERM→grace→KILL escalation finishes
-  # the group; we just await its natural exit (bounded by the 2s grace). If it did not fire,
-  # tear it down. RESIDUAL (documented): a push completing within microseconds of the
-  # NET_TIMEOUT edge can still see the wd TERM the pgroup (detached worker included) — with
-  # a 120s bound on a seconds-long push, that coincidence window is vanishing.
-  if [[ -e "$mark" ]]; then
-    wait "$wd" 2>/dev/null || true                       # wd completes its own escalation
-    rc=124
-  else
-    kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
-  fi
+  # r5 FINAL FORM (supersedes the r3 and r4 orderings, folds both reviewers' constraints):
+  # freeze the watchdog FIRST — after this kill it can signal nothing — then read the marker
+  # purely as evidence of a COMPLETED firing. The parent NEVER signals the target pgroup
+  # (post-wait the PGID is recyclable — r4), and freezing the wd before its KILL step closes
+  # the wd-side recycled-PGID window too (r5 #2). ACCEPTED RESIDUAL (r5-sanctioned trade):
+  # if the wd TERMed and froze here before its KILL, a TERM-ignoring transport helper can
+  # linger unreaped — it pins nothing (fd 9 is closed in that subtree) and the periodic
+  # sweep / OS reaps orphans; chosen over ANY post-reap pgroup KILL, which risks innocents.
+  kill -KILL -"$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  if [[ -e "$mark" ]]; then rc=124; fi
   rm -f "$mark" 2>/dev/null || true
   [[ "$had_m" -eq 1 ]] || set +m 2>/dev/null || true
   return "$rc"
@@ -494,8 +492,15 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
   git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>/dev/null \
     || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
-  git -C "$awt" -c core.hooksPath="$EXEC/nohooks" add -A >/dev/null 2>&1 \
-    || { apply_note="apply SKIPPED: git add failed (index lock / disk?)"; return 0; }   # r4 P1-B; hook-free: post-index-change fires on add (r3 P1)
+  # r4 P1-B guard + r5 P3: keep git's real stderr (index lock, disk full) instead of a
+  # hardcoded guess — 2>&1 AFTER >/dev/null captures only stderr. Hook-free: post-index-change
+  # fires on add (r3 P1). Sanitized + truncated before it reaches the inbox note.
+  local add_rc=0 add_err=""
+  add_err="$(git -C "$awt" -c core.hooksPath="$EXEC/nohooks" add -A 2>&1 >/dev/null)" || add_rc=$?
+  if [[ "$add_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: git add failed (rc=$add_rc): $(printf '%s' "$add_err" | clean | head -c 200)"
+    return 0
+  fi
   git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
       -c core.hooksPath="$EXEC/nohooks" \
       commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
