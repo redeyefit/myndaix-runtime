@@ -99,10 +99,18 @@ ok '[[ "$sha_before" == "$(git -C "$REPO" rev-parse HEAD)" ]]' "E6: dry-run did 
 ok '[[ ! -e "$TMP/home/state/RUNNING_SHA" ]]' "E6: dry-run wrote no receipt"
 ok '! grep -q "dispatching Stage-0" "$TMP/dry.out"' "E6: dry-run never triggered Stage-0 reset"
 ok '[[ "$drc" -eq 1 ]]' "dry-run reports drift (exit 1) vs un-converged fixture"
-ok '! RECONCILE_BOOTSTRAPPED=1 MYNDAIX_HOME="$TMP/home" /bin/bash "$SUB/reconcile.sh" >/dev/null 2>&1' "converge on lab role -> nonzero (factory-only)"
+# HOME stub (review 20260911131140 P1, CRITICAL now CI runs ON the factory host): a
+# BOOTSTRAPPED converge arms reconcile's restore trap, which fires on the die these tests
+# ASSERT and runs REAL `launchctl bootstrap` against the REAL $HOME/Library/LaunchAgents —
+# on the Mini that can restart live mutating ticks inside a deploy's quiesced window. The
+# trap gates on plist existence under $HOME, so an empty fake HOME neuters it (same class
+# of stub the liveness-canary tests already use).
+mkdir -p "$TMP/fakehome"
+ok '! RECONCILE_BOOTSTRAPPED=1 MYNDAIX_HOME="$TMP/home" HOME="$TMP/fakehome" /bin/bash "$SUB/reconcile.sh" >/dev/null 2>&1' "converge on lab role -> nonzero (factory-only)"
+ok '[[ ! -e "$TMP/fakehome/Library" ]]' "restore trap stayed inert (no real LaunchAgents touched)"
 # E3/E4: missing / invalid config fail-closed with no restart
 rm -f "$TMP/home/config.env"
-ok '! RECONCILE_BOOTSTRAPPED=1 MYNDAIX_HOME="$TMP/home" /bin/bash "$SUB/reconcile.sh" --dry-run >/dev/null 2>&1' "E3: missing config.env -> fail-closed"
+ok '! RECONCILE_BOOTSTRAPPED=1 MYNDAIX_HOME="$TMP/home" HOME="$TMP/fakehome" /bin/bash "$SUB/reconcile.sh" --dry-run >/dev/null 2>&1' "E3: missing config.env -> fail-closed"
 
 echo "== M4 automerge denylist (S4) — substrate self-deploy guard =="
 # Helper: check a path's classification (paths via argv to dodge shell-quoting of the eval).
