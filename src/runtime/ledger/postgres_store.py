@@ -2028,6 +2028,30 @@ class PostgresLedger:
 
     _KNOWLEDGE_LOCK_KEY = 0x6D78724B    # 'mxrK' (int4) — key1 of the (key1, hashtext(scope)) pair
 
+    # The walk fence (0016) = knowledge_scope_gen.gen + MAX(seq), NOT MAX(seq) alone: a seq-based
+    # fence only moves when a row is inserted, so an accepted TRUE NO-OP sync (file created then
+    # deleted before either walker commits) was invisible to it and a stale walk could resurrect
+    # the deleted doc (review 20260910200253 P2). The gen bump runs on EVERY accepted
+    # sync/rebuild, inside the same transaction, after the conflict gate — a rejected walk still
+    # mutates nothing. WHY THE SUM (r1 kilabz P2, the mixed-deploy window): a pre-0016 writer
+    # still running through a rolling cutover advances seq but never touches gen — gen alone is
+    # blind to its commits, the sum is not. Both terms are monotonic (gen only bumps;
+    # knowledge_doc is append-only, no DELETE path), so any accepted commit from EITHER vintage
+    # strictly increases the sum and a stamped fence can never recur. gen starts at 0 (no seed),
+    # making the fence VALUE numerically continuous with the old MAX(seq) fence across the
+    # upgrade in both directions.
+    # ASYMMETRY (r2 oracle LOW): the protection is one-way. A PRE-0016 walker checks MAX(seq)
+    # only, so it is blind to a new-code TRUE NO-OP commit (gen bump, no row) and can still
+    # commit a stale snapshot — that is exactly the original bug, alive in old code until the
+    # old processes exit. Nothing new-side can widen an old binary's check; keep the mixed
+    # window short (deploys kickstart serve, so the residual is in-flight pre-pull CLI calls).
+    _KNOWLEDGE_GEN_SQL = (
+        "SELECT COALESCE((SELECT gen FROM knowledge_scope_gen WHERE scope = $1), 0)"
+        " + (SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1)")
+    _KNOWLEDGE_GEN_BUMP_SQL = (
+        "INSERT INTO knowledge_scope_gen (scope, gen) VALUES ($1, 1) "
+        "ON CONFLICT (scope) DO UPDATE SET gen = knowledge_scope_gen.gen + 1")
+
     @staticmethod
     def _knowledge_date(iso: Optional[str]) -> Optional[_dt.date]:
         """Defensive ISO->date: a filename like 2026-13-99-x.md parses the REGEX but not a real
@@ -2063,15 +2087,16 @@ class PostgresLedger:
             raise
 
     async def knowledge_fence(self, scope: str) -> int:
-        """Read the scope's commit fence: max(seq) over its knowledge_doc events (0 = empty).
-        A walker stamps this BEFORE walking the corpus; knowledge_sync (given expect_fence)
-        then REJECTS the commit if any other sync landed in between — the walked snapshot is
-        stale and could resurrect a just-deleted doc (the walk-before-lock TOCTOU). The caller
-        re-walks and retries; a reject never mutates anything."""
+        """Read the scope's commit fence: generation counter + MAX(seq) (0 = never committed).
+        A walker stamps this BEFORE walking the corpus; knowledge_sync (given expect_fence) then
+        REJECTS the commit if any other sync/rebuild was ACCEPTED in between — the walked
+        snapshot is stale and could resurrect a just-deleted doc (the walk-before-lock TOCTOU).
+        The fence moves on every accepted commit INCLUDING true no-ops (which MAX(seq) alone
+        missed) AND on row-writing commits from pre-0016 code that never bumps gen (which gen
+        alone would miss — the mixed-deploy window). The caller re-walks and retries; a reject
+        never mutates anything."""
         async with self._pool.acquire() as con:
-            v = await con.fetchval(
-                "SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1", scope)
-            return int(v)
+            return int(await con.fetchval(self._KNOWLEDGE_GEN_SQL, scope))
 
     async def knowledge_sync(self, scope: str, docs: list[dict],
                              *, tombstone_missing: bool = True,
@@ -2091,12 +2116,13 @@ class PostgresLedger:
                 await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
                                   self._KNOWLEDGE_LOCK_KEY, scope)
                 if expect_fence is not None:
-                    cur_fence = await con.fetchval(
-                        "SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1",
-                        scope)
+                    cur_fence = await con.fetchval(self._KNOWLEDGE_GEN_SQL, scope)
                     if int(cur_fence) != int(expect_fence):
                         return {"conflict": True, "inserted": 0, "tombstoned": 0,
                                 "unchanged": 0, "skipped_oversize": []}
+                # ACCEPTED (fenced or not): bump the scope generation so even a true no-op
+                # commit moves the fence — the conflict return above is the only skip.
+                await con.execute(self._KNOWLEDGE_GEN_BUMP_SQL, scope)
                 cur = {r["path"]: (r["content_sha"], r["status"]) for r in await con.fetch(
                     "SELECT path, content_sha, status FROM knowledge_doc_current WHERE scope = $1",
                     scope)}
@@ -2146,12 +2172,12 @@ class PostgresLedger:
                 await con.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))",
                                   self._KNOWLEDGE_LOCK_KEY, scope)
                 if expect_fence is not None:
-                    cur_fence = await con.fetchval(
-                        "SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1",
-                        scope)
+                    cur_fence = await con.fetchval(self._KNOWLEDGE_GEN_SQL, scope)
                     if int(cur_fence) != int(expect_fence):
                         return {"conflict": True, "tombstoned": 0, "inserted": 0,
                                 "skipped_oversize": []}
+                # same accepted-commit bump as knowledge_sync — a no-op rebuild moves the fence
+                await con.execute(self._KNOWLEDGE_GEN_BUMP_SQL, scope)
                 for r in await con.fetch(
                         "SELECT path FROM knowledge_doc_active WHERE scope = $1", scope):
                     await con.execute(

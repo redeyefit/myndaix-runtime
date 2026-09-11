@@ -458,6 +458,41 @@ async def test_zz_migrate_restores_outbound_created_at(led: PostgresLedger) -> N
     assert await _col() == 1 and await _idx()
 
 
+# -- regression: 0016 — knowledge_scope_gen creation + fence continuity ---------
+# The walk fence is now gen + MAX(seq) (no-op syncs must move it — review 20260910200253
+# P2; the sum keeps pre-0016 row-writers visible through a mixed-deploy window). Migrating
+# an old DB must create the table; with gen starting at 0 the fence VALUE stays numerically
+# continuous with the old MAX(seq) fence; re-runs must never clobber a live counter.
+async def test_zz_migrate_creates_knowledge_scope_gen(led: PostgresLedger) -> None:
+    scope = "genseed"
+    await led.knowledge_sync(scope, [{
+        "path": "a.md", "title": "a", "tags": "", "doc_date": None,
+        "body": "seed body", "content_sha": "s1", "lossy": False}])
+    async with led._pool.acquire() as con:
+        max_seq = await con.fetchval(
+            "SELECT MAX(seq) FROM knowledge_doc WHERE scope=$1", scope)
+        # simulate a pre-0016 DB: doc rows exist, the gen table does not
+        await con.execute("DROP TABLE knowledge_scope_gen")
+
+    applied = await led.migrate()
+    assert "0016_knowledge_scope_gen.sql" in applied, f"0016 not applied: {applied}"
+    # continuity: no gen row yet, so the fence equals the old MAX(seq) fence — a walker that
+    # stamped under pre-0016 semantics with no interleaving commit still compares equal
+    fence = await led.knowledge_fence(scope)
+    assert fence == max_seq, f"fence must stay continuous with MAX(seq): {fence} != {max_seq}"
+
+    # a later accepted TRUE no-op (same doc, unchanged — zero rows written) bumps gen
+    # (fence +1); a migrate() re-run must NOT reset it
+    await led.knowledge_sync(scope, [{
+        "path": "a.md", "title": "a", "tags": "", "doc_date": None,
+        "body": "seed body", "content_sha": "s1", "lossy": False}])
+    fence2 = await led.knowledge_fence(scope)
+    assert fence2 == fence + 1, f"accepted no-op must move the fence: {fence2} != {fence}+1"
+    await led.migrate()
+    fence3 = await led.knowledge_fence(scope)
+    assert fence3 == fence2, f"re-migrate moved the fence: {fence3} != {fence2}"
+
+
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------
 # Before the lock-order fix this failed ~99% of trials with DeadlockDetectedError;
 # it is the test the green suite was missing (cancel had zero coverage).

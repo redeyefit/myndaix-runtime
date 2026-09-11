@@ -286,3 +286,13 @@ SELECT DISTINCT ON (scope, path)
 
 CREATE OR REPLACE VIEW knowledge_doc_active AS
 SELECT * FROM knowledge_doc_current WHERE status = 'active';
+
+-- per-scope commit generation (0016): the walk fence is gen + MAX(seq). gen is bumped under the
+-- per-scope advisory lock on EVERY accepted sync/rebuild — including true no-ops, which the old
+-- MAX(seq) fence missed (a stale walk could pass the check and resurrect a just-deleted doc);
+-- the MAX(seq) term keeps row-writing commits from pre-0016 code visible during a mixed-deploy
+-- window. Both terms are monotonic, so a stamped fence can never recur.
+CREATE TABLE knowledge_scope_gen (
+    scope text PRIMARY KEY,
+    gen   bigint NOT NULL DEFAULT 0
+);

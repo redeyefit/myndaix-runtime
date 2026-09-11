@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import inspect
 import os
+import uuid
 
 from runtime import knowledgerecord
 from runtime.ledger.postgres_store import PostgresLedger
@@ -28,7 +29,7 @@ def ok(cond, label):
 
 async def _truncate(led):
     async with led._pool.acquire() as con:
-        await con.execute("TRUNCATE knowledge_doc RESTART IDENTITY")
+        await con.execute("TRUNCATE knowledge_doc, knowledge_scope_gen RESTART IDENTITY")
 
 
 def _doc(path, body, **kw):
@@ -249,6 +250,53 @@ async def test_fence_reject_rebuild(led):
     active = await led._pool.fetchval(
         "SELECT count(*) FROM knowledge_doc_active WHERE scope='research'")
     ok(active == 2, "index untouched by the rejected rebuild")
+
+
+async def test_fence_reject_on_noop_interleave(led):
+    """The 0016 regression (review 20260910200253 P2): an accepted TRUE NO-OP commit must still
+    move the fence. Interleave: a.md is created on disk; walker A stamps the fence and walks
+    (snapshot has a.md); a.md is deleted; walker B walks the now-empty corpus and commits — a
+    true no-op, since a.md was never indexed there is no tombstone to write. Under the old
+    MAX(seq) fence B moved nothing, so A's stale commit passed the check and resurrected the
+    deleted a.md as active."""
+    await _truncate(led)
+    f_a = await led.knowledge_fence("research")          # walker A stamps, walks: snapshot has a.md
+    noop = await led.knowledge_sync("research", [])      # walker B: empty index, empty corpus
+    ok(not noop.get("conflict") and noop["inserted"] == 0 and noop["tombstoned"] == 0
+       and noop["unchanged"] == 0, "interleaved commit is a TRUE no-op (zero rows changed)")
+    ok(await led.knowledge_fence("research") != f_a, "accepted no-op sync still moves the fence")
+    ok(await led.knowledge_fence("fitness") == 0, "the bump is per-scope — other scopes unmoved")
+    stale = await led.knowledge_sync("research", [_doc("a.md", "# A")], expect_fence=f_a)
+    ok(stale.get("conflict") is True, "stale walk REJECTED despite the no-op interleave")
+    resurrected = await led._pool.fetchval(
+        "SELECT count(*) FROM knowledge_doc_active WHERE scope='research' AND path='a.md'")
+    ok(resurrected == 0, "the deleted doc did NOT resurrect")
+    # rebuild sits behind the same gate: stamp, no-op interleave, stale rebuild must reject
+    f_b = await led.knowledge_fence("research")
+    await led.knowledge_sync("research", [])             # another accepted no-op
+    res = await led.knowledge_rebuild("research", [_doc("a.md", "# A")], expect_fence=f_b)
+    ok(res.get("conflict") is True, "stale rebuild REJECTED despite the no-op interleave")
+
+
+async def test_fence_sees_legacy_writer_commit(led):
+    """The mixed-deploy window (r1 kilabz P2 on 0016): a pre-0016 writer advances seq but never
+    touches knowledge_scope_gen. Because the fence is gen + MAX(seq), that commit still moves it
+    and a new-code walker's stale snapshot is rejected — gen alone would be blind here."""
+    await _truncate(led)
+    await led.knowledge_sync("research", [_doc("a.md", "# A")])
+    f = await led.knowledge_fence("research")
+    # legacy commit: a raw tombstone append exactly as pre-0016 code writes it — row inserted,
+    # seq advances, gen untouched
+    async with led._pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO knowledge_doc (id, scope, path, body, content_sha, status)
+               VALUES ($1,'research','a.md','','absent','archived')""", str(uuid.uuid4()))
+    stale = await led.knowledge_sync("research", [_doc("a.md", "# A")], expect_fence=f)
+    ok(stale.get("conflict") is True,
+       "legacy seq-only commit still moves the fence — stale walk rejected")
+    resurrected = await led._pool.fetchval(
+        "SELECT count(*) FROM knowledge_doc_active WHERE scope='research' AND path='a.md'")
+    ok(resurrected == 0, "the legacy-tombstoned doc did NOT resurrect")
 
 
 async def main():
