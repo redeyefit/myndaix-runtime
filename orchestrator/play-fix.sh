@@ -440,9 +440,12 @@ net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a
   ( exec "$@" ) >/dev/null 2>&1 9>&- &
   local pid=$!
   local mark="$run/net-fired.$pid"
-  # marker touched AFTER the TERM (r6 #4): it asserts "a signal was actually delivered", so a
-  # target that exits naturally in the wake->touch window can no longer be misread as a timeout.
-  ( sleep "$NET_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; touch "$mark" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
+  # marker + KILL both GATED on the TERM actually delivering (r6 #4, tightened r7 #1+#2): a
+  # target that exited naturally leaves kill ESRCH -> no marker (no false rc=124) and no blind
+  # follow-up SIGKILL at a possibly-recycled PGID. Residual (r7 #3, wontfix): the parent can
+  # freeze the wd between its TERM and touch at the exact timeout edge — kill+touch cannot be
+  # atomic in bash; single-digit-microsecond window, same sanctioned edge class as r4/r5.
+  ( sleep "$NET_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null && { touch "$mark" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null; }; true ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
   # r5 FINAL FORM (supersedes the r3 and r4 orderings, folds both reviewers' constraints):
@@ -464,7 +467,10 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   # CONTRACT (r6 #2): ALWAYS returns 0 — outcome travels ONLY via apply_note/flags. A policy
   # skip and an operational failure are deliberately indistinguishable by rc; callers must
   # read apply_note (finish() embeds it in the delivered reason), never gate on the return.
-  [[ -f "$ORCH/AUTOFIX_APPLY_ENABLED" ]] || return 0
+  # even the disarmed skip speaks through apply_note (r7 #4 — the contract above forbids a
+  # silent 0-return): a green verdict on a disarmed host says WHY nothing was pushed.
+  [[ -f "$ORCH/AUTOFIX_APPLY_ENABLED" ]] \
+    || { apply_note="apply not attempted: AUTOFIX_APPLY_ENABLED absent (rung disarmed)"; return 0; }
   local branch="fix/auto/$play" awt="$EXEC/apply-wt"
   # secret gate BEFORE any publication (r1 P1 #1): finish()'s scan only withholds the inbox
   # diff — by then a commit/push would already be remote history. Never publish a secret hit.
