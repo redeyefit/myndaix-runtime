@@ -62,7 +62,13 @@ jobs:
         run: |
           set -e
           pip install semgrep
-          sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+          if [ "$(uname)" = "Darwin" ]; then
+            # self-hosted Mini: install-if-missing, idempotent after the first run
+            command -v shellcheck >/dev/null || brew install -q shellcheck
+            command -v bats >/dev/null || brew install -q bats-core
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+          fi
           ./tools/bash-check.sh
           bats tests/bash/
 
