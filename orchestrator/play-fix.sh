@@ -440,7 +440,9 @@ net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a
   ( exec "$@" ) >/dev/null 2>&1 9>&- &
   local pid=$!
   local mark="$run/net-fired.$pid"
-  ( sleep "$NET_TIMEOUT"; touch "$mark" 2>/dev/null; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
+  # marker touched AFTER the TERM (r6 #4): it asserts "a signal was actually delivered", so a
+  # target that exits naturally in the wake->touch window can no longer be misread as a timeout.
+  ( sleep "$NET_TIMEOUT"; kill -TERM -"$pid" 2>/dev/null; touch "$mark" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
   # r5 FINAL FORM (supersedes the r3 and r4 orderings, folds both reviewers' constraints):
@@ -459,6 +461,9 @@ net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a
   return "$rc"
 }
 apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<play> and pushes
+  # CONTRACT (r6 #2): ALWAYS returns 0 — outcome travels ONLY via apply_note/flags. A policy
+  # skip and an operational failure are deliberately indistinguishable by rc; callers must
+  # read apply_note (finish() embeds it in the delivered reason), never gate on the return.
   [[ -f "$ORCH/AUTOFIX_APPLY_ENABLED" ]] || return 0
   local branch="fix/auto/$play" awt="$EXEC/apply-wt"
   # secret gate BEFORE any publication (r1 P1 #1): finish()'s scan only withholds the inbox
@@ -498,7 +503,11 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   local add_rc=0 add_err=""
   add_err="$(git -C "$awt" -c core.hooksPath="$EXEC/nohooks" add -A 2>&1 >/dev/null)" || add_rc=$?
   if [[ "$add_rc" -ne 0 ]]; then
-    apply_note="apply SKIPPED: git add failed (rc=$add_rc): $(printf '%s' "$add_err" | clean | head -c 200)"
+    # bash CHARACTER slice, no pipeline (r6 #1 P1 + #6): `… | head -c 200` inside $() could
+    # SIGPIPE the upstream under pipefail — the assignment fails and set -e aborts the whole
+    # script before finish() (verdict lost); byte-truncation also severed UTF-8 mid-codepoint.
+    local add_trunc="${add_err:0:200}"
+    apply_note="apply SKIPPED: git add failed (rc=$add_rc): $(printf '%s' "$add_trunc" | clean)"
     return 0
   fi
   git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
