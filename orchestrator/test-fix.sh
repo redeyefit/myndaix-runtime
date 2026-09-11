@@ -254,17 +254,18 @@ run fixture "$TMP/secret.patch"; check "armed secret" REGRESSION_CHECK_ONLY
 [[ "$(auto_branches)" == "2" ]] && { echo "  ok: secret patch not committed/pushed"; pass=$((pass+1)); } \
   || { echo "  FAIL: secret patch was published"; fail=$((fail+1)); }
 echo "35. ARMED: repo hooks do NOT run during apply (r1/r2 P1: worktree add + checkout + commit all suppressed)"
-for h in pre-commit post-checkout; do
+for h in pre-commit post-checkout post-index-change; do
   printf '#!/bin/sh\ntouch "%s/hookfired-%s"\n' "$TMP" "$h" > "$REPO/.git/hooks/$h"
   chmod +x "$REPO/.git/hooks/$h"
 done
 run fixture_nof2p "$TMP/good.patch"; check "armed hook suppression" SUITE_GREEN
-if [[ ! -e "$TMP/hookfired-pre-commit" && ! -e "$TMP/hookfired-post-checkout" && "$(auto_branches)" == "3" ]]; then
-  echo "  ok: pre-commit + post-checkout suppressed, fix still pushed"; pass=$((pass+1))
+if [[ ! -e "$TMP/hookfired-pre-commit" && ! -e "$TMP/hookfired-post-checkout" \
+      && ! -e "$TMP/hookfired-post-index-change" && "$(auto_branches)" == "3" ]]; then
+  echo "  ok: pre-commit + post-checkout + post-index-change suppressed, fix still pushed"; pass=$((pass+1))
 else
-  echo "  FAIL: pc=$([[ -e "$TMP/hookfired-pre-commit" ]] && echo yes || echo no) pco=$([[ -e "$TMP/hookfired-post-checkout" ]] && echo yes || echo no) branches=$(auto_branches)"; fail=$((fail+1))
+  echo "  FAIL: pc=$([[ -e "$TMP/hookfired-pre-commit" ]] && echo yes || echo no) pco=$([[ -e "$TMP/hookfired-post-checkout" ]] && echo yes || echo no) pic=$([[ -e "$TMP/hookfired-post-index-change" ]] && echo yes || echo no) branches=$(auto_branches)"; fail=$((fail+1))
 fi
-rm -f "$REPO/.git/hooks/pre-commit" "$REPO/.git/hooks/post-checkout"
+rm -f "$REPO/.git/hooks/pre-commit" "$REPO/.git/hooks/post-checkout" "$REPO/.git/hooks/post-index-change"
 echo "36. ARMED: repo with core.hooksPath set -> APPLIED locally, push WITHHELD (r1/r2 P1 push half)"
 git -C "$REPO" config core.hooksPath .githooks
 run fixture_nof2p "$TMP/good.patch"; check "armed hooksPath withhold" SUITE_GREEN

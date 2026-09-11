@@ -443,11 +443,15 @@ net_bounded(){ # net_bounded <argv...> — run with a timeout + pgroup kill so a
   ( sleep "$NET_TIMEOUT"; touch "$mark" 2>/dev/null; kill -TERM -"$pid" 2>/dev/null; sleep 2; kill -KILL -"$pid" 2>/dev/null ) 9>&- &
   local wd=$!
   local rc=0; wait "$pid" 2>/dev/null || rc=$?
-  if [[ -e "$mark" ]]; then                              # timeout fired: finish the escalation ourselves
-    kill -KILL -"$pid" 2>/dev/null || true               # (the wd may still be in its grace sleep)
+  # r3 P2 TOCTOU: stop + reap the watchdog BEFORE consulting the marker, so the marker is
+  # evidence of a COMPLETED firing, never live state. Checking first raced both ways: a
+  # late-firing wd could TERM the pgroup (review worker included) after a clean rc=0 return,
+  # or touch the marker between check-miss and wd-kill and strand its own escalation.
+  kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
+  if [[ -e "$mark" ]]; then                              # wd HAD fired: finish its escalation
+    kill -KILL -"$pid" 2>/dev/null || true
     rc=124
   fi
-  kill -KILL -"$wd" 2>/dev/null || true; wait "$wd" 2>/dev/null || true
   rm -f "$mark" 2>/dev/null || true
   [[ "$had_m" -eq 1 ]] || set +m 2>/dev/null || true
   return "$rc"
@@ -486,7 +490,7 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
   git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>/dev/null \
     || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
-  git -C "$awt" add -A >/dev/null 2>&1
+  git -C "$awt" -c core.hooksPath="$EXEC/nohooks" add -A >/dev/null 2>&1   # post-index-change fires on add (r3 P1)
   git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
       -c core.hooksPath="$EXEC/nohooks" \
       commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
