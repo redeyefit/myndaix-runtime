@@ -139,3 +139,26 @@ terminal needed.
 - **Why a hook:** *your* `git push` is the trigger (a non-Claude originator), so it dispatches the
   durable `mxr` reviews an auto-mode agent can't trigger itself. Verdicts go only to the human
   `jefe/` inbox (no agent watches it) — the merge stays your call. Design: `docs/orchestrator-design.md`.
+
+## Self-hosted CI runner (the Mini — CI cost is zero)
+
+The repo's GitHub Actions `test` job runs on a self-hosted runner ON the Mini
+(`runs-on: [self-hosted, mini]`, since PR #135) — self-hosted minutes are unmetered, so CI is
+free at any push volume. The org's Actions budget stays as a dead-man brake only.
+
+- **Service:** launchd label `actions.runner.redeyefit-myndaix-runtime.jefes-mac-mini`, installed
+  from `~/actions-runner-myndaix-runtime` (operator-installed by hand — agents are policy-blocked
+  from creating persistent exec services). Restart: `launchctl kickstart -k gui/$(id -u)/<label>`
+  — **`./svc.sh stop` is a silent no-op over ssh** (the launchctl-context trap).
+- **Runner env:** `.env` must carry `AGENT_TOOLSDIRECTORY=<runner-dir>/_tool`. Note the workflow
+  no longer uses `setup-python` anyway (it hardcodes the GitHub-hosted toolcache path on macOS);
+  it builds a per-run venv from `/opt/homebrew/bin/python3.12`.
+- **Database:** `runtime_ci` — a DEDICATED throwaway (suites DROP/recreate its schema). Never
+  point CI at the ops `runtime` DB. Safe as a shared static DB ONLY while exactly one runner is
+  registered (a single runner serializes jobs); per-run DBs are REQUIRED before a second runner.
+- **Sandbox note:** CI executes PR-branch code UNSANDBOXED on the factory as the operator user —
+  documented accepted risk in `ci.yml` for this private solo-author repo.
+- **Monitoring gap (known):** the runner is NOT substrate-managed, so the liveness canary does
+  not watch it. If it dies, PRs strand on a pending required check with no alert — the symptom
+  is a check stuck "queued". Manual probe:
+  `gh api repos/redeyefit/myndaix-runtime/actions/runners --jq '.runners[].status'`.
