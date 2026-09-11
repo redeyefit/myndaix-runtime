@@ -1,1 +1,1 @@
-outbound_created_at_idx
+knowledge_scope_gen

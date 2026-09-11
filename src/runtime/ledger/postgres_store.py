@@ -2028,13 +2028,21 @@ class PostgresLedger:
 
     _KNOWLEDGE_LOCK_KEY = 0x6D78724B    # 'mxrK' (int4) — key1 of the (key1, hashtext(scope)) pair
 
-    # The walk fence (0016) = knowledge_scope_gen.gen, NOT MAX(seq): a seq-based fence only moves
-    # when a row is inserted, so an accepted TRUE NO-OP sync (file created then deleted before
-    # either walker commits) was invisible to it and a stale walk could resurrect the deleted doc
-    # (review 20260910200253 P2). The bump runs on EVERY accepted sync/rebuild, inside the same
-    # transaction, after the conflict gate — a rejected walk still mutates nothing.
-    _KNOWLEDGE_GEN_SQL = \
+    # The walk fence (0016) = knowledge_scope_gen.gen + MAX(seq), NOT MAX(seq) alone: a seq-based
+    # fence only moves when a row is inserted, so an accepted TRUE NO-OP sync (file created then
+    # deleted before either walker commits) was invisible to it and a stale walk could resurrect
+    # the deleted doc (review 20260910200253 P2). The gen bump runs on EVERY accepted
+    # sync/rebuild, inside the same transaction, after the conflict gate — a rejected walk still
+    # mutates nothing. WHY THE SUM (r1 kilabz P2, the mixed-deploy window): a pre-0016 writer
+    # still running through a rolling cutover advances seq but never touches gen — gen alone is
+    # blind to its commits, the sum is not. Both terms are monotonic (gen only bumps;
+    # knowledge_doc is append-only, no DELETE path), so any accepted commit from EITHER vintage
+    # strictly increases the sum and a stamped fence can never recur. gen starts at 0 (no seed),
+    # making the fence VALUE numerically continuous with the old MAX(seq) fence across the
+    # upgrade in both directions.
+    _KNOWLEDGE_GEN_SQL = (
         "SELECT COALESCE((SELECT gen FROM knowledge_scope_gen WHERE scope = $1), 0)"
+        " + (SELECT COALESCE(MAX(seq), 0) FROM knowledge_doc WHERE scope = $1)")
     _KNOWLEDGE_GEN_BUMP_SQL = (
         "INSERT INTO knowledge_scope_gen (scope, gen) VALUES ($1, 1) "
         "ON CONFLICT (scope) DO UPDATE SET gen = knowledge_scope_gen.gen + 1")
@@ -2074,12 +2082,14 @@ class PostgresLedger:
             raise
 
     async def knowledge_fence(self, scope: str) -> int:
-        """Read the scope's commit fence: its generation counter (0 = never committed). A walker
-        stamps this BEFORE walking the corpus; knowledge_sync (given expect_fence) then REJECTS
-        the commit if any other sync/rebuild was ACCEPTED in between — the walked snapshot is
-        stale and could resurrect a just-deleted doc (the walk-before-lock TOCTOU). The counter
-        moves on every accepted commit INCLUDING true no-ops, which the old MAX(seq) fence
-        missed. The caller re-walks and retries; a reject never mutates anything."""
+        """Read the scope's commit fence: generation counter + MAX(seq) (0 = never committed).
+        A walker stamps this BEFORE walking the corpus; knowledge_sync (given expect_fence) then
+        REJECTS the commit if any other sync/rebuild was ACCEPTED in between — the walked
+        snapshot is stale and could resurrect a just-deleted doc (the walk-before-lock TOCTOU).
+        The fence moves on every accepted commit INCLUDING true no-ops (which MAX(seq) alone
+        missed) AND on row-writing commits from pre-0016 code that never bumps gen (which gen
+        alone would miss — the mixed-deploy window). The caller re-walks and retries; a reject
+        never mutates anything."""
         async with self._pool.acquire() as con:
             return int(await con.fetchval(self._KNOWLEDGE_GEN_SQL, scope))
 
