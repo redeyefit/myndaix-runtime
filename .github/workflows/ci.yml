@@ -14,27 +14,16 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-
-    # The Postgres-backed suites drop/recreate their own schema each run
-    # (init_schema), so an empty database is all they need.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: runtime_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    # SELF-HOSTED (2026-09-11, cost-zero CI): runs on the Mini's registered runner — Actions
+    # minutes on self-hosted runners are unmetered. The suites hit the Mini's local Postgres
+    # against the DEDICATED throwaway `runtime_ci` DB (they DROP/recreate its schema each run
+    # — never point this at the ops `runtime` DB). FALLBACK to GitHub-hosted: restore
+    # `runs-on: ubuntu-latest` + the postgres:16 service container (git history has the
+    # exact block, removed in this commit) + the postgres:postgres@…/runtime_test DSN.
+    runs-on: [self-hosted, mini]
 
     env:
-      LEDGER_TEST_DSN: postgresql://postgres:postgres@localhost:5432/runtime_test
+      LEDGER_TEST_DSN: postgresql://localhost:5432/runtime_ci
       PYTHONPATH: src
 
     steps:
