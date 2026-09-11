@@ -29,9 +29,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # Mini-local Python instead of setup-python: on self-hosted macOS the action insists
+      # on the GitHub-hosted toolcache path (/Users/runner — permission denied) and ignores
+      # the runner's AGENT_TOOLSDIRECTORY. A per-run venv from the box's brewed 3.12 is
+      # deterministic and ~20s with warm pip cache.
+      - name: Set up venv (Mini-local Python 3.12)
+        run: |
+          /opt/homebrew/bin/python3.12 -m venv .ci-venv
+          echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install
         run: pip install -e ".[dev]"          # dev extra brings pytest (+ pytest-asyncio)
