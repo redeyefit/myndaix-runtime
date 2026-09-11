@@ -458,6 +458,38 @@ async def test_zz_migrate_restores_outbound_created_at(led: PostgresLedger) -> N
     assert await _col() == 1 and await _idx()
 
 
+# -- regression: 0016 — knowledge_scope_gen creation + MAX(seq) seed ------------
+# The walk fence is now the per-scope generation counter (no-op syncs must move it —
+# review 20260910200253 P2). Migrating an old DB must both create the table AND seed
+# gen = MAX(seq) per existing scope so fences stamped under the old semantics still
+# compare correctly; re-runs must never clobber a live counter.
+async def test_zz_migrate_seeds_knowledge_scope_gen(led: PostgresLedger) -> None:
+    scope = "genseed"
+    await led.knowledge_sync(scope, [{
+        "path": "a.md", "title": "a", "tags": "", "doc_date": None,
+        "body": "seed body", "content_sha": "s1", "lossy": False}])
+    async with led._pool.acquire() as con:
+        max_seq = await con.fetchval(
+            "SELECT MAX(seq) FROM knowledge_doc WHERE scope=$1", scope)
+        # simulate a pre-0016 DB: doc rows exist, the gen table does not
+        await con.execute("DROP TABLE knowledge_scope_gen")
+
+    applied = await led.migrate()
+    assert "0016_knowledge_scope_gen.sql" in applied, f"0016 not applied: {applied}"
+    async with led._pool.acquire() as con:
+        gen = await con.fetchval(
+            "SELECT gen FROM knowledge_scope_gen WHERE scope=$1", scope)
+    assert gen == max_seq, f"seed must equal the old MAX(seq) fence: gen={gen} max_seq={max_seq}"
+
+    # a later accepted commit bumps; a migrate() re-run must NOT reset the live counter
+    await led.knowledge_sync(scope, [])                  # accepted true no-op — must bump
+    await led.migrate()
+    async with led._pool.acquire() as con:
+        gen2 = await con.fetchval(
+            "SELECT gen FROM knowledge_scope_gen WHERE scope=$1", scope)
+    assert gen2 == gen + 1, f"re-migrate clobbered the counter: {gen2} != {gen}+1"
+
+
 # -- regression: cancel must NOT deadlock against complete/fail (the P0) --------
 # Before the lock-order fix this failed ~99% of trials with DeadlockDetectedError;
 # it is the test the green suite was missing (cancel had zero coverage).

@@ -64,7 +64,8 @@ _SYNC_CONFLICT_RETRIES = 3   # a fence reject means SOMEONE ELSE'S sync committe
 async def _sync(led: PostgresLedger, scope: str) -> dict:
     """Walk + sync ONE scope. Raises on unknown scope / bad root (hard error, caller exits 2).
 
-    Fence-and-reject closes the walk-before-lock TOCTOU: the fence (max seq) is stamped BEFORE
+    Fence-and-reject closes the walk-before-lock TOCTOU: the fence (the scope's generation
+    counter, which moves on EVERY accepted commit — including true no-ops) is stamped BEFORE
     the walk; if any other writer commits in between, knowledge_sync rejects and we re-walk.
     A stale snapshot can therefore never commit out of walk order — which could resurrect a
     just-deleted doc (stress-matrix F4/F5). On persistent conflict we raise: ingest surfaces

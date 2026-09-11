@@ -286,3 +286,11 @@ SELECT DISTINCT ON (scope, path)
 
 CREATE OR REPLACE VIEW knowledge_doc_active AS
 SELECT * FROM knowledge_doc_current WHERE status = 'active';
+
+-- per-scope commit generation: THE walk fence (0016). Bumped under the per-scope advisory lock
+-- on EVERY accepted sync/rebuild — including true no-ops, which the old MAX(seq) fence missed
+-- (a stale walk could pass the check and resurrect a just-deleted doc).
+CREATE TABLE knowledge_scope_gen (
+    scope text PRIMARY KEY,
+    gen   bigint NOT NULL DEFAULT 0
+);
