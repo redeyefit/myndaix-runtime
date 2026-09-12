@@ -566,44 +566,34 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     apply_note="APPLIED locally as $branch — push withheld: MYNDAIX_FIX_REMOTE malformed; push by hand"
     return 0
   fi
+  # a URL may carry userinfo (https://user:token@host) — strip it before push_remote ever enters a
+  # human-facing note/log so a credential can't leak into the inbox (review kilabz #4). The actual
+  # push/PR still use the raw push_remote; only the message text is sanitized.
+  local push_remote_safe="${push_remote//:\/\/*@/://***@}"
   if net_bounded git -C "$repo_path" push -q "$push_remote" "$branch"; then
     flags="$flags pushed"
-    apply_note="APPLIED + PUSHED as $branch ($1) to $push_remote — the push-review loop reviews it; merge stays gated."
+    apply_note="APPLIED + PUSHED as $branch ($1) to $push_remote_safe — the push-review loop reviews it; merge stays gated."
     if [[ "${MYNDAIX_FIX_TEST_MODE:-}" != "1" ]] && command -v gh >/dev/null 2>&1; then
-      # BIND the PR to the remote we pushed to (post-merge review #1), never gh's default `origin`:
-      # resolve push_remote to a URL (a configured remote NAME -> its push URL; a URL stays as-is),
-      # parse a github OWNER/REPO with POSIX param-expansion (BSD/macOS sed lacks lazy quantifiers),
-      # and pass `gh pr create -R owner/repo`. Not a parseable github repo -> open NO PR (branch-only,
-      # fail-closed). PR base = the ORIGINATING branch (r1 P2 #7) via env; validated, fail-CLOSED.
-      local remote_url_r="$push_remote" gh_slug=""
-      case "$push_remote" in
-        *://*|*@*:*) : ;;                                           # already a URL (https:// or scp-like git@host:path)
-        *) remote_url_r="$(git -C "$repo_path" remote get-url "$push_remote" 2>/dev/null || true)" ;;
-      esac
-      local _u="${remote_url_r%.git}"; _u="${_u%/}"                 # drop trailing .git then trailing /
-      # boundary char ([/@]) BEFORE the host so mygithub.com / notgithub.com don't false-match as
-      # github.com (a bare *github.com* substring would bind the PR to the WRONG host's owner/repo).
-      case "$_u" in
-        *[/@]github.com[:/]*) gh_slug="${_u##*github.com}"; gh_slug="${gh_slug#[:/]}" ;;   # ":owner/repo" | "/owner/repo"
-      esac
-      [[ "$gh_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || gh_slug=""
+      # PR base = the ORIGINATING branch (r1 P2 #7), passed by autofix_fire via env; validated
+      # here, fail-CLOSED: no/invalid base -> branch-only (never let gh default to main for a
+      # fix whose base commit sits on an unmerged feature branch). gh infers the target repo from
+      # $repo_path's remotes (single-origin) — no owner/repo URL derivation (that path had substring
+      # + fetch-vs-push bugs and only mattered for a multi-remote setup we don't run).
       local pr_base="${MYNDAIX_FIX_BASE_BRANCH:-}"
-      if [[ -z "$gh_slug" ]]; then
-        apply_note="$apply_note No PR opened: push remote is not a parseable github repo — open by hand."
-      elif [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
-        if net_bounded gh pr create -R "$gh_slug" --head "$branch" --base "$pr_base" \
+      if [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
+        if ( cd "$repo_path" && net_bounded gh pr create --head "$branch" --base "$pr_base" \
               --title "autofix($play): $repo_id @ ${base_sha:0:8}" \
-              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated."; then
-          apply_note="$apply_note PR opened against $pr_base on $gh_slug."
+              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated." ); then
+          apply_note="$apply_note PR opened against $pr_base."
         else
-          apply_note="$apply_note (gh pr create failed or timed out — open the PR by hand; repo=$gh_slug base=$pr_base)"
+          apply_note="$apply_note (gh pr create failed or timed out — open the PR by hand; base=$pr_base)"
         fi
       else
-        apply_note="$apply_note No PR opened: originating branch unknown/invalid — open by hand against the right base on $gh_slug."
+        apply_note="$apply_note No PR opened: originating branch unknown/invalid — open by hand against the right base."
       fi
     fi
   else
-    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push $push_remote $branch"
+    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push $push_remote_safe $branch"
   fi
   return 0
 }
