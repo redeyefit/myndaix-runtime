@@ -124,6 +124,17 @@ if [[ "${1:-}" != "--worker" ]]; then
         _slug="${_rid//[^A-Za-z0-9._-]/-}-${remoteref//[^A-Za-z0-9._-]/-}"   # == worker marker_slug
         base="$(fold_walk "$repo" "$_slug" "$base" "$localsha")"
       fi
+    elif [[ "$remoteref" == refs/heads/fix/auto/* ]] \
+         && base="$(git -C "$repo" rev-parse --verify -q "${localsha}^" 2>/dev/null)" \
+         && [[ -n "$base" ]] \
+         && git -C "$repo" merge-base --is-ancestor "$base" "$localsha" 2>/dev/null; then
+      # AUTOFIX fix branch (post-merge review #5): play-fix commits the verified patch as exactly
+      # ONE commit on the reviewed base_sha, so the parent (localsha^) IS that base — review
+      # base_sha..fix_sha is JUST the patch. The generic new-branch path below would instead use
+      # merge-base(main, fix_sha), which on a feature-branch base can sit far behind base_sha and
+      # balloon the tiny fix past MAX_DIFF_LINES, aborting the fix's OWN review. Fail-CLOSED to that
+      # path if the parent can't be resolved (root/merge commit).
+      orig_base="$base"
     elif base="$(git -C "$repo" merge-base "$BASE_REF" "$localsha" 2>/dev/null)" \
          && [[ -n "$base" && "$base" != "$localsha" ]]; then
       orig_base="$base"                                     # new branch: review vs its merge-base with main
@@ -386,8 +397,13 @@ autofix_fire(){
   # MYNDAIX_FIX_BASE_BRANCH: the ORIGINATING branch (r1 P2 #7) so play-fix can open the fix PR
   # against the right base instead of gh's default-branch fallback. Ref shape already enforced
   # refs/heads/* above; play-fix re-validates fail-closed.
+  # MYNDAIX_FIX_REMOTE: the remote that TRIGGERED this review (git's pre-push remote URL, arg 6 /
+  # $remote_url — post-merge review #1). play-fix binds its push + PR to it instead of a hardcoded
+  # origin, so a review fired against a non-origin/private remote can't publish the fix to a
+  # different (possibly public) origin. Empty here (a direct --worker call) -> play-fix uses origin.
   nohup env -i PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" HOME="$HOME" \
     MYNDAIX_FIX_BASE_BRANCH="${ref#refs/heads/}" \
+    MYNDAIX_FIX_REMOTE="$remote_url" \
     "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
   return 0
 }
@@ -409,6 +425,41 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
   # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
   : > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true
+  # AUTOFIX fix branches (post-merge review #2): a fix/auto/* branch gets exactly ONE push, so the
+  # skip-fold above (which recovers ONLY on a FUTURE push to this ref) can never re-review it — the
+  # fix's own review would be silently lost. Self-schedule a bounded retry of THIS exact range
+  # instead. Env-carried counter caps the depth; a per-tip marker records that a retry is pending.
+  # Interactive pre-push path ONLY: autofix is hard-disabled under the launchd controller/automerge
+  # (PLAY_DISABLE_AUTOFIX=1), so no fix/auto push — hence no retry — ever spawns under launchd, where
+  # a detached child would risk the process-group reap (see autofix_fire's REAP LANDMINE note). The
+  # PLAY_DISABLE_AUTOFIX guard makes that a BELT, not just an assumption: under it we fall through to
+  # the normal skip-fold/deliver path (safe, no detached child) even if a fix/auto ref is reviewed.
+  if [[ "$ref" == refs/heads/fix/auto/* && "${PLAY_DISABLE_AUTOFIX:-0}" != "1" ]]; then
+    # length-bounded numeric env (octal/overflow discipline, same as MAX_DIFF_LINES/VERIFY_TIMEOUT):
+    # the regex cap rejects an overflowing all-digit value BEFORE 10# arithmetic parses it.
+    local _rt="${PLAY_FIX_REVIEW_RETRY:-0}";             [[ "$_rt" =~ ^[0-9]{1,3}$ ]] || _rt=0
+    local _rtmax="${PLAY_FIX_REVIEW_RETRY_MAX:-3}";      [[ "$_rtmax" =~ ^[0-9]{1,3}$ ]] || _rtmax=3
+    local _rtdelay="${PLAY_FIX_REVIEW_RETRY_DELAY:-90}"; [[ "$_rtdelay" =~ ^[0-9]{1,5}$ ]] || _rtdelay=90
+    _rt=$((10#$_rt)); _rtmax=$((10#$_rtmax)); _rtdelay=$((10#$_rtdelay))   # base-10 (leading-zero octal trap)
+    if (( _rt < _rtmax )); then
+      note contention "fix-branch review skipped; scheduling retry $((_rt+1))/$_rtmax of ${base}..${tip} in ${_rtdelay}s"
+      : > "$STATE/retry-$marker_slug-$tip" 2>/dev/null || true   # test-observable: a retry is pending
+      # re-dispatch THIS worker after the delay with the retry counter bumped. `env` keeps HOME/PATH;
+      # ${@:3} = the self path ($0) + the exact --worker argv. No lock fd here (front holds none).
+      nohup bash -c 'sleep "$1"; exec env PLAY_FIX_REVIEW_RETRY="$2" "${@:3}"' \
+        _ "$_rtdelay" "$((_rt+1))" "$0" --worker "$repo" "$base" "$tip" "$ref" "$remote_url" "$orig_base" \
+        </dev/null >/dev/null 2>&1 &
+      # deliver the SKIPPED notice ONCE (first skip); middle retries note only (no inbox spam). if/fi,
+      # not `(( )) &&` — a false `(( _rt == 0 ))` returns 1 and would trip set -e.
+      if (( _rt == 0 )); then
+        deliver "review SKIPPED — $ref" "The autofix branch $ref ($tip) hit a concurrent review of this repo and was skipped. Automatic retries of ${base}..${tip} are scheduled (up to $_rtmax). If none lands, review by hand: orchestrator/xreview.sh code $repo ${base}..${tip}" || true
+      fi
+    else
+      note contention "fix-branch review still contended after $_rtmax retries — giving up"
+      deliver "review SKIPPED — $ref" "The autofix branch $ref ($tip) was skipped by a concurrent review and auto-retry ($_rtmax attempts) gave up. Review by hand: orchestrator/xreview.sh code $repo ${base}..${tip}" || true
+    fi
+    exit 0
+  fi
   if [[ "$_skrec" == "1" ]]; then
     deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. The skipped range is recorded: the next completed review of this branch folds it in automatically (within $PRUNE_DAYS days; an over-cap fold falls back loudly). Retrigger now: git commit --allow-empty -m retrigger && git push. Immediate manual option: orchestrator/xreview.sh code $repo ${base}..${tip}" || true
   else

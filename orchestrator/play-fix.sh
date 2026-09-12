@@ -499,10 +499,22 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   mkdir -p "$EXEC/nohooks"
   git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
     || { apply_note="apply SKIPPED: could not create apply worktree"; return 0; }
-  git -C "$awt" apply "$patch" >/dev/null 2>&1 \
-    || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
-  git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>/dev/null \
-    || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
+  # post-merge review #6 (silent-error-suppression): keep git's REAL stderr (index lock, disk
+  # full, missing base blob) on apply/checkout/commit instead of a hardcoded guess — the same
+  # reason the git-add step below was hardened (r4 P1-B). `2>&1 >/dev/null` captures ONLY stderr;
+  # bash slice (no `| head` — SIGPIPE-under-pipefail trap, r6 #1) + clean() + 200-char truncate.
+  local ap_rc=0 ap_err=""
+  ap_err="$(git -C "$awt" apply "$patch" 2>&1 >/dev/null)" || ap_rc=$?
+  if [[ "$ap_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: patch did not apply in the pristine worktree (rc=$ap_rc): $(printf '%s' "${ap_err:0:200}" | clean)"
+    return 0
+  fi
+  local co_rc=0 co_err=""
+  co_err="$(git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>&1 >/dev/null)" || co_rc=$?
+  if [[ "$co_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: could not create $branch (rc=$co_rc): $(printf '%s' "${co_err:0:200}" | clean)"
+    return 0
+  fi
   # r4 P1-B guard + r5 P3: keep git's real stderr (index lock, disk full) instead of a
   # hardcoded guess — 2>&1 AFTER >/dev/null captures only stderr. Hook-free: post-index-change
   # fires on add (r3 P1). Sanitized + truncated before it reaches the inbox note.
@@ -516,10 +528,18 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     apply_note="apply SKIPPED: git add failed (rc=$add_rc): $(printf '%s' "$add_trunc" | clean)"
     return 0
   fi
-  git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
-      -c core.hooksPath="$EXEC/nohooks" \
-      commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
-    || { apply_note="apply SKIPPED: commit failed"; return 0; }
+  # -c commit.gpgSign=false (post-merge review #3): --no-verify skips HOOKS but NOT GPG signing.
+  # An inherited commit.gpgSign + a signer that blocks on interactive input (or fails to match the
+  # synthetic autofix@myndaix.invalid identity) would HANG this commit while it holds the fd-held
+  # global fix lock — wedging every later fix. Disable signing explicitly. Real stderr captured (#6).
+  local ci_rc=0 ci_err=""
+  ci_err="$(git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
+      -c core.hooksPath="$EXEC/nohooks" -c commit.gpgSign=false \
+      commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>&1 >/dev/null)" || ci_rc=$?
+  if [[ "$ci_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: commit failed (rc=$ci_rc): $(printf '%s' "${ci_err:0:200}" | clean)"
+    return 0
+  fi
   flags="$flags applied-branch:$branch"
   # push from the DURABLE repo, not the ephemeral worktree (r1 P1 #3): the pre-push hook
   # detaches a review worker whose repo path must outlive this process — cleanup() removes
@@ -534,28 +554,56 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     apply_note="APPLIED locally as $branch — push withheld: core.hooksPath $([[ "$hp" -eq 0 ]] && echo "is set (tracked-hook execution risk)" || echo "probe errored (rc=$hp)"); push by hand after inspecting hooks"
     return 0
   fi
-  if net_bounded git -C "$repo_path" push -q -u origin "$branch"; then
+  # PUBLISH to the remote that TRIGGERED the review, never a hardcoded origin (post-merge review
+  # #1, missing-scoping): a review fired by pushing PRIVATE work to a non-origin/private remote must
+  # not land its fix branch on a different — possibly PUBLIC — origin. autofix_fire forwards the
+  # triggering remote as MYNDAIX_FIX_REMOTE (git's pre-push remote URL). Empty = a manual/direct
+  # play-fix run with no trigger remote -> origin (the historical default). Fail-CLOSED on a
+  # malformed value (leading dash = option injection, or control chars) rather than push somewhere
+  # unintended — `git push -- <remote>` is not portable, so we validate instead of relying on `--`.
+  local push_remote="${MYNDAIX_FIX_REMOTE:-origin}"
+  if [[ "$push_remote" == -* ]] || printf '%s' "$push_remote" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    apply_note="APPLIED locally as $branch — push withheld: MYNDAIX_FIX_REMOTE malformed; push by hand"
+    return 0
+  fi
+  if net_bounded git -C "$repo_path" push -q "$push_remote" "$branch"; then
     flags="$flags pushed"
-    apply_note="APPLIED + PUSHED as $branch ($1) — the push-review loop reviews it; merge stays gated."
+    apply_note="APPLIED + PUSHED as $branch ($1) to $push_remote — the push-review loop reviews it; merge stays gated."
     if [[ "${MYNDAIX_FIX_TEST_MODE:-}" != "1" ]] && command -v gh >/dev/null 2>&1; then
-      # PR base = the ORIGINATING branch (r1 P2 #7), passed by autofix_fire via env; validated
-      # here, fail-CLOSED: no/invalid base -> branch-only (never let gh default to main for a
-      # fix whose base commit sits on an unmerged feature branch).
+      # BIND the PR to the remote we pushed to (post-merge review #1), never gh's default `origin`:
+      # resolve push_remote to a URL (a configured remote NAME -> its push URL; a URL stays as-is),
+      # parse a github OWNER/REPO with POSIX param-expansion (BSD/macOS sed lacks lazy quantifiers),
+      # and pass `gh pr create -R owner/repo`. Not a parseable github repo -> open NO PR (branch-only,
+      # fail-closed). PR base = the ORIGINATING branch (r1 P2 #7) via env; validated, fail-CLOSED.
+      local remote_url_r="$push_remote" gh_slug=""
+      case "$push_remote" in
+        *://*|*@*:*) : ;;                                           # already a URL (https:// or scp-like git@host:path)
+        *) remote_url_r="$(git -C "$repo_path" remote get-url "$push_remote" 2>/dev/null || true)" ;;
+      esac
+      local _u="${remote_url_r%.git}"; _u="${_u%/}"                 # drop trailing .git then trailing /
+      # boundary char ([/@]) BEFORE the host so mygithub.com / notgithub.com don't false-match as
+      # github.com (a bare *github.com* substring would bind the PR to the WRONG host's owner/repo).
+      case "$_u" in
+        *[/@]github.com[:/]*) gh_slug="${_u##*github.com}"; gh_slug="${gh_slug#[:/]}" ;;   # ":owner/repo" | "/owner/repo"
+      esac
+      [[ "$gh_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || gh_slug=""
       local pr_base="${MYNDAIX_FIX_BASE_BRANCH:-}"
-      if [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
-        if ( cd "$repo_path" && net_bounded gh pr create --head "$branch" --base "$pr_base" \
+      if [[ -z "$gh_slug" ]]; then
+        apply_note="$apply_note No PR opened: push remote is not a parseable github repo — open by hand."
+      elif [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
+        if net_bounded gh pr create -R "$gh_slug" --head "$branch" --base "$pr_base" \
               --title "autofix($play): $repo_id @ ${base_sha:0:8}" \
-              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated." ); then
-          apply_note="$apply_note PR opened against $pr_base."
+              --body "Automated fix at tier $1 (sandboxed verify green, policy+integrity+tamper gates passed). The push-review verdict for this branch lands in the jefe inbox; merge is separately gated."; then
+          apply_note="$apply_note PR opened against $pr_base on $gh_slug."
         else
-          apply_note="$apply_note (gh pr create failed or timed out — open the PR by hand; base=$pr_base)"
+          apply_note="$apply_note (gh pr create failed or timed out — open the PR by hand; repo=$gh_slug base=$pr_base)"
         fi
       else
-        apply_note="$apply_note No PR opened: originating branch unknown/invalid — open by hand against the right base."
+        apply_note="$apply_note No PR opened: originating branch unknown/invalid — open by hand against the right base on $gh_slug."
       fi
     fi
   else
-    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push -u origin $branch"
+    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push $push_remote $branch"
   fi
   return 0
 }

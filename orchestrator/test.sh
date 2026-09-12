@@ -85,6 +85,7 @@ DMARKER="$STATE/done-repo-refs-heads-main-$TIP"
 #     argv (overwrite) AND appends a per-call marker so we can assert fire-count. ---
 FIXER="$ROOT/fake-play-fix.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'mkdir -p "$HOME/.myndaix" 2>/dev/null' \
+  'printf "%s\n" "REMOTE=${MYNDAIX_FIX_REMOTE-}" "BASE_BRANCH=${MYNDAIX_FIX_BASE_BRANCH-}" > "$HOME/.myndaix/fixer-env"' \
   'printf "%s\n" "$#" "$@" > "$HOME/.myndaix/fixer-argv"' \
   'printf x >> "$HOME/.myndaix/fixer-calls"' 'exit 0' > "$FIXER"
 chmod +x "$FIXER"
@@ -256,11 +257,11 @@ echo "29. reject a SYMLINKED fixer (codex BLOCKER: symlink -> in-repo copy)"; re
   ln -sf "$FIXER" "$ROOT/link-fixer.sh"
   env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$ROOT/link-fixer.sh" STUB_TRIAGE="1. fix it" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; settle
   cknofile "$FAKE/.myndaix/fixer-argv" "symlinked fixer rejected -> no fire"; rm -f "$ROOT/link-fixer.sh"
-echo "28. play-fix.sh is byte-identical to origin/main (frozen)"; reset
-  rr="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
-  if git -C "$rr" rev-parse --verify -q origin/main >/dev/null 2>&1; then
-    if git -C "$rr" diff --quiet origin/main -- orchestrator/play-fix.sh; then echo "  ok: play-fix.sh unchanged vs origin/main"; PASS=$((PASS+1)); else echo "  FAIL: play-fix.sh modified by this branch"; FAIL=$((FAIL+1)); fi
-  else echo "  skip: no origin/main to compare"; fi
+# (case 28 REMOVED: the "play-fix.sh byte-identical to origin/main (frozen)" tripwire was a
+#  point-in-time assertion from the autofix-FLIP PR (21c4605) proving THAT change touched only
+#  play-review.sh. play-fix is under active development now — the apply rung (#133) and this
+#  findings-fold both change it deliberately — so the freeze is obsolete and fires falsely on any
+#  legit play-fix edit. It was never a CI gate (CI runs pytest + substrate/test.sh + bats only).)
 
 echo "30. durable flag-file enables auto-fire WITHOUT PLAY_AUTOFIX env"; reset; af_repos "$NULLCFG"
   mkdir -p "$FAKE/.myndaix/orchestrator"; : > "$FAKE/.myndaix/orchestrator/AUTOFIX_ENABLED"
@@ -550,6 +551,46 @@ echo "62. pre-record claims the OWN hop, not the folded base (r3 toctou)"; reset
   env HOME="$FAKE" STUB_KILABZ_FAIL=1 bash "$SCRIPT" --worker "$REPO" "$TIP" "$TIP3" refs/heads/main "$bare59" "$TIP2" 2>/dev/null || true
   got="$(cat "$STATE/skipped-$SKIPSLUG-$TIP3" 2>/dev/null)"
   if [[ "$got" == "$TIP2" ]]; then echo "  ok: marker content = orig_base (own hop), not the folded base"; PASS=$((PASS+1)); else echo "  FAIL: content '$got' want $TIP2 (own hop)"; FAIL=$((FAIL+1)); fi
+
+# ====================== apply-rung findings fold (post-merge review 20260911114126) ============
+echo "63. autofix_fire forwards the triggering remote as MYNDAIX_FIX_REMOTE (review #1)"; reset; af_repos "$NULLCFG"
+  bareR="$ROOT/bare-remote63.git"; git init -q --bare "$bareR"; git -C "$REPO" push -q "$bareR" "$TIP:refs/heads/main" 2>/dev/null
+  STUB_TRIAGE="1. fix it" run_af "$bareR"; wait_fixer
+  if grep -q "REMOTE=$bareR" "$FAKE/.myndaix/fixer-env" 2>/dev/null; then echo "  ok: triggering remote forwarded to the fixer"; PASS=$((PASS+1)); else echo "  FAIL: MYNDAIX_FIX_REMOTE not forwarded (env: $(tr '\n' ' ' < "$FAKE/.myndaix/fixer-env" 2>/dev/null))"; FAIL=$((FAIL+1)); fi
+
+echo "64. FRONT: a fix/auto/* new-branch push reviews base=parent (localsha^), not merge-base (review #5)"; reset
+  mkdir -p "$FAKE/.myndaix/orchestrator"
+  fixed="$FAKE/.myndaix/orchestrator/play-review.sh"     # captures the base arg the FRONT computed
+  printf '%s\n' '#!/usr/bin/env bash' 'mkdir -p "$HOME/.myndaix" 2>/dev/null' \
+    'printf "%s" "$3" > "$HOME/.myndaix/front-base"' 'exit 0' > "$fixed"   # $1=--worker $2=repo $3=base
+  chmod +x "$fixed"
+  ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/fix/auto/test "$TIP3" refs/heads/fix/auto/test \
+      0000000000000000000000000000000000000000 | env HOME="$FAKE" bash "$SCRIPT" origin "" ) >/dev/null 2>&1
+  for _ in $(seq 1 30); do [[ -f "$FAKE/.myndaix/front-base" ]] && break; sleep 0.1; done
+  gotb="$(cat "$FAKE/.myndaix/front-base" 2>/dev/null)"
+  if [[ "$gotb" == "$TIP2" ]]; then echo "  ok: fix/auto base = parent commit $TIP2 (just-the-patch diff)"; PASS=$((PASS+1)); else echo "  FAIL: base '$gotb' != parent $TIP2"; FAIL=$((FAIL+1)); fi
+
+echo "65. contention on a fix/auto/* ref SCHEDULES a bounded retry (review #2)"; reset; mkdir -p "$STATE/lock-repo"
+  env HOME="$FAKE" PLAY_FIX_REVIEW_RETRY_DELAY=0 PLAY_FIX_REVIEW_RETRY_MAX=1 STUB_TRIAGE="PLAY_PASS" \
+    bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/fix/auto/test "" 2>/dev/null
+  ckfile "$STATE/retry-repo-refs-heads-fix-auto-test-$TIP" "fix/auto contention wrote the retry marker"
+  if grep -rlq "Automatic retries" "$INBOX" 2>/dev/null; then echo "  ok: SKIPPED notice announces the auto-retry"; PASS=$((PASS+1)); else echo "  FAIL: no auto-retry notice"; FAIL=$((FAIL+1)); fi
+  settle
+
+echo "66. a NON-fix ref contention does NOT schedule a retry (main uses the skip-fold)"; reset; mkdir -p "$STATE/lock-repo"
+  STUB_TRIAGE="PLAY_PASS" run
+  cknofile "$STATE/retry-repo-refs-heads-main-$TIP" "main-branch contention writes NO retry marker"
+
+echo "67. fix/auto retry gives up at the cap (no new marker, manual-review notice)"; reset; mkdir -p "$STATE/lock-repo"
+  env HOME="$FAKE" PLAY_FIX_REVIEW_RETRY=1 PLAY_FIX_REVIEW_RETRY_MAX=1 STUB_TRIAGE="PLAY_PASS" \
+    bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/fix/auto/test "" 2>/dev/null
+  cknofile "$STATE/retry-repo-refs-heads-fix-auto-test-$TIP" "at the cap -> no retry scheduled"
+  if grep -rlq "gave up" "$INBOX" 2>/dev/null; then echo "  ok: give-up notice delivered at the cap"; PASS=$((PASS+1)); else echo "  FAIL: no give-up notice at cap"; FAIL=$((FAIL+1)); fi
+
+echo "68. PLAY_DISABLE_AUTOFIX=1 suppresses the fix/auto self-retry (no detached child under launchd)"; reset; mkdir -p "$STATE/lock-repo"
+  env HOME="$FAKE" PLAY_DISABLE_AUTOFIX=1 PLAY_FIX_REVIEW_RETRY_DELAY=0 PLAY_FIX_REVIEW_RETRY_MAX=3 STUB_TRIAGE="PLAY_PASS" \
+    bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/fix/auto/test "" 2>/dev/null
+  cknofile "$STATE/retry-repo-refs-heads-fix-auto-test-$TIP" "disable flag -> NO retry scheduled (falls to skip-fold)"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
