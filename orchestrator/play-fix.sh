@@ -499,10 +499,22 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
   mkdir -p "$EXEC/nohooks"
   git -C "$repo_path" -c core.hooksPath="$EXEC/nohooks" worktree add --detach "$awt" "$base_sha" >/dev/null 2>&1 \
     || { apply_note="apply SKIPPED: could not create apply worktree"; return 0; }
-  git -C "$awt" apply "$patch" >/dev/null 2>&1 \
-    || { apply_note="apply SKIPPED: patch did not apply in the pristine worktree"; return 0; }
-  git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>/dev/null \
-    || { apply_note="apply SKIPPED: could not create $branch"; return 0; }
+  # post-merge review #6 (silent-error-suppression): keep git's REAL stderr (index lock, disk
+  # full, missing base blob) on apply/checkout/commit instead of a hardcoded guess — the same
+  # reason the git-add step below was hardened (r4 P1-B). `2>&1 >/dev/null` captures ONLY stderr;
+  # bash slice (no `| head` — SIGPIPE-under-pipefail trap, r6 #1) + clean() + 200-char truncate.
+  local ap_rc=0 ap_err=""
+  ap_err="$(git -C "$awt" apply "$patch" 2>&1 >/dev/null)" || ap_rc=$?
+  if [[ "$ap_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: patch did not apply in the pristine worktree (rc=$ap_rc): $(printf '%s' "${ap_err:0:200}" | clean)"
+    return 0
+  fi
+  local co_rc=0 co_err=""
+  co_err="$(git -C "$awt" -c core.hooksPath="$EXEC/nohooks" checkout -q -b "$branch" 2>&1 >/dev/null)" || co_rc=$?
+  if [[ "$co_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: could not create $branch (rc=$co_rc): $(printf '%s' "${co_err:0:200}" | clean)"
+    return 0
+  fi
   # r4 P1-B guard + r5 P3: keep git's real stderr (index lock, disk full) instead of a
   # hardcoded guess — 2>&1 AFTER >/dev/null captures only stderr. Hook-free: post-index-change
   # fires on add (r3 P1). Sanitized + truncated before it reaches the inbox note.
@@ -516,10 +528,18 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     apply_note="apply SKIPPED: git add failed (rc=$add_rc): $(printf '%s' "$add_trunc" | clean)"
     return 0
   fi
-  git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
-      -c core.hooksPath="$EXEC/nohooks" \
-      commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>/dev/null \
-    || { apply_note="apply SKIPPED: commit failed"; return 0; }
+  # -c commit.gpgSign=false (post-merge review #3): --no-verify skips HOOKS but NOT GPG signing.
+  # An inherited commit.gpgSign + a signer that blocks on interactive input (or fails to match the
+  # synthetic autofix@myndaix.invalid identity) would HANG this commit while it holds the fd-held
+  # global fix lock — wedging every later fix. Disable signing explicitly. Real stderr captured (#6).
+  local ci_rc=0 ci_err=""
+  ci_err="$(git -C "$awt" -c user.name="myndaix-autofix" -c user.email="autofix@myndaix.invalid" \
+      -c core.hooksPath="$EXEC/nohooks" -c commit.gpgSign=false \
+      commit -q --no-verify -m "autofix($play): $1 fix for $repo_id @ ${base_sha:0:8}" 2>&1 >/dev/null)" || ci_rc=$?
+  if [[ "$ci_rc" -ne 0 ]]; then
+    apply_note="apply SKIPPED: commit failed (rc=$ci_rc): $(printf '%s' "${ci_err:0:200}" | clean)"
+    return 0
+  fi
   flags="$flags applied-branch:$branch"
   # push from the DURABLE repo, not the ephemeral worktree (r1 P1 #3): the pre-push hook
   # detaches a review worker whose repo path must outlive this process — cleanup() removes
@@ -534,13 +554,31 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
     apply_note="APPLIED locally as $branch — push withheld: core.hooksPath $([[ "$hp" -eq 0 ]] && echo "is set (tracked-hook execution risk)" || echo "probe errored (rc=$hp)"); push by hand after inspecting hooks"
     return 0
   fi
-  if net_bounded git -C "$repo_path" push -q -u origin "$branch"; then
+  # PUBLISH to the remote that TRIGGERED the review, never a hardcoded origin (post-merge review
+  # #1, missing-scoping): a review fired by pushing PRIVATE work to a non-origin/private remote must
+  # not land its fix branch on a different — possibly PUBLIC — origin. autofix_fire forwards the
+  # triggering remote as MYNDAIX_FIX_REMOTE (git's pre-push remote URL). Empty = a manual/direct
+  # play-fix run with no trigger remote -> origin (the historical default). Fail-CLOSED on a
+  # malformed value (leading dash = option injection, or control chars) rather than push somewhere
+  # unintended — `git push -- <remote>` is not portable, so we validate instead of relying on `--`.
+  local push_remote="${MYNDAIX_FIX_REMOTE:-origin}"
+  if [[ "$push_remote" == -* ]] || printf '%s' "$push_remote" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    apply_note="APPLIED locally as $branch — push withheld: MYNDAIX_FIX_REMOTE malformed; push by hand"
+    return 0
+  fi
+  # a URL may carry userinfo (https://user:token@host) — strip it before push_remote ever enters a
+  # human-facing note/log so a credential can't leak into the inbox (review kilabz #4). The actual
+  # push/PR still use the raw push_remote; only the message text is sanitized.
+  local push_remote_safe="${push_remote//:\/\/*@/://***@}"
+  if net_bounded git -C "$repo_path" push -q "$push_remote" "$branch"; then
     flags="$flags pushed"
-    apply_note="APPLIED + PUSHED as $branch ($1) — the push-review loop reviews it; merge stays gated."
+    apply_note="APPLIED + PUSHED as $branch ($1) to $push_remote_safe — the push-review loop reviews it; merge stays gated."
     if [[ "${MYNDAIX_FIX_TEST_MODE:-}" != "1" ]] && command -v gh >/dev/null 2>&1; then
       # PR base = the ORIGINATING branch (r1 P2 #7), passed by autofix_fire via env; validated
       # here, fail-CLOSED: no/invalid base -> branch-only (never let gh default to main for a
-      # fix whose base commit sits on an unmerged feature branch).
+      # fix whose base commit sits on an unmerged feature branch). gh infers the target repo from
+      # $repo_path's remotes (single-origin) — no owner/repo URL derivation (that path had substring
+      # + fetch-vs-push bugs and only mattered for a multi-remote setup we don't run).
       local pr_base="${MYNDAIX_FIX_BASE_BRANCH:-}"
       if [[ "$pr_base" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$ && "$pr_base" != *..* && "$pr_base" != fix/auto/* ]]; then
         if ( cd "$repo_path" && net_bounded gh pr create --head "$branch" --base "$pr_base" \
@@ -555,7 +593,7 @@ apply_maybe(){ # $1 = verdict tier; commits the immutable patch to fix/auto/<pla
       fi
     fi
   else
-    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push -u origin $branch"
+    apply_note="APPLIED locally as $branch — PUSH FAILED or timed out (${NET_TIMEOUT}s); push by hand: git push $push_remote_safe $branch"
   fi
   return 0
 }

@@ -386,8 +386,13 @@ autofix_fire(){
   # MYNDAIX_FIX_BASE_BRANCH: the ORIGINATING branch (r1 P2 #7) so play-fix can open the fix PR
   # against the right base instead of gh's default-branch fallback. Ref shape already enforced
   # refs/heads/* above; play-fix re-validates fail-closed.
+  # MYNDAIX_FIX_REMOTE: the remote that TRIGGERED this review (git's pre-push remote URL, arg 6 /
+  # $remote_url — post-merge review #1). play-fix binds its push + PR to it instead of a hardcoded
+  # origin, so a review fired against a non-origin/private remote can't publish the fix to a
+  # different (possibly public) origin. Empty here (a direct --worker call) -> play-fix uses origin.
   nohup env -i PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" HOME="$HOME" \
     MYNDAIX_FIX_BASE_BRANCH="${ref#refs/heads/}" \
+    MYNDAIX_FIX_REMOTE="$remote_url" \
     "$fixer" "$repo_id" "$fix_base" "$run/fixlist.txt" </dev/null >/dev/null 2>&1 &
   return 0
 }

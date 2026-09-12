@@ -275,6 +275,26 @@ else
   echo "  FAIL: branches=$(auto_branches) (expected 3, no push)"; fail=$((fail+1))
 fi
 git -C "$REPO" config --unset core.hooksPath
+echo "37. ARMED: commit.gpgSign=true + failing signer still commits+pushes (-c commit.gpgSign=false, review #3)"
+git -C "$REPO" config commit.gpgSign true
+git -C "$REPO" config gpg.program /usr/bin/false      # a signer that ALWAYS fails: without the override, commit dies
+run fixture_nof2p "$TMP/good.patch"; check "gpgsign forced off" SUITE_GREEN
+[[ "$(auto_branches)" == "4" ]] && { echo "  ok: signing disabled, fix committed+pushed"; pass=$((pass+1)); } \
+  || { echo "  FAIL: gpgSign blocked the commit (branches=$(auto_branches), expected 4)"; fail=$((fail+1)); }
+git -C "$REPO" config --unset commit.gpgSign
+git -C "$REPO" config --unset gpg.program
+echo "38. ARMED: push honors MYNDAIX_FIX_REMOTE, not a hardcoded origin (review #1)"
+git init -q --bare "$TMP/origin2.git"
+auto_branches2(){ git -C "$TMP/origin2.git" for-each-ref refs/heads --format='%(refname:short)' 2>/dev/null | grep -c '^fix/auto/' || true; }
+rm -f "$INBOX"/*.md 2>/dev/null || true
+MYNDAIX_ORCH="$ORCH" MYNDAIX_REPOS_JSON="$ORCH/repos.json" MYNDAIX_FIX_INBOX="$INBOX" \
+  MYNDAIX_FIX_TEST_MODE=1 MYNDAIX_FIX_REMOTE="$TMP/origin2.git" \
+  MYNDAIX_FIX_PATCH_OVERRIDE="$TMP/good.patch" bash "$PLAY" fixture_nof2p "$BASE" "$TMP/fixlist.txt" >/dev/null 2>&1 || true
+if [[ "$(auto_branches2)" == "1" && "$(auto_branches)" == "4" ]]; then
+  echo "  ok: fix pushed to MYNDAIX_FIX_REMOTE, origin untouched"; pass=$((pass+1))
+else
+  echo "  FAIL: remote not honored (origin2=$(auto_branches2) want 1, origin=$(auto_branches) want 4)"; fail=$((fail+1))
+fi
 rm -f "$ORCH/AUTOFIX_APPLY_ENABLED"
 
 echo
