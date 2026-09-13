@@ -1,107 +1,127 @@
 # Learning-Loop Measurement Arc — DESIGN.md
 
-**Status:** design (v0.1, design-only pass — NOT built). Source brief:
-`~/company/close-the-learning-loop-inputs.md`. Scope: the **measurement arc** only. The
-**feedback arc** (auto rule/skill proposal) is a separate, hard-gated follow-on — it already
-mostly exists as the auto-capture proposer (`docs/auto-capture-design.md`); its remaining piece
-is the S7 driver, designed elsewhere.
+**Status:** design v0.2 (design-only — NOT built). v0.1 taken to cross-family review 2026-09-13;
+review found the primary metric inverted + a censoring confound + stale schema assumptions. v0.2
+folds every blocker/P1. **Fork chosen: (a) an HONEST DIAGNOSTIC, explicitly NOT a "learning rate"**
+— ledger-only, read-only, small. Source: `~/company/close-the-learning-loop-inputs.md`. Feedback
+arc (auto-capture proposer) stays fenced out (`docs/auto-capture-design.md`).
 
-## What
-A read-only, time-bucketed **recurrence-rate metric** over the existing `finding_outcome`
-event log: does the same class/finding recur *less* over time? Surfaced as a new
-`mxr outcome-recurrence` read verb (sibling of `outcome-stats`) + a weekly number the
-`audit-reviews` cadence can cite. **Collect + REPORT only — no dial acts on it, no mutation, no
-PR, no LLM** (matches the ledger's stated "v1 COLLECTS ONLY").
+## What (reframed)
+A read-only diagnostic over the `finding_outcome` event log. **Primary signal: the weekly arrival
+count of NEW instances (first-ever-seen `finding_key`) per `rule_tag` class** — "are we still
+introducing new instances of this mistake-class, and is that trending down?" This — NOT recurring
+keys — is the learning signal. Surfaced as `mxr outcome-recurrence` (read-only) + a number for the
+`audit-reviews` cadence. **Report-only: no dial, no mutation, no PR, no LLM.**
 
-## Why
-"It's learning" must be a NUMBER, not a story — otherwise you can't tell accumulation from
-improvement. This metric is the **instrument that later proves the feedback arc works**: after
-the proposer lands a skill for recurring class X, X's recurrence-rate should drop. Without it,
-arming the proposer is flying blind (a bad auto-learned rule poisons every future run). PR #140
-(recorder stderr visibility, merged+deployed 2026-09-12) is a **just-closed prerequisite** —
-before it, findings could silently fail to record, so any recurrence number would be a lie.
+## Why the v0.1 reframe (review blockers B1–B3, all verified in code)
+- **B1 — `finding_key` is a LINE, not a CLASS.** A recurring key = the same line still flagged =
+  *technical debt*, not learning. Making the same *kind* of mistake in a new file mints a NEW key.
+  So the learning signal is **new-instance arrival per `rule_tag` trending → 0**, not recurring-key.
+- **B2 — per-review counts are cadence-poisoned.** `count(DISTINCT review event)` swings with CI
+  frequency, not behavior. Measure **state transitions** (first-appearance; first reopen-after-close),
+  not per-review tallies. And `finding_outcome` has **no denominator** — clean/finding-free reviews
+  write zero rows — so we publish **counts/transitions, never a "rate."**
+- **B3 — terminal labeling CENSORS observations** (`postgres_store.py:1618`: the recorder skips
+  re-raising a `(key, family)` once it carries a human label). Post-label recurrence is invisible;
+  more labeling alone lowers observed recurrence. **Every number is scoped "observed, censored after
+  terminal labeling,"** and labeling coverage is reported beside it.
 
-## Build vs Adopt (verified against the code this pass)
-| Piece | Verdict | Basis |
+## Signals (facets of one event history — NOT disjoint totals)
+1. **New-instance arrival (primary):** per `(repo, rule_tag, UTC-week)`, count `finding_key`s whose
+   FIRST-EVER raise (min `seq` over all history, before windowing) falls in that week. Trending down
+   = the loop is preventing new instances of that class.
+2. **Regression (secondary):** one onset per `open → applied_fixed → open` *episode* on the **same
+   `ref`**, ordered by `seq` (not `created_at`); later raises in the episode = continuation, not new
+   onsets. `applied_fixed` is a **lifecycle proxy** (fires on delete/rename/edit — NOT confirmed
+   truth), so this is labeled "observed reappearance after recorded closure," not "a real fix returned."
+3. **Repeated-raise-without-close (replaces "persistently-open"):** ≥2 recorded raises of a key with
+   no intervening recorded close. ("Persistently-open across reviews" is NOT computable — the ledger
+   has no record of clean reviews that inspected-and-passed.) Expiry (`ttl_sweep/expired`) ends an episode.
+
+## Admission predicate (a "raise" is exactly this — the source_event grammar has 5 prefixes)
+```sql
+outcome_source = 'review_raised' AND outcome = 'open' AND source_event LIKE 'review:%'
+```
+Count **distinct event identifiers**, grain `(finding_key, reviewer_family, source_event)`. Closures
+(`auto_fix_landed/applied_fixed`) also carry `review:<play>` — the predicate excludes them.
+`human:*`, `sweep:*`, `probe:*`, `panel:*` are NOT raises. Prefix text does not authenticate an event
+— rely on the `(outcome_source, outcome)` pair, not the string.
+
+## Real-vs-machine-vs-unadjudicated (via full algebra — schema evolved past schema.sql)
+`finding_current` resolves one row per **`(finding_key, reviewer_family)`** — join on that grain, never
+key alone (else multiplied rows / conflicting family labels). Keep four explicit states; machine priors
+must NEVER silently become confirmed truth:
+
+| `outcome_source` | outcome(s) | treatment |
 |---|---|---|
-| Repeat-detection storage | **ADOPT** | `finding_outcome` is append-only; `finding_key = sha256(repo\0tag\0path\0line_hash)` already gives content identity — a repeat = same key across ≥2 `source_event='review:%'` rows |
-| Outcome classification | **ADOPT** | `finding_current` view (human-terminal precedence, else latest-by-seq) already resolves real-vs-fp per key |
-| Recurrence-rate view (time-bucketed trend) | **BUILD (small)** | `finding_precision` has NO time window (all-history); no recurrence-rate view exists |
-| Read verb | **BUILD (small)** | mirror `outcome_stats()` → `outcome_recurrence()` + a `mxr` printer |
-| External tools (SonarQube new-vs-existing recurrence) | **BORROW-THE-PATTERN only** | our `finding_key` already mirrors issue-identity-across-scans (our code even references SonarQube); adopting a tool violates local-first |
+| `review_raised` | `open` | a RAISE (the observation unit) |
+| `auto_fix_landed` | `applied_fixed` | closure PROXY (lifecycle, not truth) |
+| `human_confirm` | `confirmed_real` | human real (ground truth) |
+| `human_dismiss` | `dismissed_false_positive` / `dismissed_wontfix` | human FP vs declined (distinct) |
+| `ttl_sweep` | `expired` | episode end, NOT a fix |
+| `auto_git_revert` | `reverted` | reserved — no v1 writer; excluded |
+| `exec_verified` | `exec_real_prior` | UNCONFIRMED machine — excluded from truth split |
+| `panel_proposed` | `panel_real` / `panel_fp` | UNCONFIRMED machine — excluded from truth split |
 
-## Data flow
-```
-review raises finding  --(existing)-->  finding_outcome append (source_event='review:<play>')
-                                             |
-   [NEW] recurrence views aggregate DISTINCT review-events per key / per rule_tag, by week
-                                             |
-        mxr outcome-recurrence  --reads views (read-only)-->  weekly trend table
-                                             |
-             audit-reviews (weekly)  --cites the number-->  is the repeat-rate dropping?
-```
+FP recurrence (`dismissed_false_positive`) = a REVIEWER repeating a wrong call → reported under
+reviewer-quality (`audit-reviews`), NOT the learning signal. Correction: the ops DB has
+`finding_precision_raw` / `finding_precision_promoted` (migration 0010), NOT `finding_precision`.
 
-## The metric — three distinct signals (do NOT conflate)
-1. **Class recurrence (primary):** per `rule_tag` per week — distinct review-events raising it,
-   split NEW-key vs RECURRING-key (a key first-seen in a prior week). "Are we making the same
-   *kind* of mistake, and is that trending down?" This is what the proposer acts on.
-2. **Regression (sharpest):** a `finding_key` that reached `applied_fixed` (by event `seq`) and
-   later reappears as a `review_raised` `open` — the fix came back. Ordered by `seq`, never
-   `created_at`.
-3. **Persistently-open:** same key raised across consecutive reviews, never fixed — an
-   *unaddressed* finding, not a regression. Reported separately.
+## Intervention overlay (so before/after is attributable)
+Join `skill_use (review_play, skill_name, body_sha, used_at)` to anchor "Day-0" = when a skill was
+actually EXPOSED to reviews (more precise than PR-open time). The diagnostic can then show new-instance
+arrival for a `rule_tag` before vs after its skill's first exposure. (Correlational, clearly labeled.)
 
-**Real vs FP split (via `finding_current`):** recurrence of `applied_fixed` / human-confirmed
-findings = the SYSTEM repeating a real mistake (the loop's target). Recurrence of
-`dismissed_false_positive` = the REVIEWER repeating a wrong call (reviewer-quality —
-`audit-reviews`' domain, reported separately, NOT the learning-loop mistake-rate).
+## Reporting contract
+UTC weeks, half-open `[start,end)`; first-seen computed over FULL history then windowed; dedup to the
+admission grain BEFORE bucketing; current (partial) week marked incomplete; classification policy =
+**as-of reporting-cutoff** (frozen — so before/after comparisons use consistent adjudication, unlike
+current-knowledge which silently restates history); every output stamps generation-time, cutoff, and
+metric-version. Small-N: show distinct reviews/tips + labeling coverage beside counts; suppress no real
+observation, but never imply a rate from a handful of events.
 
-## Edge cases
-- **Sparse/zero data:** empty view → surface prints "no recurrence data yet" (like `outcome-stats`
-  on empty precision). All-zero must stay VISIBLE — it's the #140-class starvation signal, not
-  "we're perfect."
-- **Multiple rows per key per review** (open + later applied_fixed + human label): count
-  **DISTINCT `source_event LIKE 'review:%'`**, never raw rows; classify outcome via
-  `finding_current`, never the raw per-event `outcome` (else a later human correction is ignored).
-- **Non-review events:** `source_event` also holds `'human:*'` and `'sweep:<utcday>'` — a label
-  or a TTL sweep is NOT a re-raise; recurrence counts filter to `review:%`.
-- **Small-N honesty:** never print a confident rate on a handful of events — show counts + N, and
-  suppress/annotate the rate below a minimum sample (avoid a "learning!" story from noise).
-- **Cross-family:** `applied_fixed` is per (key, family); regression = ANY family re-raising a
-  previously-fixed key.
-
-## Security surface
-Read-only views + read-only CLI. No untrusted input (no user-supplied query fragments), no
-mutation, no PR/skill creation (that's the deferred proposer), no LLM. Blast radius = a
-*misleading number* on a report — mitigated by the precise metric definition above, the small-N
-honesty rule, and the acceptance gate below. Nothing here can act on or poison a future run.
+## Runtime contract / trust boundary (precise)
+`connect → read-only SELECT aggregation → print`. NO migrations, recorder/TTL/label writes, snapshots,
+job dispatch, or skill/PR ops in the read path. Reviewer-derived tags are untrusted EVIDENCE — structured
+filtering limits interpretation, not truthfulness; the diagnostic reports what was OBSERVED, asserts no
+truth. Four distinct terminal states, none conflated: (i) observations present, zero repeats; (ii) no
+finding observations; (iii) no/unknown review activity; (iv) query/connection FAILURE. **A measurement
+failure MUST exit non-zero and be distinguishable from an empty successful report** — do NOT copy
+`outcome_stats()`'s success-on-failure (that is the #140 silent-failure class, again).
 
 ## Files (build phase — NOT this pass)
-- `src/runtime/ledger/migrations/NNNN_finding_recurrence.sql` — the view(s), idempotent
-  (`CREATE OR REPLACE VIEW`); rebuildable, zero data migration.
-- `src/runtime/ledger/schema.sql` — same view(s) on the fresh-DB path (lockstep w/ migration).
-- `src/runtime/ledger/postgres_store.py` — `outcome_recurrence()` read method (mirrors
-  `outcome_stats()`).
-- `src/runtime/outcomerecord.py` (or `cli.py`) — `mxr outcome-recurrence` printer + routing.
-- `tests/test_postgres_ledger.py` — seed events → assert class-recurrence, regression, and
-  real-vs-fp split; assert `review:%`-only filtering and `finding_current` classification.
+- `migrations/NNNN_finding_recurrence.sql` — the diagnostic view(s), idempotent `CREATE OR REPLACE VIEW`.
+- `schema.sql` — same view(s), fresh-DB path (lockstep).
+- `postgres_store.py` — `outcome_recurrence()` read method (own read path; distinguishable failure).
+- `outcomerecord.py`/`cli.py` — `mxr outcome-recurrence` printer + routing.
+- `tests/test_postgres_ledger.py` — the acceptance fixtures below.
 - *(later, separate)* `audit-reviews` skill — cite the weekly number.
 
-## Dependencies
-`finding_outcome` accrual working (PR #140 ✓). Postgres. No new libraries.
+## Acceptance fixtures (declared expected results — must pass before build is "green")
+| History / boundary | Required assertion |
+|---|---|
+| raise A → close B | NO recurrence, NO regression |
+| same key twice in one play (both families) | explicit dedup; not a second raise |
+| raise → raise within one week | defined new-vs-repeat behavior (first-seen from full history) |
+| raise → close → raise → raise | ONE regression onset + continuation |
+| raise → expire → raise | NOT a fixed-key regression |
+| raise → human real/FP → attempted re-raise | demonstrates the CENSORED (missing) observation |
+| fix on ref A → raise on ref B | NO unqualified regression (ref fence) |
+| new + recurring keys in one class/review | no accidental partition / double-count |
+| human correction; intervening panel/probe rows | correct truth precedence; raise counts unchanged |
+| first obs before window; reversed timestamps; empty week; query failure | correct lookup/ordering/visibility; failure ≠ empty |
 
 ## Deliberately NOT built (scope fence)
-The S7 proposer / any rule or skill mutation (deferred, hard-gated — its own design + attack
-pass); any ML/embedding; any new storage table; any dial that ACTS on the metric. Stays
-report-only.
+The S7 proposer / any rule/skill mutation (its own gated design + attack pass); a true "learning rate"
+(needs a recorder change to un-censor + a denominator source — deferred unless this diagnostic proves
+insufficient); any ML/embedding; any new storage table; any dial that ACTS on the output.
 
 ## Acceptance / prove-it-green
-- **This slice:** the views compute correct recurrence/regression/real-vs-fp on seeded fixture
-  events (test), and produce a sane baseline number on the real ledger.
-- **Loop-closing (later, gated, after the proposer exists):** the repeat-rate of an intervened
-  class measurably DROPS on a real before/after. Until that number moves, the loop is a wish.
+- **This slice:** views compute new-instance / regression / repeated-raise correctly on the fixtures
+  above; the read path returns a sane baseline on the real ledger AND fails non-zero on a broken DSN.
+- **Loop-closing (later, gated):** after the proposer lands a skill for class X, X's new-instance
+  arrival measurably drops on a real before/after (overlay-anchored). Until that moves, the loop is a wish.
 
 ## Concurrency boundary
-Design + this doc's review change zero runtime code and restart nothing — parallel-safe. The
-BUILD (a migration `serve` auto-applies on boot) must land only when no other build depends on
-the live runtime ("renovate the engine only when it isn't pulling a train").
+Design + review = zero runtime code, no restart — parallel-safe. The BUILD (a migration `serve`
+auto-applies on boot) lands only when no other build depends on the live runtime.
