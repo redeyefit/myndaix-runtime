@@ -443,13 +443,14 @@ def test_mark_raise_retains_reservation():
 
 def test_proposing_claim_suspect_kept_but_not_double_reserved():
     # ff-r5 P2: a surviving 'proposing' claim (failed release) is ALREADY in count_open_proposals;
-    # its retained suspect must not reserve a second slot. inflight={fpP} + open_count=1 (the
-    # proposing row) under cap 3: creation for fpZ must still be possible (1 counted + 1 new < 3).
+    # its retained suspect must not reserve a second slot. open_count=2 under cap 3 (kilabz r6 P3:
+    # at open_count=1 the assertion passed even with double-counting restored — 2 is the boundary
+    # where an erroneous extra reservation hits the cap and blocks fpZ; verified discriminating).
     _reset(False)
     P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpP", "repo_scope": "myndaix-runtime",
                                             "branch": "skill/auto/fail-open"}]))
-    led = FakeLedger(open_count=1, inflight={"fpP"},
+    led = FakeLedger(open_count=2, inflight={"fpP"},
                      ready=[{"fingerprint": "fpZ", "repo_scope": "myndaix-runtime",
                              "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
     async def _claim(fp, branch, draft_sha):
