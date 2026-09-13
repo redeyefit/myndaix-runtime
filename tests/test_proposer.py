@@ -34,14 +34,20 @@ def ok(cond, label):
 class FakeLedger:
     """Records every mutating call so a test can assert DRY_RUN mutates NOTHING (A9) and the happy
     path mutates exactly right. Read methods return seeded data."""
-    def __init__(self, ready=None, proposed=None, open_count=0, provenance=None):
+    def __init__(self, ready=None, proposed=None, open_count=0, provenance=None, inflight=None):
         self._ready = ready or []
         self._proposed = proposed or []
         self._open = open_count
         self._prov = provenance or []
+        self._inflight = inflight    # None -> derive from proposed (like the real ledger's superset)
         self.mutations = []          # (verb, *args) for every state-changing call
         self.claim_ok = True
         self.mark_ok = True
+
+    async def list_inflight_fingerprints(self):
+        if self._inflight is not None:
+            return set(self._inflight)
+        return {p["fingerprint"] for p in self._proposed}
 
     # -- reads --
     async def list_ready_candidates(self, limit, after=""):
@@ -367,22 +373,30 @@ def test_corrupt_suspects_file_disables_creation_and_is_preserved():
 
 
 def test_already_tracked_suspect_cleared_without_double_reserve():
-    # ff-r4 P2: a suspect whose class is ALREADY tracked (state='proposed' — e.g. a mark committed
-    # but its response raised) must be cleared, not kept — its ledger row already counts in
-    # n_open, so keeping it would double-reserve and block real capacity until closure.
+    # ff-r4 P2 + ff-r5 discrimination fix: a suspect whose class is ALREADY tracked
+    # (state='proposed' — e.g. a mark committed but its response raised) is cleared even when its
+    # PR lookup returns FOUND and the claim would be refused (row not 'ready'). Capacity is
+    # arranged so DOUBLE-counting would block the next candidate's create: open_count=2 (fpT +
+    # one other) under cap 3 — the buggy keep+reserve makes n_open 3 and blocks fpZ; correct
+    # clearing leaves room and fpZ creates.
     _reset(False)
     P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpT", "repo_scope": "myndaix-runtime",
                                             "branch": "skill/auto/fail-open"}]))
-    led = FakeLedger(open_count=1,
+    led = FakeLedger(open_count=2,
                      proposed=[{"fingerprint": "fpT", "repo_scope": "myndaix-runtime",
                                 "rule_tag": "fail-open", "pr_number": 44,
                                 "branch": "skill/auto/fail-open", "proposed_at": None}],
                      ready=[{"fingerprint": "fpZ", "repo_scope": "myndaix-runtime",
                              "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
+    async def _claim(fp, branch, draft_sha):
+        led.mutations.append(("claim", fp, branch))
+        return fp != "fpT"                                       # the tracked row refuses a claim
+    led.claim_for_proposing = _claim
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    P._find_open_bot_pr = lambda repo, branch: (("found", 44) if branch.endswith("fail-open")
+                                                else ("none", None))
     saved_rbe = P._remote_branch_exists
     P._remote_branch_exists = lambda repo, branch: False
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
@@ -391,7 +405,72 @@ def test_already_tracked_suspect_cleared_without_double_reserve():
         _run(P.propose(led))
         ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "the already-tracked suspect is cleared")
         ok(("mark", "fpZ", 45) in led.mutations,
-           "no phantom reservation: capacity 1+0 tracked-suspect-overlap leaves room for fpZ")
+           "no double reservation: fpZ still creates (2 tracked incl. fpT + 1 new = cap 3)")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_mark_raise_retains_reservation():
+    # ff-r5 P1: a RAISING mark (or failed fence-close) is an unresolved exit — the reservation
+    # taken at intent-persist must survive so further creates stay gated. 2 tracked / cap 3: the
+    # first create's mark raises; the second candidate must NOT create (reservation held).
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i}", "repo_scope": "myndaix-runtime", "rule_tag": t,
+              "path_glob": "src/*.py", "decline_count": 0}
+             for i, t in enumerate(["fail-open", "toctou-race"])]
+    led = FakeLedger(open_count=2, ready=ready)
+    async def _raising_mark(fp, branch, draft_sha, pr):
+        raise RuntimeError("mark response lost")
+    led.mark_capture_proposed = _raising_mark
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    creates = {"n": 0}
+    def _create(repo, wt, branch, slug):
+        creates["n"] += 1; return ("opened", 46)
+    P._push_and_open_pr = _create
+    try:
+        _run(P.propose(led))
+        ok(creates["n"] == 1, "a raising mark retains the reservation — no second create")
+        ok(json.loads(P.SUSPECTS_FILE.read_text())[0]["fingerprint"] == "fp0",
+           "the intent survives the raising mark (next tick re-tracks the real PR)")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_proposing_claim_suspect_kept_but_not_double_reserved():
+    # ff-r5 P2: a surviving 'proposing' claim (failed release) is ALREADY in count_open_proposals;
+    # its retained suspect must not reserve a second slot. inflight={fpP} + open_count=1 (the
+    # proposing row) under cap 3: creation for fpZ must still be possible (1 counted + 1 new < 3).
+    _reset(False)
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpP", "repo_scope": "myndaix-runtime",
+                                            "branch": "skill/auto/fail-open"}]))
+    led = FakeLedger(open_count=1, inflight={"fpP"},
+                     ready=[{"fingerprint": "fpZ", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
+    async def _claim(fp, branch, draft_sha):
+        led.mutations.append(("claim", fp, branch))
+        return fp != "fpP"                                       # the proposing row refuses a claim
+    led.claim_for_proposing = _claim
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: (("found", 47) if branch.endswith("fail-open")
+                                                else ("none", None))
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 48)
+    try:
+        _run(P.propose(led))
+        suspects = json.loads(P.SUSPECTS_FILE.read_text())
+        ok(len(suspects) == 1 and suspects[0]["fingerprint"] == "fpP",
+           "the suspect for a live 'proposing' claim is KEPT (may still resolve either way)")
+        ok(("mark", "fpZ", 48) in led.mutations,
+           "but NOT double-reserved: fpZ still creates (the count already holds fpP's slot)")
     finally:
         P._remote_branch_exists = saved_rbe
 

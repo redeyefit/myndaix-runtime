@@ -1496,6 +1496,15 @@ class PostgresLedger:
         return await self._pool.fetchval(
             "SELECT count(*) FROM capture_candidate WHERE state IN ('proposing','proposed')")
 
+    async def list_inflight_fingerprints(self) -> set:
+        """The fingerprints count_open_proposals() counts (proposing OR proposed). The proposer's
+        suspect resolution dedupes its capacity reservations against this set (ff-r5 P2: a
+        surviving 'proposing' claim is already in the count — reserving again for its retained
+        suspect double-blocks capacity until reap). READ-ONLY."""
+        rows = await self._pool.fetch(
+            "SELECT fingerprint FROM capture_candidate WHERE state IN ('proposing','proposed')")
+        return {r["fingerprint"] for r in rows}
+
     async def list_ready_candidates(self, limit: int, after: str = "") -> list[dict]:
         """The proposer's work queue: 'ready' classes in FINGERPRINT keyset order, starting strictly
         AFTER `after` (the proposer persists the last-visited fingerprint as a cursor and wraps to

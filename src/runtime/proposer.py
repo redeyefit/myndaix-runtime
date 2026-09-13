@@ -388,10 +388,17 @@ def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> tuple[str
                         and the next tick's adopt-probe re-tracks it if real.
     Push is PLAIN (no --force): the caller verified the branch's absence just before; a branch
     racing into existence in that gap is rejected non-fast-forward (or, if it points at an
-    ancestor of our commit, fast-forwards losslessly — its commit stays in our history)."""
-    push = _git(wt, "push", "origin", f"HEAD:refs/heads/{branch}")
-    if push.returncode != 0:
-        log(f"push failed: {push.stderr.strip()[:200]}"); return ("no-pr", None)
+    ancestor of our commit, fast-forwards losslessly — its commit stays in our history).
+
+    NEVER RAISES (ff-r5 P1: an escaping exception — a push TimeoutExpired, a UnicodeDecodeError
+    from output decoding — bypassed the caller's outcome accounting): any unexpected error after
+    entry is 'unknown' (the push may have gone through), reported as a value, not an exception."""
+    try:
+        push = _git(wt, "push", "origin", f"HEAD:refs/heads/{branch}")
+        if push.returncode != 0:
+            log(f"push failed: {push.stderr.strip()[:200]}"); return ("no-pr", None)
+    except Exception as e:
+        log(f"push raised ({e!r}) — outcome UNKNOWN"); return ("unknown", None)
     title = f"skill(auto): {slug} — recurring review finding (review before merge)"
     body = (f"Auto-proposed by the S7 proposer from a recurring `rule:{slug}` finding. This is an "
             f"UNAUTHORED STUB — fill in the real lesson (see the provenance commits in the diff) and "
@@ -401,7 +408,7 @@ def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> tuple[str
                             "--base", repo["default_branch"], "--head", branch,
                             "--title", title, "--body", body],
                            capture_output=True, text=True, env=_git_env(), timeout=GH_TIMEOUT, check=False)
-    except subprocess.SubprocessError as e:
+    except Exception as e:                        # SubprocessError, UnicodeDecodeError, anything:
         log(f"gh pr create raised ({e!r}) — outcome UNKNOWN, reserve + recover next tick"); return ("unknown", None)
     if r.returncode != 0:
         log(f"gh pr create failed: {r.stderr.strip()[:200]} — outcome unknown"); return ("unknown", None)
@@ -493,11 +500,19 @@ def _load_suspects() -> tuple[list[dict], bool]:
         raw = json.loads(SUSPECTS_FILE.read_text())
     except FileNotFoundError:
         return [], True
-    except (json.JSONDecodeError, OSError):
-        return [], False
+    except (ValueError, OSError):      # ValueError covers JSONDecodeError AND UnicodeDecodeError
+        return [], False               # (ff-r5: invalid UTF-8 escaped and aborted before adoption)
     if not isinstance(raw, list):
         return [], False
-    return [s for s in raw if isinstance(s, dict) and s.get("fingerprint")], True
+    # STRICT whole-schema validation (ff-r5 P1): a single malformed record — [null], a dict missing
+    # fingerprint/repo_scope/branch — marks the WHOLE file unhealthy. Filtering it away would
+    # silently discard what may be a real (corrupted) reservation and then overwrite the evidence.
+    for s in raw:
+        if not (isinstance(s, dict)
+                and all(isinstance(s.get(k), str) and s.get(k)
+                        for k in ("fingerprint", "repo_scope", "branch"))):
+            return [], False
+    return list(raw), True
 
 
 def _save_suspects(suspects: list[dict]) -> bool:
@@ -569,6 +584,11 @@ async def propose(led) -> None:
             log("suspects file DAMAGED/unreadable — preserving as-is; creation DISABLED this tick")
         else:
             tracked = {p["fingerprint"] for p in await led.list_proposed()}
+            # inflight = everything count_open_proposals() counts, INCLUDING 'proposing' claims a
+            # failed release left behind (ff-r5 P2): their suspects are KEPT (the claim may still
+            # resolve either way) but never reserved — the count already holds their slot.
+            inflight = (await led.list_inflight_fingerprints()
+                        if hasattr(led, "list_inflight_fingerprints") else tracked)
             remaining: list[dict] = []
             for s in suspects:
                 try:
@@ -606,9 +626,14 @@ async def propose(led) -> None:
                     log(f"suspect {s.get('branch')} resolution raised ({e!r}) — keep + reserve")
                     remaining.append(s)
             _save_suspects(remaining)
-            if remaining:
-                n_open += len(remaining)                          # capacity reserved while uncertain
-                log(f"{len(remaining)} unresolved suspect(s) — reserving {len(remaining)} MAX_OPEN slot(s)")
+            # reserve ONLY for suspects the ledger count doesn't already hold (ff-r5 P2: a
+            # surviving 'proposing' claim is in count_open_proposals — reserving its suspect too
+            # would double-block capacity until reap).
+            reserve = sum(1 for s in remaining if s["fingerprint"] not in inflight)
+            if reserve:
+                n_open += reserve
+                log(f"{len(remaining)} unresolved suspect(s) — reserving {reserve} MAX_OPEN slot(s) "
+                    f"({len(remaining) - reserve} already counted in-flight)")
     # FAIRNESS (kilabz r2 #7): scan in fingerprint keyset order starting after a PERSISTED cursor,
     # wrapping to the start when the tail is exhausted — every ready row is eventually visited even
     # if 100+ persistently-skipped candidates (unlisted scope, render reject) sit ahead of it. The
@@ -715,6 +740,11 @@ async def propose(led) -> None:
                 except Exception:
                     pass
                 await led.release_proposing(fp, branch, draft_sha); continue
+            # RESERVE EXACTLY ONCE, here, with the intent (ff-r5 P1): every unresolved exit — an
+            # unknown outcome, a raising mark, a failed fence-close, the candidate exception
+            # handler — RETAINS this reservation; only a DEFINITIVE no-pr refunds it, and an
+            # opened+marked outcome converts it into the tracked count (no second increment).
+            n_open += 1
             attempts += 1                                         # burn budget on the ATTEMPT
             try:
                 outcome, pr_number = _push_and_open_pr(repo, wt, branch, slug)
@@ -724,9 +754,8 @@ async def propose(led) -> None:
                 except Exception as ce:                           # outcome accounting (ff-r2 M2a);
                     log(f"worktree cleanup raised ({ce!r}) — tick-start GC sweeps it")
             if outcome == "unknown":
-                # a REAL PR may exist untracked — the intent (already durable) IS the suspect;
-                # reserve the slot in-tick; next tick's resolution re-tracks or clears it.
-                n_open += 1
+                # a REAL PR may exist untracked — the durable intent IS the suspect and the
+                # reservation is already held; next tick's resolution re-tracks or clears it.
                 try:
                     await led.release_proposing(fp, branch, draft_sha)
                 except Exception as e:                            # ff-r3 gap-1: reservation survives
@@ -734,16 +763,18 @@ async def propose(led) -> None:
                 continue
             if outcome != "opened" or pr_number is None:          # "no-pr": DEFINITIVE, nothing created
                 _clear_suspect(fp)
+                n_open -= 1                                       # refund the reservation
                 await led.release_proposing(fp, branch, draft_sha); continue
             if await led.mark_capture_proposed(fp, branch, draft_sha, pr_number):
-                _clear_suspect(fp)                                # tracked in the ledger now
-                log(f"opened draft PR#{pr_number} for {branch} ({repo['nwo']})"); n_open += 1; opened += 1
+                _clear_suspect(fp)                                # the reservation now IS the tracked PR
+                log(f"opened draft PR#{pr_number} for {branch} ({repo['nwo']})"); opened += 1
             else:
                 log(f"mark_proposed fenced out (PR#{pr_number}) — closing our PR")
                 if _gh_close(repo["nwo"], pr_number):
-                    _clear_suspect(fp)                            # definitively closed
+                    _clear_suspect(fp)
+                    n_open -= 1                                   # definitively closed: refund
                 else:
-                    log(f"close of fenced-out PR#{pr_number} FAILED — suspect kept; next tick adopts it")
+                    log(f"close of fenced-out PR#{pr_number} FAILED — suspect+reservation kept")
         except Exception as e:                                    # never let one class wedge the tick
             log(f"propose {c['rule_tag']} raised ({e!r}) — release + continue")
             if claimed and branch is not None:
