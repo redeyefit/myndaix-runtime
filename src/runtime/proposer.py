@@ -101,8 +101,17 @@ def _git_env() -> dict:
     return env
 
 
+# EVERY proposer git op runs with hooks DISABLED (kilabz BLOCKER + MAJOR, one fix): (a) a tracked
+# checkout's hooks (core.hooksPath / .git/hooks) execute during worktree-add/commit/push and inherit
+# GH_TOKEN — a hostile hook exfiltrates the bot credential or stages files AFTER the path assert;
+# (b) the orchestrator's OWN pre-push hook would fire play-review from the ephemeral worktree path,
+# which the proposer then deletes mid-review. /dev/null is not a directory, so git finds no hooks.
+# The PR + human merge is the review gate for a proposal; the pre-push review is not wanted here.
+_GIT_NOHOOKS = ("-c", "core.hooksPath=/dev/null")
+
+
 def _git(cwd: Path, *args: str, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(cwd), "--no-pager", *args],
+    return subprocess.run(["git", "-C", str(cwd), "--no-pager", *_GIT_NOHOOKS, *args],
                           capture_output=True, text=True, env=_git_env(),
                           timeout=timeout or GIT_TIMEOUT, check=False)
 
@@ -157,7 +166,9 @@ def resolve_repo(repo_scope: str) -> Optional[dict]:
     path = Path(p).expanduser().resolve()
     if not (path.is_dir() and (path / ".git").exists()):
         return None
-    info = _gh_json_path(path, "repo", "view", "--json", "nameWithOwner", "defaultBranchRef")
+    # ONE comma-joined --json field list (kilabz BLOCKER: as two argv items, the second becomes
+    # gh's positional REPOSITORY argument — dref never returns and every repo resolves to None).
+    info = _gh_json_path(path, "repo", "view", "--json", "nameWithOwner,defaultBranchRef")
     nwo = info.get("nameWithOwner") if isinstance(info, dict) else None
     dref = (info.get("defaultBranchRef") or {}).get("name") if isinstance(info, dict) else None
     if not (isinstance(nwo, str) and "/" in nwo and isinstance(dref, str) and dref):
@@ -219,29 +230,54 @@ def gc_worktrees() -> None:
 
 # -- K3: symlink-safe, creation-only write of skills/<slug>/SKILL.md inside the worktree ----------
 def _safe_write_skill(wt: Path, slug: str, rendered: str) -> bool:
-    """Write ONLY skills/<slug>/SKILL.md, refusing any symlinked ancestor and creating the file
-    O_EXCL|O_NOFOLLOW (a post-write diff assert can't stop a symlink escape DURING the write — K3).
-    An existing target is refused (enforces the v1 'never edit an existing skill' promise). Returns
-    True on a clean write."""
-    skills = wt / "skills"
-    # ancestor 'skills' must be a real directory, never a symlink
-    if skills.is_symlink() or (skills.exists() and not skills.is_dir()):
-        log(f"skills/ is not a real dir in the worktree — refuse write"); return False
-    skills.mkdir(exist_ok=True)
-    slugdir = skills / slug
-    if slugdir.is_symlink() or slugdir.exists():
-        log(f"skills/{slug} already exists (symlink or dir) — refuse (creation-only)"); return False
-    slugdir.mkdir()
-    target = slugdir / "SKILL.md"
+    """Write ONLY skills/<slug>/SKILL.md via DIRECTORY DESCRIPTORS with O_NOFOLLOW at EVERY
+    component (K3 + kilabz race fix: a static pre-check can be swapped for a symlink between the
+    check and the open — O_NOFOLLOW on the final component alone doesn't cover ancestors; openat
+    against a pinned dir-fd does). An existing slug dir/target is refused (creation-only — enforces
+    the v1 'never edit an existing skill' promise). Returns True on a clean write."""
+    fds: list[int] = []
     try:
-        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    except (FileExistsError, OSError) as e:
-        log(f"O_EXCL open of SKILL.md failed ({e}) — refuse"); return False
-    try:
-        os.write(fd, rendered.encode())
+        try:
+            wt_fd = os.open(str(wt), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as e:
+            log(f"open worktree dir failed ({e}) — refuse"); return False
+        fds.append(wt_fd)
+        try:
+            os.mkdir("skills", dir_fd=wt_fd)
+        except FileExistsError:
+            pass                                   # tracked skills/ dir already in the checkout
+        except OSError as e:
+            log(f"mkdir skills/ failed ({e}) — refuse"); return False
+        try:                                       # ELOOP here = skills/ is a symlink → refuse
+            skills_fd = os.open("skills", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=wt_fd)
+        except OSError as e:
+            log(f"skills/ is not a real dir in the worktree ({e}) — refuse write"); return False
+        fds.append(skills_fd)
+        try:
+            os.mkdir(slug, dir_fd=skills_fd)       # creation-only: an existing slug dir refuses
+        except OSError as e:
+            log(f"skills/{slug} already exists or mkdir failed ({e}) — refuse (creation-only)"); return False
+        try:
+            slug_fd = os.open(slug, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=skills_fd)
+        except OSError as e:
+            log(f"skills/{slug} vanished/replaced after mkdir ({e}) — refuse"); return False
+        fds.append(slug_fd)
+        try:
+            fd = os.open("SKILL.md", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o644, dir_fd=slug_fd)
+        except OSError as e:
+            log(f"O_EXCL open of SKILL.md failed ({e}) — refuse"); return False
+        try:
+            os.write(fd, rendered.encode())
+        finally:
+            os.close(fd)
+        return True
     finally:
-        os.close(fd)
-    return True
+        for f in fds:
+            try:
+                os.close(f)
+            except OSError:
+                pass
 
 
 def _staged_paths(wt: Path) -> list[str]:
@@ -281,6 +317,13 @@ def _make_proposal_commit(repo: dict, wt_name: str, slug: str, rendered: str) ->
                   "commit", "-m", f"skill(auto): propose {slug} (unauthored stub — review before merge)")
     if commit.returncode != 0:
         log(f"commit failed: {commit.stderr.strip()[:200]}"); _git(path, "worktree", "remove", "--force", str(wt)); return None
+    # belt: verify the FINAL COMMITTED change set, not just the pre-commit staging (kilabz: with
+    # hooks disabled this should never differ, but the push gate must not rest on that assumption)
+    show = _git(wt, "show", "--name-only", "--format=", "-z", "HEAD")
+    committed = [p for p in show.stdout.split("\0") if p]
+    if show.returncode != 0 or not capture.assert_only_skill_path(committed, slug):
+        log(f"COMMITTED change set is not exactly {capture.skill_path(slug)} (got {committed}) — abort")
+        _git(path, "worktree", "remove", "--force", str(wt)); return None
     return wt
 
 
@@ -310,21 +353,28 @@ def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> Optional[
     return int(m.group(1))
 
 
-def _find_open_bot_pr(repo: dict, branch: str) -> Optional[int]:
+def _find_open_bot_pr(repo: dict, branch: str) -> tuple[str, Optional[int]]:
     """K1/K2 recovery: is there already an OPEN PR that WE (the bot) opened for this exact branch in
-    OUR repo (not a fork)? Scoped by `--author @me`; validates head is same-repo; rejects an
-    ambiguous multi-match (never 'first match'). Returns the single PR number, or None."""
+    OUR repo (not a fork)? Scoped by `--author @me`; validates head is same-repo. TRI-STATE return
+    (kilabz MAJOR: a single None conflated lookup-failure/ambiguity/absence, and the caller treated
+    all three as permission to create — after a crash-before-mark, a transient lookup failure would
+    force-push a fresh stub OVER a human-edited PR branch):
+      ("found", n)     — exactly one same-repo bot PR: adopt it.
+      ("none", None)   — DEFINITIVE absence (successful empty lookup): creating is safe.
+      ("unknown", None)— lookup failed (gh down/rate-limited): DEFER, never create.
+      ("ambiguous", None) — multi-match: DEFER for a human, never pick-first, never create."""
     rows = _gh_json(repo["nwo"], "pr", "list", "--head", branch, "--state", "open",
                     "--author", "@me", "--json", "number,isCrossRepository,headRefName")
     if not isinstance(rows, list):
-        return None
+        return ("unknown", None)
     mine = [r for r in rows if isinstance(r, dict) and r.get("isCrossRepository") is False
             and r.get("headRefName") == branch and isinstance(r.get("number"), int)]
-    if len(mine) != 1:
-        if mine:
-            log(f"ambiguous open bot PRs for {branch} ({[r['number'] for r in mine]}) — skip")
-        return None
-    return mine[0]["number"]
+    if len(mine) == 1:
+        return ("found", mine[0]["number"])
+    if len(mine) > 1:
+        log(f"ambiguous open bot PRs for {branch} ({[r['number'] for r in mine]}) — defer")
+        return ("ambiguous", None)
+    return ("none", None)
 
 
 # =====================================================================================
@@ -381,12 +431,20 @@ def _age_days(ts) -> float:
 
 async def propose(led) -> None:
     """While under MAX_OPEN, take each ready class AT MOST ONCE (K6): resolve repo (A2), render the
-    stub (K4 marker), claim (CAS), then adopt an existing bot PR (K1) or create one, then mark."""
+    stub (K4 marker), claim (CAS), then adopt an existing bot PR (K1) or create one, then mark.
+    `attempts` counts CREATE ATTEMPTS (not confirmed opens): an unknown gh outcome may have opened
+    a PR whose response was lost, so the budget must burn on the attempt (kilabz MAJOR: counting
+    only confirmed marks allowed 6 create attempts against a 2-per-tick budget)."""
     n_open = await led.count_open_proposals()
     opened = 0
+    attempts = 0
     seen: set = set()
-    for c in await led.list_ready_candidates(MAX_OPEN() * 2):
-        if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK:
+    pruned: set = set()
+    # limit 100, not MAX_OPEN*2 (kilabz MAJOR: a small fixed window re-fetches the same oldest rows
+    # every tick, so a handful of persistently-skipped candidates — unlisted scope, render reject —
+    # STARVE every valid candidate behind them forever; visit-once + budgets still bound the tick)
+    for c in await led.list_ready_candidates(100):
+        if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK or attempts >= MAX_PER_TICK:
             break
         fp = c["fingerprint"]
         if fp in seen:
@@ -402,6 +460,8 @@ async def propose(led) -> None:
             repo = resolve_repo(c["repo_scope"])
             if repo is None:
                 log(f"ready {c['rule_tag']} scope {c['repo_scope']!r} not in repo allowlist — skip"); continue
+            if repo["path"] not in pruned:                        # clear stale worktree admin entries
+                _git(repo["path"], "worktree", "prune"); pruned.add(repo["path"])
             slug = capture.slug(c["rule_tag"])
             if slug is None:
                 log(f"ready {c['rule_tag']} → no safe slug — skip"); continue
@@ -418,16 +478,22 @@ async def propose(led) -> None:
             if not await led.claim_for_proposing(fp, branch, draft_sha):
                 continue                                          # lost the CAS / not ready
             claimed = True
-            existing = _find_open_bot_pr(repo, branch)            # K1: adopt by identity, not hash
-            if existing is not None:
+            status, existing = _find_open_bot_pr(repo, branch)    # K1: adopt by identity, not hash
+            if status == "found":
                 if await led.mark_capture_proposed(fp, branch, draft_sha, existing):
                     log(f"adopted existing PR#{existing} for {branch}"); n_open += 1; opened += 1
                 else:
                     await led.release_proposing(fp, branch, draft_sha)
                 continue
-            wt = _make_proposal_commit(repo, f"{c['repo_scope']}-{slug}", slug, rendered)
+            if status != "none":                                  # unknown/ambiguous: NEVER create
+                log(f"recovery lookup {status} for {branch} — release + defer (no create)")
+                await led.release_proposing(fp, branch, draft_sha); continue
+            # worktree named by fingerprint, not repo_scope (kilabz MINOR: keep the scope string out
+            # of every git argv, including the worktree path — A2's boundary stated fully)
+            wt = _make_proposal_commit(repo, f"wt-{fp[:16]}", slug, rendered)
             if wt is None:
                 await led.release_proposing(fp, branch, draft_sha); continue
+            attempts += 1                                         # burn budget on the ATTEMPT
             try:
                 pr_number = _push_and_open_pr(repo, wt, branch, slug)
             finally:

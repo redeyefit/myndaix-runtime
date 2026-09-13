@@ -19,6 +19,14 @@ TOKEN_FILE="${MYNDAIX_PROPOSER_TOKEN_FILE:-$HOME/.myndaix/.proposer-token}"
 if [[ -r "$TOKEN_FILE" ]]; then
   GH_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
   export GH_TOKEN
+elif [[ "${MYNDAIX_PROPOSER_DRY_RUN:-}" != "1" ]]; then
+  # A LIVE tick without the dedicated token would silently fall back to ambient gh credentials
+  # (the human/automerge identity) — then `--author @me` adoption matches the WRONG author and the
+  # bot's PRs carry the wrong identity (kilabz MAJOR). Refuse loudly; exit 0 so launchd doesn't
+  # thrash. Dry-run needs no token (it never touches gh mutations).
+  printf '[%s] [proposer-tick] dedicated bot token missing/unreadable at %s — REFUSING live tick\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$TOKEN_FILE"
+  exit 0
 fi
 
 # DSN default pinned to 127.0.0.1 (NOT `localhost`), matching the other ticks.

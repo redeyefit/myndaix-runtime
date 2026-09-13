@@ -11,9 +11,11 @@ from pathlib import Path
 
 import runtime.proposer as P
 
-# Capture the REAL resolve_repo BEFORE any test monkeypatches the module global (bare harness has no
-# fixture teardown; other tests stub P.resolve_repo and don't restore it — this test needs the real one).
+# Capture the REAL functions BEFORE any test monkeypatches the module globals (bare harness has no
+# fixture teardown; tests stub P.resolve_repo/P._git and don't restore them).
 _REAL_RESOLVE_REPO = P.resolve_repo
+_REAL_GIT = P._git
+_REAL_FIND_PR = P._find_open_bot_pr
 
 PASS = [0]
 FAIL = [0]
@@ -122,18 +124,93 @@ def test_resolve_repo_fail_closed(monkeypatch=None):
         ok(_REAL_RESOLVE_REPO("_comment") is None, "an underscore/meta key -> None")
 
 
-# ---- K2: adopt only OUR single open PR; reject fork/ambiguous --------------------------------
+# ---- K2/K1: tri-state recovery lookup (found / none / unknown / ambiguous) -------------------
 def test_find_open_bot_pr_identity(monkeypatch=None):
     repo = {"nwo": "redeyefit/myndaix-runtime"}
     P._gh_json = lambda nwo, *a: [{"number": 5, "isCrossRepository": False, "headRefName": "skill/auto/fail-open"}]
-    ok(P._find_open_bot_pr(repo, "skill/auto/fail-open") == 5, "single same-repo bot PR adopted")
+    ok(_REAL_FIND_PR(repo, "skill/auto/fail-open") == ("found", 5), "single same-repo bot PR -> found")
     P._gh_json = lambda nwo, *a: [{"number": 6, "isCrossRepository": True, "headRefName": "skill/auto/fail-open"}]
-    ok(P._find_open_bot_pr(repo, "skill/auto/fail-open") is None, "a FORK PR (cross-repo) is not adopted (K2)")
+    ok(_REAL_FIND_PR(repo, "skill/auto/fail-open") == ("none", None),
+       "a FORK PR (cross-repo) is not ours -> definitive absence (K2)")
     P._gh_json = lambda nwo, *a: [{"number": 7, "isCrossRepository": False, "headRefName": "skill/auto/fail-open"},
                                   {"number": 8, "isCrossRepository": False, "headRefName": "skill/auto/fail-open"}]
-    ok(P._find_open_bot_pr(repo, "skill/auto/fail-open") is None, "ambiguous multi-match -> None (never first-match)")
+    ok(_REAL_FIND_PR(repo, "skill/auto/fail-open")[0] == "ambiguous",
+       "multi-match -> ambiguous (never first-match)")
     P._gh_json = lambda nwo, *a: None
-    ok(P._find_open_bot_pr(repo, "skill/auto/fail-open") is None, "gh failure -> None")
+    ok(_REAL_FIND_PR(repo, "skill/auto/fail-open")[0] == "unknown",
+       "gh failure -> unknown (NOT permission to create — kilabz #3)")
+
+
+def test_unknown_lookup_never_creates():
+    # kilabz MAJOR: after a crash-before-mark, a transient lookup failure must NOT force-push a
+    # fresh stub over a (possibly human-edited) PR branch — release + defer, never create.
+    _reset(False)
+    led = FakeLedger(ready=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("unknown", None)
+    created = {"n": 0}
+    def _create(*a, **k):
+        created["n"] += 1; return Path("/tmp/wt")
+    P._make_proposal_commit = _create
+    _run(P.propose(led))
+    ok(created["n"] == 0, "unknown lookup -> NO worktree/commit/push (defer)")
+    ok(("release", "fp1") in led.mutations, "the claim is released back to ready")
+
+
+def test_attempt_budget_burns_on_unknown_outcome():
+    # kilabz MAJOR: an unknown create outcome may have opened a PR whose response was lost — the
+    # per-tick budget must burn on the ATTEMPT, not only on a confirmed mark (else 3 ready
+    # candidates x unknown outcomes = 3+ create attempts against a 2-per-tick budget).
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i}", "repo_scope": "myndaix-runtime", "rule_tag": t,
+              "path_glob": "src/*.py", "decline_count": 0}
+             for i, t in enumerate(["fail-open", "toctou-race", "missing-scoping"])]
+    led = FakeLedger(ready=ready, provenance=["deadbeef"])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    calls = {"n": 0}
+    def _unknown_create(repo, wt, branch, slug):
+        calls["n"] += 1; return None                              # outcome unknown every time
+    P._push_and_open_pr = _unknown_create
+    _run(P.propose(led))
+    ok(calls["n"] <= P.MAX_PER_TICK,
+       f"create ATTEMPTS bounded by MAX_PER_TICK ({calls['n']} <= {P.MAX_PER_TICK})")
+
+
+def test_resolver_json_argv_is_one_field_list():
+    # kilabz BLOCKER unmask: `--json A B` makes B gh's positional REPO argument; the field list
+    # must be ONE comma-joined argv element. The old resolver test stubbed the helper and masked it.
+    seen = {}
+    def _record(path, *args):
+        seen["args"] = args
+        return {"nameWithOwner": "o/r", "defaultBranchRef": {"name": "main"}}
+    saved = P._gh_json_path
+    P._gh_json_path = _record
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            rj = Path(d) / "repos.json"
+            rj.write_text('{"myndaix-runtime":{"path":"' + d + '"}}')
+            P.REPOS_JSON = rj
+            (Path(d) / ".git").mkdir()
+            _REAL_RESOLVE_REPO("myndaix-runtime")
+        args = seen.get("args", ())
+        ji = args.index("--json") if "--json" in args else -1
+        ok(ji >= 0 and args[ji + 1] == "nameWithOwner,defaultBranchRef" and len(args) == ji + 2,
+           f"--json takes ONE comma-joined field list as the FINAL arg (got {args})")
+    finally:
+        P._gh_json_path = saved
+
+
+def test_git_hooks_disabled_on_every_git_op():
+    # kilabz BLOCKER: tracked hooks must never run during worktree/commit/push (they inherit
+    # GH_TOKEN + can stage files post-assert + fire the orchestrator pre-push reviewer).
+    ok(P._GIT_NOHOOKS == ("-c", "core.hooksPath=/dev/null"), "hook-disable config pair defined")
+    r = _REAL_GIT(Path("/tmp"), "version")
+    ok(r.returncode == 0, "_git still executes with the no-hooks config injected")
 
 
 # ---- A9: DRY_RUN mutates NOTHING across propose + reconcile ----------------------------------
@@ -200,7 +277,7 @@ def test_propose_happy_path_marks_pr():
                              "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}],
                      provenance=["deadbeef"])
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
-    P._find_open_bot_pr = lambda repo, branch: None        # no existing PR
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)   # definitive absence
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
     P._push_and_open_pr = lambda repo, wt, branch, slug: 142
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()  # worktree remove no-op
@@ -215,7 +292,7 @@ def test_propose_adopts_existing_pr():
     led = FakeLedger(ready=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
                              "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}])
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
-    P._find_open_bot_pr = lambda repo, branch: 77          # K1: a bot PR already open (crash recovery)
+    P._find_open_bot_pr = lambda repo, branch: ("found", 77)  # K1: a bot PR already open (crash recovery)
     opened = {"made": False}
     def _boom(*a, **k):
         opened["made"] = True; return Path("/tmp/wt")
@@ -267,7 +344,7 @@ def test_propose_poison_pill_does_not_wedge_tick():
         return ["deadbeef"]
     led.capture_provenance = _prov
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
-    P._find_open_bot_pr = lambda repo, branch: None
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
     P._push_and_open_pr = lambda repo, wt, branch, slug: 143
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
