@@ -84,6 +84,97 @@ def test_cli_default_valued_timeout_defers_to_profile_known_boundary():
     assert "1s" in r.text, "explicit default-valued timeout defers to the profile (accepted)"
 
 
+# -- structured-output contract (kilabz-sr): output_schema + output_last_message adapter keys --
+
+def _sh_cli(body):
+    """Write an executable /bin/sh script (POSIX-only body) and return its path."""
+    fd, path = tempfile.mkstemp(prefix="mdx-testcli-", suffix=".sh")
+    os.write(fd, ("#!/bin/sh\n" + body).encode())
+    os.close(fd)
+    os.chmod(path, 0o755)
+    return path
+
+
+def test_cli_output_last_message_preferred_over_stdout():
+    # the `-o` file holds the final message ALONE; stdout carries transcript noise around it
+    # (codex exec). The runner must return the file's content, and remove the temp file.
+    script = _sh_cli(
+        'out=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "-o" ]; then out="$2"; shift 2; continue; fi\n'
+        '  shift\n'
+        'done\n'
+        'printf "transcript noise"\n'
+        'printf %s "{\\"verdict\\":\\"pass\\",\\"findings\\":[]}" > "$out"\n')
+    try:
+        spec = _spec([script], "stdin")
+        spec.adapter["output_last_message"] = True
+        before = {f for f in os.listdir(tempfile.gettempdir()) if f.startswith("mdx-lastmsg-")}
+        r = asyncio.run(runner.invoke_cli(spec, _job("x")))
+        after = {f for f in os.listdir(tempfile.gettempdir()) if f.startswith("mdx-lastmsg-")}
+        assert r.status is ResultStatus.OK
+        assert r.text == '{"verdict":"pass","findings":[]}', "the -o file wins over stdout"
+        assert after <= before, "the per-invocation last-message temp file is removed"
+    finally:
+        os.unlink(script)
+
+
+def test_cli_output_last_message_empty_falls_back_to_stdout():
+    # a CLI that never writes the -o file (or writes nothing) must fall back to stdout —
+    # the caller's own JSON validation is the contract gate, not the transport.
+    script = _sh_cli('printf "stdout answer"\n')
+    try:
+        spec = _spec([script], "stdin")
+        spec.adapter["output_last_message"] = True
+        r = asyncio.run(runner.invoke_cli(spec, _job("x")))
+        assert r.status is ResultStatus.OK
+        assert r.text == "stdout answer"
+    finally:
+        os.unlink(script)
+
+
+def test_cli_output_schema_missing_file_is_terminal():
+    # fail-CLOSED: a declared-but-missing schema must never run the agent (the synthesis
+    # stage would receive prose it no longer expects).
+    spec = _spec(["printf", "%s"], "arg")
+    spec.adapter["output_schema"] = "schemas/does-not-exist.schema.json"
+    r = asyncio.run(runner.invoke_cli(spec, _job("x")))
+    assert r.status is ResultStatus.ERROR and r.error_class is ErrorClass.TERMINAL
+    assert "output_schema not found" in r.text
+
+
+def test_cli_output_schema_flag_appended_before_prompt():
+    # the resolved --output-schema flag lands in argv BEFORE the arg-channel prompt (codex
+    # requires flags before the positional), and resolves relative to the runtime package.
+    spec = _spec(["printf", "%s\\n"], "arg")
+    spec.adapter["output_schema"] = "schemas/kilabz_review.schema.json"
+    r = asyncio.run(runner.invoke_cli(spec, _job("the-prompt")))
+    assert r.status is ResultStatus.OK
+    lines = r.text.splitlines()
+    assert lines[0] == "--output-schema"
+    assert lines[1].endswith(os.path.join("schemas", "kilabz_review.schema.json"))
+    assert os.path.isfile(lines[1]), "the shipped schema file resolves on this host"
+    assert lines[2] == "the-prompt", "prompt stays the LAST argv element"
+
+
+def test_registry_kilabz_sr_declares_the_contract():
+    # the structured reviewer is a SEPARATE spec (plain kilabz keeps prose for ad-hoc calls)
+    # and its declared schema file ships with the package.
+    from runtime.registry import get as reg_get
+    sr, plain = reg_get("kilabz-sr"), reg_get("kilabz")
+    assert sr is not None and plain is not None
+    assert sr.adapter.get("output_schema") and sr.adapter.get("output_last_message")
+    assert not plain.adapter.get("output_schema") and not plain.adapter.get("output_last_message")
+    assert sr.profile.timeout_s == plain.profile.timeout_s == 900
+    schema_abs = os.path.join(os.path.dirname(os.path.abspath(runner.__file__)),
+                              sr.adapter["output_schema"])
+    assert os.path.isfile(schema_abs)
+    import json
+    with open(schema_abs) as f:
+        schema = json.load(f)
+    assert schema["required"] == ["verdict", "findings"]
+
+
 # -- gate fix: a job WITHOUT a worktree must run in a fresh empty scratch cwd, NOT the serve
 #    process's inherited cwd (the repo at base) — else a reviewer reads the wrong tree and calls
 #    real diff-findings "phantom". The scratch cwd is removed after the run.
