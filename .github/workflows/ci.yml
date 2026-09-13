@@ -101,3 +101,32 @@ jobs:
           echo "linting changed migrations:"; echo "$changed"
           # shellcheck disable=SC2086
           python substrate/migration_lint.py $changed
+
+      - name: Skill stub gate (skills/**/SKILL.md)
+        # An auto-proposed SKILL.md still carrying capture.py's STUB_MARKER (or empty) must turn
+        # this check red: merging it unedited makes reconcile mark the capture class terminally
+        # "promoted" while the controller's index step rejects the same blob — no re-proposal,
+        # no skill, ever. The checker imports the SAME is_unauthored_stub the controller gates
+        # on (never a draft-hash compare — proven unconditionally fail-open in design review).
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 origin main || true
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] && [ -n "$base" ]; then
+            # checkout@v4 puts the PR MERGE commit at HEAD, so merge-base..HEAD is exactly the
+            # PR's own changes — never HEAD~1 (that would be one side of the merge, not the PR).
+            changed="$(git diff --diff-filter=AMR --name-only "$base"..HEAD -- 'skills/' || true)"
+          else
+            # DELIBERATE divergence from the migration step's no-base SKIP: reconcile re-enforces
+            # migrations at deploy, but NOTHING downstream saves this class — so no computable
+            # merge-base (and every push, incl. main) fail-closed WIDENS to all tracked skills
+            # files. On main this is the backstop: a stub that landed turns main CI red
+            # (operator signal + automerge blocker) until authored or deleted.
+            changed="$(git ls-files -- 'skills/' || true)"
+          fi
+          if [ -z "$changed" ]; then echo "no skills/ files to gate"; exit 0; fi
+          echo "skill stub gate over:"; echo "$changed"
+          # word-splitting $changed into argv is intended; a hostile space-mangled name splits
+          # into paths the checker can't read -> exit 1 fail-closed.
+          # shellcheck disable=SC2086
+          python tools/skill_stub_gate.py $changed

@@ -17,7 +17,7 @@ import re
 from runtime import skillmatch
 
 __all__ = [
-    "RULE_TAG_TAXONOMY", "is_allowed_tag", "slug", "fingerprint", "is_hex_sha",
+    "RULE_TAG_TAXONOMY", "is_allowed_tag", "slug", "fingerprint", "is_hex_sha", "normalize_sha",
     "path_to_glob", "candidate_glob", "recurrence_ready", "reready_threshold",
     "skill_branch", "skill_path", "assert_only_skill_path",
     "sanitize_field", "render_skill_md", "draft_hash", "DEFAULTS",
@@ -95,16 +95,28 @@ def fingerprint(repo_scope: str, rule_tag: str) -> str:
 _HEX_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
+def normalize_sha(s: str) -> str:
+    """The canonical commit_sha form (strip + lower). is_hex_sha validates THIS form, and the
+    storage boundary (capturerecord.record) must store EXACTLY this form: the read side
+    (capture_provenance's `commit_sha ~ '^[0-9a-f]{7,40}$'` — case-sensitive, true end-anchored)
+    silently drops any noncanonical stored row, stranding the recurrence provenance the human
+    needs (the draft renders finding_ids=n/a). Shared helper so validator and writer can't drift:
+    is_hex_sha(s) is True ⟺ normalize_sha(s) fullmatches [0-9a-f]{7,40} ⟺ the stored form
+    passes the SQL filter."""
+    return (s or "").strip().lower()
+
+
 def is_hex_sha(s: str) -> bool:
-    """True iff `s` is a plausible git commit SHA (7-40 lowercase hex). commit_sha reaches the
-    rendered SKILL.md body + PR as provenance (finding_ids); the recorder validates on the way IN
-    and provenance filters on the way OUT so an attacker-chosen non-hex string (attack-pass A3) can
-    never carry injection payload into the human-reviewed draft. sanitize_field is the last belt.
+    """True iff `s` NORMALIZES (normalize_sha) to a plausible git commit SHA (7-40 lowercase hex).
+    commit_sha reaches the rendered SKILL.md body + PR as provenance (finding_ids); the recorder
+    validates on the way IN and provenance filters on the way OUT so an attacker-chosen non-hex
+    string (attack-pass A3) can never carry injection payload into the human-reviewed draft.
+    sanitize_field is the last belt.
 
     Uses fullmatch, NOT `...$`: Python's `$` also matches JUST BEFORE a terminal newline, so
     `^[0-9a-f]+$` would accept "deadbeef\\n" and let a trailing-newline injection through (kilabz
     cross-family review). fullmatch anchors the WHOLE string."""
-    return bool(_HEX_SHA_RE.fullmatch((s or "").strip().lower()))
+    return bool(_HEX_SHA_RE.fullmatch(normalize_sha(s)))
 
 
 # ---- secondary locality: a changed path -> the path_trigger a proposed skill would carry --------
@@ -224,9 +236,17 @@ STUB_MARKER = "MDX-AUTOPROPOSED-STUB-UNAUTHORED"
 
 def is_unauthored_stub(rendered: str) -> bool:
     """True iff `rendered` is an auto-proposed SKILL.md whose real lesson was never authored (the
-    STUB_MARKER survives). The controller's index step + CI gate on this so a no-op stub can never
-    reach the injected corpus even if a human merges it without filling it in."""
-    return STUB_MARKER in (rendered or "")
+    STUB_MARKER survives) — OR is empty/whitespace-only. The controller's index step + CI gate on
+    this so a no-op stub can never reach the injected corpus even if a human merges it without
+    filling it in.
+
+    Degenerate content counts as unauthored because callers may use this function as their SOLE
+    check (the CI skill-stub gate does): an empty or truncated-to-nothing blob must never pass as
+    "authored" (oracle finding — the marker-in-content test alone is fail-open on such input). At
+    the controller, lint_skill runs FIRST and already rejects empty blobs, so ordering and reject
+    reasons there are unchanged; this guard is the belt for direct callers."""
+    r = rendered or ""
+    return (not r.strip()) or (STUB_MARKER in r)
 
 
 def render_skill_md(s: str, rule_tag: str, path_trigger: str,

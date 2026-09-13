@@ -31,6 +31,10 @@ def ok(cond, label):
         print("  FAIL:", label)
 
 
+def _res(rc=0, out="", err=""):
+    return type("R", (), {"returncode": rc, "stdout": out, "stderr": err})()
+
+
 class FakeLedger:
     """Records every mutating call so a test can assert DRY_RUN mutates NOTHING (A9) and the happy
     path mutates exactly right. Read methods return seeded data."""
@@ -241,28 +245,29 @@ def test_existing_remote_branch_refuses_create():
 def test_probe_exhaustion_does_not_starve_below_capacity():
     # kilabz ff MAJOR: with creation budget left but probes spent, the old `continue` put the
     # unprocessed candidate in `seen` and the cursor moved PAST it — an adoptable orphan beyond
-    # PROBE_CAP was never adopted, permanently. Now the scan BREAKS before consuming it; the next
-    # tick resumes exactly there. MAX_OPEN is raised ABOVE the 7 candidates (kilabz ff-r2 m-test:
-    # with the default 3, the pre-existing capacity break masked the difference — the base commit
-    # passed this test; with 10 the base fails and HEAD passes: the new cutoff is what's exercised).
+    # the probe budget was never adopted, permanently. Now the scan BREAKS before consuming it;
+    # the next tick resumes exactly there. CAPTURE_MAX_OPEN=10 >= PROBE_CAP=6 also triggers the
+    # attack-pass FLOOR: the effective probe budget becomes MAX_OPEN+1 = 11 (a suspect head must
+    # never be able to consume every probe and starve adoption — the accounting's self-heal
+    # path). 12 adoptable candidates: tick 1 probes exactly 11 and does NOT consume the 12th.
     _reset(False)
     prior_max_open = os.environ.get("CAPTURE_MAX_OPEN")          # restore, don't just pop (ff-r3 MINOR)
     os.environ["CAPTURE_MAX_OPEN"] = "10"
     try:
         ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
-                  "path_glob": "src/*.py", "decline_count": 0} for i in range(7)]
+                  "path_glob": "src/*.py", "decline_count": 0} for i in range(12)]
         P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
         P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         P._find_open_bot_pr = lambda repo, branch: ("found", 70)
         led = FakeLedger(ready=ready)
         _run(P.propose(led))
         t1 = [m for m in led.mutations if m[0] == "mark"]
-        ok(len(t1) == P.PROBE_CAP, f"tick 1 adopts exactly PROBE_CAP candidates (got {len(t1)})")
+        ok(len(t1) == 11, f"tick 1 adopts exactly the FLOORED budget (MAX_OPEN+1 = 11) (got {len(t1)})")
         claimed1 = {m[1] for m in led.mutations if m[0] == "claim"}
-        ok("fp06" not in claimed1, "the 7th candidate is NOT consumed in tick 1")
+        ok("fp11" not in claimed1, "the 12th candidate is NOT consumed in tick 1")
         led2 = FakeLedger(ready=ready)
         _run(P.propose(led2))
-        ok(("mark", "fp06", 70) in led2.mutations,
+        ok(("mark", "fp11", 70) in led2.mutations,
            "tick 2 resumes AT the unprocessed candidate and ADOPTS it (no starvation)")
     finally:
         if prior_max_open is None:
@@ -919,6 +924,348 @@ def test_reconcile_poison_pill_does_not_wedge_tick():
     _run(P.reconcile(led))
     ok(("resolve", "good", "promoted") in led.mutations,
        "the row AFTER a raising reconcile row is still resolved (tick not wedged)")
+
+
+# ---- P1 push-wedge: nonzero push exit must re-verify the remote ref ---------------------------
+def test_push_failure_reverifies_remote_ref():
+    # P1: a nonzero `git push` exit does NOT prove the ref didn't update (a network drop AFTER the
+    # server applied refs/heads/<branch> exits 128) — the old definitive "no-pr" cleared the
+    # suspect + refunded, and the next tick's branch-exists guard then REFUSED create forever.
+    # The fix re-verifies: ref at OUR sha -> the push landed, proceed to create; "absent" must be
+    # confirmed by TWO spaced reads (a lagging read right after a failed push is evidence about
+    # NOW, not the push's final server-side outcome); foreign sha -> no-pr-foreign; lookup
+    # failure/raise -> unknown (never-raises contract intact).
+    _reset(False)
+    saved_git, saved_run = P._git, P.subprocess.run
+    saved_pause = getattr(P, "PUSH_REVERIFY_PAUSE_S", None)
+    P.PUSH_REVERIFY_PAUSE_S = 0
+    repo = {"nwo": "o/r", "default_branch": "main", "path": Path("/tmp/x")}
+
+    def run_case(ls_script, rev_raises=False):
+        state = {"ls": 0, "argvs": [], "gh": 0}
+        def fake_git(cwd, *a, **k):
+            state["argvs"].append(a)
+            if a and a[0] == "push":
+                return _res(1, "", "fatal: the remote end hung up unexpectedly")
+            if a and a[0] == "rev-parse":
+                if rev_raises:
+                    raise P.subprocess.TimeoutExpired("git", 1)
+                return _res(0, "abc123\n", "")
+            if a and a[0] == "ls-remote":
+                step = ls_script[min(state["ls"], len(ls_script) - 1)]
+                state["ls"] += 1
+                if step == "raise":
+                    raise P.subprocess.TimeoutExpired("git", 1)
+                return _res(step[0], step[1], "")
+            return _res()
+        def fake_run(*a, **k):
+            state["gh"] += 1
+            return _res(0, "https://github.com/o/r/pull/9\n", "")
+        P._git, P.subprocess.run = fake_git, fake_run
+        return _REAL_PUSH_PR(repo, Path("/tmp/wt"), "skill/auto/x", "x"), state
+
+    try:
+        # (A) DISCRIMINATOR: ref present at OUR sha -> the push landed; PR still gets created
+        r, st = run_case([(0, "abc123\trefs/heads/skill/auto/x\n")])
+        ok(r == ("opened", 9), f"push-exit-nonzero + ref at our sha -> PR created (got {r})")
+        ok(st["gh"] == 1, f"gh pr create invoked exactly once (got {st['gh']})")
+        ls = next((a for a in st["argvs"] if a and a[0] == "ls-remote"), None)
+        ok(ls is not None and ls[-1] == "refs/heads/skill/auto/x",
+           f"ls-remote queries the FULL ref (suffix-match trap guard) (got {ls})")
+        # (B) verified absent -> definitive no-pr, but only after TWO consistent reads
+        r, st = run_case([(0, "")])
+        ok(r == ("no-pr", None) and st["gh"] == 0, f"double-read absent -> no-pr, no create (got {r})")
+        ok(st["ls"] == 2, f"'absent' requires TWO spaced ls-remote reads (got {st['ls']})")
+        # (B2) read1 absent, read2 present at our sha: the ref materialized late -> still create
+        r, st = run_case([(0, ""), (0, "abc123\trefs/heads/skill/auto/x\n")])
+        ok(r == ("opened", 9), f"late-applied ref caught by the second read -> created (got {r})")
+        # (B3) read1 absent, read2 raising -> unknown (disagreement is never definitive)
+        r, st = run_case([(0, ""), "raise"])
+        ok(r == ("unknown", None) and st["gh"] == 0, f"read2 raise -> unknown (got {r})")
+        # (C) ref lookup failed -> unknown (caller keeps suspect + reservation)
+        r, st = run_case([(1, "")])
+        ok(r == ("unknown", None) and st["gh"] == 0, f"ls-remote nonzero -> unknown (got {r})")
+        # (D) foreign sha: our PLAIN no-force push cannot have landed -> no-pr-foreign
+        r, st = run_case([(0, "0000beef\trefs/heads/skill/auto/x\n")])
+        ok(r == ("no-pr-foreign", None) and st["gh"] == 0, f"foreign sha -> no-pr-foreign (got {r})")
+        # (E) never-raises: a raising ls-remote / rev-parse stays inside the contract
+        r, st = run_case(["raise"])
+        ok(r == ("unknown", None), f"ls-remote raise -> unknown, no escape (got {r})")
+        r, st = run_case([(0, "")], rev_raises=True)
+        ok(r == ("unknown", None), f"rev-parse raise -> unknown via the outer try (got {r})")
+    finally:
+        P._git, P.subprocess.run = saved_git, saved_run
+        if saved_pause is None:
+            try:
+                del P.PUSH_REVERIFY_PAUSE_S
+            except AttributeError:
+                pass
+        else:
+            P.PUSH_REVERIFY_PAUSE_S = saved_pause
+
+
+def test_verified_absent_push_failure_keeps_suspect():
+    # attack amendment (crash-window hole 2): a "no-pr" from the failed-push re-verification path
+    # must NOT clear the write-ahead suspect — absence read seconds after a failed push can be a
+    # lagging read of a ref the server applies late; only the FOREIGN-sha flavor clears (positive
+    # evidence the branch content is not ours). Refund + release still happen (clean retry).
+    _reset(False)
+    ready = [{"fingerprint": "fp1", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0}]
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: _res()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("no-pr", None)
+    try:
+        led = FakeLedger(ready=ready)
+        _run(P.propose(led))
+        suspects = json.loads(P.SUSPECTS_FILE.read_text())
+        ok(len(suspects) == 1 and suspects[0]["fingerprint"] == "fp1",
+           "verified-absent no-pr KEEPS the suspect (next tick's resolution disposes of it)")
+        ok(("release", "fp1") in led.mutations, "the claim is still released (row back to 'ready')")
+        # the FOREIGN flavor is the one sub-case that must clear (a kept suspect would arm the
+        # recovery-create over foreign content)
+        _reset(False)
+        P._push_and_open_pr = lambda repo, wt, branch, slug: ("no-pr-foreign", None)
+        led2 = FakeLedger(ready=ready)
+        _run(P.propose(led2))
+        ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "foreign-sha no-pr clears the suspect")
+        ok(("release", "fp1") in led2.mutations, "foreign flavor also refunds + releases")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_stranded_pushed_branch_recovered_without_push():
+    # attack amendment (crash-window hole 1): a durable write-ahead suspect + PR probe "none" +
+    # remote branch PRESENT means WE verified the branch absent, pushed, and crashed (or gh
+    # failed) before any PR existed. The old "none" arm cleared the durable suspect and the
+    # branch-exists guard then REFUSED create forever. Recovery: open the PR for the EXISTING
+    # remote head — NO push, so the no-overwrite rule stays intact.
+    _reset(False)
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpS", "repo_scope": "myndaix-runtime",
+                                            "branch": "skill/auto/fail-open"}]))
+    led = FakeLedger(open_count=0, ready=[])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    git_argvs = []
+    def _rec_git(cwd, *a, **k):
+        git_argvs.append(a); return _res()
+    P._git = _rec_git
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: True
+    gh_argvs = []
+    saved_run = P.subprocess.run
+    def _gh(argv, **k):
+        gh_argvs.append(argv); return _res(0, "https://github.com/o/r/pull/91\n", "")
+    P.subprocess.run = _gh
+    try:
+        _run(P.propose(led))
+        ok(("mark", "fpS", 91) in led.mutations, "the stranded branch's PR is created + marked")
+        ok(any("--head" in a and "skill/auto/fail-open" in a for a in gh_argvs),
+           f"gh pr create targets the EXISTING remote head (got {gh_argvs})")
+        ok(not any(a and a[0] == "push" for a in git_argvs),
+           f"recovery makes NO git push (no overwrite) (got {git_argvs})")
+        ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "the recovered suspect is cleared")
+    finally:
+        P._remote_branch_exists = saved_rbe
+        P.subprocess.run = saved_run
+
+
+# ---- capacity accounting: conversion, terminal drop, shared probe budget -----------------------
+def test_adopting_reserved_suspect_converts_not_double_counts():
+    # capacity (a) P1: a suspect reserved at resolution time (probe unknown) whose main-scan probe
+    # then found the PR was counted TWICE (tick-start reserve + bare adopt increment) — n_open hit
+    # MAX_OPEN with only 2 real PRs and starved the next candidate. The adopt must CONVERT the
+    # reservation in place.
+    _reset(False)
+    ready = [{"fingerprint": "fpA", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0},
+             {"fingerprint": "fpZ", "repo_scope": "myndaix-runtime", "rule_tag": "toctou-race",
+              "path_glob": "src/*.py", "decline_count": 0}]
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpA", "repo_scope": "myndaix-runtime",
+                                            "branch": "skill/auto/fail-open"}]))
+    led = FakeLedger(open_count=1, ready=ready)
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: _res()
+    calls = {"failopen": 0}
+    def _probe(repo, branch):
+        if branch.endswith("fail-open"):
+            calls["failopen"] += 1
+            return ("unknown", None) if calls["failopen"] == 1 else ("found", 91)
+        return ("none", None)
+    P._find_open_bot_pr = _probe
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 45)
+    try:
+        _run(P.propose(led))
+        ok(("mark", "fpA", 91) in led.mutations, "the reserved suspect's PR is adopted mid-scan")
+        ok(("mark", "fpZ", 45) in led.mutations,
+           "conversion, not double-count: fpZ still creates (1 tracked + adopted fpA = 2 < cap 3)")
+        ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "the adopted suspect is cleared in-tick")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_unclaimable_terminal_suspect_dropped_not_leaked():
+    # capacity (b) P2: a found-but-unclaimable suspect whose candidate left 'ready' OUTSIDE the
+    # proposer (no concurrent writer exists under the flock — the ledger disposed of it) can
+    # NEVER complete; keep+reserve leaked one MAX_OPEN slot every tick forever. Drop it LOUDLY:
+    # log + a jefe-inbox note (the residual is permanent-until-human and STACKS per orphan, so
+    # the human channel is load-bearing — launchd stderr is not one).
+    _reset(False)
+    home = Path(tempfile.mkdtemp(prefix="mdx-test-home."))
+    saved_home = P.HOME
+    P.HOME = home
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpB", "repo_scope": "myndaix-runtime",
+                                            "branch": "skill/auto/fail-open"}]))
+    led = FakeLedger(open_count=2, ready=[{"fingerprint": "fpZ", "repo_scope": "myndaix-runtime",
+                                           "rule_tag": "toctou-race", "path_glob": "src/*.py",
+                                           "decline_count": 0}])
+    async def _claim(fp, branch, draft_sha):
+        led.mutations.append(("claim", fp, branch))
+        return fp != "fpB"                                       # the terminal row refuses a claim
+    led.claim_for_proposing = _claim
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: _res()
+    P._find_open_bot_pr = lambda repo, branch: (("found", 44) if branch.endswith("fail-open")
+                                                else ("none", None))
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 45)
+    try:
+        _run(P.propose(led))
+        ok(("mark", "fpZ", 45) in led.mutations, "the freed slot is usable: fpZ still creates")
+        ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "the terminal suspect is dropped, not leaked")
+        ok(not any(m[0] == "mark" and m[1] == "fpB" for m in led.mutations), "fpB is never marked")
+        inbox = home / ".myndaix" / "bridge" / "inbox" / "jefe"
+        drops = list(inbox.glob("*.md")) if inbox.is_dir() else []
+        ok(len(drops) == 1 and "44" in drops[0].read_text(),
+           f"the drop reaches the jefe inbox naming PR#44 (got {[d.name for d in drops]})")
+    finally:
+        P._remote_branch_exists = saved_rbe
+        P.HOME = saved_home
+
+
+def test_suspect_probes_share_probe_cap():
+    # capacity (c) P2: suspect-resolution probes bypassed PROBE_CAP (N suspects + PROBE_CAP gh
+    # reads per tick). They now share the budget; cap-hit suspects are kept + reserved and
+    # ROTATED to the file head so a persistently-unknown head cannot starve the tail forever.
+    # CAPTURE_MAX_OPEN=1 keeps the MAX_OPEN+1 floor (2) from lifting the tightened cap (2).
+    _reset(False)
+    saved_cap = P.PROBE_CAP
+    prior_max_open = os.environ.get("CAPTURE_MAX_OPEN")
+    os.environ["CAPTURE_MAX_OPEN"] = "1"
+    P.PROBE_CAP = 2
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([
+        {"fingerprint": "fpS1", "repo_scope": "myndaix-runtime", "branch": "skill/auto/a"},
+        {"fingerprint": "fpS2", "repo_scope": "myndaix-runtime", "branch": "skill/auto/b"},
+        {"fingerprint": "fpS3", "repo_scope": "myndaix-runtime", "branch": "skill/auto/c"}]))
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: _res()
+    probed = []
+    def _probe(repo, branch):
+        probed.append(branch); return ("unknown", None)
+    P._find_open_bot_pr = _probe
+    try:
+        led = FakeLedger(open_count=0, ready=[{"fingerprint": "fpZ", "repo_scope": "myndaix-runtime",
+                                               "rule_tag": "toctou-race", "path_glob": "src/*.py",
+                                               "decline_count": 0}])
+        _run(P.propose(led))
+        ok(len(probed) == 2, f"suspect probes share the cap: exactly 2 this tick (got {len(probed)})")
+        ok("skill/auto/toctou-race" not in probed,
+           "cap exhausted by suspects -> the ready scan makes no probe (fail-closed break)")
+        saved = json.loads(P.SUSPECTS_FILE.read_text())
+        ok({s["fingerprint"] for s in saved} == {"fpS1", "fpS2", "fpS3"},
+           f"all three suspects kept (2 probed-unknown + 1 cap-deferred) (got {saved})")
+        ok(bool(saved) and saved[0]["fingerprint"] == "fpS3",
+           f"the cap-deferred suspect rotates to the file HEAD (got {[s['fingerprint'] for s in saved]})")
+        ok(led.mutations == [], "no claims/creates under an exhausted budget")
+        # tick 2: rotation means the previously-deferred suspect is probed FIRST
+        led2 = FakeLedger(open_count=0, ready=[])
+        _run(P.propose(led2))
+        ok("skill/auto/c" in probed, "tick 2 probes the previously-deferred suspect (rotation works)")
+    finally:
+        P.PROBE_CAP = saved_cap
+        if prior_max_open is None:
+            os.environ.pop("CAPTURE_MAX_OPEN", None)
+        else:
+            os.environ["CAPTURE_MAX_OPEN"] = prior_max_open
+
+
+# ---- write-ahead intent durability (fsync ordering) --------------------------------------------
+def test_save_suspects_durable_ordering():
+    # fsync P1: write_text + replace left the write-ahead intent in the page cache — a crash
+    # after `gh pr create` lost the suspect (arm a: untracked PR, MAX_OPEN undercount) or made
+    # the rename durable pointing at unwritten data (arm b: DAMAGED file -> creation wedged every
+    # tick with no self-heal). Required order: file-data durability (F_FULLFSYNC on macOS,
+    # os.fsync fallback) BEFORE the rename, directory fsync AFTER it.
+    _reset(False)
+    import stat as _stat
+    events = []
+    def _has_entry():
+        try:
+            return "fpA" in P.SUSPECTS_FILE.read_text()
+        except OSError:
+            return False
+    real_fsync, real_fcntl = os.fsync, P.fcntl.fcntl
+    full = getattr(P.fcntl, "F_FULLFSYNC", None)
+    def rec_fsync(fd):
+        events.append(("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file", _has_entry()))
+    def rec_fcntl(fd, cmd, *a):
+        if full is not None and cmd == full:
+            events.append(("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file", _has_entry()))
+            return 0
+        return real_fcntl(fd, cmd, *a)
+    os.fsync = rec_fsync
+    P.fcntl.fcntl = rec_fcntl
+    try:
+        ok(P._add_suspect("fpA", "myndaix-runtime", "skill/auto/x"), "durable add returns True")
+        files = [e for e in events if e[0] == "file"]
+        dirs = [e for e in events if e[0] == "dir"]
+        ok(len(files) == 1 and len(dirs) == 1,
+           f"exactly one FILE durability call + one DIR fsync (got {events})")
+        ok(bool(files) and files[0][1] is False,
+           "file-data durability precedes the rename (target does not yet hold the entry)")
+        ok(bool(dirs) and dirs[0][1] is True,
+           "dir fsync follows the rename (target already holds the entry)")
+        data = json.loads(P.SUSPECTS_FILE.read_text())
+        ok(any(s.get("fingerprint") == "fpA" for s in data), "final content parses + holds the entry")
+    finally:
+        os.fsync = real_fsync
+        P.fcntl.fcntl = real_fcntl
+
+
+def test_add_suspect_fsync_failure_refuses():
+    # the fsync sits INSIDE the try/except-OSError: an undurable intent must make _add_suspect
+    # return False so the caller refuses to create (ff-r4 P1 contract) — a sick disk becomes
+    # per-candidate create refusals, never a silent cache-only "success".
+    _reset(False)
+    real_fsync, real_fcntl = os.fsync, P.fcntl.fcntl
+    full = getattr(P.fcntl, "F_FULLFSYNC", None)
+    def boom_fsync(fd):
+        raise OSError("disk sick")
+    def boom_fcntl(fd, cmd, *a):
+        if full is not None and cmd == full:
+            raise OSError("disk sick")
+        return real_fcntl(fd, cmd, *a)
+    os.fsync = boom_fsync
+    P.fcntl.fcntl = boom_fcntl
+    try:
+        ok(P._add_suspect("fpA", "myndaix-runtime", "skill/auto/x") is False,
+           "fsync failure -> _add_suspect False (caller refuses to create)")
+    finally:
+        os.fsync = real_fsync
+        P.fcntl.fcntl = real_fcntl
 
 
 def main():

@@ -74,11 +74,19 @@ def _th(name: str) -> int:
 MAX_OPEN = lambda: _th("MAX_OPEN")            # re-read per tick so a live env change takes effect
 TTL_DAYS = lambda: _th("TTL_DAYS")
 MAX_PER_TICK = _int_env("MYNDAIX_PROPOSER_MAX_TICK", 2)      # K6: bound proposals opened per tick
-PROBE_CAP = _int_env("MYNDAIX_PROPOSER_PROBE_CAP", 6)        # gh PR-lookup reads per tick (K6 bound);
-                                                             # the fairness cursor rotates who gets probed
+PROBE_CAP = _int_env("MYNDAIX_PROPOSER_PROBE_CAP", 6)        # gh PR-lookup reads per tick (K6 bound),
+                                                             # SHARED by suspect resolution + the ready
+                                                             # scan and floored to MAX_OPEN+1 at tick
+                                                             # start (a suspect head must not starve
+                                                             # adoption); the fairness cursor rotates
+                                                             # who gets probed
 REAP_TIMEOUT_MIN = _int_env("MYNDAIX_PROPOSER_REAP_MIN", 30)  # release a 'proposing' row stuck this long
 GH_TIMEOUT = _int_env("MYNDAIX_PROPOSER_GH_TIMEOUT", 60)
 GIT_TIMEOUT = _int_env("MYNDAIX_PROPOSER_GIT_TIMEOUT", 120)
+PUSH_REVERIFY_PAUSE_S = _int_env("MYNDAIX_PROPOSER_PUSH_REVERIFY_PAUSE", 2)  # spacing between the
+                                                             # two failed-push ls-remote reads: one
+                                                             # read right after a failed push races
+                                                             # server-side ref application
 DRY_RUN = os.environ.get("MYNDAIX_PROPOSER_DRY_RUN") == "1"
 
 _PR_URL_RE = re.compile(r"/pull/(\d+)\s*$")   # `gh pr create` prints the PR URL, NOT json (K6)
@@ -376,29 +384,32 @@ def _remote_branch_exists(repo: dict, branch: str) -> Optional[bool]:
     return False
 
 
-def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> tuple[str, Optional[int]]:
-    """Push the branch and open a --draft PR. TRI-STATE return so the caller can account
-    conservatively (kilabz ff-review MAJOR — an unknown create may have opened a REAL PR whose
-    response was lost, and MAX_OPEN must reserve for it):
-      ("opened", n)   — PR confirmed open (number parsed from the create URL; K6: create prints a
-                        URL, not JSON).
-      ("no-pr", None) — DEFINITIVE failure BEFORE any PR could exist (the push itself failed).
-      ("unknown", None) — the create's outcome is uncertain (raise/timeout/nonzero/unparseable):
-                        a PR may exist untracked; the caller reserves a MAX_OPEN slot this tick
-                        and the next tick's adopt-probe re-tracks it if real.
-    Push is PLAIN (no --force): the caller verified the branch's absence just before; a branch
-    racing into existence in that gap is rejected non-fast-forward (or, if it points at an
-    ancestor of our commit, fast-forwards losslessly — its commit stays in our history).
-
-    NEVER RAISES (ff-r5 P1: an escaping exception — a push TimeoutExpired, a UnicodeDecodeError
-    from output decoding — bypassed the caller's outcome accounting): any unexpected error after
-    entry is 'unknown' (the push may have gone through), reported as a value, not an exception."""
+def _remote_ref_sha(repo: dict, branch: str) -> tuple[str, Optional[str]]:
+    """The sha origin holds for refs/heads/<branch>: ("present", sha) | ("absent", None) |
+    ("unknown", None). Same FULL-ref + exact-compare discipline as _remote_branch_exists (a bare
+    pattern is SUFFIX-matched by ls-remote). Unlike _remote_branch_exists this NEVER raises —
+    `_git` can raise TimeoutExpired and this helper is used inside never-raises paths (do not
+    refactor _remote_branch_exists onto it: silently converting the create-path's raise into a
+    defer is a separate deliberate change)."""
+    ref = f"refs/heads/{branch}"
     try:
-        push = _git(wt, "push", "origin", f"HEAD:refs/heads/{branch}")
-        if push.returncode != 0:
-            log(f"push failed: {push.stderr.strip()[:200]}"); return ("no-pr", None)
-    except Exception as e:
-        log(f"push raised ({e!r}) — outcome UNKNOWN"); return ("unknown", None)
+        r = _git(repo["path"], "ls-remote", "origin", ref)
+    except Exception:
+        return ("unknown", None)
+    if r.returncode != 0:
+        return ("unknown", None)
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1] == ref and parts[0]:
+            return ("present", parts[0])
+    return ("absent", None)
+
+
+def _create_pr_for_branch(repo: dict, branch: str, slug: str) -> tuple[str, Optional[int]]:
+    """`gh pr create` for an ALREADY-PUSHED remote head — shared by the normal push path and the
+    stranded-branch recovery (which must NOT push: the no-overwrite rule stays intact). NEVER
+    RAISES; ("opened", n) | ("unknown", None) — after entry a PR may exist whose response was
+    lost, so every failure arm is unknown, never definitive."""
     title = f"skill(auto): {slug} — recurring review finding (review before merge)"
     body = (f"Auto-proposed by the S7 proposer from a recurring `rule:{slug}` finding. This is an "
             f"UNAUTHORED STUB — fill in the real lesson (see the provenance commits in the diff) and "
@@ -416,6 +427,71 @@ def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> tuple[str
     if not m:
         log(f"gh pr create gave no parseable PR URL ({r.stdout.strip()[:120]}) — unknown"); return ("unknown", None)
     return ("opened", int(m.group(1)))
+
+
+def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> tuple[str, Optional[int]]:
+    """Push the branch and open a --draft PR. Outcome states (the caller accounts conservatively —
+    kilabz ff-review MAJOR: an unknown create may have opened a REAL PR whose response was lost,
+    and MAX_OPEN must reserve for it):
+      ("opened", n)   — PR confirmed open (number parsed from the create URL; K6: create prints a
+                        URL, not JSON).
+      ("no-pr", None) — the push is VERIFIED not to have landed: the remote ref read absent on TWO
+                        spaced reads. NOT "the push command exited nonzero" — a network drop AFTER
+                        the server applied the ref also exits nonzero (128), so the exit code alone
+                        never proves absence (P1 fix). The caller refunds + releases but KEEPS the
+                        write-ahead suspect: a ref applied server-side after both reads still
+                        converges via the next tick's resolution instead of wedging.
+      ("no-pr-foreign", None) — remote ref present at a sha that is NOT ours: our PLAIN no-force
+                        push cannot have landed, so definitively nothing of OURS exists (the caller
+                        clears the intent; the branch-exists guard then protects the foreign
+                        content — that refusal is the deliberate human-content protection).
+      ("unknown", None) — outcome uncertain (raise/timeout/nonzero create/unparseable/failed
+                        re-verify): a PR or ref may exist untracked; the caller keeps the suspect
+                        + the MAX_OPEN reservation and the next tick re-resolves.
+    When the failed push's re-verify finds the ref at OUR HEAD sha, the push succeeded — PROCEED
+    to `gh pr create` (returning unknown instead re-wedges: the kept suspect clears on the none-PR
+    lookup next tick and the branch-exists guard then refuses forever).
+    Push is PLAIN (no --force): the caller verified the branch's absence just before; a branch
+    racing into existence in that gap is rejected non-fast-forward (or, if it points at an
+    ancestor of our commit, fast-forwards losslessly — its commit stays in our history).
+
+    NEVER RAISES (ff-r5 P1: an escaping exception — a push TimeoutExpired, a UnicodeDecodeError
+    from output decoding — bypassed the caller's outcome accounting): any unexpected error after
+    entry is 'unknown' (the push may have gone through), reported as a value, not an exception."""
+    try:
+        push = _git(wt, "push", "origin", f"HEAD:refs/heads/{branch}")
+        if push.returncode != 0:
+            # P1 fix: exit 128 covers both rejection and transport loss after the server applied
+            # the ref — re-verify the remote ref before declaring anything. Any raise below falls
+            # to the outer except (unknown), keeping the never-raises contract.
+            head = _git(wt, "rev-parse", "HEAD")
+            ours = head.stdout.strip() if head.returncode == 0 else None
+            state, rsha = _remote_ref_sha(repo, branch)
+            log(f"push failed ({push.stderr.strip()[:150]}) — re-verify read1: {state}"
+                f"{'@' + rsha[:12] if rsha else ''}, our HEAD {ours[:12] if ours else 'unknown'}")
+            if state == "absent":
+                # absence observed immediately after a failed push is evidence about NOW, not the
+                # push's final server-side outcome (receive-pack can apply the ref after the
+                # client drop; read replicas lag) — 'absent' is definitive only on TWO spaced
+                # consistent reads. Residual: lag longer than the pause still converges to the
+                # loud REFUSING refusal next tick, strictly narrower than the pre-fix wedge.
+                time.sleep(PUSH_REVERIFY_PAUSE_S)
+                state, rsha = _remote_ref_sha(repo, branch)
+                log(f"re-verify read2: {state}{'@' + rsha[:12] if rsha else ''}")
+                if state == "absent":
+                    return ("no-pr", None)
+            if state == "present" and ours and rsha == ours:
+                log("push reported failure but the remote ref is at OUR commit — the push landed; "
+                    "proceeding to PR create")
+            elif state == "present" and ours:
+                return ("no-pr-foreign", None)
+            else:
+                # lookup unknown, or present with our HEAD unreadable (cannot compare) — a push
+                # that truly failed re-verifies branch-absent next tick and retries cleanly.
+                return ("unknown", None)
+    except Exception as e:
+        log(f"push raised ({e!r}) — outcome UNKNOWN"); return ("unknown", None)
+    return _create_pr_for_branch(repo, branch, slug)
 
 
 def _find_open_bot_pr(repo: dict, branch: str) -> tuple[str, Optional[int]]:
@@ -488,9 +564,16 @@ async def reconcile(led) -> None:
 #    fairness cursor — kilabz fault-injection proved every cursor-based reservation dies at a tick
 #    boundary (a newly-ready candidate can sort between the cursor and the suspect, so "resume at
 #    the suspect" is not guaranteed). Each tick resolves suspects FIRST, before any creation:
-#    found → adopt (pre-capacity, it re-tracks an existing PR); definitively-none → drop (nothing
-#    was created; the branch-exists refusal covers a pushed-branch leftover); unknown → keep AND
-#    reserve a MAX_OPEN slot while the uncertainty persists.
+#    found → adopt (pre-capacity, it re-tracks an existing PR); none + remote branch ABSENT → drop
+#    (nothing was created); none + remote branch PRESENT → the durable write-ahead intent proves
+#    the stranded push is OURS — recover by opening the PR for the existing head, NO push (attack
+#    pass: dropping here left the branch-exists guard refusing forever); unknown → keep AND
+#    reserve a MAX_OPEN slot while the uncertainty persists. CLEAR-INVARIANT: a suspect may be
+#    cleared only when its class is TRACKED, when BOTH no open bot PR AND no remote branch exist,
+#    or on positive foreign-branch evidence (no-pr-foreign). SINGLE-MACHINE INVARIANT: the
+#    suspects file + the "no concurrent writer" reasoning behind the terminal-drop arm rest on
+#    the tick flock, which is MACHINE-local while the ledger is shared — arm the proposer on ONE
+#    machine only (a second armed machine needs its own design pass, not a bigger lock).
 def _load_suspects() -> tuple[list[dict], bool]:
     """(suspects, healthy). A MISSING file is healthy-empty; a DAMAGED/unreadable one returns
     ([], False) and the caller must NOT overwrite it and must DISABLE creation for the tick —
@@ -516,11 +599,36 @@ def _load_suspects() -> tuple[list[dict], bool]:
 
 
 def _save_suspects(suspects: list[dict]) -> bool:
+    # Durability order is load-bearing (fsync P1): the file DATA must reach stable media BEFORE
+    # the rename is issued — a rename journaled durable ahead of cache-only data yields a durable
+    # rename to unwritten bytes: an empty/truncated file post-crash, which _load_suspects treats
+    # as DAMAGED and which wedges creation EVERY tick with no self-heal (unlike a lost rename,
+    # arm (a), which the K1 adoption probe eventually re-tracks). macOS os.fsync stops at the
+    # drive cache, so the FILE fd takes F_FULLFSYNC (stable media; arm (b) does not self-heal),
+    # falling back to os.fsync where unavailable/refused (non-APFS test filesystems); the DIR
+    # fsync after the rename makes the write-ahead intent itself survive the crash the suspects
+    # file exists for. All inside the try: an undurable write returns False and _add_suspect's
+    # caller refuses to create (ff-r4 P1 contract).
     try:
         SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = SUSPECTS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(suspects))
+        with tmp.open("w") as f:
+            f.write(json.dumps(suspects))
+            f.flush()
+            full = getattr(fcntl, "F_FULLFSYNC", None)
+            if full is not None:
+                try:
+                    fcntl.fcntl(f.fileno(), full)
+                except OSError:
+                    os.fsync(f.fileno())
+            else:
+                os.fsync(f.fileno())
         tmp.replace(SUSPECTS_FILE)                # atomic on APFS
+        dfd = os.open(str(SUSPECTS_FILE.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
         return True
     except OSError as e:
         log(f"suspects write failed ({e}) — reservation may not survive a crash this tick")
@@ -539,12 +647,34 @@ def _add_suspect(fingerprint: str, repo_scope: str, branch: str) -> bool:
 
 
 def _clear_suspect(fingerprint: str) -> None:
-    """Drop a DEFINITIVELY-resolved intent/suspect (opened+marked, or no-pr). Best-effort: a
-    failed clear leaves a stale suspect, which the next tick's resolution recognizes as already-
-    tracked (or definitively-none) and clears — never a double reservation (ff-r4 P2)."""
+    """Drop a DEFINITIVELY-resolved intent/suspect (opened+marked, adopted, foreign-branch, or
+    verified nothing-exists). Best-effort: a failed clear leaves a stale suspect, which the next
+    tick's resolution recognizes as already-tracked (or verified-absent) and clears — never a
+    double reservation (ff-r4 P2). Skips the save when nothing was removed: _save_suspects is a
+    2-fsync durable write now, and every successful adoption calls this for non-suspects too."""
     suspects, healthy = _load_suspects()
-    if healthy:
-        _save_suspects([s for s in suspects if s.get("fingerprint") != fingerprint])
+    if not healthy:
+        return
+    kept = [s for s in suspects if s.get("fingerprint") != fingerprint]
+    if len(kept) != len(suspects):
+        _save_suspects(kept)
+
+
+def _notify_jefe(subject: str, body: str) -> None:
+    """Best-effort drop into the jefe verdict inbox (~/.myndaix/bridge/inbox/jefe/ — the one live
+    bridge path). Used ONLY when a suspect is dropped whose orphan (open PR / stranded branch)
+    now needs HUMAN disposition: the residual is permanent until that disposition and stacks per
+    orphan, so launchd stderr alone is not an acceptable channel. Never raises; a failed write
+    degrades to the log line the caller already emitted."""
+    if DRY_RUN:
+        return
+    try:
+        inbox = HOME / ".myndaix" / "bridge" / "inbox" / "jefe"
+        inbox.mkdir(parents=True, exist_ok=True)
+        name = f"proposer-{time.strftime('%Y%m%d%H%M%S')}-{time.time_ns() % 1_000_000}.md"
+        (inbox / name).write_text(f"# {subject}\n\n{body}\n")
+    except OSError:
+        pass
 
 
 def _age_days(ts) -> float:
@@ -566,7 +696,8 @@ async def propose(led) -> None:
     before the adopt path ran — real open PRs then exceed MAX_OPEN forever). Adoption converts an
     untracked PR into a tracked one — it RESTORES the accounting, so it must never be capacity-
     gated; only CREATION is. Lookups are reads (safe pre-claim under the single-host flock) and
-    are bounded by PROBE_CAP per tick; the fairness cursor rotates which candidates get probed.
+    are bounded by the shared per-tick probe budget (PROBE_CAP floored to MAX_OPEN+1, consumed by
+    suspect resolution first); the fairness cursor rotates which candidates get probed.
     `attempts` counts CREATE ATTEMPTS (not confirmed opens): an unknown gh outcome may have opened
     a PR whose response was lost, so the budget must burn on the attempt (kilabz MAJOR)."""
     n_open = await led.count_open_proposals()
@@ -574,6 +705,25 @@ async def propose(led) -> None:
     attempts = 0
     probes = 0
     seen: set = set()
+    reserved_fps: set = set()      # fingerprints whose n_open slot is a SUSPECT RESERVATION — an
+                                   # adopt/recovery for one of these CONVERTS the slot in place
+                                   # (a bare second increment double-counted one real PR and
+                                   # starved the tick); only verified nothing-exists refunds it
+    # PROBE FLOOR (attack pass): PROBE_CAP and MAX_OPEN are INDEPENDENT operator knobs; with
+    # PROBE_CAP <= MAX_OPEN a full suspect head could consume every probe, every tick — starving
+    # the ready scan and with it ADOPTION, the path every accounting self-heal relies on. Floor
+    # the budget so the scan always keeps at least one probe past a full suspect head.
+    effective_probe_cap = max(PROBE_CAP, MAX_OPEN() + 1)
+    if effective_probe_cap != PROBE_CAP:
+        log(f"PROBE_CAP {PROBE_CAP} <= MAX_OPEN {MAX_OPEN()} — raising this tick's probe budget to "
+            f"{effective_probe_cap} (a suspect head must never starve the ready scan's adoption)")
+
+    def _create_spent() -> bool:
+        # evaluated at USE time, not tick start: a reservation refunded mid-scan (verified
+        # nothing-exists) must be spendable by the refunding candidate itself.
+        return (not suspects_ok or n_open >= MAX_OPEN()
+                or opened >= MAX_PER_TICK or attempts >= MAX_PER_TICK)
+
     # -- resolve persisted orphan suspects FIRST, before any creation (ff-r3 M2b) --
     suspects_ok = True
     if not DRY_RUN:
@@ -590,17 +740,26 @@ async def propose(led) -> None:
             inflight = (await led.list_inflight_fingerprints()
                         if hasattr(led, "list_inflight_fingerprints") else tracked)
             remaining: list[dict] = []
+            deferred: list[dict] = []
             for s in suspects:
                 try:
                     if s["fingerprint"] in tracked:
                         # ff-r4 P2: the class got tracked after all (scan adopted it, or a mark
                         # committed but its response raised) — the ledger row already counts in
-                        # n_open; keeping the suspect would DOUBLE-reserve. Clear it.
+                        # n_open; keeping the suspect would DOUBLE-reserve. Clear it. (A set
+                        # lookup that frees capacity — never cap-gated.)
                         log(f"suspect {s['branch']} is already tracked — cleared (no double reserve)")
                         continue
+                    if probes >= effective_probe_cap:
+                        # cap hit mid-suspects (probes share the K6 gh-read budget with the scan —
+                        # they bypassed it entirely before): keep + RESERVE the unprocessed
+                        # suspect fail-closed, and rotate it to the file HEAD below so a
+                        # persistently-unknown head cannot starve the tail forever.
+                        deferred.append(s); continue
                     repo = resolve_repo(s["repo_scope"])
                     if repo is None:
                         remaining.append(s); continue             # unresolvable scope: keep + reserve
+                    probes += 1                                   # count the ATTEMPT (mirrors the scan)
                     status, existing = _find_open_bot_pr(repo, s["branch"])
                     if status == "found":
                         # the orphan is REAL — re-track it (pre-capacity: adoption adds no load).
@@ -616,24 +775,85 @@ async def propose(led) -> None:
                             else:
                                 await led.release_proposing(s["fingerprint"], s["branch"], dsha)
                                 remaining.append(s)
+                        elif s["fingerprint"] in inflight:
+                            # young stuck 'proposing': its slot is already inside
+                            # count_open_proposals — keep, unreserved; reap returns the row to
+                            # 'ready' and the next tick's claim succeeds.
+                            remaining.append(s)
                         else:
-                            remaining.append(s)                   # not ready/claimable: keep one more look
+                            # No concurrent writer exists under the single-instance flock and reap
+                            # already ran: a failed CAS means the LEDGER holds this candidate in a
+                            # resolved/terminal state — the claim will fail EVERY tick, so a kept
+                            # reservation protects nothing and leaks one MAX_OPEN slot forever.
+                            # Drop, loudly. Residual: PR#existing stays OPEN but uncounted — real
+                            # open bot PRs can exceed MAX_OPEN and STACK per orphan, permanently
+                            # until human disposition; that is why the drop goes to the jefe
+                            # inbox, not only this log.
+                            msg = (f"suspect {s['branch']}: PR#{existing} is OPEN but its candidate "
+                                   f"left 'ready' outside the proposer — dropping the suspect; the "
+                                   f"PR needs human disposition (close or merge PR#{existing})")
+                            log(msg)
+                            _notify_jefe("proposer: orphan PR needs disposition", msg)
                     elif status == "none":
-                        log(f"suspect resolved: no PR exists for {s['branch']} — cleared")
+                        # CLEAR-INVARIANT (attack pass): "no open PR" alone never clears — a crash
+                        # (or a definitive create failure) AFTER a landed push leaves a stranded
+                        # branch and no PR; clearing here wedged the class behind the branch-exists
+                        # refusal forever, destroying the durable intent the fsync work protects.
+                        rbe = _remote_branch_exists(repo, s["branch"])
+                        if rbe is False:
+                            log(f"suspect resolved: no PR and no remote branch for {s['branch']} — cleared")
+                        elif rbe is True:
+                            # the durable write-ahead intent proves WE verified this branch absent
+                            # and then pushed — the stranded ref is OURS: open the PR for the
+                            # EXISTING head (no push, so the no-overwrite rule is intact).
+                            # Bounded residual: a human branch pushed to the exact slug name inside
+                            # the crash window gets ONE re-opened draft PR; the mark hands it to
+                            # reconcile, so the next human close resolves it 'declined'.
+                            slug_s = s["branch"].rsplit("/", 1)[-1]
+                            prov = await led.capture_provenance(s["fingerprint"])
+                            rendered = capture.render_skill_md(slug_s, slug_s, "src/**", "", "",
+                                                               finding_ids=prov, origin_repo=s["repo_scope"])
+                            dsha = capture.draft_hash(rendered) if rendered else "unknown"
+                            if await led.claim_for_proposing(s["fingerprint"], s["branch"], dsha):
+                                st2, pr2 = _create_pr_for_branch(repo, s["branch"], slug_s)
+                                if st2 == "opened" and pr2 is not None and await led.mark_capture_proposed(
+                                        s["fingerprint"], s["branch"], dsha, pr2):
+                                    log(f"suspect recovered: opened PR#{pr2} for stranded pushed "
+                                        f"branch {s['branch']} (existing head, no push)")
+                                    n_open += 1
+                                else:
+                                    await led.release_proposing(s["fingerprint"], s["branch"], dsha)
+                                    remaining.append(s)           # create/mark unresolved: keep + reserve
+                            elif s["fingerprint"] in inflight:
+                                remaining.append(s)
+                            else:
+                                msg = (f"suspect {s['branch']}: stranded remote branch exists (no "
+                                       f"PR) and the candidate left 'ready' outside the proposer — "
+                                       f"dropping the suspect; delete the branch to clean up")
+                                log(msg)
+                                _notify_jefe("proposer: stranded branch needs disposition", msg)
+                        else:
+                            remaining.append(s)                   # branch lookup unknown: keep + reserve
                     else:                                         # unknown/ambiguous: keep + RESERVE
                         remaining.append(s)
                 except Exception as e:
                     log(f"suspect {s.get('branch')} resolution raised ({e!r}) — keep + reserve")
                     remaining.append(s)
-            _save_suspects(remaining)
+            kept = deferred + remaining                           # rotation: cap-deferred entries go
+            if suspects:                                          # to the HEAD for next tick
+                _save_suspects(kept)
             # reserve ONLY for suspects the ledger count doesn't already hold (ff-r5 P2: a
             # surviving 'proposing' claim is in count_open_proposals — reserving its suspect too
             # would double-block capacity until reap).
-            reserve = sum(1 for s in remaining if s["fingerprint"] not in inflight)
-            if reserve:
-                n_open += reserve
-                log(f"{len(remaining)} unresolved suspect(s) — reserving {reserve} MAX_OPEN slot(s) "
-                    f"({len(remaining) - reserve} already counted in-flight)")
+            reserved_fps = {s["fingerprint"] for s in kept if s["fingerprint"] not in inflight}
+            n_open += len(reserved_fps)
+            if reserved_fps:
+                log(f"{len(kept)} unresolved suspect(s) — reserving {len(reserved_fps)} MAX_OPEN "
+                    f"slot(s) ({len(kept) - len(reserved_fps)} already counted in-flight)")
+            if deferred and probes >= effective_probe_cap:
+                log(f"suspect probes exhausted the probe budget ({probes}/{effective_probe_cap}) — "
+                    f"ready scan starved this tick; {len(deferred)} suspect(s) rotated to next "
+                    f"tick's head")
     # FAIRNESS (kilabz r2 #7): scan in fingerprint keyset order starting after a PERSISTED cursor,
     # wrapping to the start when the tail is exhausted — every ready row is eventually visited even
     # if 100+ persistently-skipped candidates (unlisted scope, render reject) sit ahead of it. The
@@ -649,9 +869,7 @@ async def propose(led) -> None:
         cursor = ""                                               # wrapped: tail exhausted
         batch = await led.list_ready_candidates(100, after="")
     for c in batch:
-        create_spent = (not suspects_ok or n_open >= MAX_OPEN()
-                        or opened >= MAX_PER_TICK or attempts >= MAX_PER_TICK)
-        if create_spent and probes >= PROBE_CAP:
+        if _create_spent() and probes >= effective_probe_cap:
             break                                                 # nothing left this tick can do
         fp = c["fingerprint"]
         if fp in seen:
@@ -688,7 +906,7 @@ async def propose(led) -> None:
                 if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK:
                     break
                 continue
-            if probes >= PROBE_CAP:
+            if probes >= effective_probe_cap:
                 # this candidate was NOT processed — it must not advance the cursor, or a persistent
                 # probe-exhaustion permanently starves it (kilabz ff MAJOR: `continue` put it in
                 # `seen`, the cursor moved past it, and an adoptable orphan was stranded forever).
@@ -703,7 +921,17 @@ async def propose(led) -> None:
                 if await led.claim_for_proposing(fp, branch, draft_sha):
                     claimed = True
                     if await led.mark_capture_proposed(fp, branch, draft_sha, existing):
-                        log(f"adopted existing PR#{existing} for {branch}"); n_open += 1
+                        log(f"adopted existing PR#{existing} for {branch}")
+                        if fp in reserved_fps:
+                            reserved_fps.discard(fp)              # CONVERT the reservation in place —
+                                                                  # the PR moves reserved→tracked,
+                                                                  # count unchanged (a bare increment
+                                                                  # here double-counted one real PR)
+                        else:
+                            n_open += 1
+                        _clear_suspect(fp)                        # no-op for non-suspects (skip-save);
+                                                                  # keeps the file consistent with the
+                                                                  # conversion now, not next tick
                     else:
                         await led.release_proposing(fp, branch, draft_sha)
                 continue
@@ -714,7 +942,38 @@ async def propose(led) -> None:
                 # orphan risk (orphans exist only after an unknown CREATE, which persists a suspect).
                 log(f"recovery lookup {status} for {branch} — defer (no claim, no create)")
                 continue
-            if create_spent:
+            if fp in reserved_fps:
+                # a RESERVED suspect probed DEFINITIVELY none mid-scan: apply the CLEAR-INVARIANT
+                # (no PR AND no remote branch) before touching the reservation — the "none" PR
+                # lookup alone must never destroy the durable intent for a stranded pushed branch.
+                rbe = _remote_branch_exists(repo, branch)
+                if rbe is False:
+                    n_open -= 1
+                    reserved_fps.discard(fp)
+                    _clear_suspect(fp)                            # verified nothing exists: refund
+                                                                  # BEFORE the create path takes its
+                                                                  # own slot at the reserve-exactly-
+                                                                  # once point below
+                elif rbe is True:
+                    # stranded pushed branch that is OURS (durable write-ahead intent): recover —
+                    # PR for the EXISTING head, no push (see the resolution-pass twin arm).
+                    if await led.claim_for_proposing(fp, branch, draft_sha):
+                        claimed = True
+                        st2, pr2 = _create_pr_for_branch(repo, branch, slug)
+                        if st2 == "opened" and pr2 is not None and await led.mark_capture_proposed(
+                                fp, branch, draft_sha, pr2):
+                            log(f"recovered stranded branch {branch}: opened PR#{pr2} for the "
+                                f"existing head (no push)")
+                            reserved_fps.discard(fp)              # conversion: reservation → tracked
+                            _clear_suspect(fp)
+                        else:
+                            await led.release_proposing(fp, branch, draft_sha)
+                    continue                                      # resolved or kept — never a fresh push
+                else:
+                    log(f"reserved suspect {branch}: branch-exists lookup unknown — keep the "
+                        f"reservation, defer")
+                    continue
+            if _create_spent():
                 continue                                          # capacity gates CREATION only
             exists = _remote_branch_exists(repo, branch)
             if exists is not False:
@@ -761,8 +1020,14 @@ async def propose(led) -> None:
                 except Exception as e:                            # ff-r3 gap-1: reservation survives
                     log(f"release after unknown create raised ({e!r}) — reap recovers the claim")
                 continue
-            if outcome != "opened" or pr_number is None:          # "no-pr": DEFINITIVE, nothing created
-                _clear_suspect(fp)
+            if outcome != "opened" or pr_number is None:
+                # "no-pr" flavors (attack pass): only FOREIGN-sha no-pr clears the intent —
+                # positive evidence the branch content is not ours. A verified-absent no-pr KEEPS
+                # the suspect: absence read seconds after a failed push can be a lagging read of a
+                # ref the server applies late; next tick's resolution clears it only once no-PR
+                # AND branch-absent are both confirmed (or recovers via create if the ref landed).
+                if outcome == "no-pr-foreign":
+                    _clear_suspect(fp)
                 n_open -= 1                                       # refund the reservation
                 await led.release_proposing(fp, branch, draft_sha); continue
             if await led.mark_capture_proposed(fp, branch, draft_sha, pr_number):
@@ -790,6 +1055,21 @@ async def propose(led) -> None:
             log(f"cursor write failed ({e}) — scan restarts next tick (harmless)")
 
 
+def _log_gh_identity() -> None:
+    """One best-effort tick-start line naming the authenticated gh login (attack pass): every
+    `--author @me` lookup silently changes meaning across a bot-PAT rotation — old-identity PRs
+    then read as definitive 'none' and their suspects clear while the real PRs stay open. The
+    log makes an identity change visible exactly when 'none' verdicts start lying. Unknown-
+    tolerant, never raises."""
+    try:
+        r = subprocess.run(["gh", "api", "user", "-q", ".login"], capture_output=True, text=True,
+                           env=_git_env(), timeout=GH_TIMEOUT, check=False)
+        ident = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "unknown"
+    except Exception:
+        ident = "unknown"
+    log(f"gh identity: {ident}")
+
+
 async def _amain() -> int:
     # DRY_RUN bypasses the arm flag (kilabz r4): the flag gates LIVE operation; a dry tick is
     # proven side-effect-free (A9 — zero DB/git/gh mutations, tested) and is exactly the pre-arm
@@ -801,6 +1081,8 @@ async def _amain() -> int:
     led = None
     try:
         gc_worktrees()                                            # A6: tick-start GC (flock ⇒ prior tick dead)
+        if not DRY_RUN:                                           # a dry tick makes no gh reads (A9 discipline)
+            _log_gh_identity()
         led = await PostgresLedger.connect(DSN)
         # reap crashed 'proposing' claims back to 'ready' (skip under DRY_RUN — it's a mutation, A9)
         if not DRY_RUN:
