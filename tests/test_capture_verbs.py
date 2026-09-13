@@ -236,6 +236,55 @@ async def test_expire_stale_closes_abandoned_pr(led):
     ok(await led.expire_stale_captures(14) == [], "a fresh proposal is not expired")
 
 
+async def test_list_ready_candidates(led):
+    await _truncate(led)
+    r = await _drive_to_ready(led, repo="repoR", tag="toctou-race")
+    rows = await led.list_ready_candidates(10)
+    ok(any(x["fingerprint"] == r["fingerprint"] and x["repo_scope"] == "repoR"
+           and x["rule_tag"] == "toctou-race" for x in rows), "the ready class is listed")
+    ok(all(set(("fingerprint", "repo_scope", "rule_tag", "path_glob", "decline_count")) <= set(x)
+           for x in rows), "list carries exactly the fields the resolve+render need")
+
+
+async def test_capture_provenance_hex_filtered(led):
+    await _truncate(led)
+    for c, e in (("deadbeef01", "e1"), ("cafebabe02", "e2")):
+        await sight(led, "repoP", "fail-open", "src/*.py", c, e, "a1")
+    await sight(led, "repoP", "fail-open", "src/*.py", "not-a-real-sha", "e3", "a1")
+    fp = capture.fingerprint("repoP", "fail-open")
+    prov = await led.capture_provenance(fp)
+    ok(set(prov) == {"deadbeef01", "cafebabe02"}, "provenance returns the hex commit_shas")
+    ok("not-a-real-sha" not in prov, "a non-hex commit_sha is filtered out in SQL (A3 belt)")
+
+
+async def test_list_proposed(led):
+    await _truncate(led)
+    r = await _drive_to_ready(led, repo="repoQ")
+    fp = r["fingerprint"]
+    ok(await led.list_proposed() == [], "a merely-ready class is NOT in list_proposed")
+    await led.claim_for_proposing(fp, "skill/auto/fail-open", "sha")
+    await led.mark_capture_proposed(fp, "skill/auto/fail-open", "sha", 55)
+    rows = await led.list_proposed()
+    ok(len(rows) == 1 and rows[0]["pr_number"] == 55 and rows[0]["branch"] == "skill/auto/fail-open",
+       "list_proposed returns the open proposal with its pr_number + branch (RECONCILE queue)")
+
+
+async def test_resolve_stale(led):
+    await _truncate(led)
+    r = await _drive_to_ready(led, repo="repoS")
+    fp = r["fingerprint"]
+    await led.claim_for_proposing(fp, "b", "s")
+    await led.mark_capture_proposed(fp, "b", "s", 66)
+    ok(await led.resolve_capture(fp, "stale") is True, "stale resolves from 'proposed'")
+    st = await led._pool.fetchrow(
+        "SELECT state, decline_count, pr_number FROM capture_candidate WHERE fingerprint=$1", fp)
+    ok(st["state"] == "stale", "state -> stale")
+    ok(st["decline_count"] == 1, "stale bumps decline_count (respects the repropose backoff)")
+    ok(st["pr_number"] is None, "proposal fields cleared")
+    ok(await led.count_open_proposals() == 0, "a staled class frees its MAX_OPEN slot")
+    ok(await led.resolve_capture(fp, "stale") is False, "idempotent: already-resolved returns False")
+
+
 async def main():
     led = await PostgresLedger.connect(DSN)
     async with led._pool.acquire() as con:

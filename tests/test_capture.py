@@ -206,6 +206,23 @@ def test_render_provenance_field_cannot_forge_lines():
        "A3: newline-bearing provenance can never occupy its own SKILL.md line")
 
 
+def test_unauthored_stub_marker_gate():
+    # v1 renders with NO captured whats_wrong -> the draft is an unauthored STUB and must carry the
+    # marker so the promotion/index gate refuses it (cross-family K4: an un-authored stub pollutes
+    # future reviews). It must still LINT clean (the gate is separate from render-time lint).
+    stub = C.render_skill_md("fail-open", "fail-open", "src/*.py", "", "",
+                             finding_ids=["deadbeef"], origin_repo="myndaix-runtime")
+    ok(stub is not None, "an unauthored stub still renders + lints (gate is separate from lint)")
+    ok(stub is not None and C.is_unauthored_stub(stub), "an unauthored stub carries the marker")
+    ok(stub is not None and C.STUB_MARKER in stub, "STUB_MARKER present in the stub body")
+    # an AUTHORED draft (real whats_wrong) carries NO marker -> passes the gate
+    authored = C.render_skill_md("fail-open", "fail-open", "src/*.py",
+                                 "Gate defaulted open on the unhandled branch.", "Default deny.",
+                                 finding_ids=["deadbeef"], origin_repo="myndaix-runtime")
+    ok(authored is not None and not C.is_unauthored_stub(authored),
+       "an authored draft has no marker -> passes the index gate")
+
+
 def test_is_hex_sha():
     ok(C.is_hex_sha("deadbeef"), "8-hex ok")
     ok(C.is_hex_sha("0123456789abcdef0123456789abcdef01234567"), "40-hex ok")

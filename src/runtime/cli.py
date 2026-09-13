@@ -355,7 +355,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # `mxr capture-record ...` — auto-capture INSTRUMENTATION (observe-only). Same routing
     # rationale as skillselect (inherits venv/PYTHONPATH/DSN via mxr); fails OPEN, never blocks
-    # a review. Records cross-family-agreed rule:<tag> signals; never opens a PR (no proposer yet).
+    # a review. Records cross-family-agreed rule:<tag> signals; the SEPARATE S7 proposer
+    # (`python -m runtime.proposer tick`, launchd `ai.myndaix.proposer`) turns `ready` classes into
+    # skill-draft PRs — this recorder never opens a PR.
     if raw and raw[0] == "capture-record":
         from runtime import capturerecord
         return capturerecord.main(["capture-record", *raw[1:]])

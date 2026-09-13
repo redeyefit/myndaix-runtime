@@ -22,6 +22,7 @@ __all__ = [
     "skill_branch", "skill_path", "assert_only_skill_path",
     "sanitize_field", "render_skill_md", "draft_hash", "DEFAULTS",
     "parse_rule_tags", "agreed_tags", "pick_glob",
+    "STUB_MARKER", "is_unauthored_stub",
 ]
 
 # ---- feature-flagged defaults (v0.4 — the proposer reads env + passes these in) -----------
@@ -210,29 +211,55 @@ def sanitize_field(text: str, maxlen: int) -> str:
     return t[:maxlen].strip()
 
 
+# Cross-family MAJOR (kilabz K4 + oracle): an un-authored auto-stub PASSES promotion lint, so if it
+# were merged as-is the controller would INDEX it and inject a no-op "flag any change…" skill into
+# every future review — actively degrading reviews (selection prefers unused skills + admits only a
+# few, so a stub can DISPLACE real guidance). The render therefore stamps this MACHINE-DETECTABLE
+# marker into the body of any draft whose problem-statement was not captured (every v1 draft). The
+# promotion path (controller _index_skills) + CI REFUSE to index/merge a body that still carries it;
+# authoring the real lesson deletes the marker line. A plain sentinel (no tags/paths) so it can't
+# trip scan_injection and render still lints clean.
+STUB_MARKER = "MDX-AUTOPROPOSED-STUB-UNAUTHORED"
+
+
+def is_unauthored_stub(rendered: str) -> bool:
+    """True iff `rendered` is an auto-proposed SKILL.md whose real lesson was never authored (the
+    STUB_MARKER survives). The controller's index step + CI gate on this so a no-op stub can never
+    reach the injected corpus even if a human merges it without filling it in."""
+    return STUB_MARKER in (rendered or "")
+
+
 def render_skill_md(s: str, rule_tag: str, path_trigger: str,
                     whats_wrong: str, preferred_pattern: str,
                     *, finding_ids: list[str], origin_repo: str) -> str | None:
     """Render ONE auto-proposed SKILL.md from a FIXED template over sanitized structured fields.
     Returns the markdown, or None (fail-closed) if the result would not pass the SAME
     skillmatch.lint_skill the controller runs at promotion — so auto-capture never opens a PR for a
-    draft its own promotion gate would reject. NO raw reviewer comment text is pasted in."""
+    draft its own promotion gate would reject. NO raw reviewer comment text is pasted in.
+
+    An un-authored draft (no captured whats_wrong — every v1 draft, since v1 does not capture the
+    finding text) carries STUB_MARKER so the promotion/index gate refuses it until a human authors
+    the body (cross-family K4)."""
     if slug(s) != s or not is_allowed_tag(rule_tag):
         return None
     if skillmatch.is_banned_trigger(path_trigger) or _RAW_CTRL.search(path_trigger):  # belt vs injection
         return None
     desc = sanitize_field(f"Recurring review finding: {rule_tag}", 60)
-    wrong = sanitize_field(whats_wrong, 700) or "(no description captured)"
+    wrong = sanitize_field(whats_wrong, 700)
     pref = sanitize_field(preferred_pattern, 700) or "(no preferred pattern captured)"
     ids = ", ".join(sanitize_field(i, 40) for i in (finding_ids or [])[:8]) or "n/a"
     origin = sanitize_field(origin_repo, 80) or "n/a"
+    # a draft with no captured problem-statement is an unauthored STUB -> mark it (K4 gate).
+    stub_line = ("" if wrong else
+                 f"\n\n{STUB_MARKER}: replace the description + preferred-pattern with the real "
+                 f"lesson and delete this line before merging (an unedited stub is refused at index).")
     body = (
-        f"{wrong}\n\n"
+        f"{wrong or '(no description captured)'}\n\n"
         f"Preferred pattern: {pref}\n\n"
         f"Flag any change matching `{path_trigger}` that repeats this class of issue.\n\n"
         f"(Auto-proposed from recurring reviewer findings [{rule_tag}]. "
         f"Provenance: origin_repo={origin}; finding_ids={ids}. "
-        f"Drafted deterministically — review before merge.)"
+        f"Drafted deterministically — review before merge.){stub_line}"
     )
     raw = (
         "---\n"

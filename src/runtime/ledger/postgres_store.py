@@ -1453,23 +1453,42 @@ class PostgresLedger:
         return row is not None
 
     async def resolve_capture(self, fingerprint: str, outcome: str) -> bool:
-        """The human's decision on a proposed candidate: 'promoted' (PR merged) or 'declined' (PR
-        closed). CAS from 'proposed' only. A declined class increments decline_count and clears its
-        proposal state so it can RE-accumulate toward the (higher) repropose floor; a promoted one
-        is terminal. A class already resolved returns False (idempotent)."""
+        """Resolve a 'proposed' candidate from the proposer's RECONCILE/SWEEP (CAS from 'proposed'
+        only; idempotent — already-resolved returns False):
+          - 'promoted' (PR merged): terminal.
+          - 'declined'  (PR closed by the human): increments decline_count + clears proposal state
+            so it re-accumulates toward the (higher) exponential repropose floor.
+          - 'stale' (TTL: PR sat un-acted past CAPTURE_TTL_DAYS): same clear + decline bump as a
+            decline, distinct state name. The proposer calls this ONLY after re-reading the live PR
+            and confirming it is NOT merged (A7 — never flip state before the read, or a TTL close
+            races a human merge and inverts the learning signal). This supersedes the batch
+            expire_stale_captures (which flipped state BEFORE the proposer could re-read)."""
         if outcome == "promoted":
             row = await self._pool.fetchrow(
                 """UPDATE capture_candidate SET state = 'promoted'
                     WHERE fingerprint = $1 AND state = 'proposed' RETURNING fingerprint""", fingerprint)
-        elif outcome == "declined":
+        elif outcome in ("declined", "stale"):
             row = await self._pool.fetchrow(
                 """UPDATE capture_candidate
-                       SET state = 'declined', decline_count = decline_count + 1,
+                       SET state = $2, decline_count = decline_count + 1,
                            branch = NULL, draft_sha = NULL, pr_number = NULL, proposed_at = NULL
-                    WHERE fingerprint = $1 AND state = 'proposed' RETURNING fingerprint""", fingerprint)
+                    WHERE fingerprint = $1 AND state = 'proposed' RETURNING fingerprint""",
+                fingerprint, outcome)
         else:
             raise ValueError(f"resolve_capture: bad outcome {outcome!r}")
         return row is not None
+
+    async def list_proposed(self) -> list[dict]:
+        """RECONCILE/SWEEP queue: every OPEN proposal (state='proposed') with its PR + branch + age,
+        so the proposer can re-read each PR's LIVE state and resolve it (merged→promoted,
+        closed→declined, or TTL-past-and-still-open→stale). READ-ONLY: the state flip is a separate
+        resolve_capture CAS the proposer runs AFTER the live read (A7), never before. Oldest first."""
+        rows = await self._pool.fetch(
+            """SELECT fingerprint, repo_scope, rule_tag, pr_number, branch, proposed_at
+                 FROM capture_candidate
+                WHERE state = 'proposed' AND pr_number IS NOT NULL
+                ORDER BY proposed_at ASC NULLS FIRST""")
+        return [dict(r) for r in rows]
 
     async def count_open_proposals(self) -> int:
         """Open auto-PRs in flight (proposing or proposed) — the proposer gates on this vs
