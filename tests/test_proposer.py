@@ -234,23 +234,82 @@ def test_probe_exhaustion_does_not_starve_below_capacity():
     # kilabz ff MAJOR: with creation budget left but probes spent, the old `continue` put the
     # unprocessed candidate in `seen` and the cursor moved PAST it — an adoptable orphan beyond
     # PROBE_CAP was never adopted, permanently. Now the scan BREAKS before consuming it; the next
-    # tick resumes exactly there. 7 adoptable candidates, PROBE_CAP=6, two ticks → all 7 adopted.
+    # tick resumes exactly there. MAX_OPEN is raised ABOVE the 7 candidates (kilabz ff-r2 m-test:
+    # with the default 3, the pre-existing capacity break masked the difference — the base commit
+    # passed this test; with 10 the base fails and HEAD passes: the new cutoff is what's exercised).
+    _reset(False)
+    os.environ["CAPTURE_MAX_OPEN"] = "10"
+    try:
+        ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+                  "path_glob": "src/*.py", "decline_count": 0} for i in range(7)]
+        P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+        P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        P._find_open_bot_pr = lambda repo, branch: ("found", 70)
+        led = FakeLedger(ready=ready)
+        _run(P.propose(led))
+        t1 = [m for m in led.mutations if m[0] == "mark"]
+        ok(len(t1) == P.PROBE_CAP, f"tick 1 adopts exactly PROBE_CAP candidates (got {len(t1)})")
+        claimed1 = {m[1] for m in led.mutations if m[0] == "claim"}
+        ok("fp06" not in claimed1, "the 7th candidate is NOT consumed in tick 1")
+        led2 = FakeLedger(ready=ready)
+        _run(P.propose(led2))
+        ok(("mark", "fp06", 70) in led2.mutations,
+           "tick 2 resumes AT the unprocessed candidate and ADOPTS it (no starvation)")
+    finally:
+        os.environ.pop("CAPTURE_MAX_OPEN", None)
+
+
+def test_unknown_create_stops_tick_and_recovers_next():
+    # kilabz ff-r2 M2b: an in-tick-only reservation died at the tick boundary while the cursor
+    # moved on — tick 2 could CREATE again before ever revisiting the orphan (4 real PRs, cap 3).
+    # Now an unknown create outcome stops the pass WITHOUT consuming the candidate: the cursor
+    # stays before it, and tick 2's adopt-probe (pre-capacity) re-tracks the orphan FIRST.
     _reset(False)
     ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
               "path_glob": "src/*.py", "decline_count": 0} for i in range(7)]
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-    P._find_open_bot_pr = lambda repo, branch: ("found", 70)
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    creates = {"n": 0}
+    def _unknown(repo, wt, branch, slug):
+        creates["n"] += 1; return ("unknown", None)
+    P._push_and_open_pr = _unknown
+    try:
+        led = FakeLedger(open_count=2, ready=ready)              # 2 tracked, cap 3
+        _run(P.propose(led))
+        ok(creates["n"] == 1, "tick 1: ONE unknown create, then the pass stops")
+        ok(not P.CURSOR_FILE.exists() or "fp00" not in P.CURSOR_FILE.read_text(),
+           "the suspect candidate does not advance the cursor")
+        # tick 2: the orphan turned out REAL — the adopt-probe re-tracks it before any creation
+        P._find_open_bot_pr = lambda repo, branch: ("found", 91)
+        led2 = FakeLedger(open_count=2, ready=ready)
+        _run(P.propose(led2))
+        ok(("mark", "fp00", 91) in led2.mutations, "tick 2 ADOPTS the orphan first (re-tracked)")
+        ok(creates["n"] == 1, "tick 2 creates nothing more at capacity (3 tracked after adopt)")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_unknown_lookup_stops_pass_without_consuming():
+    # ff-r2 M2 companion: an unknown LOOKUP on a candidate (gh down) also stops the pass without
+    # consuming it — the cursor can never advance past an unresolved suspect.
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0} for i in range(3)]
     led = FakeLedger(ready=ready)
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    probes = {"n": 0}
+    def _unknown_lookup(repo, branch):
+        probes["n"] += 1; return ("unknown", None)
+    P._find_open_bot_pr = _unknown_lookup
     _run(P.propose(led))
-    t1 = [m for m in led.mutations if m[0] == "mark"]
-    ok(len(t1) == P.PROBE_CAP, f"tick 1 adopts exactly PROBE_CAP candidates (got {len(t1)})")
-    claimed1 = {m[1] for m in led.mutations if m[0] == "claim"}
-    ok("fp06" not in claimed1, "the 7th candidate is NOT consumed in tick 1")
-    led2 = FakeLedger(ready=ready)
-    _run(P.propose(led2))
-    claimed2 = {m[1] for m in led2.mutations if m[0] == "claim"}
-    ok("fp06" in claimed2, "tick 2 resumes AT the unprocessed candidate and adopts it (no starvation)")
+    ok(probes["n"] == 1, "the pass stops at the FIRST unknown lookup (gh unhealthy)")
+    ok(led.mutations == [], "no claims taken")
+    ok(not P.CURSOR_FILE.exists(), "cursor not advanced (nothing was consumed)")
 
 
 def test_unknown_create_reserves_max_open_slot():

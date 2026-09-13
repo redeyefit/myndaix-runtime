@@ -545,11 +545,16 @@ async def propose(led) -> None:
             branch = capture.skill_branch(slug)
             draft_sha = capture.draft_hash(rendered)
             if DRY_RUN:
-                log(f"would propose {c['rule_tag']} → {branch} for {repo['nwo']} (draft_sha {draft_sha[:8]})")
-                n_open += 1; opened += 1                          # A9: log BEFORE any DB verb or gh read
+                # budget check BEFORE the log (an already-exhausted budget logs ZERO lines — kilabz
+                # ff-r2 m3) AND right after the increment (a just-filled budget stops the scan
+                # without visiting the next candidate). A9 intact: no DB verb, no gh read.
                 if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK:
-                    break                                         # dry-run models the CREATION budget
-                continue                                          # (kilabz ff MINOR: was unbounded)
+                    break
+                log(f"would propose {c['rule_tag']} → {branch} for {repo['nwo']} (draft_sha {draft_sha[:8]})")
+                n_open += 1; opened += 1
+                if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK:
+                    break
+                continue
             if probes >= PROBE_CAP:
                 # this candidate was NOT processed — it must not advance the cursor, or a persistent
                 # probe-exhaustion permanently starves it (kilabz ff MAJOR: `continue` put it in
@@ -569,8 +574,16 @@ async def propose(led) -> None:
                     else:
                         await led.release_proposing(fp, branch, draft_sha)
                 continue
-            if status != "none":                                  # unknown/ambiguous: NEVER create
-                log(f"recovery lookup {status} for {branch} — defer (no claim, no create)"); continue
+            if status == "unknown":
+                # gh is unhealthy — and this candidate may be an unresolved orphan-suspect. Do NOT
+                # consume it (the cursor must never advance past an unresolved suspect — kilabz
+                # ff-r2 M2: cursor-past-suspect let the next tick create before recovering the
+                # orphan → real PRs over cap). Stop the propose pass; next tick resumes HERE.
+                log(f"recovery lookup unknown for {branch} — stop propose pass, resume here next tick")
+                seen.discard(fp); break
+            if status != "none":                                  # ambiguous: NEVER create; consume +
+                log(f"recovery lookup {status} for {branch} — defer (no claim, no create)")
+                continue                                          # revisit after wrap (can't block queue)
             if create_spent:
                 continue                                          # capacity gates CREATION only
             exists = _remote_branch_exists(repo, branch)
@@ -591,15 +604,19 @@ async def propose(led) -> None:
             try:
                 outcome, pr_number = _push_and_open_pr(repo, wt, branch, slug)
             finally:
-                _git(repo["path"], "worktree", "remove", "--force", str(wt))
+                try:                                              # cleanup must NOT raise past the
+                    _git(repo["path"], "worktree", "remove", "--force", str(wt))
+                except Exception as ce:                           # outcome accounting (ff-r2 M2a);
+                    log(f"worktree cleanup raised ({ce!r}) — tick-start GC sweeps it")
             if outcome == "unknown":
-                # a REAL PR may exist untracked — RESERVE a MAX_OPEN slot this tick so further
-                # creates can't overflow real open PRs past the cap (kilabz ff MAJOR: 2 tracked +
-                # 2 unknown creates = 4 real PRs under a 3 cap). Next tick's adopt-probe runs
-                # before the capacity gate and re-tracks it if it exists; the claim is released so
-                # the class isn't wedged either way.
-                n_open += 1
-                await led.release_proposing(fp, branch, draft_sha); continue
+                # a REAL PR may exist untracked (kilabz ff MAJOR: 2 tracked + 2 unknowns = 4 real
+                # PRs under a 3 cap). Release the claim, then STOP the pass WITHOUT consuming this
+                # candidate — the cursor stays before it, so the NEXT tick resumes here and the
+                # adopt-probe (pre-capacity) re-tracks the orphan or the create retries, BEFORE any
+                # other creation can run (ff-r2 M2b: an in-tick-only reservation died at the tick
+                # boundary while the cursor moved on — overflow across ticks).
+                await led.release_proposing(fp, branch, draft_sha)
+                seen.discard(fp); break
             if outcome != "opened" or pr_number is None:          # "no-pr": definite, nothing created
                 await led.release_proposing(fp, branch, draft_sha); continue
             if await led.mark_capture_proposed(fp, branch, draft_sha, pr_number):
