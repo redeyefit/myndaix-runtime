@@ -123,6 +123,21 @@ def _gh_json(nwo: str, *args: str):
         return None
 
 
+def _gh_close(nwo: str, pr_number: int) -> bool:
+    """`gh pr close` prints NO JSON, so success = exit 0 (NOT _gh_json, whose None conflates a
+    successful non-JSON mutation with failure — oracle code-review BLOCKER: a failed close that
+    still records 'stale' orphans a live OPEN PR). Callers gate the DB flip on this."""
+    try:
+        r = subprocess.run(["gh", "pr", "close", str(int(pr_number)), "--repo", nwo],
+                           capture_output=True, text=True, env=_git_env(),
+                           timeout=GH_TIMEOUT, check=False)
+    except subprocess.SubprocessError as e:
+        log(f"gh pr close #{pr_number}: {e!r} — unknown"); return False
+    if r.returncode != 0:
+        log(f"gh pr close #{pr_number} failed: {r.stderr.strip()[:150]}")
+    return r.returncode == 0
+
+
 # -- the trusted repo allowlist MAP (A2): repo_scope → {path, nwo}, exact-key only ---------------
 def resolve_repo(repo_scope: str) -> Optional[dict]:
     """EXACT-KEY lookup of `repo_scope` in repos.json → the local path + the nwo resolved FROM THAT
@@ -244,7 +259,9 @@ def _make_proposal_commit(repo: dict, wt_name: str, slug: str, rendered: str) ->
     else None (caller releases the claim)."""
     path = repo["path"]
     _git(path, "worktree", "prune")                              # clear stale admin entries (A6)
-    _git(path, "fetch", "--no-tags", "origin", repo["default_branch"], timeout=GIT_TIMEOUT)
+    fetch = _git(path, "fetch", "--no-tags", "origin", repo["default_branch"], timeout=GIT_TIMEOUT)
+    if fetch.returncode != 0:                                    # a silent stale base is a wrong-diff PR
+        log(f"fetch origin/{repo['default_branch']} failed: {fetch.stderr.strip()[:150]}"); return None
     wt = WORKTREE_ROOT / wt_name
     shutil.rmtree(wt, ignore_errors=True)
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -315,31 +332,40 @@ def _find_open_bot_pr(repo: dict, branch: str) -> Optional[int]:
 # =====================================================================================
 async def reconcile(led) -> None:
     """proposed → promoted|declined|stale by RE-READING each PR's LIVE state (A5/A7). gh-unknown →
-    DEFER. merged always wins. TTL close only for a still-OPEN PR past TTL, and only after the read."""
+    DEFER. merged always wins. TTL close only for a still-OPEN PR past TTL, and only after the read.
+    Per-candidate exception boundary (oracle code-review MAJOR): one bad row must defer, never abort
+    the loop and starve the propose() phase behind it."""
     for c in await led.list_proposed():
-        repo = resolve_repo(c["repo_scope"])
-        if repo is None:
-            log(f"proposed {c['rule_tag']} scope {c['repo_scope']!r} unresolvable — defer"); continue
-        pr = _gh_json(repo["nwo"], "pr", "view", str(c["pr_number"]), "--json", "state,mergedAt")
-        if not isinstance(pr, dict):
-            continue                                              # A5: unknown → defer
-        merged = bool(pr.get("mergedAt")) or pr.get("state") == "MERGED"
-        outcome = None
-        if merged:
-            outcome = "promoted"
-        elif pr.get("state") == "CLOSED":
-            outcome = "declined"
-        elif pr.get("state") == "OPEN" and _age_days(c.get("proposed_at")) > TTL_DAYS():
+        try:
+            repo = resolve_repo(c["repo_scope"])
+            if repo is None:
+                log(f"proposed {c['rule_tag']} scope {c['repo_scope']!r} unresolvable — defer"); continue
+            pr = _gh_json(repo["nwo"], "pr", "view", str(c["pr_number"]), "--json", "state,mergedAt")
+            if not isinstance(pr, dict):
+                continue                                          # A5: unknown → defer
+            merged = bool(pr.get("mergedAt")) or pr.get("state") == "MERGED"
+            outcome = None
+            if merged:
+                outcome = "promoted"
+            elif pr.get("state") == "CLOSED":
+                outcome = "declined"
+            elif pr.get("state") == "OPEN" and _age_days(c.get("proposed_at")) > TTL_DAYS():
+                if DRY_RUN:
+                    log(f"would TTL-close+stale PR#{c['pr_number']} ({c['rule_tag']})"); continue
+                # the close must be CONFIRMED before the DB flip (oracle BLOCKER: an unchecked
+                # failed close + 'stale' write orphans a live OPEN PR the ledger no longer tracks).
+                # `gh pr close` prints no JSON, so _gh_close's success = exit 0.
+                if not _gh_close(repo["nwo"], c["pr_number"]):
+                    log(f"TTL close of PR#{c['pr_number']} failed — defer to next tick"); continue
+                outcome = "stale"
+            if outcome is None:
+                continue
             if DRY_RUN:
-                log(f"would TTL-close+stale PR#{c['pr_number']} ({c['rule_tag']})"); continue
-            _gh_json(repo["nwo"], "pr", "close", str(c["pr_number"]))   # re-read already done above (A7)
-            outcome = "stale"
-        if outcome is None:
-            continue
-        if DRY_RUN:
-            log(f"would resolve {c['rule_tag']} → {outcome} (PR#{c['pr_number']})"); continue
-        await led.resolve_capture(c["fingerprint"], outcome)
-        log(f"resolved {c['rule_tag']} → {outcome} (PR#{c['pr_number']})")
+                log(f"would resolve {c['rule_tag']} → {outcome} (PR#{c['pr_number']})"); continue
+            await led.resolve_capture(c["fingerprint"], outcome)
+            log(f"resolved {c['rule_tag']} → {outcome} (PR#{c['pr_number']})")
+        except Exception as e:                                    # defer this row, keep the tick alive
+            log(f"reconcile {c.get('rule_tag')} raised ({e!r}) — defer + continue")
 
 
 def _age_days(ts) -> float:
@@ -366,25 +392,32 @@ async def propose(led) -> None:
         if fp in seen:
             continue
         seen.add(fp)                                              # K6: visit-once, no infinite retry
-        repo = resolve_repo(c["repo_scope"])
-        if repo is None:
-            log(f"ready {c['rule_tag']} scope {c['repo_scope']!r} not in repo allowlist — skip"); continue
-        slug = capture.slug(c["rule_tag"])
-        if slug is None:
-            log(f"ready {c['rule_tag']} → no safe slug — skip"); continue
-        prov = await led.capture_provenance(fp)
-        rendered = capture.render_skill_md(slug, c["rule_tag"], c["path_glob"] or "src/**",
-                                           "", "", finding_ids=prov, origin_repo=c["repo_scope"])
-        if rendered is None:
-            log(f"ready {c['rule_tag']} → render fail-closed — skip"); continue
-        branch = capture.skill_branch(slug)
-        draft_sha = capture.draft_hash(rendered)
-        if DRY_RUN:
-            log(f"would propose {c['rule_tag']} → {branch} for {repo['nwo']} (draft_sha {draft_sha[:8]})")
-            n_open += 1; opened += 1; continue                    # A9: log BEFORE any DB verb
-        if not await led.claim_for_proposing(fp, branch, draft_sha):
-            continue                                              # lost the CAS / not ready
+        # the exception boundary wraps the WHOLE candidate body (oracle code-review MAJOR: a raise
+        # in provenance/render BEFORE the claim escaped the loop, crashed the tick, and — the row
+        # still 'ready' — re-crashed every subsequent tick: a poison-pill halt). claimed tracks
+        # whether the except-arm owes a release.
+        branch = draft_sha = None
+        claimed = False
         try:
+            repo = resolve_repo(c["repo_scope"])
+            if repo is None:
+                log(f"ready {c['rule_tag']} scope {c['repo_scope']!r} not in repo allowlist — skip"); continue
+            slug = capture.slug(c["rule_tag"])
+            if slug is None:
+                log(f"ready {c['rule_tag']} → no safe slug — skip"); continue
+            prov = await led.capture_provenance(fp)
+            rendered = capture.render_skill_md(slug, c["rule_tag"], c["path_glob"] or "src/**",
+                                               "", "", finding_ids=prov, origin_repo=c["repo_scope"])
+            if rendered is None:
+                log(f"ready {c['rule_tag']} → render fail-closed — skip"); continue
+            branch = capture.skill_branch(slug)
+            draft_sha = capture.draft_hash(rendered)
+            if DRY_RUN:
+                log(f"would propose {c['rule_tag']} → {branch} for {repo['nwo']} (draft_sha {draft_sha[:8]})")
+                n_open += 1; opened += 1; continue                # A9: log BEFORE any DB verb
+            if not await led.claim_for_proposing(fp, branch, draft_sha):
+                continue                                          # lost the CAS / not ready
+            claimed = True
             existing = _find_open_bot_pr(repo, branch)            # K1: adopt by identity, not hash
             if existing is not None:
                 if await led.mark_capture_proposed(fp, branch, draft_sha, existing):
@@ -405,13 +438,15 @@ async def propose(led) -> None:
                 log(f"opened draft PR#{pr_number} for {branch} ({repo['nwo']})"); n_open += 1; opened += 1
             else:
                 log(f"mark_proposed fenced out (PR#{pr_number}) — closing our PR")
-                _gh_json(repo["nwo"], "pr", "close", str(pr_number))
+                if not _gh_close(repo["nwo"], pr_number):
+                    log(f"close of fenced-out PR#{pr_number} FAILED — orphan open PR, close it by hand")
         except Exception as e:                                    # never let one class wedge the tick
             log(f"propose {c['rule_tag']} raised ({e!r}) — release + continue")
-            try:
-                await led.release_proposing(fp, branch, draft_sha)
-            except Exception:
-                pass
+            if claimed and branch is not None:
+                try:
+                    await led.release_proposing(fp, branch, draft_sha)
+                except Exception:
+                    pass
 
 
 async def _amain() -> int:

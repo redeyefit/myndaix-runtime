@@ -234,6 +234,70 @@ def test_propose_skips_unlisted_scope():
     ok(led.mutations == [], "A2: a scope not in the allowlist is skipped before any claim/PR")
 
 
+# ---- oracle code-review folds ------------------------------------------------------------------
+def test_ttl_close_failure_defers_not_stale():
+    # oracle BLOCKER: a FAILED `gh pr close` must DEFER — never record 'stale' and orphan a live PR.
+    _reset(False)
+    import datetime as dt
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+    led = FakeLedger(proposed=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
+                                "rule_tag": "fail-open", "pr_number": 9,
+                                "branch": "skill/auto/fail-open", "proposed_at": old}])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._gh_json = lambda nwo, *a: {"state": "OPEN", "mergedAt": None}     # over-TTL and still open
+    P._gh_close = lambda nwo, pr: False                                   # the close FAILS
+    _run(P.reconcile(led))
+    ok(led.mutations == [], "failed TTL close -> defer (no 'stale' write, PR not orphaned)")
+    P._gh_close = lambda nwo, pr: True                                    # the close succeeds
+    _run(P.reconcile(led))
+    ok(("resolve", "fp1", "stale") in led.mutations, "confirmed close -> stale recorded")
+
+
+def test_propose_poison_pill_does_not_wedge_tick():
+    # oracle MAJOR: a candidate that RAISES before the claim (provenance/render) must be skipped,
+    # not crash the tick — and the NEXT candidate must still be processed.
+    _reset(False)
+    led = FakeLedger(ready=[{"fingerprint": "bad", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0},
+                            {"fingerprint": "good", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
+    async def _prov(fp, limit=8):
+        if fp == "bad":
+            raise RuntimeError("malformed provenance row")
+        return ["deadbeef"]
+    led.capture_provenance = _prov
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._find_open_bot_pr = lambda repo, branch: None
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: 143
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    _run(P.propose(led))
+    ok(("mark", "good", 143) in led.mutations, "the candidate AFTER the poison pill still proposes")
+    ok(not any(m[0] == "release" and m[1] == "bad" for m in led.mutations),
+       "a pre-claim raise releases nothing (it never claimed)")
+
+
+def test_reconcile_poison_pill_does_not_wedge_tick():
+    # oracle MAJOR: a raising reconcile row must defer, and the NEXT row must still resolve.
+    _reset(False)
+    led = FakeLedger(proposed=[{"fingerprint": "bad", "repo_scope": "myndaix-runtime",
+                                "rule_tag": "fail-open", "pr_number": 1,
+                                "branch": "skill/auto/fail-open", "proposed_at": None},
+                               {"fingerprint": "good", "repo_scope": "myndaix-runtime",
+                                "rule_tag": "toctou-race", "pr_number": 2,
+                                "branch": "skill/auto/toctou-race", "proposed_at": None}])
+    async def _resolve(fp, outcome):
+        if fp == "bad":
+            raise RuntimeError("db hiccup")
+        led.mutations.append(("resolve", fp, outcome)); return True
+    led.resolve_capture = _resolve
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._gh_json = lambda nwo, *a: {"state": "MERGED", "mergedAt": "2026-09-13T00:00:00Z"}
+    _run(P.reconcile(led))
+    ok(("resolve", "good", "promoted") in led.mutations,
+       "the row AFTER a raising reconcile row is still resolved (tick not wedged)")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
