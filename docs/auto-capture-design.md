@@ -340,3 +340,72 @@ are all CRASH windows (flock released on death, next tick resumes).
 - **A10 [MINOR] — `assert_only_skill_path` must run on `git diff --name-only -z`, not the intended
   string;** `author`/`%ae` is forgeable and must never be a security control (it isn't today —
   `MIN_AUTHORS=1`). Documented; no code beyond A4's actual-diff assertion.
+
+## v0.6 — CROSS-FAMILY design review folds (kilabz NEEDS-REVISION + oracle APPROVE-WITH-FIXES)
+
+Both families reviewed v0.5. They CONVERGED strongly, and oracle caught a logic trap in v0.5's own
+A4 resolution. v0.6 is what the build implements; it SUPERSEDES the A-item resolutions where noted.
+
+**Convergent simplifications (both families independently):**
+- **DROP `claim_token` (A1) and DROP the MAX_OPEN-in-UPDATE belt (A8).** Under the single-host flock,
+  `reap_stuck_proposing` can never race a live claim and no concurrent writer exists, so the state-
+  column CAS (`ready`→`proposing`) and a plain Python `count_open_proposals()` check are sufficient.
+  Both were over-engineered. The build keeps it simple: flock + CAS + count-then-claim.
+
+- **K1/A4 [BLOCKER] — recovery + adoption is by BRANCH + BOT-AUTHOR IDENTITY, never by content
+  hash.** oracle showed v0.5's "content-verify the tip before adopt" creates an INFINITE LOOP: after
+  a crash-before-mark, a human who edits the stub to fill it in changes the tip → `draft_hash(tip)
+  != draft_sha` → the proposer refuses to adopt, releases, and retries FOREVER. And `draft_sha`
+  isn't time-stable anyway (provenance grows). **Resolution (both families):** on recovery, find the
+  bot's open PR for `skill/auto/<slug>` scoped by authenticated author (`--author @me` / `owner:branch`
+  — NOT a bare `--head`, which fork branches can shadow), validate its head/base repo identity, and
+  ADOPT IT AS-IS regardless of current content — never overwrite a human's edits to restore a stub.
+  `draft_sha` stays a create-time integrity stamp, not the recovery key. Persist a durable
+  attempt/`generation` so an uncertain attempt is recovered BEFORE a MAX_OPEN slot is freed or a
+  replacement rendered.
+
+- **K4 + oracle [MAJOR] — an un-authored stub POISONS future reviews.** It passes promotion lint,
+  the controller indexes it independent of merge, and selection (unused-first, ~2 admitted) lets a
+  no-op DISPLACE real guidance. Both families' fix: the promotion/index gate REJECTS a skill whose
+  body is still the placeholder — enforce `hash(final_body) != draft_sha` AND require authored
+  problem+pattern content at BOTH CI and the controller's index step (blocking only
+  `resolve_capture(promoted)` is too late — indexing reads the merged tree). Open the PR `--draft`.
+  This keeps the stub+provenance UX (human authors from the provenance commits) while a no-op can
+  never reach the corpus.
+
+- **K5 + oracle [MAJOR] — closure is an ambiguous, reversible label.** A human "not now" close must
+  NOT bump the reject backoff like a "bad rule". Both families' fix: negative recurrence weight ONLY
+  on an explicit rejection label (e.g. `invalid-rule`); a bare close is a NEUTRAL deferral with a
+  `retry_after`, not a decline. Retain historical PR identity (a closed PR can be reopened+merged).
+
+**kilabz-only (GPT-family) additional blockers/majors:**
+- **K2 [BLOCKER] — check the ACTUAL PR + complete change set.** Validate returned head/base repo
+  identities, reject ambiguous, never "first match". Diff via **merge-base..head** (not `base..head`),
+  NUL, **rename-detection OFF**, require the one permitted path + `A` status + regular-file mode.
+  Re-read head/base OIDs right before recording adoption (movement → defer).
+- **K3 [BLOCKER] — symlink escape DURING the write.** A symlinked `skills`/slug-dir/`SKILL.md`
+  mutates outside the worktree before the assert. **Create O_EXCL, no-follow-symlink; reject
+  symlinked/non-dir ancestors; reject an existing target** (also enforces "never edit an existing skill").
+- **K6 [MAJOR] — gh helpers conflate absence/failure/mutation.** `gh pr create` prints a URL, not
+  JSON; a create TIMEOUT = "unknown", never "not opened" (preserve for recovery). Bound each tick by
+  candidate + attempt + elapsed; visit each ready candidate AT MOST ONCE (a `continue` on an
+  unchanged next-ready loops forever); on rate-limit stop + honor retry. "≤1 new/day" is NOT enforced
+  by MAX_OPEN — implement a daily limit or drop the promise.
+- **K8 [MAJOR] — migration/compat pass.** APPEND a guarded migration (never edit `0007`); update
+  `schema.sql` + the substrate pin; verify populated-DB upgrade + repeated boot re-run; `connect()`
+  does NOT migrate — apply/verify schema before ARMING.
+- **K9 [MAJOR] — CI code-exec risk.** Unsandboxed CI-on-Mini + a `Contents:Write` bot token = run
+  code without merging → bypasses the human-merge gate. **v1 posture (documented + accepted):** the
+  proposer writes ONLY `skills/<slug>/SKILL.md` (inert data, our repo, our reviewers), is
+  path-confined (K3 + `assert_only_skill_path`), adds no capability the existing automerge token
+  lacks. **Sandboxing the CI runner is a SEPARATE follow-up rung** — flagged, gate-on-it is Jefe's call.
+
+**oracle-only (Gemini) additional:** MINOR — a prior tick where `git push` succeeded but `gh pr
+create` failed leaves a remote branch with no PR; the recovery push must handle the existing remote
+branch safely (own-namespace, creation-only).
+
+**A-item adjustments carried:** A2 validated (exact-key MAP, `repo_scope` never into argv) — also
+apply the map at reconcile/sweep; A3 validated (the `\n`/`\t` strip + hex-validate already shipped);
+A5 use `gh pr view --json state,mergedAt` (`state` exposes `MERGED`; there is no `merged` field);
+A6 validated (tick-start GC, stable proposer root, remove via `git worktree remove`); A7 validated;
+A9 DRY_RUN suppresses mutations in ALL THREE passes, not just PROPOSE.
