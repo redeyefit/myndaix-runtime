@@ -170,7 +170,16 @@ V1_ROSTER: list[AgentSpec] = [
               # Oracle real review depth. (Debug-first 2026-06-28: the old "~50KB prompt -> empty"
               # field note did NOT reproduce — agy returns correct output at 662KB, so there is no
               # packet ceiling to engineer around; the only real handicap was the un-pinned model.)
-              adapter={"kind": "cli", "argv": ["agy", "--model", "Gemini 3.1 Pro (High)", "-p"],
+              # --disable-slash-commands (root-caused 2026-09-12, the FieldVision design review):
+              # agy EXPANDS slash-commands + skills in print mode. Review payloads routinely contain
+              # `/word` tokens — a design doc's route paths (/schedule, /projects, /dashboard), a code
+              # diff's leading-slash paths — and agy HIJACKS on the first match: e.g. `/schedule` in
+              # the doc fired agy's schedule skill ("what would you like me to schedule?") instead of
+              # reviewing, so xreview saw non-review garbage and degraded to "oracle unavailable" (its
+              # 2>/dev/null hid the cause for weeks). This ALSO closes an injection vector: an untrusted
+              # doc/diff can no longer trigger an agy skill in the unconfined reviewer. Verified: same
+              # /schedule-laden prompt returns a real architecture review WITH this flag.
+              adapter={"kind": "cli", "argv": ["agy", "--model", "Gemini 3.1 Pro (High)", "--disable-slash-commands", "-p"],
                        "prompt_channel": "arg",
                        "env_passthrough": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]}),
     AgentSpec(agent_id="curator", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
