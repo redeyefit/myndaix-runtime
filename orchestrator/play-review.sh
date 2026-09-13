@@ -613,12 +613,28 @@ fi
 outcomes_record(){
   gate && return 0                                     # HARD no-op in gate mode
   [[ -f "$ORCH/OUTCOMES_ENABLED" && "$ref" != *skill/auto/* ]] && have_perl || return 0
-  local out_keys
+  local out_keys rc
   # flags FIRST, then `--`, then ALL positionals — so a positional beginning with `-` (a sha, a path)
   # can't be mis-parsed as an option. changed[] is the reviewed diff's changed-path set (empty-safe).
+  # stderr -> $run/outcomes.err, NOT /dev/null (root-caused 2026-09-12: a NEEDS-FIX review whose valid
+  # findings never recorded, undiagnosable because stderr was discarded). Capture the exit code
+  # SEPARATELY from stdout so a fault is not conflated with a genuine clean-pass (r1 CRITICAL).
   out_keys="$(cap_run mxr outcome-record --kilabz "$review" --oracle "$oracle_review" -- \
-                "$repo" "$base" "$tip" "$ref" "$play" ${changed[@]+"${changed[@]}"} 2>/dev/null || true)"
-  [[ -n "${out_keys//[[:space:]]/}" ]] || return 0     # nothing recorded (clean PASS / all dropped)
+                "$repo" "$base" "$tip" "$ref" "$play" ${changed[@]+"${changed[@]}"} 2>>"$run/outcomes.err")" && rc=0 || rc=$?
+  # rc≠0 = the recorder was killed/crashed (e.g. SIGALRM at CAPTURE_TIMEOUT). We say "UNCERTAIN", not
+  # "not recorded" (r2 P2): the recorder commits rows BEFORE its post-commit expiry sweep, so a timeout
+  # AFTER the commit leaves findings IN the ledger yet exits nonzero — claiming "not recorded" would lie.
+  # This note is often the ONLY trace: a SIGALRM kill can beat the process to writing $run/outcomes.err.
+  # Still fail-open (return 0): a recorder fault must NEVER delay the verdict or wedge the held lock (its
+  # core invariant). Deliberately NO retry / NO fail-closed, and NO reparse of possibly-truncated stdout
+  # keys (the committed rows still surface via `mxr labelqueue`); reliable recorded-vs-not signaling
+  # would require the fail-open recorder itself to emit it — a separate, evidence-gated change.
+  # NOTE (r2 P2, ACCEPTED-AS-IS): a connection failure is caught INSIDE outcomerecord (logs + returns []
+  # exit 0), so it lands here as rc=0 + empty out_keys — same branch as a clean pass, but its stderr IS
+  # in $run/outcomes.err. That trace is the scoped "make it visible" win; distinguishing it in control
+  # flow is the same deferred recorder-signal change.
+  if (( rc != 0 )); then note outcomes "outcome-record exited $rc — recording UNCERTAIN (may be partial/none); see $run/outcomes.err"; return 0; fi
+  [[ -n "${out_keys//[[:space:]]/}" ]] || return 0     # rc=0 + empty = clean PASS / all dropped (or caught-fail, logged)
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
@@ -796,7 +812,12 @@ $review
     cap_author="$(git -C "$repo" log -1 --format='%ae' "$tip" 2>/dev/null || echo unknown)"
     # flags FIRST, then `--`, then ALL positionals — so a positional that begins with `-`
     # (repo_id/sha/author) can't be mis-parsed as an option and crash the record (silent drop).
+    # stderr -> $run/capture.err (same rationale as outcomes_record above), and on failure a LOUD note
+    # in the play log instead of a silent `|| true` (r1 HIGH). DELIBERATELY best-effort/fail-open: the
+    # capture signal has NO downstream consumer yet (no proposer), so losing one is acceptable and a
+    # dead-letter would be premature machinery — but the loss is now VISIBLE, not silent.
     cap_run mxr capture-record --kilabz "$review" --oracle "$oracle_review" -- \
-      "$repo_id" "$tip" "$play" "$cap_author" ${changed[@]+"${changed[@]}"} >/dev/null 2>&1 || true
+      "$repo_id" "$tip" "$play" "$cap_author" ${changed[@]+"${changed[@]}"} >/dev/null 2>>"$run/capture.err" \
+      || note capture "capture-record exited nonzero — outcome UNCERTAIN; see $run/capture.err (best-effort: no consumer yet, nothing lost downstream)"
   fi
 fi
