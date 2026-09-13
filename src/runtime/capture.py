@@ -17,7 +17,7 @@ import re
 from runtime import skillmatch
 
 __all__ = [
-    "RULE_TAG_TAXONOMY", "is_allowed_tag", "slug", "fingerprint",
+    "RULE_TAG_TAXONOMY", "is_allowed_tag", "slug", "fingerprint", "is_hex_sha",
     "path_to_glob", "candidate_glob", "recurrence_ready", "reready_threshold",
     "skill_branch", "skill_path", "assert_only_skill_path",
     "sanitize_field", "render_skill_md", "draft_hash", "DEFAULTS",
@@ -89,6 +89,17 @@ def fingerprint(repo_scope: str, rule_tag: str) -> str:
     """Deterministic recurrence key for a (repo, rule_tag) CLASS (v0.4: keyed on the allowlisted
     tag, not the glob — Recon delta). NUL-separated so ('a','b-c') and ('a-b','c') can't collide."""
     return hashlib.sha256(f"{repo_scope}\x00{rule_tag}".encode()).hexdigest()
+
+
+_HEX_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def is_hex_sha(s: str) -> bool:
+    """True iff `s` is a plausible git commit SHA (7-40 lowercase hex). commit_sha reaches the
+    rendered SKILL.md body + PR as provenance (finding_ids); the recorder validates on the way IN
+    and provenance filters on the way OUT so an attacker-chosen non-hex string (attack-pass A3) can
+    never carry injection payload into the human-reviewed draft. sanitize_field is the last belt."""
+    return bool(_HEX_SHA_RE.match((s or "").strip().lower()))
 
 
 # ---- secondary locality: a changed path -> the path_trigger a proposed skill would carry --------
@@ -177,16 +188,20 @@ def assert_only_skill_path(changed_paths: list[str], s: str) -> bool:
 # ---- S4: deterministic drafting — render from STRUCTURED fields, never raw reviewer text -------
 _TAG_LIKE = re.compile(r"<[^>\n]{0,200}>")   # XML/HTML-ish tags where injection framing hides
 _WS = re.compile(r"[ \t\r\f\v]+")
-_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def sanitize_field(text: str, maxlen: int) -> str:
     """Make one structured field safe to embed in a SKILL.md body (S4): drop tag-like spans and
     control chars, collapse runs of whitespace, trim, and hard-cap length. This is a BEST-EFFORT
     filter, NOT the security boundary (the human merge is) — but it removes the obvious injection
-    affordances before the body goes anywhere near a reviewer prompt as PR diff."""
+    affordances before the body goes anywhere near a reviewer prompt as PR diff.
+
+    Uses _RAW_CTRL (the STRICT [\\x00-\\x1f\\x7f], incl. \\n and \\t) — NOT a looser class: the
+    attack pass found that letting a raw newline through here forges extra SKILL.md lines from a
+    structured field (e.g. an injected finding_id / origin_repo), and _WS does not cover \\n. Map
+    every C0/DEL to a space FIRST, then _WS collapses the run — a multi-line field becomes one line."""
     t = _TAG_LIKE.sub(" ", text or "")
-    t = _CTRL.sub(" ", t)
+    t = _RAW_CTRL.sub(" ", t)
     t = _WS.sub(" ", t).strip()
     return t[:maxlen].strip()
 

@@ -1477,6 +1477,31 @@ class PostgresLedger:
         return await self._pool.fetchval(
             "SELECT count(*) FROM capture_candidate WHERE state IN ('proposing','proposed')")
 
+    async def list_ready_candidates(self, limit: int) -> list[dict]:
+        """The proposer's work queue: the 'ready' classes to propose, oldest-signal first (fair),
+        capped. READ-ONLY — the actual claim is a separate CAS (claim_for_proposing) under the
+        MAX_OPEN check, so two reads can never double-propose. Returns the fields the allowlist-map
+        resolve + render need (repo_scope is resolved by EXACT-KEY lookup by the caller; it is NEVER
+        passed to a git/gh argv — attack-pass A2)."""
+        rows = await self._pool.fetch(
+            """SELECT fingerprint, repo_scope, rule_tag, path_glob, decline_count
+                 FROM capture_candidate WHERE state = 'ready'
+                ORDER BY last_seen ASC, fingerprint ASC LIMIT $1""", limit)
+        return [dict(r) for r in rows]
+
+    async def capture_provenance(self, fingerprint: str, limit: int = 8) -> list[str]:
+        """The distinct commit SHAs where this class recurred — the proposer passes them to
+        render_skill_md as finding_ids provenance (the human reads those commits to author the skill
+        body). HEX-FILTERED in SQL (belt vs a non-hex commit_sha that slipped past the recorder —
+        attack-pass A3), so a forged provenance string can never reach the rendered body. commit_sha
+        is already unique per fingerprint (occurrence PK), so no DISTINCT needed. Most-recent first,
+        capped (render truncates to 8 regardless)."""
+        rows = await self._pool.fetch(
+            """SELECT commit_sha FROM capture_occurrence
+                WHERE fingerprint = $1 AND commit_sha ~ '^[0-9a-f]{7,40}$'
+                ORDER BY seen_at DESC, commit_sha ASC LIMIT $2""", fingerprint, limit)
+        return [r["commit_sha"] for r in rows]
+
     async def expire_stale_captures(self, ttl_days: int) -> list[dict]:
         """S8 anti-wedge: mark any 'proposed' class whose PR has sat past the TTL as 'stale' and
         RETURN {fingerprint, pr_number} so the proposer can close the abandoned PR — a garbage flood
