@@ -51,6 +51,7 @@ LOCK = ORCH / "proposer.lock"
 ENABLED_FLAG = ORCH / "PROPOSER_ENABLED"
 WORKTREE_ROOT = Path(os.environ.get("MYNDAIX_PROPOSER_WORKTREES", str(STATE / "proposer-worktrees")))
 CURSOR_FILE = STATE / "proposer-cursor"       # last-visited fingerprint (fairness keyset, r2 #7)
+SUSPECTS_FILE = STATE / "proposer-suspects.json"   # unresolved unknown-create outcomes (ff-r3 M2b)
 BOT_NAME = os.environ.get("MYNDAIX_PROPOSER_BOT_NAME", "myndaix-proposer")
 BOT_EMAIL = os.environ.get("MYNDAIX_PROPOSER_BOT_EMAIL", "proposer@myndaix.local")
 
@@ -475,6 +476,41 @@ async def reconcile(led) -> None:
             log(f"reconcile {c.get('rule_tag')} raised ({e!r}) — defer + continue")
 
 
+# -- orphan suspects (ff-r3 M2b): an unknown `gh pr create` outcome may be a REAL open PR the
+#    ledger doesn't track. The suspect is PERSISTED (fingerprint+scope+branch) independently of the
+#    fairness cursor — kilabz fault-injection proved every cursor-based reservation dies at a tick
+#    boundary (a newly-ready candidate can sort between the cursor and the suspect, so "resume at
+#    the suspect" is not guaranteed). Each tick resolves suspects FIRST, before any creation:
+#    found → adopt (pre-capacity, it re-tracks an existing PR); definitively-none → drop (nothing
+#    was created; the branch-exists refusal covers a pushed-branch leftover); unknown → keep AND
+#    reserve a MAX_OPEN slot while the uncertainty persists.
+def _load_suspects() -> list[dict]:
+    try:
+        raw = json.loads(SUSPECTS_FILE.read_text())
+        return [s for s in raw if isinstance(s, dict) and s.get("fingerprint")] if isinstance(raw, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_suspects(suspects: list[dict]) -> bool:
+    try:
+        SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SUSPECTS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(suspects))
+        tmp.replace(SUSPECTS_FILE)                # atomic on APFS
+        return True
+    except OSError as e:
+        log(f"suspects write failed ({e}) — reservation may not survive a crash this tick")
+        return False
+
+
+def _add_suspect(fingerprint: str, repo_scope: str, branch: str) -> bool:
+    suspects = _load_suspects()
+    if not any(s["fingerprint"] == fingerprint for s in suspects):
+        suspects.append({"fingerprint": fingerprint, "repo_scope": repo_scope, "branch": branch})
+    return _save_suspects(suspects)
+
+
 def _age_days(ts) -> float:
     if ts is None:
         return 0.0
@@ -502,6 +538,43 @@ async def propose(led) -> None:
     attempts = 0
     probes = 0
     seen: set = set()
+    # -- resolve persisted orphan suspects FIRST, before any creation (ff-r3 M2b) --
+    if not DRY_RUN:
+        remaining: list[dict] = []
+        for s in _load_suspects():
+            try:
+                repo = resolve_repo(s["repo_scope"])
+                if repo is None:
+                    remaining.append(s); continue                 # unresolvable scope: keep + reserve
+                status, existing = _find_open_bot_pr(repo, s["branch"])
+                if status == "found":
+                    # the orphan is REAL — re-track it (pre-capacity: adoption adds no load). The
+                    # row is still 'ready'; claim just before the mark, same as scan adoption.
+                    slug_s = s["branch"].rsplit("/", 1)[-1]
+                    prov = await led.capture_provenance(s["fingerprint"])
+                    rendered = capture.render_skill_md(slug_s, slug_s, "src/**", "", "",
+                                                       finding_ids=prov, origin_repo=s["repo_scope"])
+                    dsha = capture.draft_hash(rendered) if rendered else "unknown"
+                    if await led.claim_for_proposing(s["fingerprint"], s["branch"], dsha):
+                        if await led.mark_capture_proposed(s["fingerprint"], s["branch"], dsha, existing):
+                            log(f"suspect resolved: adopted orphan PR#{existing} for {s['branch']}")
+                            n_open += 1
+                        else:
+                            await led.release_proposing(s["fingerprint"], s["branch"], dsha)
+                            remaining.append(s)
+                    else:
+                        remaining.append(s)                       # not ready anymore: keep one more look
+                elif status == "none":
+                    log(f"suspect resolved: no PR exists for {s['branch']} — cleared")
+                else:                                             # unknown/ambiguous: keep + RESERVE
+                    remaining.append(s)
+            except Exception as e:
+                log(f"suspect {s.get('branch')} resolution raised ({e!r}) — keep + reserve")
+                remaining.append(s)
+        _save_suspects(remaining)
+        if remaining:
+            n_open += len(remaining)                              # capacity reserved while uncertain
+            log(f"{len(remaining)} unresolved suspect(s) — reserving {len(remaining)} MAX_OPEN slot(s)")
     # FAIRNESS (kilabz r2 #7): scan in fingerprint keyset order starting after a PERSISTED cursor,
     # wrapping to the start when the tail is exhausted — every ready row is eventually visited even
     # if 100+ persistently-skipped candidates (unlisted scope, render reject) sit ahead of it. The
@@ -574,16 +647,13 @@ async def propose(led) -> None:
                     else:
                         await led.release_proposing(fp, branch, draft_sha)
                 continue
-            if status == "unknown":
-                # gh is unhealthy — and this candidate may be an unresolved orphan-suspect. Do NOT
-                # consume it (the cursor must never advance past an unresolved suspect — kilabz
-                # ff-r2 M2: cursor-past-suspect let the next tick create before recovering the
-                # orphan → real PRs over cap). Stop the propose pass; next tick resumes HERE.
-                log(f"recovery lookup unknown for {branch} — stop propose pass, resume here next tick")
-                seen.discard(fp); break
-            if status != "none":                                  # ambiguous: NEVER create; consume +
+            if status != "none":
+                # unknown/ambiguous: NEVER create for this candidate; consume + continue — the pass
+                # is NOT stopped (ff-r3: break-on-unknown wedged the whole queue behind one repo's
+                # gh trouble, blocking adoption in healthy repos). A non-suspect candidate has no
+                # orphan risk (orphans exist only after an unknown CREATE, which persists a suspect).
                 log(f"recovery lookup {status} for {branch} — defer (no claim, no create)")
-                continue                                          # revisit after wrap (can't block queue)
+                continue
             if create_spent:
                 continue                                          # capacity gates CREATION only
             exists = _remote_branch_exists(repo, branch)
@@ -610,13 +680,22 @@ async def propose(led) -> None:
                     log(f"worktree cleanup raised ({ce!r}) — tick-start GC sweeps it")
             if outcome == "unknown":
                 # a REAL PR may exist untracked (kilabz ff MAJOR: 2 tracked + 2 unknowns = 4 real
-                # PRs under a 3 cap). Release the claim, then STOP the pass WITHOUT consuming this
-                # candidate — the cursor stays before it, so the NEXT tick resumes here and the
-                # adopt-probe (pre-capacity) re-tracks the orphan or the create retries, BEFORE any
-                # other creation can run (ff-r2 M2b: an in-tick-only reservation died at the tick
-                # boundary while the cursor moved on — overflow across ticks).
+                # PRs under a 3 cap). PERSIST the suspect FIRST — before the release, whose own
+                # exception must not bypass the reservation (ff-r3 M2b gap 1) — then reserve the
+                # slot in-tick and continue; the next tick resolves suspects BEFORE any creation,
+                # independent of the fairness cursor (ff-r3 M2b gap 2: a newly-ready candidate can
+                # sort between the cursor and the suspect, so cursor position guarantees nothing).
+                persisted = _add_suspect(fp, c["repo_scope"], branch)
+                n_open += 1                                       # in-tick reservation
+                if not persisted:
+                    log(f"suspect for {branch} NOT persisted — stopping the pass as belt")
+                    try:
+                        await led.release_proposing(fp, branch, draft_sha)
+                    except Exception:
+                        pass
+                    seen.discard(fp); break
                 await led.release_proposing(fp, branch, draft_sha)
-                seen.discard(fp); break
+                continue
             if outcome != "opened" or pr_number is None:          # "no-pr": definite, nothing created
                 await led.release_proposing(fp, branch, draft_sha); continue
             if await led.mark_capture_proposed(fp, branch, draft_sha, pr_number):

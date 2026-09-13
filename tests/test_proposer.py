@@ -71,8 +71,10 @@ def _run(coro):
 
 def _reset(monkey_dry=False):
     P.DRY_RUN = monkey_dry
-    # per-test cursor isolation: the fairness cursor is process state; point it at a fresh temp file
-    P.CURSOR_FILE = Path(tempfile.mkdtemp(prefix="mdx-test-cursor.")) / "cursor"
+    # per-test isolation: cursor + suspects are process state; point them at fresh temp files
+    d = Path(tempfile.mkdtemp(prefix="mdx-test-state."))
+    P.CURSOR_FILE = d / "cursor"
+    P.SUSPECTS_FILE = d / "suspects.json"
 
 
 # ---- K3: symlink-safe, creation-only SKILL.md write --------------------------------------
@@ -238,6 +240,7 @@ def test_probe_exhaustion_does_not_starve_below_capacity():
     # with the default 3, the pre-existing capacity break masked the difference — the base commit
     # passed this test; with 10 the base fails and HEAD passes: the new cutoff is what's exercised).
     _reset(False)
+    prior_max_open = os.environ.get("CAPTURE_MAX_OPEN")          # restore, don't just pop (ff-r3 MINOR)
     os.environ["CAPTURE_MAX_OPEN"] = "10"
     try:
         ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
@@ -256,14 +259,15 @@ def test_probe_exhaustion_does_not_starve_below_capacity():
         ok(("mark", "fp06", 70) in led2.mutations,
            "tick 2 resumes AT the unprocessed candidate and ADOPTS it (no starvation)")
     finally:
-        os.environ.pop("CAPTURE_MAX_OPEN", None)
+        if prior_max_open is None:
+            os.environ.pop("CAPTURE_MAX_OPEN", None)
+        else:
+            os.environ["CAPTURE_MAX_OPEN"] = prior_max_open
 
 
-def test_unknown_create_stops_tick_and_recovers_next():
-    # kilabz ff-r2 M2b: an in-tick-only reservation died at the tick boundary while the cursor
-    # moved on — tick 2 could CREATE again before ever revisiting the orphan (4 real PRs, cap 3).
-    # Now an unknown create outcome stops the pass WITHOUT consuming the candidate: the cursor
-    # stays before it, and tick 2's adopt-probe (pre-capacity) re-tracks the orphan FIRST.
+def test_unknown_create_persists_suspect_and_recovers_next_tick():
+    # ff-r3 M2b: the suspect is PERSISTED independently of the fairness cursor; the next tick
+    # resolves it (adopt/clear/reserve) BEFORE any creation.
     _reset(False)
     ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
               "path_glob": "src/*.py", "decline_count": 0} for i in range(7)]
@@ -280,36 +284,96 @@ def test_unknown_create_stops_tick_and_recovers_next():
     try:
         led = FakeLedger(open_count=2, ready=ready)              # 2 tracked, cap 3
         _run(P.propose(led))
-        ok(creates["n"] == 1, "tick 1: ONE unknown create, then the pass stops")
-        ok(not P.CURSOR_FILE.exists() or "fp00" not in P.CURSOR_FILE.read_text(),
-           "the suspect candidate does not advance the cursor")
-        # tick 2: the orphan turned out REAL — the adopt-probe re-tracks it before any creation
+        ok(creates["n"] == 1, "tick 1: ONE unknown create (the in-tick reservation gates the rest)")
+        suspects = json.loads(P.SUSPECTS_FILE.read_text())
+        ok(len(suspects) == 1 and suspects[0]["fingerprint"] == "fp00",
+           "the suspect is PERSISTED (fingerprint+scope+branch)")
+        # tick 2: the orphan turned out REAL — suspect resolution adopts it BEFORE any creation
         P._find_open_bot_pr = lambda repo, branch: ("found", 91)
         led2 = FakeLedger(open_count=2, ready=ready)
         _run(P.propose(led2))
-        ok(("mark", "fp00", 91) in led2.mutations, "tick 2 ADOPTS the orphan first (re-tracked)")
-        ok(creates["n"] == 1, "tick 2 creates nothing more at capacity (3 tracked after adopt)")
+        ok(("mark", "fp00", 91) in led2.mutations, "tick 2 ADOPTS the orphan via the suspect file")
+        ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "the resolved suspect is cleared")
+        ok(creates["n"] == 1, "tick 2 creates nothing more (3 tracked after the adopt)")
     finally:
         P._remote_branch_exists = saved_rbe
 
 
-def test_unknown_lookup_stops_pass_without_consuming():
-    # ff-r2 M2 companion: an unknown LOOKUP on a candidate (gh down) also stops the pass without
-    # consuming it — the cursor can never advance past an unresolved suspect.
+def test_suspect_beats_newly_ready_candidate():
+    # kilabz ff-r3 M2b gap-2 repro: cursor fp00, suspect fp20, a NEWLY-READY fp10 sorts between
+    # them. The suspect must be recovered BEFORE fp10 can create — else 4 real PRs under cap 3.
     _reset(False)
-    ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
-              "path_glob": "src/*.py", "decline_count": 0} for i in range(3)]
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 55)
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fp20", "repo_scope": "myndaix-runtime",
+                                            "branch": "skill/auto/fail-open"}]))
+    P.CURSOR_FILE.write_text("fp00")
+    P._find_open_bot_pr = lambda repo, branch: ("found", 77)     # the orphan is real
+    led = FakeLedger(open_count=2,                               # 2 tracked + 1 orphan = cap FULL
+                     ready=[{"fingerprint": "fp10", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
+    try:
+        _run(P.propose(led))
+        ok(("mark", "fp20", 77) in led.mutations, "the suspect is adopted FIRST (pre-scan)")
+        ok(not any(m == ("mark", "fp10", 55) for m in led.mutations),
+           "fp10 does NOT create — capacity is full once the orphan is re-tracked (no overflow)")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_release_exception_cannot_bypass_reservation():
+    # ff-r3 M2b gap-1: a raising release after an unknown create must not bypass the reservation —
+    # the suspect is persisted BEFORE the release attempt.
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i}", "repo_scope": "myndaix-runtime", "rule_tag": t,
+              "path_glob": "src/*.py", "decline_count": 0}
+             for i, t in enumerate(["fail-open", "toctou-race"])]
+    led = FakeLedger(open_count=2, ready=ready)                  # 2 tracked, cap 3
+    async def _raising_release(fp, branch, draft_sha):
+        raise RuntimeError("db hiccup mid-release")
+    led.release_proposing = _raising_release
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    creates = {"n": 0}
+    def _unknown(repo, wt, branch, slug):
+        creates["n"] += 1; return ("unknown", None)
+    P._push_and_open_pr = _unknown
+    try:
+        _run(P.propose(led))
+        ok(creates["n"] == 1, "the raising release does not enable a second create")
+        ok(json.loads(P.SUSPECTS_FILE.read_text())[0]["fingerprint"] == "fp0",
+           "the suspect was persisted BEFORE the release raised (reservation survives)")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_unknown_lookup_defers_without_wedging_queue():
+    # ff-r3: an unknown LOOKUP must not stop the pass (one repo's gh trouble would block adoption
+    # in healthy repos). It defers that candidate only; the next candidate still proceeds.
+    _reset(False)
+    ready = [{"fingerprint": "fp00", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0},
+             {"fingerprint": "fp01", "repo_scope": "myndaix-runtime", "rule_tag": "toctou-race",
+              "path_glob": "src/*.py", "decline_count": 0}]
     led = FakeLedger(ready=ready)
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-    probes = {"n": 0}
-    def _unknown_lookup(repo, branch):
-        probes["n"] += 1; return ("unknown", None)
-    P._find_open_bot_pr = _unknown_lookup
+    def _lookup(repo, branch):
+        return ("unknown", None) if branch.endswith("fail-open") else ("found", 61)
+    P._find_open_bot_pr = _lookup
     _run(P.propose(led))
-    ok(probes["n"] == 1, "the pass stops at the FIRST unknown lookup (gh unhealthy)")
-    ok(led.mutations == [], "no claims taken")
-    ok(not P.CURSOR_FILE.exists(), "cursor not advanced (nothing was consumed)")
+    ok(not any(m[0] == "claim" and m[1] == "fp00" for m in led.mutations),
+       "the unknown-lookup candidate takes no claim (deferred)")
+    ok(("mark", "fp01", 61) in led.mutations, "the NEXT candidate still adopts (queue not wedged)")
 
 
 def test_unknown_create_reserves_max_open_slot():
