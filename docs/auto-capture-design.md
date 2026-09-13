@@ -1,6 +1,15 @@
 # DESIGN — auto-capture rung v0.3 ("the proposer"): turn a recurring review lesson into a PROPOSED skill
 
-**Status:** v0.4 — recalibrates the S3 recurrence signal for solo-founder reality (drops the
+**Status:** v0.5 — the observe-only data layer is merged + armed and REAL signal has accrued (Mini
+ledger: 2 `ready` classes — `myndaix-runtime/toctou-race`, `myndaix-runtime/fail-open`). This
+revision specs the **S7 proposer BUILD** (the driver) and folds three corrections earned from
+grounding the build against live code + data: **N1** (`repo_scope` pollution → fail-closed
+repo allowlist), **S5 honesty** (a fine-grained PAT cannot path/branch-scope — real containment is
+a separate bot identity + server-side branch protection), and the **gate-(b) reframe** (rotating
+the shared automerge PAT is an ARM-time step, not a build blocker). See the **v0.5 — S7 PROPOSER
+BUILD** section at the bottom. Prior revisions unchanged below.
+
+**Status (v0.4):** v0.4 — recalibrates the S3 recurrence signal for solo-founder reality (drops the
 hard ≥2-authors gate; preserves anti-single-actor via distinct-commit + distinct-event + cross-family
 signals; author-count becomes a per-repo dial defaulting to 1). v0.3 folded the **cross-family design review** (kilabz NEEDS-REVISION + oracle
 APPROVE-WITH-FIXES, jobs 3a00fb30 / 16867680). Both converged on a CRITICAL: a draft escaping
@@ -156,8 +165,10 @@ prompt-inject a reviewer into emitting arbitrary tags → manufactured recurrenc
   carries a PR-body `> [!WARNING] auto-summarized from untrusted code — review for injection`.
   `scan_injection` is a best-effort filter, NOT the boundary; the human merge is.
 
-**S5 — Restricted writer identity [HIGH, both].** A dedicated bot PAT/GitHub-App: `Contents:Write`
-scoped to `skill/auto/*` branches ONLY; NO merge, NO `workflow`/Actions write, NO secrets, NO
+**S5 — Restricted writer identity [HIGH, both]. — CORRECTED in v0.5 (see N2 below): a
+fine-grained PAT CANNOT scope to a branch/path.** The original text below is retained for history;
+the achievable mechanism is in v0.5/N2. A dedicated bot PAT/GitHub-App: ~~`Contents:Write`
+scoped to `skill/auto/*` branches ONLY~~; NO merge, NO `workflow`/Actions write, NO secrets, NO
 `.github/**`, NOT in the automerge author-allowlist. Lock default workflow perms `read-all`; no
 `pull_request_target` consuming PR-controlled files.
 
@@ -183,3 +194,88 @@ repo-local skills repo-local unless cross-repo recurrence is proven. Periodic hu
   (distinct commits), `CAPTURE_MIN_EVENTS=2` (distinct review/push events), `CAPTURE_MIN_AUTHORS=1`
   (per-repo dial), `CAPTURE_MAX_OPEN=3`, `CAPTURE_TTL_DAYS=14`, `CAPTURE_REPROPOSE=2×MIN_RECUR`.
   v1 ships **deterministic-template-only** drafting (no LLM summarization — safer per S4; defer LLM).
+
+---
+
+## v0.5 — S7 PROPOSER BUILD (the driver design + corrections earned from grounding)
+
+The data layer (pure core `capture.py` + all S6 state-machine ledger verbs) is **built, merged,
+and observe-only-armed**. This section specs the missing piece: the **driver** — a separate,
+flag-gated launchd job (`ai.myndaix.proposer`, S7) that turns `ready` classes into skill-draft PRs.
+
+### Driver mechanics (`src/runtime/proposer.py`, `python -m runtime.proposer tick`)
+Mirrors the existing autonomous git-writer (`automerge.py`): flag-gated OFF, single-instance lock,
+`DRY_RUN`, `PostgresLedger.connect(DSN)`, runs ONE bounded tick then exits (not a daemon). Reuses
+`automerge._git`/`_gh_json`/`_git_env` for git/gh, and `WorkspaceManager` for worktree isolation
+(invariant 5 — the SKILL.md is written in an ephemeral worktree, never the live tree). Each tick:
+
+1. **Reconcile** (`proposed` → terminal): for each `state='proposed'` class, read its PR via `gh`;
+   merged → `resolve_capture(fp,'promoted')`, closed-unmerged → `resolve_capture(fp,'declined')`.
+   This is how the human merge/close decision feeds the repropose backoff — the loop closes here.
+2. **Sweep** (S6/S8 anti-wedge): `reap_stuck_proposing(timeout)` releases claims orphaned by a
+   crash between claim and PR-open; `expire_stale_captures(TTL_DAYS)` returns pr_numbers whose PR
+   we then `gh pr close`.
+3. **Propose**: while `count_open_proposals() < CAPTURE_MAX_OPEN`, take the next `ready` class and
+   (a) **N1 repo-allowlist fail-closed** — skip unless `repo_scope` is a configured real repo;
+   (b) render via `capture.render_skill_md(...)` (S4 deterministic; `None`→skip);
+   (c) `claim_for_proposing(fp, branch=skill_branch(slug), draft_sha=draft_hash(rendered))` — a
+   `False` return means we lost the CAS race, skip;
+   (d) in a worktree off the repo default branch, write ONLY `skill_path(slug)`, then
+   `assert_only_skill_path` (S1) — else abort + `release_proposing`;
+   (e) **idempotency (S6)** — if `branch` already exists on the remote at the same `draft_sha`
+   (crash-resume), reuse it instead of re-pushing; else push;
+   (f) `gh pr create` (net-bounded); then `mark_capture_proposed(fp, branch, draft_sha, pr)` — a
+   `False` return means a reap+reclaim fenced us out (the CAS is fenced on branch+draft_sha), so we
+   `gh pr close` our just-opened PR and stop.
+   Any failure BEFORE the PR opens → `release_proposing` (back to `ready`, no orphan claim).
+
+### Draft form: STUB + PROVENANCE (deterministic, no LLM — chosen v0.5)
+The DB never stored the reviewer's finding TEXT, only the tag + glob, so a deterministic render is a
+scaffold, not a finished skill — and a skill's value is its *body*, so **every draft is authored by
+a human before merge regardless**. Therefore v1 renders the stub `capture.render_skill_md` already
+produces AND fills its `finding_ids` provenance from `capture_provenance(fp)` = the distinct
+`commit_sha`s where the class recurred. The reviewer reads those real commits, writes the body,
+merges. This costs one extra read (SHAs are already in `capture_occurrence`), keeps LLM/untrusted
+prose out (S4), and helps the classes ready NOW. **Capturing the finding text to auto-fill the body
+is a DEFERRED rung** — build it only on evidence the stubs are too thin, not ahead of it (it means
+reopening shipped code + re-arming accrual, and the current `ready` classes have no stored text).
+
+### N1 — `repo_scope` pollution [NEW, load-bearing]
+Live data shows `capture_candidate.repo_scope` contains non-repo values — branch names
+(`feat-sync-phase1`) and workflow run-ids (`wf_80d11feb-cb4-3`) — because the recorder (the
+play-review caller) passes a context-derived id as `repo_id`. A polluted or hostile scope must
+NEVER cause a PR against an unintended repo. **The proposer fails closed against a configured
+known-repo allowlist** (from `orchestrator/repos.json` / the registry): a scope not on the list is
+skipped, never proposed. Root-causing the recorder (so `repo_scope` is always a real repo id) is a
+separate, smaller follow-up; the allowlist is the proposer's non-negotiable belt regardless of that
+fix. The Mini's live signal is already clean (all `myndaix-runtime`), so this blocks nothing today.
+
+### N2 — S5 restricted-writer, corrected [supersedes S5's path-scoping claim]
+GitHub fine-grained PATs scope to **repository + permission**, NOT to a file path or branch prefix,
+so S5's "`Contents:Write` scoped to `skill/auto/*` branches only" is **not achievable** and was an
+over-claim. The real, layered containment is: **(a)** a dedicated bot IDENTITY for the proposer
+(its own token, token-file driven like automerge's, **NOT** in the automerge author-allowlist) —
+this preserves the true S5 intent: attribution + blast-radius separation from the merge-capable
+writer; **(b)** server-side branch protection requiring a human PR-merge; **(c)** `skills/**` is
+already in automerge's `_DENY_DIRS`, so an auto-PR can never self-merge. Path confinement is
+enforced *client-side deterministically* by `assert_only_skill_path` (S1) before every push — the
+PAT scope was never the mechanism that did it.
+
+### Gate-(b) reframe — the automerge PAT rotation is ARM-time, not a build blocker
+The "exposed automerge PAT" is one shared `r2` fine-grained token: active on the Mini, parked but
+unrevoked on the MacBook (`~/.myndaix/.automerge-token.decommissioned`). Building and DRY-running
+the proposer needs no token at all. The credential hygiene pairs with ARMING, done once on the
+Mini: provision the proposer's own bot token (N2), and rotate `r2` (mint a Mini-only `r3`, revoke
+`r2`, delete the MacBook copy) so no autonomous git-writer shares a credential.
+
+### Deploy topology
+Built on the MacBook (lab), **run on the Mini** (the autonomy host — clean signal; controller +
+automerge already run there). Ships via the substrate + trusted installed copies at
+`~/.myndaix/orchestrator/`, like play-review/automerge. Armed on the Mini only, after the credential
+step. Rollback = `rm $ORCH/PROPOSER_ENABLED` or `launchctl unload`.
+
+### First live proof
+Dry-run reads the Mini's 2 `ready` classes and logs "would open `skill/auto/toctou-race` for
+myndaix-runtime" / "…`fail-open`…", opening nothing. After arming, the first real tick opens the
+`skill/auto/toctou-race` draft PR; Jefe authors the body from the provenance commits and merges;
+the next tick reconciles it to `promoted`.
