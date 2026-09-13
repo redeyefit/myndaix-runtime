@@ -279,3 +279,64 @@ Dry-run reads the Mini's 2 `ready` classes and logs "would open `skill/auto/toct
 myndaix-runtime" / "…`fail-open`…", opening nothing. After arming, the first real tick opens the
 `skill/auto/toctou-race` draft PR; Jefe authors the body from the provenance commits and merges;
 the next tick reconciles it to `promoted`.
+
+## v0.5 — ATTACK-PASS findings folded (2-agent adversarial pass over the planned mechanics)
+
+The mandatory implementation attack pass (git-writer + lock/race + trust-boundary) returned one
+BLOCKER and several MAJORs — including bugs in the ALREADY-MERGED data layer that the prior
+cross-family review + tests missed. These resolutions are load-bearing; the build implements them.
+
+**Deploy invariant (scopes several findings):** the proposer runs on **exactly one host** (the
+Mini) under a single-instance `flock` — it is NOT shipped to both machines like automerge. So
+concurrent ticks against one Postgres cannot happen within a host, and `reap_stuck_proposing`
+(called only inside the tick) never races a live claim while the lock is held. The residual races
+are all CRASH windows (flock released on death, next tick resumes).
+
+- **A1 [BLOCKER] — the `mark_capture_proposed` fence (branch+draft_sha) is NON-discriminating.**
+  `render_skill_md` is deterministic and `draft_sha=sha256(rendered)`, so a reaped-then-reclaimed
+  proposer B computes the IDENTICAL branch + draft_sha as the crashed A. The CAS survives only on
+  the `state='proposing'→'proposed'` column; branch+draft_sha add zero discrimination (the code
+  comment claiming otherwise is wrong). A crash between `gh pr create` and the DB mark leaves an
+  **orphan PR the ledger never tracks** (RECONCILE keys on stored `pr_number`, never written).
+  **Resolution:** (i) key the protocol on the deterministic branch and **adopt before create** —
+  `gh pr list --head skill/auto/<slug> --state open`; if an open PR exists, adopt it
+  (`mark_capture_proposed` with that number) instead of creating a second (GitHub also refuses a
+  2nd PR per head→base, so "create" is not the recovery path — "adopt" is); (ii) add a
+  `claim_token uuid` stamped by `claim_for_proposing`, carried in-process, and fenced on by
+  `mark_capture_proposed`/`release_proposing` (reap nulls it) so a late claimant can never clobber
+  another's row. Both are data-layer changes (migration + verb-signature) → re-reviewed at code review.
+- **A2 [BLOCKER] — `repo_scope` is unvalidated into the DB and has no repo→remote resolver.**
+  `repo_scope` is stored verbatim (`schema.sql` has no CHECK; `capturerecord.py`'s regex is a CLI
+  belt only) and live data holds branch/workflow ids. **Resolution:** N1's allowlist is a **MAP**
+  `repo_scope → {nwo, local_path}`; the proposer resolves the PR target and worktree path by
+  **exact-key lookup only** (unknown → skip), and `repo_scope` NEVER reaches a git/gh argv position.
+  Add a recorder-side reject so a non-allowlisted scope can't enter the DB. Enforce at the
+  remote-mapping altitude, not merely propose-time.
+- **A3 [MAJOR] — `sanitize_field` lets newline/tab through** (`_CTRL=[\x00-\x08\x0b-\x1f\x7f]`
+  excludes `\x09`/`\x0a`; `_WS` lacks `\n`), so `finding_ids` (commit_sha) / `origin_repo` can forge
+  lines in the human-reviewed SKILL.md body. **Resolution:** `_CTRL=[\x00-\x1f\x7f]` AND validate
+  `commit_sha` as `^[0-9a-f]{7,40}$` at the recorder before it enters the DB (both belts).
+- **A4 [MAJOR] — branch-reuse trusts `draft_sha` match alone → third-party push hijack.** The bot
+  PAT is repo-wide `Contents:Write`; `skill/auto/*` is not an owned ref namespace. **Resolution:**
+  before reusing/adopting a remote branch, fetch it and assert `draft_hash(SKILL.md@tip)==D` AND
+  `assert_only_skill_path(git diff base..branch, slug)` on the ACTUAL diff — never the bare name.
+- **A5 [MAJOR] — RECONCILE mis-declines on `_gh_json→None`.** gh down/rate-limited collapses to
+  "not merged" → destructive `resolve_capture(declined)` (bumps repropose floor, orphans the open
+  PR). **Resolution:** act ONLY on definitive states (dict result AND `merged===true`→promoted;
+  `state==CLOSED && !merged`→declined); None/OPEN/undetermined → DEFER. Fail-closed to "leave open."
+- **A6 [MAJOR] — proposer worktrees leak** (it's not a worker job; `WorkspaceManager.sweep` only GCs
+  closed-attempt ids). **Resolution:** proposer owns GC — per-tick private root rmtree'd at tick
+  start, or deterministic `attempt_id=proposer-<fp>` pruned when not `state='proposing'`.
+- **A7 [MAJOR] — TTL `gh pr close` races a human merge → inverts the signal** (a merged skill
+  recorded as stale/declined). **Resolution:** SWEEP re-reads live PR state before closing;
+  `merged`→`resolve_capture(promoted)`, else close-then-stale. Split `expire_stale_captures` into
+  select-due + per-PR resolve.
+- **A8 [MAJOR] — MAX_OPEN TOCTOU** (count-then-claim across statements). Mitigated by single-host
+  flock, but **Resolution (cheap belt):** enforce `< MAX_OPEN` INSIDE the `claim_for_proposing`
+  UPDATE (subselect count in the WHERE), so the invariant holds regardless of tick overlap.
+- **A9 [MAJOR] — DRY_RUN must short-circuit BEFORE any capture verb.** If it guards only push/gh,
+  a dry run mutates the state machine (claim/mark) and wedges a real MAX_OPEN slot with a bogus
+  pr_number. **Resolution:** `if DRY_RUN: log('would propose …'); continue` before `claim_for_proposing`.
+- **A10 [MINOR] — `assert_only_skill_path` must run on `git diff --name-only -z`, not the intended
+  string;** `author`/`%ae` is forgeable and must never be a security control (it isn't today —
+  `MIN_AUTHORS=1`). Documented; no code beyond A4's actual-diff assertion.
