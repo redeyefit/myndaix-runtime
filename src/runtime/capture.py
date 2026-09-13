@@ -91,15 +91,19 @@ def fingerprint(repo_scope: str, rule_tag: str) -> str:
     return hashlib.sha256(f"{repo_scope}\x00{rule_tag}".encode()).hexdigest()
 
 
-_HEX_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_HEX_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
 def is_hex_sha(s: str) -> bool:
     """True iff `s` is a plausible git commit SHA (7-40 lowercase hex). commit_sha reaches the
     rendered SKILL.md body + PR as provenance (finding_ids); the recorder validates on the way IN
     and provenance filters on the way OUT so an attacker-chosen non-hex string (attack-pass A3) can
-    never carry injection payload into the human-reviewed draft. sanitize_field is the last belt."""
-    return bool(_HEX_SHA_RE.match((s or "").strip().lower()))
+    never carry injection payload into the human-reviewed draft. sanitize_field is the last belt.
+
+    Uses fullmatch, NOT `...$`: Python's `$` also matches JUST BEFORE a terminal newline, so
+    `^[0-9a-f]+$` would accept "deadbeef\\n" and let a trailing-newline injection through (kilabz
+    cross-family review). fullmatch anchors the WHOLE string."""
+    return bool(_HEX_SHA_RE.fullmatch((s or "").strip().lower()))
 
 
 # ---- secondary locality: a changed path -> the path_trigger a proposed skill would carry --------

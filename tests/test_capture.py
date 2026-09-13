@@ -213,7 +213,8 @@ def test_is_hex_sha():
     ok(not C.is_hex_sha("abcdef"), "too short (<7) rejected")
     ok(not C.is_hex_sha("0" * 41), "too long (>40) rejected")
     ok(not C.is_hex_sha("g1234567"), "non-hex char rejected")
-    ok(not C.is_hex_sha("deadbeef\nrule:fail-open"), "embedded newline rejected (injection vector)")
+    ok(not C.is_hex_sha("deadbeef\nrule:fail-open"), "sha + INTERNAL newline + payload rejected (fullmatch, not $)")
+    ok(C.is_hex_sha("deadbeef\n"), "a bare trailing newline is stripped to a clean sha (benign, no payload)")
     ok(not C.is_hex_sha("-1234567"), "leading dash rejected (arg-injection shaped)")
     ok(not C.is_hex_sha(""), "empty rejected")
 
