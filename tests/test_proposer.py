@@ -61,6 +61,7 @@ class FakeLedger:
         self.mutations.append(("resolve", fp, outcome)); return True
     async def reap_stuck_proposing(self, mins):
         self.mutations.append(("reap", mins)); return 0
+    async def close(self): pass
 
 
 def _run(coro):
@@ -261,6 +262,34 @@ def test_cursor_fairness_rotates_past_skipped():
     ok(led3.mutations == [], "wrapped scan revisits skips without claiming")
     ok(P.CURSOR_FILE.read_text() == "fp099",
        "wrap PROVEN: cursor moved from the tail back to the first batch's last fingerprint")
+
+
+def test_dry_run_bypasses_arm_flag_live_does_not():
+    # kilabz r4 MINOR: the pre-arm dry-run diagnostic must run WITHOUT the flag (a dry tick is
+    # proven side-effect-free), while a LIVE tick without the flag must still exit before the
+    # ledger is even touched.
+    _reset(False)
+    with tempfile.TemporaryDirectory() as d:
+        P.ENABLED_FLAG = Path(d) / "PROPOSER_ENABLED"      # absent
+        P.LOCK = Path(d) / "proposer.lock"
+        P.REPOS_JSON = Path(d) / "repos.json"              # unreadable -> gc no-op
+        connects = {"n": 0}
+        class _FakePG:
+            @staticmethod
+            async def connect(dsn):
+                connects["n"] += 1; return FakeLedger()
+        saved = P.PostgresLedger
+        P.PostgresLedger = _FakePG
+        try:
+            P.DRY_RUN = False
+            ok(_run(P._amain()) == 0 and connects["n"] == 0,
+               "LIVE tick without the flag exits before any ledger connect")
+            P.DRY_RUN = True
+            ok(_run(P._amain()) == 0 and connects["n"] == 1,
+               "DRY_RUN tick without the flag PROCEEDS (the pre-arm diagnostic works)")
+        finally:
+            P.PostgresLedger = saved
+            P.DRY_RUN = False
 
 
 def test_gc_survives_bad_allowlist_entry():

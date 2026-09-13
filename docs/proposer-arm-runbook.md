@@ -29,6 +29,8 @@ launchctl load ~/Library/LaunchAgents/ai.myndaix.proposer.plist
 (Hourly at :45 — offset from controller :00 / automerge :30.)
 
 ## 3. Green dry-run BEFORE arming (the ≤15s check)
+DRY_RUN deliberately bypasses the `PROPOSER_ENABLED` flag (a dry tick is proven side-effect-free),
+so this diagnostic runs while the scheduled live job stays fully disarmed:
 ```bash
 cd ~/code/active/myndaix-runtime
 MYNDAIX_PROPOSER_DRY_RUN=1 MYNDAIX_DSN=postgresql://127.0.0.1/runtime \

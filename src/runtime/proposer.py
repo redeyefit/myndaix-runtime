@@ -554,7 +554,10 @@ async def propose(led) -> None:
 
 
 async def _amain() -> int:
-    if not ENABLED_FLAG.exists():
+    # DRY_RUN bypasses the arm flag (kilabz r4): the flag gates LIVE operation; a dry tick is
+    # proven side-effect-free (A9 — zero DB/git/gh mutations, tested) and is exactly the pre-arm
+    # diagnostic the runbook needs, so requiring the flag for it would force arming to test.
+    if not ENABLED_FLAG.exists() and not DRY_RUN:
         log("PROPOSER_ENABLED absent — off; exiting"); return 0
     if not acquire_lock():
         return 0
