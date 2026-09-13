@@ -118,6 +118,11 @@ def main(argv: list) -> int:
         log("CAPTURE_ENABLED absent — instrumentation OFF; no-op"); return 0
     if not _REPO_ID_RE.match(a.repo_id) or ".." in a.repo_id:
         log(f"unsafe repo_id {a.repo_id!r} — no-op"); return 0
+    # commit_sha reaches the proposer's rendered SKILL.md body as provenance (finding_ids); reject a
+    # non-hex value on the way IN so a forged/injected sha can never carry a payload into a
+    # human-reviewed draft (attack-pass A3, way-in belt; provenance hex-filters on the way out too).
+    if not capture.is_hex_sha(a.commit_sha):
+        log(f"non-hex commit_sha {a.commit_sha!r} — no-op"); return 0
     # never learn from a diff that touches the corpus itself: pick_glob collapses a mixed diff to
     # ONE glob, so the per-glob skills/ reject in record_capture can miss a mixed push (cross-family
     # MAJOR). Fail-closed on ANY skills/ path here, with the full path context.

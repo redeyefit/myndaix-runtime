@@ -876,6 +876,22 @@ async def test_skills_indexed_when_protected(led: PostgresLedger) -> None:
     assert not _has_skill_alert(C.JEFE_INBOX), "a clean index does not alert"
 
 
+async def test_skills_unauthored_stub_refused_at_index(led: PostgresLedger) -> None:
+    # K4 (cross-family): a merged-but-UNAUTHORED auto-proposed stub PASSES lint but must NOT be
+    # indexed — else it injects a no-op "flag any change…" skill into every future review. The
+    # controller refuses it here (the load-bearing gate) even under protection + a clean merge.
+    await _truncate(led); await _truncate_skills(led)
+    fresh_seam("skstub"); repo = make_repo("skstub")
+    C.JEFE_INBOX = _TMP / "jefe-skstub"
+    C._gh_json = _make_gh(protected=True)
+    add_skill(repo, "fail-open", trigger="src/*.py",
+              body=f"(no description captured)\n\n{C.capture.STUB_MARKER}: author me before merge")
+    await C.process_repo(led, repo, [0])
+    assert (await led.select_skills("skstub", ["src/a.py"]))["skills"] == [], \
+        "an un-authored stub (STUB_MARKER present) is refused at index — never enters the corpus"
+    assert _has_skill_alert(C.JEFE_INBOX), "the stub refusal alerts jefe (like a lint reject)"
+
+
 async def test_skills_blocked_when_unprotected(led: PostgresLedger) -> None:
     await _truncate(led); await _truncate_skills(led)
     fresh_seam("skblock"); repo = make_repo("skblock")

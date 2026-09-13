@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from runtime import skillmatch
+from runtime import capture, skillmatch
 from runtime.ledger.postgres_store import PostgresLedger
 
 # -- config --------------------------------------------------------------------
@@ -907,6 +907,15 @@ async def _index_skills(led: PostgresLedger, repo: Repo) -> None:
             skill, why = skillmatch.lint_skill(name, blob.stdout)
             if skill is None:
                 rejects.append((p.strip(), why)); continue
+            # K4 (cross-family): an auto-proposed draft whose real lesson was never authored carries
+            # capture.STUB_MARKER and PASSES lint — but indexing it would inject a no-op "flag any
+            # change…" skill into every future review (selection prefers unused skills + admits few,
+            # so a stub DISPLACES real guidance). Refuse it here — the load-bearing gate — so even a
+            # human who merges an unedited stub can NEVER pollute the injected corpus. Authoring the
+            # lesson deletes the marker and the skill indexes normally on the next tick.
+            if capture.is_unauthored_stub(blob.stdout):
+                rejects.append((p.strip(), "un-authored auto-proposed stub (STUB_MARKER present) — "
+                                           "replace the body with the real lesson to promote")); continue
             skill["content_sha"] = hashlib.sha256(blob.stdout.encode()).hexdigest()
             skill["body_sha"] = hashlib.sha256(skill["body"].encode()).hexdigest()
             skills.append(skill)

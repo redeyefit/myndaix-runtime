@@ -17,11 +17,12 @@ import re
 from runtime import skillmatch
 
 __all__ = [
-    "RULE_TAG_TAXONOMY", "is_allowed_tag", "slug", "fingerprint",
+    "RULE_TAG_TAXONOMY", "is_allowed_tag", "slug", "fingerprint", "is_hex_sha",
     "path_to_glob", "candidate_glob", "recurrence_ready", "reready_threshold",
     "skill_branch", "skill_path", "assert_only_skill_path",
     "sanitize_field", "render_skill_md", "draft_hash", "DEFAULTS",
     "parse_rule_tags", "agreed_tags", "pick_glob",
+    "STUB_MARKER", "is_unauthored_stub",
 ]
 
 # ---- feature-flagged defaults (v0.4 — the proposer reads env + passes these in) -----------
@@ -89,6 +90,21 @@ def fingerprint(repo_scope: str, rule_tag: str) -> str:
     """Deterministic recurrence key for a (repo, rule_tag) CLASS (v0.4: keyed on the allowlisted
     tag, not the glob — Recon delta). NUL-separated so ('a','b-c') and ('a-b','c') can't collide."""
     return hashlib.sha256(f"{repo_scope}\x00{rule_tag}".encode()).hexdigest()
+
+
+_HEX_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
+def is_hex_sha(s: str) -> bool:
+    """True iff `s` is a plausible git commit SHA (7-40 lowercase hex). commit_sha reaches the
+    rendered SKILL.md body + PR as provenance (finding_ids); the recorder validates on the way IN
+    and provenance filters on the way OUT so an attacker-chosen non-hex string (attack-pass A3) can
+    never carry injection payload into the human-reviewed draft. sanitize_field is the last belt.
+
+    Uses fullmatch, NOT `...$`: Python's `$` also matches JUST BEFORE a terminal newline, so
+    `^[0-9a-f]+$` would accept "deadbeef\\n" and let a trailing-newline injection through (kilabz
+    cross-family review). fullmatch anchors the WHOLE string."""
+    return bool(_HEX_SHA_RE.fullmatch((s or "").strip().lower()))
 
 
 # ---- secondary locality: a changed path -> the path_trigger a proposed skill would carry --------
@@ -177,18 +193,40 @@ def assert_only_skill_path(changed_paths: list[str], s: str) -> bool:
 # ---- S4: deterministic drafting — render from STRUCTURED fields, never raw reviewer text -------
 _TAG_LIKE = re.compile(r"<[^>\n]{0,200}>")   # XML/HTML-ish tags where injection framing hides
 _WS = re.compile(r"[ \t\r\f\v]+")
-_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def sanitize_field(text: str, maxlen: int) -> str:
     """Make one structured field safe to embed in a SKILL.md body (S4): drop tag-like spans and
     control chars, collapse runs of whitespace, trim, and hard-cap length. This is a BEST-EFFORT
     filter, NOT the security boundary (the human merge is) — but it removes the obvious injection
-    affordances before the body goes anywhere near a reviewer prompt as PR diff."""
+    affordances before the body goes anywhere near a reviewer prompt as PR diff.
+
+    Uses _RAW_CTRL (the STRICT [\\x00-\\x1f\\x7f], incl. \\n and \\t) — NOT a looser class: the
+    attack pass found that letting a raw newline through here forges extra SKILL.md lines from a
+    structured field (e.g. an injected finding_id / origin_repo), and _WS does not cover \\n. Map
+    every C0/DEL to a space FIRST, then _WS collapses the run — a multi-line field becomes one line."""
     t = _TAG_LIKE.sub(" ", text or "")
-    t = _CTRL.sub(" ", t)
+    t = _RAW_CTRL.sub(" ", t)
     t = _WS.sub(" ", t).strip()
     return t[:maxlen].strip()
+
+
+# Cross-family MAJOR (kilabz K4 + oracle): an un-authored auto-stub PASSES promotion lint, so if it
+# were merged as-is the controller would INDEX it and inject a no-op "flag any change…" skill into
+# every future review — actively degrading reviews (selection prefers unused skills + admits only a
+# few, so a stub can DISPLACE real guidance). The render therefore stamps this MACHINE-DETECTABLE
+# marker into the body of any draft whose problem-statement was not captured (every v1 draft). The
+# promotion path (controller _index_skills) + CI REFUSE to index/merge a body that still carries it;
+# authoring the real lesson deletes the marker line. A plain sentinel (no tags/paths) so it can't
+# trip scan_injection and render still lints clean.
+STUB_MARKER = "MDX-AUTOPROPOSED-STUB-UNAUTHORED"
+
+
+def is_unauthored_stub(rendered: str) -> bool:
+    """True iff `rendered` is an auto-proposed SKILL.md whose real lesson was never authored (the
+    STUB_MARKER survives). The controller's index step + CI gate on this so a no-op stub can never
+    reach the injected corpus even if a human merges it without filling it in."""
+    return STUB_MARKER in (rendered or "")
 
 
 def render_skill_md(s: str, rule_tag: str, path_trigger: str,
@@ -197,23 +235,31 @@ def render_skill_md(s: str, rule_tag: str, path_trigger: str,
     """Render ONE auto-proposed SKILL.md from a FIXED template over sanitized structured fields.
     Returns the markdown, or None (fail-closed) if the result would not pass the SAME
     skillmatch.lint_skill the controller runs at promotion — so auto-capture never opens a PR for a
-    draft its own promotion gate would reject. NO raw reviewer comment text is pasted in."""
+    draft its own promotion gate would reject. NO raw reviewer comment text is pasted in.
+
+    An un-authored draft (no captured whats_wrong — every v1 draft, since v1 does not capture the
+    finding text) carries STUB_MARKER so the promotion/index gate refuses it until a human authors
+    the body (cross-family K4)."""
     if slug(s) != s or not is_allowed_tag(rule_tag):
         return None
     if skillmatch.is_banned_trigger(path_trigger) or _RAW_CTRL.search(path_trigger):  # belt vs injection
         return None
     desc = sanitize_field(f"Recurring review finding: {rule_tag}", 60)
-    wrong = sanitize_field(whats_wrong, 700) or "(no description captured)"
+    wrong = sanitize_field(whats_wrong, 700)
     pref = sanitize_field(preferred_pattern, 700) or "(no preferred pattern captured)"
     ids = ", ".join(sanitize_field(i, 40) for i in (finding_ids or [])[:8]) or "n/a"
     origin = sanitize_field(origin_repo, 80) or "n/a"
+    # a draft with no captured problem-statement is an unauthored STUB -> mark it (K4 gate).
+    stub_line = ("" if wrong else
+                 f"\n\n{STUB_MARKER}: replace the description + preferred-pattern with the real "
+                 f"lesson and delete this line before merging (an unedited stub is refused at index).")
     body = (
-        f"{wrong}\n\n"
+        f"{wrong or '(no description captured)'}\n\n"
         f"Preferred pattern: {pref}\n\n"
         f"Flag any change matching `{path_trigger}` that repeats this class of issue.\n\n"
         f"(Auto-proposed from recurring reviewer findings [{rule_tag}]. "
         f"Provenance: origin_repo={origin}; finding_ids={ids}. "
-        f"Drafted deterministically — review before merge.)"
+        f"Drafted deterministically — review before merge.){stub_line}"
     )
     raw = (
         "---\n"
