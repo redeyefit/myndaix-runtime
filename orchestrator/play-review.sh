@@ -616,8 +616,13 @@ outcomes_record(){
   local out_keys
   # flags FIRST, then `--`, then ALL positionals — so a positional beginning with `-` (a sha, a path)
   # can't be mis-parsed as an option. changed[] is the reviewed diff's changed-path set (empty-safe).
+  # stderr -> $run/outcomes.err, NOT /dev/null: this call is FAIL-OPEN (`|| true`), so a transient
+  # recorder failure (ledger/git hiccup, SIGALRM at CAPTURE_TIMEOUT) would otherwise drop the review's
+  # findings out of the labelqueue with ZERO trace — a silent hole in the learning loop's data accrual
+  # (root-caused 2026-09-12: a NEEDS-FIX review whose valid findings never recorded, undiagnosable
+  # because stderr was discarded). Keep stdout captured (it IS out_keys); only stderr is redirected.
   out_keys="$(cap_run mxr outcome-record --kilabz "$review" --oracle "$oracle_review" -- \
-                "$repo" "$base" "$tip" "$ref" "$play" ${changed[@]+"${changed[@]}"} 2>/dev/null || true)"
+                "$repo" "$base" "$tip" "$ref" "$play" ${changed[@]+"${changed[@]}"} 2>>"$run/outcomes.err" || true)"
   [[ -n "${out_keys//[[:space:]]/}" ]] || return 0     # nothing recorded (clean PASS / all dropped)
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
@@ -796,7 +801,10 @@ $review
     cap_author="$(git -C "$repo" log -1 --format='%ae' "$tip" 2>/dev/null || echo unknown)"
     # flags FIRST, then `--`, then ALL positionals — so a positional that begins with `-`
     # (repo_id/sha/author) can't be mis-parsed as an option and crash the record (silent drop).
+    # stderr -> $run/capture.err (same rationale as outcomes_record above): this is FAIL-OPEN, so a
+    # transient failure must leave a trace instead of vanishing into /dev/null. stdout stays discarded
+    # (capture-record's stdout is unused on this path).
     cap_run mxr capture-record --kilabz "$review" --oracle "$oracle_review" -- \
-      "$repo_id" "$tip" "$play" "$cap_author" ${changed[@]+"${changed[@]}"} >/dev/null 2>&1 || true
+      "$repo_id" "$tip" "$play" "$cap_author" ${changed[@]+"${changed[@]}"} >/dev/null 2>>"$run/capture.err" || true
   fi
 fi
