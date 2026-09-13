@@ -47,7 +47,7 @@ fi
 # BEFORE config-load / deploy-clone-assert — so a failure in that early window can't leave autonomy
 # silently down. The restore uses only fixed labels + LA_DIR (no config), so it's valid this early.
 # Cleared after step 6 restarts the ticks. Must match bootstrap-fetch QUIESCE_LABELS (test.sh asserts).
-MUTATING_TICKS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
+MUTATING_TICKS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep ai.myndaix.proposer)
 # The arm-sentinel that gates the unattended reconcile poll. MUST equal the poll descriptor's
 # requires_sentinel (substrate/plists/ai.myndaix.reconcile.json) — asserted by test.sh. Re-read ON DISK
 # at the disarm site so a mid-converge disarm isn't missed by a stale ROLE_LABELS snapshot (r3 HIGH #4).
