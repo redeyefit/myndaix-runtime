@@ -18,6 +18,13 @@ holds the clean `ready` signal). Each step is reversible; rollback is always `rm
    as `r2`, replace `~/.myndaix/.automerge-token` on the Mini, verify an automerge tick is healthy,
    then REVOKE `r2` on GitHub and delete the MacBook's `~/.myndaix/.automerge-token.decommissioned`.
    After this, each autonomous git-writer holds its own single-host credential.
+4. Know the push identity: the proposer's `git push` does NOT authenticate with `GH_TOKEN` — git
+   uses the machine's ambient credential (the `gh` credential helper for https, or the SSH agent).
+   `GH_TOKEN` covers only `gh` API calls (PR create/list). On the current single-account setup
+   (everything resolves to the same GitHub account) this is identity-equivalent, but the PAT's
+   least-privilege scoping does not cover the push path. After ANY credential change on the Mini,
+   verify with `gh auth status` there. (Verified today: auto PRs #145/#146 were opened by the
+   expected account.)
 
 ## 2. Launchd job — NOTHING TO DO (substrate-managed)
 `substrate/plists/ai.myndaix.proposer.json` ships the job; the Mini's reconcile installs + loads it
@@ -25,6 +32,18 @@ in its own launchd context on the first converge after merge (hourly at :45 — 
 controller :00 / automerge :30; `launchctl load` over SSH fails on macOS, which is why this is
 reconcile's job, not a hand step). Verify after converge: `launchctl list | grep proposer`.
 (`orchestrator/ai.myndaix.proposer.plist.example` remains for a hand-managed/lab install only.)
+
+## 2b. Bootstrap quiesce list — the ONE hand deploy step (static installed copy)
+`substrate/bootstrap-fetch.sh` changes do NOT reach the Mini by pull alone — the machine runs a
+STATIC installed copy at `$MYNDAIX_HOME/bin/bootstrap-fetch`, refreshed only by an explicit
+human-approved `substrate/reconcile.sh --update-bootstrap`. Any change touching `QUIESCE_LABELS`
+(e.g. adding a new launchd label like `ai.myndaix.proposer`) must be followed by
+`--update-bootstrap` on the Mini, verified by comparing hashes against the repo file:
+```bash
+shasum -a 256 "$MYNDAIX_HOME/bin/bootstrap-fetch" substrate/bootstrap-fetch.sh   # must match
+```
+(Verified today: the installed copy currently matches origin/main — this documents the standing
+procedure, not a pending action.)
 
 ## 3. Green dry-run BEFORE arming (the ≤15s check)
 DRY_RUN deliberately bypasses the `PROPOSER_ENABLED` flag (a dry tick is proven side-effect-free),

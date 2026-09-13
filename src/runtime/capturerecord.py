@@ -63,6 +63,18 @@ async def record(repo_id: str, commit_sha: str, event_id: str, author: str,
                  tags: list[str], path_glob: str | None) -> int:
     """Record each cross-family-agreed tag as one occurrence; log any that JUST became ready.
     OBSERVE-ONLY: a 'ready' class is logged, never proposed. Fail-OPEN on any error."""
+    # storage boundary: is_hex_sha validates the NORMALIZED form (strip+lower); store exactly that
+    # form or the strict read-side hex filter (capture_provenance ~ '^[0-9a-f]{7,40}$') silently
+    # drops the row and the proposed draft renders finding_ids=n/a. Also keeps case/whitespace
+    # variants of one commit deduping on the (fingerprint, commit_sha) PK instead of double-counting
+    # toward recurrence. Must run before ANY ledger write so every stored occurrence is canonical.
+    commit_sha = capture.normalize_sha(commit_sha)
+    # belt for callers that skip main()'s validation (a backfill/hook calling record() directly):
+    # a stored non-hex value counts toward recurrence (the count(*) has no hex filter) yet is
+    # unmatchable at read time — same stranded-provenance failure one layer down. Fail-open no-op
+    # per the instrumentation contract; the caller's review must never break on this.
+    if not capture.is_hex_sha(commit_sha):
+        log(f"non-hex commit_sha {commit_sha!r} after normalize — recorded nothing"); return 0
     try:
         led = await PostgresLedger.connect(DSN)
     except Exception as e:
