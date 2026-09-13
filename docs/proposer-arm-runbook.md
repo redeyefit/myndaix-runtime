@@ -19,14 +19,12 @@ holds the clean `ready` signal). Each step is reversible; rollback is always `rm
    then REVOKE `r2` on GitHub and delete the MacBook's `~/.myndaix/.automerge-token.decommissioned`.
    After this, each autonomous git-writer holds its own single-host credential.
 
-## 2. Install the launchd job (Mini)
-```bash
-cd ~/code/active/myndaix-runtime   # the Mini's pull-only mirror, post-reconcile
-sed "s|/Users/you|$HOME|g" orchestrator/ai.myndaix.proposer.plist.example \
-  > ~/Library/LaunchAgents/ai.myndaix.proposer.plist
-launchctl load ~/Library/LaunchAgents/ai.myndaix.proposer.plist
-```
-(Hourly at :45 — offset from controller :00 / automerge :30.)
+## 2. Launchd job — NOTHING TO DO (substrate-managed)
+`substrate/plists/ai.myndaix.proposer.json` ships the job; the Mini's reconcile installs + loads it
+in its own launchd context on the first converge after merge (hourly at :45 — offset from
+controller :00 / automerge :30; `launchctl load` over SSH fails on macOS, which is why this is
+reconcile's job, not a hand step). Verify after converge: `launchctl list | grep proposer`.
+(`orchestrator/ai.myndaix.proposer.plist.example` remains for a hand-managed/lab install only.)
 
 ## 3. Green dry-run BEFORE arming (the ≤15s check)
 DRY_RUN deliberately bypasses the `PROPOSER_ENABLED` flag (a dry tick is proven side-effect-free),

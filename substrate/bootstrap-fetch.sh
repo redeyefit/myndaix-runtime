@@ -71,7 +71,7 @@ top="$(cd "$(git -C "$DEPLOY_CLONE" rev-parse --show-toplevel 2>/dev/null || ech
 real_deploy="$(cd "$DEPLOY_CLONE" && pwd -P)"
 [[ -n "$top" && "$top" == "$real_deploy" ]] || die "DEPLOY_CLONE is not a git worktree TOPLEVEL ($DEPLOY_CLONE -> $top)"
 
-QUIESCE_LABELS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep)
+QUIESCE_LABELS=(ai.myndaix.controller ai.myndaix.automerge ai.myndaix.fix-sweep ai.myndaix.proposer)
 DOMAIN="gui/$(id -u)"
 LA_DIR="$HOME/Library/LaunchAgents"
 
