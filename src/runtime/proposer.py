@@ -73,6 +73,8 @@ def _th(name: str) -> int:
 MAX_OPEN = lambda: _th("MAX_OPEN")            # re-read per tick so a live env change takes effect
 TTL_DAYS = lambda: _th("TTL_DAYS")
 MAX_PER_TICK = _int_env("MYNDAIX_PROPOSER_MAX_TICK", 2)      # K6: bound proposals opened per tick
+PROBE_CAP = _int_env("MYNDAIX_PROPOSER_PROBE_CAP", 6)        # gh PR-lookup reads per tick (K6 bound);
+                                                             # the fairness cursor rotates who gets probed
 REAP_TIMEOUT_MIN = _int_env("MYNDAIX_PROPOSER_REAP_MIN", 30)  # release a 'proposing' row stuck this long
 GH_TIMEOUT = _int_env("MYNDAIX_PROPOSER_GH_TIMEOUT", 60)
 GIT_TIMEOUT = _int_env("MYNDAIX_PROPOSER_GIT_TIMEOUT", 120)
@@ -351,11 +353,25 @@ def _make_proposal_commit(repo: dict, wt_name: str, slug: str, rendered: str) ->
     return wt
 
 
+def _remote_branch_exists(repo: dict, branch: str) -> Optional[bool]:
+    """Does refs/heads/<branch> exist on origin? True/False, or None (lookup failed → treat as
+    unknown, fail-closed). The create path REFUSES to push when the branch already exists with no
+    open bot PR (inbox synthesis P1: a human can close the bot's draft and keep content on the
+    deterministic branch name — a force/overwrite push would erase it; the flock can't serialize
+    GitHub-side edits). A leftover from a crashed push-before-create hits the same refusal LOUDLY —
+    human cleanup (delete the branch) unwedges it; TTL/backoff machinery is unaffected."""
+    r = _git(repo["path"], "ls-remote", "--heads", "origin", branch)
+    if r.returncode != 0:
+        return None
+    return branch in r.stdout
+
+
 def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> Optional[int]:
-    """Push the branch (own namespace, creation-only → --force is safe over a crashed prior push,
-    oracle MINOR) and open a --draft PR. Returns the PR number parsed from `gh pr create`'s URL
-    (K6: create prints a URL, not JSON), or None on failure/unknown."""
-    push = _git(wt, "push", "--force", "origin", f"HEAD:refs/heads/{branch}")
+    """Push the branch and open a --draft PR. Returns the PR number parsed from `gh pr create`'s
+    URL (K6: create prints a URL, not JSON), or None on failure/unknown. NO --force (inbox
+    synthesis P1): the caller verified the branch does not exist; if a racing push creates it in
+    the gap, the plain push is rejected non-fast-forward and we release — never overwrite."""
+    push = _git(wt, "push", "origin", f"HEAD:refs/heads/{branch}")
     if push.returncode != 0:
         log(f"push failed: {push.stderr.strip()[:200]}"); return None
     title = f"skill(auto): {slug} — recurring review finding (review before merge)"
@@ -454,14 +470,20 @@ def _age_days(ts) -> float:
 
 
 async def propose(led) -> None:
-    """While under MAX_OPEN, take each ready class AT MOST ONCE (K6): resolve repo (A2), render the
-    stub (K4 marker), claim (CAS), then adopt an existing bot PR (K1) or create one, then mark.
+    """Take each ready class AT MOST ONCE (K6): resolve repo (A2), render the stub (K4 marker),
+    LOOK UP an existing bot PR (K1), then adopt or create. The lookup runs BEFORE the claim and
+    BEFORE the capacity gate (inbox-synthesis P1: an untracked PR from an unknown create outcome
+    could never be adopted once tracked PRs hit MAX_OPEN, because the old loop broke at capacity
+    before the adopt path ran — real open PRs then exceed MAX_OPEN forever). Adoption converts an
+    untracked PR into a tracked one — it RESTORES the accounting, so it must never be capacity-
+    gated; only CREATION is. Lookups are reads (safe pre-claim under the single-host flock) and
+    are bounded by PROBE_CAP per tick; the fairness cursor rotates which candidates get probed.
     `attempts` counts CREATE ATTEMPTS (not confirmed opens): an unknown gh outcome may have opened
-    a PR whose response was lost, so the budget must burn on the attempt (kilabz MAJOR: counting
-    only confirmed marks allowed 6 create attempts against a 2-per-tick budget)."""
+    a PR whose response was lost, so the budget must burn on the attempt (kilabz MAJOR)."""
     n_open = await led.count_open_proposals()
     opened = 0
     attempts = 0
+    probes = 0
     seen: set = set()
     # FAIRNESS (kilabz r2 #7): scan in fingerprint keyset order starting after a PERSISTED cursor,
     # wrapping to the start when the tail is exhausted — every ready row is eventually visited even
@@ -478,8 +500,9 @@ async def propose(led) -> None:
         cursor = ""                                               # wrapped: tail exhausted
         batch = await led.list_ready_candidates(100, after="")
     for c in batch:
-        if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK or attempts >= MAX_PER_TICK:
-            break
+        create_spent = (n_open >= MAX_OPEN() or opened >= MAX_PER_TICK or attempts >= MAX_PER_TICK)
+        if create_spent and probes >= PROBE_CAP:
+            break                                                 # nothing left this tick can do
         fp = c["fingerprint"]
         if fp in seen:
             continue
@@ -506,20 +529,35 @@ async def propose(led) -> None:
             draft_sha = capture.draft_hash(rendered)
             if DRY_RUN:
                 log(f"would propose {c['rule_tag']} → {branch} for {repo['nwo']} (draft_sha {draft_sha[:8]})")
-                n_open += 1; opened += 1; continue                # A9: log BEFORE any DB verb
+                n_open += 1; opened += 1; continue                # A9: log BEFORE any DB verb or gh read
+            if probes >= PROBE_CAP:
+                continue                                          # keep scanning cheap local skips only
+            probes += 1
+            status, existing = _find_open_bot_pr(repo, branch)    # K1: adopt by identity, not hash
+            if status == "found":
+                # ADOPT — allowed even at MAX_OPEN (it re-tracks an already-open PR). Claim just
+                # before the mark: the lookup was a read, and the single-host flock means nobody
+                # else could have claimed in between; a failed CAS = the row left 'ready' → skip.
+                if await led.claim_for_proposing(fp, branch, draft_sha):
+                    claimed = True
+                    if await led.mark_capture_proposed(fp, branch, draft_sha, existing):
+                        log(f"adopted existing PR#{existing} for {branch}"); n_open += 1
+                    else:
+                        await led.release_proposing(fp, branch, draft_sha)
+                continue
+            if status != "none":                                  # unknown/ambiguous: NEVER create
+                log(f"recovery lookup {status} for {branch} — defer (no claim, no create)"); continue
+            if create_spent:
+                continue                                          # capacity gates CREATION only
+            exists = _remote_branch_exists(repo, branch)
+            if exists is not False:
+                # branch present with NO open bot PR (human content on a closed-PR branch, or a
+                # crashed push-before-create) OR the lookup failed — either way, NEVER push over it.
+                log(f"remote {branch} exists-or-unknown ({exists}) with no open bot PR — REFUSING "
+                    f"create; delete the branch (or wait) to unwedge"); continue
             if not await led.claim_for_proposing(fp, branch, draft_sha):
                 continue                                          # lost the CAS / not ready
             claimed = True
-            status, existing = _find_open_bot_pr(repo, branch)    # K1: adopt by identity, not hash
-            if status == "found":
-                if await led.mark_capture_proposed(fp, branch, draft_sha, existing):
-                    log(f"adopted existing PR#{existing} for {branch}"); n_open += 1; opened += 1
-                else:
-                    await led.release_proposing(fp, branch, draft_sha)
-                continue
-            if status != "none":                                  # unknown/ambiguous: NEVER create
-                log(f"recovery lookup {status} for {branch} — release + defer (no create)")
-                await led.release_proposing(fp, branch, draft_sha); continue
             # worktree named by fingerprint, not repo_scope (kilabz MINOR: keep the scope string out
             # of every git argv, including the worktree path — A2's boundary stated fully)
             wt = _make_proposal_commit(repo, f"wt-{fp[:16]}", slug, rendered)

@@ -17,6 +17,7 @@ import runtime.proposer as P
 _REAL_RESOLVE_REPO = P.resolve_repo
 _REAL_GIT = P._git
 _REAL_FIND_PR = P._find_open_bot_pr
+_REAL_PUSH_PR = P._push_and_open_pr
 
 PASS = [0]
 FAIL = [0]
@@ -148,8 +149,9 @@ def test_find_open_bot_pr_identity(monkeypatch=None):
 
 
 def test_unknown_lookup_never_creates():
-    # kilabz MAJOR: after a crash-before-mark, a transient lookup failure must NOT force-push a
-    # fresh stub over a (possibly human-edited) PR branch — release + defer, never create.
+    # kilabz MAJOR: after a crash-before-mark, a transient lookup failure must NOT lead to a push
+    # over a (possibly human-edited) PR branch. Under the lookup-before-claim order there is now
+    # NOTHING to release — an unknown lookup defers with zero DB mutations and zero creation.
     _reset(False)
     led = FakeLedger(ready=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
                              "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}])
@@ -162,7 +164,91 @@ def test_unknown_lookup_never_creates():
     P._make_proposal_commit = _create
     _run(P.propose(led))
     ok(created["n"] == 0, "unknown lookup -> NO worktree/commit/push (defer)")
-    ok(("release", "fp1") in led.mutations, "the claim is released back to ready")
+    ok(led.mutations == [], "unknown lookup takes no claim at all (lookup precedes claim)")
+
+
+def test_adoption_bypasses_max_open():
+    # inbox-synthesis P1: an untracked open PR (unknown create outcome) must be adoptable even
+    # when tracked PRs are at MAX_OPEN — adoption RE-TRACKS an existing PR, it adds no load. The
+    # old loop broke at capacity before the adopt path could run; the orphan was stranded forever.
+    _reset(False)
+    led = FakeLedger(open_count=99,                        # way over MAX_OPEN: creation is gated
+                     ready=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("found", 88)
+    created = {"n": 0}
+    def _create(*a, **k):
+        created["n"] += 1; return Path("/tmp/wt")
+    P._make_proposal_commit = _create
+    _run(P.propose(led))
+    ok(("mark", "fp1", 88) in led.mutations, "the orphaned PR is adopted DESPITE MAX_OPEN")
+    ok(created["n"] == 0, "no creation at capacity (only adoption bypasses the gate)")
+
+
+def test_probe_cap_bounds_lookups_at_capacity():
+    # K6: the adopt-probe at capacity is bounded — with many ready candidates and creation gated,
+    # at most PROBE_CAP gh lookups run per tick (the fairness cursor rotates who gets probed).
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0} for i in range(20)]
+    led = FakeLedger(open_count=99, ready=ready)
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    looked = {"n": 0}
+    def _lookup(repo, branch):
+        looked["n"] += 1; return ("none", None)
+    P._find_open_bot_pr = _lookup
+    _run(P.propose(led))
+    ok(looked["n"] == P.PROBE_CAP, f"exactly PROBE_CAP lookups at capacity (got {looked['n']})")
+    ok(led.mutations == [], "no claims/creates at capacity when nothing is adoptable")
+
+
+def test_existing_remote_branch_refuses_create():
+    # inbox-synthesis P1 (force-push erasure): a remote branch with NO open bot PR (human content
+    # on a closed-PR branch, or a crashed prior push) must REFUSE creation — never push over it.
+    # An unknown existence lookup refuses too (fail-closed).
+    _reset(False)
+    saved = P._remote_branch_exists
+    try:
+        for exists in (True, None):
+            led = FakeLedger(ready=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
+                                     "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}])
+            P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+            P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            P._find_open_bot_pr = lambda repo, branch: ("none", None)
+            P._remote_branch_exists = lambda repo, branch, _e=exists: _e
+            created = {"n": 0}
+            def _create(*a, **k):
+                created["n"] += 1; return Path("/tmp/wt")
+            P._make_proposal_commit = _create
+            _run(P.propose(led))
+            ok(created["n"] == 0 and led.mutations == [],
+               f"remote-branch exists={exists} + no open PR -> refuse create, no claim")
+    finally:
+        P._remote_branch_exists = saved
+
+
+def test_push_has_no_force():
+    # inbox-synthesis P1: the push must be a PLAIN push (a racing branch creation gets a
+    # non-fast-forward rejection, never an overwrite).
+    _reset(False)
+    git_calls = []
+    def _rec_git(cwd, *a, **k):
+        git_calls.append(a); return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    saved_git, saved_run = P._git, P.subprocess.run
+    P._git = _rec_git
+    P.subprocess.run = lambda *a, **k: type("R", (), {
+        "returncode": 0, "stdout": "https://github.com/o/r/pull/9\n", "stderr": ""})()
+    try:
+        n = _REAL_PUSH_PR({"nwo": "o/r", "default_branch": "main", "path": Path("/tmp/x")},
+                                Path("/tmp/wt"), "skill/auto/x", "x")
+        ok(n == 9, "PR number parsed from create URL")
+        push = next((c for c in git_calls if c and c[0] == "push"), None)
+        ok(push is not None and "--force" not in push, f"push argv has NO --force (got {push})")
+    finally:
+        P._git, P.subprocess.run = saved_git, saved_run
 
 
 def test_attempt_budget_burns_on_unknown_outcome():
