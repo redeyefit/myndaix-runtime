@@ -313,15 +313,85 @@ def test_suspect_beats_newly_ready_candidate():
     P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fp20", "repo_scope": "myndaix-runtime",
                                             "branch": "skill/auto/fail-open"}]))
     P.CURSOR_FILE.write_text("fp00")
-    P._find_open_bot_pr = lambda repo, branch: ("found", 77)     # the orphan is real
+    # found ONLY for the suspect's branch; fp10's branch (toctou-race) gets a definitive none so
+    # fp10 WOULD create if capacity allowed (kilabz ff-r4: an all-found stub made the assertion
+    # vacuous — fp10 could never attempt creation regardless of capacity)
+    P._find_open_bot_pr = lambda repo, branch: (("found", 77) if branch.endswith("fail-open")
+                                                else ("none", None))
+    creates = {"n": 0}
+    def _create_counting(repo, wt, branch, slug):
+        creates["n"] += 1; return ("opened", 55)
+    P._push_and_open_pr = _create_counting
     led = FakeLedger(open_count=2,                               # 2 tracked + 1 orphan = cap FULL
                      ready=[{"fingerprint": "fp10", "repo_scope": "myndaix-runtime",
                              "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
     try:
         _run(P.propose(led))
         ok(("mark", "fp20", 77) in led.mutations, "the suspect is adopted FIRST (pre-scan)")
-        ok(not any(m == ("mark", "fp10", 55) for m in led.mutations),
-           "fp10 does NOT create — capacity is full once the orphan is re-tracked (no overflow)")
+        ok(creates["n"] == 0,
+           "fp10 attempts NO create — capacity is full once the orphan is re-tracked (no overflow)")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_corrupt_suspects_file_disables_creation_and_is_preserved():
+    # ff-r4 P1: damaged JSON may hold live reservations — never overwrite it, never create while
+    # it is unreadable. Adoption stays allowed.
+    _reset(False)
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text("{not-json[")
+    ready = [{"fingerprint": "fp00", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0},
+             {"fingerprint": "fp01", "repo_scope": "myndaix-runtime", "rule_tag": "toctou-race",
+              "path_glob": "src/*.py", "decline_count": 0}]
+    led = FakeLedger(ready=ready)
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    def _lookup(repo, branch):
+        return ("found", 62) if branch.endswith("fail-open") else ("none", None)
+    P._find_open_bot_pr = _lookup
+    creates = {"n": 0}
+    def _create(repo, wt, branch, slug):
+        creates["n"] += 1; return ("opened", 63)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = _create
+    try:
+        _run(P.propose(led))
+        ok(creates["n"] == 0, "creation DISABLED while the suspects file is damaged")
+        ok(("mark", "fp00", 62) in led.mutations, "adoption still allowed under a damaged file")
+        ok(P.SUSPECTS_FILE.read_text() == "{not-json[", "the damaged file is preserved, not overwritten")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_already_tracked_suspect_cleared_without_double_reserve():
+    # ff-r4 P2: a suspect whose class is ALREADY tracked (state='proposed' — e.g. a mark committed
+    # but its response raised) must be cleared, not kept — its ledger row already counts in
+    # n_open, so keeping it would double-reserve and block real capacity until closure.
+    _reset(False)
+    P.SUSPECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    P.SUSPECTS_FILE.write_text(json.dumps([{"fingerprint": "fpT", "repo_scope": "myndaix-runtime",
+                                            "branch": "skill/auto/fail-open"}]))
+    led = FakeLedger(open_count=1,
+                     proposed=[{"fingerprint": "fpT", "repo_scope": "myndaix-runtime",
+                                "rule_tag": "fail-open", "pr_number": 44,
+                                "branch": "skill/auto/fail-open", "proposed_at": None}],
+                     ready=[{"fingerprint": "fpZ", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 45)
+    try:
+        _run(P.propose(led))
+        ok(json.loads(P.SUSPECTS_FILE.read_text()) == [], "the already-tracked suspect is cleared")
+        ok(("mark", "fpZ", 45) in led.mutations,
+           "no phantom reservation: capacity 1+0 tracked-suspect-overlap leaves room for fpZ")
     finally:
         P._remote_branch_exists = saved_rbe
 
