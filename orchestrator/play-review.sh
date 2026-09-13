@@ -618,17 +618,23 @@ outcomes_record(){
   # can't be mis-parsed as an option. changed[] is the reviewed diff's changed-path set (empty-safe).
   # stderr -> $run/outcomes.err, NOT /dev/null (root-caused 2026-09-12: a NEEDS-FIX review whose valid
   # findings never recorded, undiagnosable because stderr was discarded). Capture the exit code
-  # SEPARATELY from stdout so a tool FAILURE is not conflated with a genuine clean-pass (r1 CRITICAL):
-  # empty out_keys after rc=0 = nothing to record; rc≠0 = the recorder faulted and findings were LOST.
+  # SEPARATELY from stdout so a fault is not conflated with a genuine clean-pass (r1 CRITICAL).
   out_keys="$(cap_run mxr outcome-record --kilabz "$review" --oracle "$oracle_review" -- \
                 "$repo" "$base" "$tip" "$ref" "$play" ${changed[@]+"${changed[@]}"} 2>>"$run/outcomes.err")" && rc=0 || rc=$?
-  # A faulted recorder (crash / SIGALRM at CAPTURE_TIMEOUT) is announced LOUDLY in the play log — not
-  # just the side .err — so the drop is visible where anyone triaging the play already looks. Then STILL
-  # fail-open (return 0): a recorder fault must NEVER delay the verdict or wedge the held lock (the
-  # recorder's core invariant, comment above). Deliberately NO retry / NO fail-closed here — visibility
-  # first; a bounded retry or dead-letter is a separate, evidence-gated change once we can SEE the rate.
-  if (( rc != 0 )); then note outcomes "outcome-record FAILED (rc=$rc) — findings NOT recorded; see $run/outcomes.err"; return 0; fi
-  [[ -n "${out_keys//[[:space:]]/}" ]] || return 0     # rc=0 + empty = genuine clean PASS / all dropped
+  # rc≠0 = the recorder was killed/crashed (e.g. SIGALRM at CAPTURE_TIMEOUT). We say "UNCERTAIN", not
+  # "not recorded" (r2 P2): the recorder commits rows BEFORE its post-commit expiry sweep, so a timeout
+  # AFTER the commit leaves findings IN the ledger yet exits nonzero — claiming "not recorded" would lie.
+  # This note is often the ONLY trace: a SIGALRM kill can beat the process to writing $run/outcomes.err.
+  # Still fail-open (return 0): a recorder fault must NEVER delay the verdict or wedge the held lock (its
+  # core invariant). Deliberately NO retry / NO fail-closed, and NO reparse of possibly-truncated stdout
+  # keys (the committed rows still surface via `mxr labelqueue`); reliable recorded-vs-not signaling
+  # would require the fail-open recorder itself to emit it — a separate, evidence-gated change.
+  # NOTE (r2 P2, ACCEPTED-AS-IS): a connection failure is caught INSIDE outcomerecord (logs + returns []
+  # exit 0), so it lands here as rc=0 + empty out_keys — same branch as a clean pass, but its stderr IS
+  # in $run/outcomes.err. That trace is the scoped "make it visible" win; distinguishing it in control
+  # flow is the same deferred recorder-signal change.
+  if (( rc != 0 )); then note outcomes "outcome-record exited $rc — recording UNCERTAIN (may be partial/none); see $run/outcomes.err"; return 0; fi
+  [[ -n "${out_keys//[[:space:]]/}" ]] || return 0     # rc=0 + empty = clean PASS / all dropped (or caught-fail, logged)
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
@@ -812,6 +818,6 @@ $review
     # dead-letter would be premature machinery — but the loss is now VISIBLE, not silent.
     cap_run mxr capture-record --kilabz "$review" --oracle "$oracle_review" -- \
       "$repo_id" "$tip" "$play" "$cap_author" ${changed[@]+"${changed[@]}"} >/dev/null 2>>"$run/capture.err" \
-      || note capture "capture-record failed (rc=$?) — see $run/capture.err (best-effort: no consumer yet, nothing lost downstream)"
+      || note capture "capture-record exited nonzero — outcome UNCERTAIN; see $run/capture.err (best-effort: no consumer yet, nothing lost downstream)"
   fi
 fi
