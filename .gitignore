@@ -13,3 +13,4 @@ build/
 .DS_Store
 .runtime.log
 .playwright-mcp/
+docs/diagrams/

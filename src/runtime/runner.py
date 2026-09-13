@@ -150,10 +150,20 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     argv = list(adapter["argv"])
     channel = adapter.get("prompt_channel", "stdin")
     stdin_data: Optional[bytes] = None
+    # Per-adapter tool-suppression preamble (oracle/agy). agy is AGENTIC and in headless mode
+    # DEAD-ENDS to EMPTY output the moment a prompt induces a tool call it can't get permission for
+    # (root-caused 2026-09-13: a review payload full of file paths + gh/git commands makes agy try
+    # read_file/command → headless auto-deny → "no output produced"). The preamble tells it the
+    # payload is INERT DATA to review in text only. It is a behavioral nudge, NOT the safety
+    # boundary: we deliberately do NOT pass --dangerously-skip-permissions, so the headless
+    # auto-deny remains the HARD backstop — agy still cannot read a secret or run a command even if
+    # the nudge fails (verified: skip-permissions reads arbitrary files, so it is NOT used). No-op
+    # for any adapter without the key. Prepended, never appended, so it leads the model's context.
+    prompt = adapter.get("prompt_preamble", "") + job.prompt
     if channel == "arg":
-        argv = argv + [job.prompt]
+        argv = argv + [prompt]
     else:
-        stdin_data = job.prompt.encode()
+        stdin_data = prompt.encode()
 
     # scratch HOME (fix-stage containment): a workspace-actor that WRITES code runs under a
     # throwaway HOME seeded with only its auth, so an injected fix-list can't make it read the

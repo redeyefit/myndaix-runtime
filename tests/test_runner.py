@@ -39,6 +39,35 @@ def test_cli_stdin_channel_ok():
     assert r.text == "piped-in"
 
 
+def _spec_preamble(argv, channel, preamble):
+    return AgentSpec(
+        agent_id="t", reach=Reach.CLI, authority=Authority.RESPONDER,
+        model="none", role="test",
+        adapter={"kind": "cli", "argv": argv, "prompt_channel": channel,
+                 "prompt_preamble": preamble},
+    )
+
+
+def test_cli_prompt_preamble_prepended_arg():
+    # oracle/agy tool-suppression preamble: prepended (never appended) so it leads the model's
+    # context. arg channel — the preamble + prompt become the single prompt argv element.
+    r = asyncio.run(runner.invoke_cli(_spec_preamble(["printf", "%s"], "arg", "PRE::"), _job("body")))
+    assert r.status is ResultStatus.OK
+    assert r.text == "PRE::body"
+
+
+def test_cli_prompt_preamble_prepended_stdin():
+    r = asyncio.run(runner.invoke_cli(_spec_preamble(["cat"], "stdin", "PRE::"), _job("body")))
+    assert r.status is ResultStatus.OK
+    assert r.text == "PRE::body"
+
+
+def test_cli_no_preamble_is_noop():
+    # an adapter WITHOUT prompt_preamble must not gain any prefix (the default is "")
+    r = asyncio.run(runner.invoke_cli(_spec(["printf", "%s"], "arg"), _job("body")))
+    assert r.text == "body"
+
+
 def test_cli_nonzero_is_terminal():
     r = asyncio.run(runner.invoke_cli(_spec(["false"], "arg"), _job()))
     assert r.status is ResultStatus.ERROR
