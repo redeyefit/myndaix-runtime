@@ -1496,16 +1496,19 @@ class PostgresLedger:
         return await self._pool.fetchval(
             "SELECT count(*) FROM capture_candidate WHERE state IN ('proposing','proposed')")
 
-    async def list_ready_candidates(self, limit: int) -> list[dict]:
-        """The proposer's work queue: the 'ready' classes to propose, oldest-signal first (fair),
-        capped. READ-ONLY — the actual claim is a separate CAS (claim_for_proposing) under the
-        MAX_OPEN check, so two reads can never double-propose. Returns the fields the allowlist-map
-        resolve + render need (repo_scope is resolved by EXACT-KEY lookup by the caller; it is NEVER
-        passed to a git/gh argv — attack-pass A2)."""
+    async def list_ready_candidates(self, limit: int, after: str = "") -> list[dict]:
+        """The proposer's work queue: 'ready' classes in FINGERPRINT keyset order, starting strictly
+        AFTER `after` (the proposer persists the last-visited fingerprint as a cursor and wraps to
+        "" when a scan comes back empty — kilabz r2 #7: a fixed oldest-first window re-reads the
+        same prefix every tick, so persistently-skipped candidates STARVE everything behind them;
+        the rotating cursor guarantees every ready row is eventually visited). READ-ONLY — the
+        actual claim is a separate CAS (claim_for_proposing), so two reads can never double-propose.
+        repo_scope is resolved by EXACT-KEY lookup by the caller; it is NEVER passed to a git/gh
+        argv (attack-pass A2)."""
         rows = await self._pool.fetch(
             """SELECT fingerprint, repo_scope, rule_tag, path_glob, decline_count
-                 FROM capture_candidate WHERE state = 'ready'
-                ORDER BY last_seen ASC, fingerprint ASC LIMIT $1""", limit)
+                 FROM capture_candidate WHERE state = 'ready' AND fingerprint > $2
+                ORDER BY fingerprint ASC LIMIT $1""", limit, after)
         return [dict(r) for r in rows]
 
     async def capture_provenance(self, fingerprint: str, limit: int = 8) -> list[str]:

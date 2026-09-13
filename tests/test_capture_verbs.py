@@ -246,6 +246,20 @@ async def test_list_ready_candidates(led):
            for x in rows), "list carries exactly the fields the resolve+render need")
 
 
+async def test_list_ready_keyset_cursor(led):
+    # kilabz r2 #7 (fairness): the scan is fingerprint-keyset — `after` returns strictly-greater
+    # fingerprints only, so a persisted cursor rotates past previously-visited rows.
+    await _truncate(led)
+    r1 = await _drive_to_ready(led, repo="repoK1", tag="fail-open")
+    r2 = await _drive_to_ready(led, repo="repoK2", tag="toctou-race")
+    fps = sorted([r1["fingerprint"], r2["fingerprint"]])
+    rows = await led.list_ready_candidates(10)
+    ok([x["fingerprint"] for x in rows] == fps, "no cursor -> all ready rows in fingerprint order")
+    rows = await led.list_ready_candidates(10, after=fps[0])
+    ok([x["fingerprint"] for x in rows] == [fps[1]], "after=first -> only the strictly-greater row")
+    ok(await led.list_ready_candidates(10, after=fps[1]) == [], "after=last -> empty (caller wraps)")
+
+
 async def test_capture_provenance_hex_filtered(led):
     await _truncate(led)
     for c, e in (("deadbeef01", "e1"), ("cafebabe02", "e2")):

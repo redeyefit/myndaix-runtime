@@ -42,7 +42,9 @@ class FakeLedger:
         self.mark_ok = True
 
     # -- reads --
-    async def list_ready_candidates(self, limit): return list(self._ready)[:limit]
+    async def list_ready_candidates(self, limit, after=""):
+        rows = sorted(self._ready, key=lambda r: r["fingerprint"])
+        return [r for r in rows if r["fingerprint"] > after][:limit]
     async def list_proposed(self): return list(self._proposed)
     async def count_open_proposals(self): return self._open
     async def capture_provenance(self, fp, limit=8): return list(self._prov)
@@ -66,6 +68,8 @@ def _run(coro):
 
 def _reset(monkey_dry=False):
     P.DRY_RUN = monkey_dry
+    # per-test cursor isolation: the fairness cursor is process state; point it at a fresh temp file
+    P.CURSOR_FILE = Path(tempfile.mkdtemp(prefix="mdx-test-cursor.")) / "cursor"
 
 
 # ---- K3: symlink-safe, creation-only SKILL.md write --------------------------------------
@@ -203,6 +207,48 @@ def test_resolver_json_argv_is_one_field_list():
            f"--json takes ONE comma-joined field list as the FINAL arg (got {args})")
     finally:
         P._gh_json_path = saved
+
+
+def test_dry_run_makes_zero_git_calls():
+    # kilabz r2 #1: the per-candidate prune ran BEFORE the DRY_RUN guard — a dry tick mutated git.
+    # Prune now lives in gc_worktrees (guarded). Assert a dry propose makes ZERO _git calls.
+    _reset(monkey_dry=True)
+    led = FakeLedger(ready=[{"fingerprint": "fp1", "repo_scope": "myndaix-runtime",
+                             "rule_tag": "fail-open", "path_glob": "src/*.py", "decline_count": 0}])
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    calls = {"n": 0}
+    def _rec_git(*a, **k):
+        calls["n"] += 1; return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._git = _rec_git
+    _run(P.propose(led))
+    P.gc_worktrees()                                   # DRY_RUN=True → must be a no-op too
+    ok(calls["n"] == 0, f"A9: dry-run makes ZERO git calls incl. prune/GC (got {calls['n']})")
+    ok(not P.CURSOR_FILE.exists(), "dry-run does not advance the fairness cursor")
+    _reset(False)
+
+
+def test_cursor_fairness_rotates_past_skipped():
+    # kilabz r2 #7: persistently-skipped candidates must not starve those behind them — the
+    # persisted keyset cursor advances past visited rows and wraps when the tail is exhausted.
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i}", "repo_scope": "unlisted", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0} for i in range(3)]
+    ready.append({"fingerprint": "fp9-valid", "repo_scope": "myndaix-runtime",
+                  "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0})
+    led = FakeLedger(ready=ready, provenance=["deadbeef"])
+    P.resolve_repo = lambda s: (None if s == "unlisted" else
+                                {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"})
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    P._push_and_open_pr = lambda repo, wt, branch, slug: 150
+    _run(P.propose(led))
+    ok(("mark", "fp9-valid", 150) in led.mutations, "the valid candidate BEHIND 3 skips is reached")
+    ok(P.CURSOR_FILE.read_text() == "fp9-valid", "cursor persisted at the last visited fingerprint")
+    # next tick: cursor at the tail → the scan WRAPS to the start (skips are revisited, no wedge)
+    led2 = FakeLedger(ready=ready[:3], provenance=["deadbeef"])
+    _run(P.propose(led2))
+    ok(led2.mutations == [], "wrapped scan revisits the skipped candidates without claiming")
 
 
 def test_git_hooks_disabled_on_every_git_op():

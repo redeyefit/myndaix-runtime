@@ -50,6 +50,7 @@ REPOS_JSON = Path(os.environ.get("MYNDAIX_REPOS_JSON", str(ORCH / "repos.json"))
 LOCK = ORCH / "proposer.lock"
 ENABLED_FLAG = ORCH / "PROPOSER_ENABLED"
 WORKTREE_ROOT = Path(os.environ.get("MYNDAIX_PROPOSER_WORKTREES", str(STATE / "proposer-worktrees")))
+CURSOR_FILE = STATE / "proposer-cursor"       # last-visited fingerprint (fairness keyset, r2 #7)
 BOT_NAME = os.environ.get("MYNDAIX_PROPOSER_BOT_NAME", "myndaix-proposer")
 BOT_EMAIL = os.environ.get("MYNDAIX_PROPOSER_BOT_EMAIL", "proposer@myndaix.local")
 
@@ -220,12 +221,29 @@ def release_lock() -> None:
 
 
 # -- worktree GC (A6): the flock proves the prior tick is dead, so any leftover worktree is safe to
-#    remove. rmtree the dirs; a per-repo `git worktree prune` (in _make_worktree) clears the stale
-#    admin entries a bare rmtree leaves behind (kilabz/oracle: remove via git, not just rmtree).
+#    remove. rmtree the dirs, then `git worktree prune` EVERY allowlisted repo so the stale admin
+#    entries a bare rmtree leaves are cleared in the same GC — independent of whether the propose
+#    loop later selects a candidate for that repo (kilabz r2 #12), and strictly under the DRY_RUN
+#    guard (kilabz r2 #1: prune is a git mutation; A9 forbids it in a dry tick).
 def gc_worktrees() -> None:
     if DRY_RUN:
         return
     shutil.rmtree(WORKTREE_ROOT, ignore_errors=True)
+    try:
+        raw = json.loads(REPOS_JSON.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    if not isinstance(raw, dict):
+        return
+    for key, entry in raw.items():
+        if key.startswith("_") or not isinstance(entry, dict):
+            continue
+        p = entry.get("path")
+        if not p:
+            continue
+        path = Path(p).expanduser().resolve()
+        if path.is_dir() and (path / ".git").exists():
+            _git(path, "worktree", "prune")
 
 
 # -- K3: symlink-safe, creation-only write of skills/<slug>/SKILL.md inside the worktree ----------
@@ -439,11 +457,21 @@ async def propose(led) -> None:
     opened = 0
     attempts = 0
     seen: set = set()
-    pruned: set = set()
-    # limit 100, not MAX_OPEN*2 (kilabz MAJOR: a small fixed window re-fetches the same oldest rows
-    # every tick, so a handful of persistently-skipped candidates — unlisted scope, render reject —
-    # STARVE every valid candidate behind them forever; visit-once + budgets still bound the tick)
-    for c in await led.list_ready_candidates(100):
+    # FAIRNESS (kilabz r2 #7): scan in fingerprint keyset order starting after a PERSISTED cursor,
+    # wrapping to the start when the tail is exhausted — every ready row is eventually visited even
+    # if 100+ persistently-skipped candidates (unlisted scope, render reject) sit ahead of it. The
+    # cursor advances to the last VISITED fingerprint each tick (best-effort file; a lost cursor
+    # just restarts the scan, never skips forever).
+    cursor = ""
+    try:
+        cursor = CURSOR_FILE.read_text().strip()
+    except OSError:
+        pass
+    batch = await led.list_ready_candidates(100, after=cursor)
+    if not batch and cursor:
+        cursor = ""                                               # wrapped: tail exhausted
+        batch = await led.list_ready_candidates(100, after="")
+    for c in batch:
         if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK or attempts >= MAX_PER_TICK:
             break
         fp = c["fingerprint"]
@@ -460,8 +488,6 @@ async def propose(led) -> None:
             repo = resolve_repo(c["repo_scope"])
             if repo is None:
                 log(f"ready {c['rule_tag']} scope {c['repo_scope']!r} not in repo allowlist — skip"); continue
-            if repo["path"] not in pruned:                        # clear stale worktree admin entries
-                _git(repo["path"], "worktree", "prune"); pruned.add(repo["path"])
             slug = capture.slug(c["rule_tag"])
             if slug is None:
                 log(f"ready {c['rule_tag']} → no safe slug — skip"); continue
@@ -513,6 +539,12 @@ async def propose(led) -> None:
                     await led.release_proposing(fp, branch, draft_sha)
                 except Exception:
                     pass
+    if seen and not DRY_RUN:                                      # advance the fairness cursor (r2 #7)
+        try:
+            CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CURSOR_FILE.write_text(max(seen))
+        except OSError as e:
+            log(f"cursor write failed ({e}) — scan restarts next tick (harmless)")
 
 
 async def _amain() -> int:
