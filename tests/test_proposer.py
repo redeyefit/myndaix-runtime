@@ -5,6 +5,7 @@ pure render/slug/stub-marker core is in test_capture.py; the ledger verbs in tes
 Run:  PYTHONPATH=src python3 tests/test_proposer.py
 """
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -228,27 +229,72 @@ def test_dry_run_makes_zero_git_calls():
 
 
 def test_cursor_fairness_rotates_past_skipped():
-    # kilabz r2 #7: persistently-skipped candidates must not starve those behind them — the
-    # persisted keyset cursor advances past visited rows and wraps when the tail is exhausted.
+    # kilabz r2 #7 + r3 MINOR: the test must be DISCRIMINATING — >100 skipped rows so the valid
+    # candidate sits BEYOND the first batch (reaching it REQUIRES the persisted cursor), and the
+    # wrap assertion checks the cursor's VALUE (which a no-op wrap cannot produce). kilabz proved
+    # the old version passed with the cursor disabled entirely.
     _reset(False)
-    ready = [{"fingerprint": f"fp{i}", "repo_scope": "unlisted", "rule_tag": "fail-open",
-              "path_glob": "src/*.py", "decline_count": 0} for i in range(3)]
-    ready.append({"fingerprint": "fp9-valid", "repo_scope": "myndaix-runtime",
-                  "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0})
-    led = FakeLedger(ready=ready, provenance=["deadbeef"])
+    skipped = [{"fingerprint": f"fp{i:03d}", "repo_scope": "unlisted", "rule_tag": "fail-open",
+                "path_glob": "src/*.py", "decline_count": 0} for i in range(101)]
+    ready = skipped + [{"fingerprint": "fpzz-valid", "repo_scope": "myndaix-runtime",
+                        "rule_tag": "toctou-race", "path_glob": "src/*.py", "decline_count": 0}]
     P.resolve_repo = lambda s: (None if s == "unlisted" else
                                 {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"})
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     P._find_open_bot_pr = lambda repo, branch: ("none", None)
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
     P._push_and_open_pr = lambda repo, wt, branch, slug: 150
+    # tick 1: only the first 100 skips fit the batch — the valid row is NOT reachable this tick
+    led = FakeLedger(ready=ready, provenance=["deadbeef"])
     _run(P.propose(led))
-    ok(("mark", "fp9-valid", 150) in led.mutations, "the valid candidate BEHIND 3 skips is reached")
-    ok(P.CURSOR_FILE.read_text() == "fp9-valid", "cursor persisted at the last visited fingerprint")
-    # next tick: cursor at the tail → the scan WRAPS to the start (skips are revisited, no wedge)
-    led2 = FakeLedger(ready=ready[:3], provenance=["deadbeef"])
+    ok(led.mutations == [], "tick 1 visits only the first 100 skips (valid row beyond the batch)")
+    ok(P.CURSOR_FILE.read_text() == "fp099", "cursor persisted at the last visited fingerprint")
+    # tick 2: the scan RESUMES after fp099 — reaching fpzz-valid REQUIRES the cursor
+    led2 = FakeLedger(ready=ready, provenance=["deadbeef"])
     _run(P.propose(led2))
-    ok(led2.mutations == [], "wrapped scan revisits the skipped candidates without claiming")
+    ok(("mark", "fpzz-valid", 150) in led2.mutations,
+       "tick 2 reaches the valid candidate PAST 101 skips (cursor-driven rotation)")
+    ok(P.CURSOR_FILE.read_text() == "fpzz-valid", "cursor at the tail after tick 2")
+    # tick 3: tail exhausted → WRAP to the start; the cursor VALUE proves rows were re-visited
+    led3 = FakeLedger(ready=skipped, provenance=["deadbeef"])
+    _run(P.propose(led3))
+    ok(led3.mutations == [], "wrapped scan revisits skips without claiming")
+    ok(P.CURSOR_FILE.read_text() == "fp099",
+       "wrap PROVEN: cursor moved from the tail back to the first batch's last fingerprint")
+
+
+def test_gc_survives_bad_allowlist_entry():
+    # kilabz r3 MAJOR: one malformed repos.json entry (non-string path / raising prune) must not
+    # abort the whole tick — the sweep logs + continues, and healthy repos still get pruned.
+    _reset(False)
+    with tempfile.TemporaryDirectory() as d:
+        good = Path(d) / "goodrepo"; (good / ".git").mkdir(parents=True)
+        rj = Path(d) / "repos.json"
+        rj.write_text(json.dumps({
+            "bad-type": {"path": 123},                       # TypeError-shaped
+            "bad-missing": {"path": d + "/nope"},
+            "good": {"path": str(good)},
+        }))
+        P.REPOS_JSON = rj
+        pruned = []
+        def _rec_git(cwd, *a, **k):
+            pruned.append(str(cwd)); return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        P._git = _rec_git
+        try:
+            P.gc_worktrees()
+        except Exception as e:
+            ok(False, f"gc_worktrees raised through a bad entry: {e!r}")
+        else:
+            ok(any(str(good) in p for p in pruned), "the healthy repo is still pruned")
+        # a RAISING prune on one repo must not stop the sweep either
+        def _raise_git(cwd, *a, **k):
+            raise RuntimeError("wedged prune")
+        P._git = _raise_git
+        try:
+            P.gc_worktrees()
+            ok(True, "a raising prune is caught per-entry (sweep + tick continue)")
+        except Exception as e:
+            ok(False, f"raising prune escaped gc_worktrees: {e!r}")
 
 
 def test_git_hooks_disabled_on_every_git_op():

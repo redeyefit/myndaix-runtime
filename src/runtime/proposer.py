@@ -236,14 +236,20 @@ def gc_worktrees() -> None:
     if not isinstance(raw, dict):
         return
     for key, entry in raw.items():
-        if key.startswith("_") or not isinstance(entry, dict):
-            continue
-        p = entry.get("path")
-        if not p:
-            continue
-        path = Path(p).expanduser().resolve()
-        if path.is_dir() and (path / ".git").exists():
-            _git(path, "worktree", "prune")
+        # per-entry boundary (kilabz r3 MAJOR): a malformed path (TypeError) or a wedged prune
+        # (TimeoutExpired) in ONE allowlist entry must never abort the whole tick before the ledger
+        # connects — log + continue the sweep.
+        try:
+            if key.startswith("_") or not isinstance(entry, dict):
+                continue
+            p = entry.get("path")
+            if not isinstance(p, str) or not p:
+                continue
+            path = Path(p).expanduser().resolve()
+            if path.is_dir() and (path / ".git").exists():
+                _git(path, "worktree", "prune")
+        except Exception as e:
+            log(f"gc prune for {key!r} raised ({e!r}) — continue sweep")
 
 
 # -- K3: symlink-safe, creation-only write of skills/<slug>/SKILL.md inside the worktree ----------
