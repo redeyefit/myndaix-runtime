@@ -230,6 +230,72 @@ def test_existing_remote_branch_refuses_create():
         P._remote_branch_exists = saved
 
 
+def test_probe_exhaustion_does_not_starve_below_capacity():
+    # kilabz ff MAJOR: with creation budget left but probes spent, the old `continue` put the
+    # unprocessed candidate in `seen` and the cursor moved PAST it — an adoptable orphan beyond
+    # PROBE_CAP was never adopted, permanently. Now the scan BREAKS before consuming it; the next
+    # tick resumes exactly there. 7 adoptable candidates, PROBE_CAP=6, two ticks → all 7 adopted.
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0} for i in range(7)]
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("found", 70)
+    led = FakeLedger(ready=ready)
+    _run(P.propose(led))
+    t1 = [m for m in led.mutations if m[0] == "mark"]
+    ok(len(t1) == P.PROBE_CAP, f"tick 1 adopts exactly PROBE_CAP candidates (got {len(t1)})")
+    claimed1 = {m[1] for m in led.mutations if m[0] == "claim"}
+    ok("fp06" not in claimed1, "the 7th candidate is NOT consumed in tick 1")
+    led2 = FakeLedger(ready=ready)
+    _run(P.propose(led2))
+    claimed2 = {m[1] for m in led2.mutations if m[0] == "claim"}
+    ok("fp06" in claimed2, "tick 2 resumes AT the unprocessed candidate and adopts it (no starvation)")
+
+
+def test_unknown_create_reserves_max_open_slot():
+    # kilabz ff MAJOR: an unknown create outcome may be a REAL open PR — it must consume a
+    # MAX_OPEN slot this tick so further creates can't push real open PRs past the cap.
+    _reset(False)
+    ready = [{"fingerprint": f"fp{i}", "repo_scope": "myndaix-runtime", "rule_tag": t,
+              "path_glob": "src/*.py", "decline_count": 0}
+             for i, t in enumerate(["fail-open", "toctou-race"])]
+    led = FakeLedger(open_count=2, ready=ready, provenance=["deadbeef"])   # 2 tracked, cap 3
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    P._find_open_bot_pr = lambda repo, branch: ("none", None)
+    saved_rbe = P._remote_branch_exists
+    P._remote_branch_exists = lambda repo, branch: False
+    P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
+    calls = {"n": 0}
+    def _unknown(repo, wt, branch, slug):
+        calls["n"] += 1; return ("unknown", None)
+    P._push_and_open_pr = _unknown
+    try:
+        _run(P.propose(led))
+        ok(calls["n"] == 1, f"the unknown outcome RESERVES the last slot — no 2nd create (got {calls['n']})")
+    finally:
+        P._remote_branch_exists = saved_rbe
+
+
+def test_dry_run_bounded_by_creation_budget():
+    # kilabz ff MINOR: dry-run must model the creation limits, not report the whole 100-row batch.
+    _reset(monkey_dry=True)
+    ready = [{"fingerprint": f"fp{i:02d}", "repo_scope": "myndaix-runtime", "rule_tag": "fail-open",
+              "path_glob": "src/*.py", "decline_count": 0} for i in range(10)]
+    led = FakeLedger(ready=ready, provenance=["deadbeef"])
+    visited = {"n": 0}
+    async def _prov(fp, limit=8):
+        visited["n"] += 1; return ["deadbeef"]
+    led.capture_provenance = _prov
+    P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
+    _run(P.propose(led))
+    ok(visited["n"] == P.MAX_PER_TICK,
+       f"dry-run stops at the creation budget ({visited['n']} == MAX_PER_TICK)")
+    ok(led.mutations == [], "still zero mutations (A9)")
+    _reset(False)
+
+
 def test_push_has_no_force():
     # inbox-synthesis P1: the push must be a PLAIN push (a racing branch creation gets a
     # non-fast-forward rejection, never an overwrite).
@@ -244,7 +310,7 @@ def test_push_has_no_force():
     try:
         n = _REAL_PUSH_PR({"nwo": "o/r", "default_branch": "main", "path": Path("/tmp/x")},
                                 Path("/tmp/wt"), "skill/auto/x", "x")
-        ok(n == 9, "PR number parsed from create URL")
+        ok(n == ("opened", 9), "tri-state opened + PR number parsed from create URL")
         push = next((c for c in git_calls if c and c[0] == "push"), None)
         ok(push is not None and "--force" not in push, f"push argv has NO --force (got {push})")
     finally:
@@ -266,7 +332,7 @@ def test_attempt_budget_burns_on_unknown_outcome():
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
     calls = {"n": 0}
     def _unknown_create(repo, wt, branch, slug):
-        calls["n"] += 1; return None                              # outcome unknown every time
+        calls["n"] += 1; return ("unknown", None)                 # outcome unknown every time
     P._push_and_open_pr = _unknown_create
     _run(P.propose(led))
     ok(calls["n"] <= P.MAX_PER_TICK,
@@ -330,7 +396,7 @@ def test_cursor_fairness_rotates_past_skipped():
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     P._find_open_bot_pr = lambda repo, branch: ("none", None)
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
-    P._push_and_open_pr = lambda repo, wt, branch, slug: 150
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 150)
     # tick 1: only the first 100 skips fit the batch — the valid row is NOT reachable this tick
     led = FakeLedger(ready=ready, provenance=["deadbeef"])
     _run(P.propose(led))
@@ -486,7 +552,7 @@ def test_propose_happy_path_marks_pr():
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
     P._find_open_bot_pr = lambda repo, branch: ("none", None)   # definitive absence
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
-    P._push_and_open_pr = lambda repo, wt, branch, slug: 142
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 142)
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()  # worktree remove no-op
     _run(P.propose(led))
     verbs = [m[0] for m in led.mutations]
@@ -553,7 +619,7 @@ def test_propose_poison_pill_does_not_wedge_tick():
     P.resolve_repo = lambda s: {"nwo": "o/r", "path": Path("/tmp/x"), "default_branch": "main"}
     P._find_open_bot_pr = lambda repo, branch: ("none", None)
     P._make_proposal_commit = lambda repo, wtn, slug, rendered: Path("/tmp/wt")
-    P._push_and_open_pr = lambda repo, wt, branch, slug: 143
+    P._push_and_open_pr = lambda repo, wt, branch, slug: ("opened", 143)
     P._git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     _run(P.propose(led))
     ok(("mark", "good", 143) in led.mutations, "the candidate AFTER the poison pill still proposes")

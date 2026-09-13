@@ -357,23 +357,40 @@ def _remote_branch_exists(repo: dict, branch: str) -> Optional[bool]:
     """Does refs/heads/<branch> exist on origin? True/False, or None (lookup failed → treat as
     unknown, fail-closed). The create path REFUSES to push when the branch already exists with no
     open bot PR (inbox synthesis P1: a human can close the bot's draft and keep content on the
-    deterministic branch name — a force/overwrite push would erase it; the flock can't serialize
-    GitHub-side edits). A leftover from a crashed push-before-create hits the same refusal LOUDLY —
-    human cleanup (delete the branch) unwedges it; TTL/backoff machinery is unaffected."""
-    r = _git(repo["path"], "ls-remote", "--heads", "origin", branch)
+    deterministic branch name — an overwrite push would erase it; the flock can't serialize
+    GitHub-side edits). A leftover from a crashed push-before-create — or a human closure that
+    kept its branch — hits the same refusal LOUDLY; deleting the branch unwedges re-proposal.
+
+    Queries the FULL ref and exact-compares the returned ref name: a bare pattern to `ls-remote`
+    is SUFFIX-matched by git (an existing `archive/skill/auto/x` would block absent `skill/auto/x`)
+    and substring-checking stdout was looser still (kilabz ff-review MINOR)."""
+    ref = f"refs/heads/{branch}"
+    r = _git(repo["path"], "ls-remote", "origin", ref)
     if r.returncode != 0:
         return None
-    return branch in r.stdout
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1] == ref:
+            return True
+    return False
 
 
-def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> Optional[int]:
-    """Push the branch and open a --draft PR. Returns the PR number parsed from `gh pr create`'s
-    URL (K6: create prints a URL, not JSON), or None on failure/unknown. NO --force (inbox
-    synthesis P1): the caller verified the branch does not exist; if a racing push creates it in
-    the gap, the plain push is rejected non-fast-forward and we release — never overwrite."""
+def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> tuple[str, Optional[int]]:
+    """Push the branch and open a --draft PR. TRI-STATE return so the caller can account
+    conservatively (kilabz ff-review MAJOR — an unknown create may have opened a REAL PR whose
+    response was lost, and MAX_OPEN must reserve for it):
+      ("opened", n)   — PR confirmed open (number parsed from the create URL; K6: create prints a
+                        URL, not JSON).
+      ("no-pr", None) — DEFINITIVE failure BEFORE any PR could exist (the push itself failed).
+      ("unknown", None) — the create's outcome is uncertain (raise/timeout/nonzero/unparseable):
+                        a PR may exist untracked; the caller reserves a MAX_OPEN slot this tick
+                        and the next tick's adopt-probe re-tracks it if real.
+    Push is PLAIN (no --force): the caller verified the branch's absence just before; a branch
+    racing into existence in that gap is rejected non-fast-forward (or, if it points at an
+    ancestor of our commit, fast-forwards losslessly — its commit stays in our history)."""
     push = _git(wt, "push", "origin", f"HEAD:refs/heads/{branch}")
     if push.returncode != 0:
-        log(f"push failed: {push.stderr.strip()[:200]}"); return None
+        log(f"push failed: {push.stderr.strip()[:200]}"); return ("no-pr", None)
     title = f"skill(auto): {slug} — recurring review finding (review before merge)"
     body = (f"Auto-proposed by the S7 proposer from a recurring `rule:{slug}` finding. This is an "
             f"UNAUTHORED STUB — fill in the real lesson (see the provenance commits in the diff) and "
@@ -384,13 +401,13 @@ def _push_and_open_pr(repo: dict, wt: Path, branch: str, slug: str) -> Optional[
                             "--title", title, "--body", body],
                            capture_output=True, text=True, env=_git_env(), timeout=GH_TIMEOUT, check=False)
     except subprocess.SubprocessError as e:
-        log(f"gh pr create raised ({e!r}) — outcome UNKNOWN, leave for recovery"); return None
+        log(f"gh pr create raised ({e!r}) — outcome UNKNOWN, reserve + recover next tick"); return ("unknown", None)
     if r.returncode != 0:
-        log(f"gh pr create failed: {r.stderr.strip()[:200]} — outcome unknown"); return None
+        log(f"gh pr create failed: {r.stderr.strip()[:200]} — outcome unknown"); return ("unknown", None)
     m = _PR_URL_RE.search((r.stdout or "").strip())
     if not m:
-        log(f"gh pr create gave no parseable PR URL ({r.stdout.strip()[:120]}) — unknown"); return None
-    return int(m.group(1))
+        log(f"gh pr create gave no parseable PR URL ({r.stdout.strip()[:120]}) — unknown"); return ("unknown", None)
+    return ("opened", int(m.group(1)))
 
 
 def _find_open_bot_pr(repo: dict, branch: str) -> tuple[str, Optional[int]]:
@@ -529,9 +546,16 @@ async def propose(led) -> None:
             draft_sha = capture.draft_hash(rendered)
             if DRY_RUN:
                 log(f"would propose {c['rule_tag']} → {branch} for {repo['nwo']} (draft_sha {draft_sha[:8]})")
-                n_open += 1; opened += 1; continue                # A9: log BEFORE any DB verb or gh read
+                n_open += 1; opened += 1                          # A9: log BEFORE any DB verb or gh read
+                if n_open >= MAX_OPEN() or opened >= MAX_PER_TICK:
+                    break                                         # dry-run models the CREATION budget
+                continue                                          # (kilabz ff MINOR: was unbounded)
             if probes >= PROBE_CAP:
-                continue                                          # keep scanning cheap local skips only
+                # this candidate was NOT processed — it must not advance the cursor, or a persistent
+                # probe-exhaustion permanently starves it (kilabz ff MAJOR: `continue` put it in
+                # `seen`, the cursor moved past it, and an adoptable orphan was stranded forever).
+                seen.discard(fp)
+                break
             probes += 1
             status, existing = _find_open_bot_pr(repo, branch)    # K1: adopt by identity, not hash
             if status == "found":
@@ -565,10 +589,18 @@ async def propose(led) -> None:
                 await led.release_proposing(fp, branch, draft_sha); continue
             attempts += 1                                         # burn budget on the ATTEMPT
             try:
-                pr_number = _push_and_open_pr(repo, wt, branch, slug)
+                outcome, pr_number = _push_and_open_pr(repo, wt, branch, slug)
             finally:
                 _git(repo["path"], "worktree", "remove", "--force", str(wt))
-            if pr_number is None:
+            if outcome == "unknown":
+                # a REAL PR may exist untracked — RESERVE a MAX_OPEN slot this tick so further
+                # creates can't overflow real open PRs past the cap (kilabz ff MAJOR: 2 tracked +
+                # 2 unknown creates = 4 real PRs under a 3 cap). Next tick's adopt-probe runs
+                # before the capacity gate and re-tracks it if it exists; the claim is released so
+                # the class isn't wedged either way.
+                n_open += 1
+                await led.release_proposing(fp, branch, draft_sha); continue
+            if outcome != "opened" or pr_number is None:          # "no-pr": definite, nothing created
                 await led.release_proposing(fp, branch, draft_sha); continue
             if await led.mark_capture_proposed(fp, branch, draft_sha, pr_number):
                 log(f"opened draft PR#{pr_number} for {branch} ({repo['nwo']})"); n_open += 1; opened += 1
