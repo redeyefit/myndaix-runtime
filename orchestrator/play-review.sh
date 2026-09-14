@@ -167,7 +167,11 @@ trunk_ref(){
 # so it stays silent. Fully guarded: a diagnosis must never break the abort it is decorating.
 trunk_lag(){
   local _repo="$1" _base="$2" _tip="$3" _t _ts _tn _n
-  _t="$(trunk_ref "$_repo" "" 2>/dev/null || true)"
+  # NO 2>/dev/null on trunk_ref (kilabz/oracle r4): trunk_ref's own contract (see its body) keeps
+  # stderr open on PURPOSE — --quiet already eats the expected "not a valid ref", so the only thing
+  # a redirect here could hide is a REAL git failure (corrupt repo, permissions). `|| true` still
+  # protects the abort this diagnosis decorates; it must never let trunk_ref's exit status through.
+  _t="$(trunk_ref "$_repo" "" || true)"
   _ts="${_t%% *}"; _tn="${_t#* }"
   [[ "$_ts" =~ ^[0-9a-f]{40}$ ]] || return 0                                       # unresolved trunk -> no diagnosis
   git -C "$_repo" merge-base --is-ancestor "$_ts" "$_tip" 2>/dev/null || return 0   # trunk inside the range?
@@ -193,6 +197,10 @@ fold_walk(){
     _prev="$(head -c 64 "$_m" 2>/dev/null || true)"
     if [[ ! "$_prev" =~ ^[0-9a-f]{40}$ ]]; then break; fi     # strict lowercase 40-hex only
     if [[ "$_prev" == "$_local" ]]; then break; fi            # would empty the whole diff
+    # EMPTY_TREE (the whole-tree base written when no shared trunk resolved) is 40-hex so it passes
+    # the regex, but it is a TREE — ^{commit} fails and STOPS the fold here. That is correct, not a
+    # loss (kilabz r4): a whole-tree range has no incremental base to fold onto. The marker stays
+    # standing as backlog for skip-audit to surface; it is never silently dropped.
     if ! git -C "$_repo" cat-file -e "${_prev}^{commit}" 2>/dev/null; then break; fi
     if ! git -C "$_repo" merge-base --is-ancestor "$_prev" "$_local" 2>/dev/null; then break; fi
     _b="$_prev"; _hops=$((_hops+1))
@@ -713,7 +721,7 @@ while :; do
   # Ancestry proves containment, not prior review, so state both readings and let a human pick.
   _lag="$(trunk_lag "$repo" "$base" "$tip" || true)"
   if [[ -n "$_lag" ]]; then
-    diff_fail="$diff_fail — OBSERVED: ${_lag%% *} commit(s) in ${base:0:12}..${tip:0:12} are also contained in ${_lag#* } (resolved via origin, which may not be this push's remote). EITHER the base is stale and this range re-covers already-merged commits (fast-forward $BASE_REF and re-push; raising PLAY_MAX_DIFF_LINES would only pay to re-review merged code) OR this is a push to the trunk itself and those commits ARE the unreviewed change (split the push, or raise the cap). Ancestry cannot tell them apart — check which before acting."
+    diff_fail="$diff_fail — OBSERVED: ${_lag%% *} commit(s) in ${base:0:12}..${tip:0:12} are also contained in ${_lag#* } (that trunk was resolved independently of this push's remote and may not be its destination). EITHER the base is stale and this range re-covers already-merged commits (fast-forward $BASE_REF and re-push; raising PLAY_MAX_DIFF_LINES would only pay to re-review merged code) OR this is a push to the trunk itself and those commits ARE the unreviewed change (split the push, or raise the cap). Ancestry cannot tell them apart — check which before acting."
   fi
   abort diff "$diff_fail"
 done

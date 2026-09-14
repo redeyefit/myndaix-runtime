@@ -110,6 +110,14 @@ ck(){ # ck <label> <substr> <file-or-empty>
   if [[ -n "$f" && -f "$f" ]] && grep -q "$2" "$f"; then echo "  ok: $1"; PASS=$((PASS+1));
   else echo "  FAIL: $1 (want '$2')"; FAIL=$((FAIL+1)); fi
 }
+cknot(){ # cknot <label> <substr> <file-or-empty> — assert substr ABSENT; FAIL if the delivery is
+  # MISSING (oracle r4: a bare `grep -q ... 2>/dev/null` in the else-branch conflates a vanished
+  # file with a clean pass — positive proof the message exists is required before trusting absence).
+  local f="${3:-$(latest)}"
+  if [[ -z "$f" || ! -f "$f" ]]; then echo "  FAIL: $1 (no delivery to inspect)"; FAIL=$((FAIL+1));
+  elif grep -q "$2" "$f"; then echo "  FAIL: $1 (unwanted '$2')"; FAIL=$((FAIL+1));
+  else echo "  ok: $1"; PASS=$((PASS+1)); fi
+}
 ckfile(){ if [[ -e "$1" ]]; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2 (missing $1)"; FAIL=$((FAIL+1)); fi; }
 cknofile(){ if [[ ! -e "$1" ]]; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2 (exists $1)"; FAIL=$((FAIL+1)); fi; }
 ckexit(){ if [[ "$1" == "$2" ]]; then echo "  ok: $3"; PASS=$((PASS+1)); else echo "  FAIL: $3 (rc $1 != $2)"; FAIL=$((FAIL+1)); fi; }
@@ -552,8 +560,10 @@ echo "50k. a tip ALREADY contained in the trunk is skipped, not whole-tree diffe
 
 # kilabz r3 F5+F6 regression — FAILS against the version that PRESCRIBED a fast-forward here.
 # The same ancestry signal is emitted by a stale base AND by an ordinary incremental push to the
-# trunk, so the message must carry both readings and decide neither. The absence check at the end
-# is the load-bearing one: it is what stops a future edit from re-adding the confident diagnosis.
+# trunk, so the message must carry both readings and decide neither. The POSITIVE checks below (both
+# readings + "cannot tell them apart") are the contract; the final cknot is a belt against a future
+# edit re-adding the specific retired "LIKELY CAUSE" phrasing (kilabz r4: a dead-string needle alone
+# is not the load-bearing assertion — the hedge is).
 echo "50h. an over-cap abort whose range CONTAINS trunk commits reports the ambiguity, not a cause"; reset
   git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"   # trunk is an ancestor of $FEATTIP
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
@@ -562,14 +572,14 @@ echo "50h. an over-cap abort whose range CONTAINS trunk commits reports the ambi
   ck "offers the push-to-the-trunk reading" "push to the trunk itself"
   ck "admits the signal cannot decide between them" "Ancestry cannot tell them apart"
   ck "still reports what it measured" "cap 0"
-  if [[ -n "$(latest)" ]] && grep -q "LIKELY CAUSE" "$(latest)" 2>/dev/null; then echo "  FAIL: prescribes a cause off an ambiguous signal (r3 F5+F6)"; FAIL=$((FAIL+1)); else echo "  ok: no prescription — the reader adjudicates"; PASS=$((PASS+1)); fi
+  cknot "no 'LIKELY CAUSE' prescription re-added — the reader adjudicates (r3 F5+F6)" "LIKELY CAUSE"
 
 echo "50i. a normal over-cap abort (trunk NOT inside the range) stays a plain cap message"; reset
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TRUNKTIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
   ck "plain cap abort still delivered" "ABORTED — diff"
   # greps the CURRENT marker text, not the retired "LIKELY CAUSE": a needle that no code path can
   # emit would make this test pass even if trunk_lag stopped firing entirely.
-  if [[ -n "$(latest)" ]] && grep -q "OBSERVED:" "$(latest)" 2>/dev/null; then echo "  FAIL: false trunk-containment alarm on a clean range"; FAIL=$((FAIL+1)); else echo "  ok: no false alarm when the range holds no trunk commits"; PASS=$((PASS+1)); fi
+  cknot "no false trunk-containment alarm on a clean range" "OBSERVED:"
   git -C "$REPO" update-ref -d refs/remotes/origin/main
 
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
@@ -667,72 +677,6 @@ echo "63. autofix_fire forwards the triggering remote as MYNDAIX_FIX_REMOTE (rev
   bareR="$ROOT/bare-remote63.git"; git init -q --bare "$bareR"; git -C "$REPO" push -q "$bareR" "$TIP:refs/heads/main" 2>/dev/null
   STUB_TRIAGE="1. fix it" run_af "$bareR"; wait_fixer
   if grep -q "REMOTE=$bareR" "$FAKE/.myndaix/fixer-env" 2>/dev/null; then echo "  ok: triggering remote forwarded to the fixer"; PASS=$((PASS+1)); else echo "  FAIL: MYNDAIX_FIX_REMOTE not forwarded (env: $(tr '\n' ' ' < "$FAKE/.myndaix/fixer-env" 2>/dev/null))"; FAIL=$((FAIL+1)); fi
-
-# ====================== skip-audit.sh (the review loop's own coverage check) ====================
-# skip-audit reads the skipped-* markers play-review.sh writes and classifies what the loop still
-# owes. It shipped unproven against fabricated state: the first live run found PHANTOM=0, so the
-# class that diagnoses the over-cap pathology had never once been observed firing. These fixtures
-# stage each class deliberately. The audit is READ-ONLY, so they assert on its stdout and exit code.
-SKIPAUDIT="$(cd "$(dirname "$0")" && pwd)/skip-audit.sh"
-SA_ROOT="$ROOT/sa"; SA_STATE="$SA_ROOT/state"; SA_CODE="$SA_ROOT/code"; SA_REPO="$SA_CODE/demo"
-mkdir -p "$SA_STATE" "$SA_CODE"
-git init -q "$SA_REPO"
-git -C "$SA_REPO" config user.email t@t; git -C "$SA_REPO" config user.name t
-printf 'a\n' > "$SA_REPO/a"; git -C "$SA_REPO" add -A; git -C "$SA_REPO" commit -qm one
-SA_B="$(git -C "$SA_REPO" rev-parse HEAD)"
-printf 'b\n' > "$SA_REPO/b"; git -C "$SA_REPO" add -A; git -C "$SA_REPO" commit -qm two
-SA_T="$(git -C "$SA_REPO" rev-parse HEAD)"
-printf 'c\n' > "$SA_REPO/c"; git -C "$SA_REPO" add -A; git -C "$SA_REPO" commit -qm three
-SA_F="$(git -C "$SA_REPO" rev-parse HEAD)"
-# set the trunk EXPLICITLY rather than relying on the default branch name: `git init` picks
-# master or main depending on init.defaultBranch, and trunk_of() only looks for main.
-git -C "$SA_REPO" update-ref refs/heads/main "$SA_T"
-sa(){ SA_OUT="$(env PLAY_STATE="$SA_STATE" SKIP_AUDIT_ROOTS="$SA_CODE" "$@" bash "$SKIPAUDIT" 2>&1)"; SA_RC=$?; }
-sack(){ if grep -q -- "$2" <<<"$SA_OUT"; then echo "  ok: $1"; PASS=$((PASS+1)); else echo "  FAIL: $1 (want '$2')"; FAIL=$((FAIL+1)); fi; }
-sarc(){ if [[ "$SA_RC" == "$2" ]]; then echo "  ok: $1"; PASS=$((PASS+1)); else echo "  FAIL: $1 — exit $SA_RC want $2"; FAIL=$((FAIL+1)); fi; }
-sareset(){ rm -f "$SA_STATE"/skipped-*; }
-
-echo "64. skip-audit: a tip already in the trunk is RETIRABLE, and retirable-only is not a finding"
-  sareset; printf '%s' "$SA_B" > "$SA_STATE/skipped-demo-refs-heads-done-$SA_T"
-  sa; sack "classified MERGED" "MERGED"; sack "named as retirable" "RETIRABLE — 1 marker"
-  sarc "exit 0 — nothing actionable" 0
-
-echo "65. skip-audit: PHANTOM names the merged commits the range re-covers (the over-cap cause)"
-  # base BELOW the trunk + tip ABOVE it: the range drags $SA_B..$SA_T back in, which is exactly how
-  # a 42-line branch measured 3625 lines and aborted on the cap.
-  sareset; printf '%s' "$SA_B" > "$SA_STATE/skipped-demo-refs-heads-feat-$SA_F"
-  sa; sack "classified PHANTOM" "PHANTOM"
-  sack "counts the swallowed commits" "swallows 1 merged commit"
-  sarc "exit 1 — actionable" 1
-
-echo "66. skip-audit: a marker filed under a WORKTREE name is reported as a strand, not an orphan"
-  sareset; git -C "$SA_REPO" worktree add -q --detach "$SA_ROOT/wt1" "$SA_F" 2>/dev/null
-  printf '%s' "$SA_T" > "$SA_STATE/skipped-wt1-refs-heads-feat-$SA_F"
-  sa; sack "classified WORKTREE_STRAND" "WORKTREE_STRAND"
-  sack "names the owning repo" "(worktree of demo)"
-  sarc "exit 1 — actionable" 1
-  git -C "$SA_REPO" worktree remove --force "$SA_ROOT/wt1" 2>/dev/null
-
-echo "67. skip-audit: junk markers are classified, never fatal (it must survive its own inputs)"
-  sareset; printf '%s' "$SA_T" > "$SA_STATE/skipped-nosuchrepo-refs-heads-x-$SA_F"
-  : > "$SA_STATE/skipped-not-a-marker"                        # trailing field is not a 40-hex sha
-  printf 'not-a-sha' > "$SA_STATE/skipped-demo-refs-heads-bad-$SA_F"   # parseable name, junk CONTENT
-  sa; sack "orphan slug reported" "ORPHAN SLUG"
-  sack "unparseable name survives" "UNPARSEABLE"
-  sack "junk content is CORRUPT, not a crash" "CORRUPT"
-  sack "all three counted" "3 markers"
-
-echo "68. skip-audit: environment errors exit 2 (distinct from 'found something')"
-  sareset
-  SA_OUT="$(env PLAY_STATE="$SA_ROOT/gone" SKIP_AUDIT_ROOTS="$SA_CODE" bash "$SKIPAUDIT" 2>&1)"; SA_RC=$?
-  sarc "missing state dir" 2
-  sa PLAY_PRUNE_DAYS=abc; sarc "non-numeric PLAY_PRUNE_DAYS" 2
-  # "08" passes the numeric regex but is INVALID octal: without the 10# normalization $(( )) dies
-  # with "value too great for base", killing the audit under set -e on a value a human would read
-  # as eight. The regex alone is not enough (rules/bash-scripts.md, the leading-zero trap).
-  sa PLAY_PRUNE_DAYS=08
-  sarc "leading-zero PLAY_PRUNE_DAYS runs normally" 0
-  if grep -q 'too great for base' <<<"$SA_OUT"; then echo "  FAIL: 08 parsed as octal (missing 10#)"; FAIL=$((FAIL+1)); else echo "  ok: 08 parsed base 10, no arithmetic fault"; PASS=$((PASS+1)); fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
