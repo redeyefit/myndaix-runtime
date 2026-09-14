@@ -85,19 +85,63 @@ EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 # commits behind origin/main, so a 42-line branch was computed as a 3625-line range and aborted
 # on MAX_DIFF_LINES. The remote ref is the right question ("what is new vs the shared trunk?")
 # and is fast-forwarded by the very push that triggers this hook.
-# Candidate order: the remote git is ACTUALLY pushing to, then origin, then the local ref (a repo
-# with no remote, or a mirror whose remote-tracking refs were never fetched, still reviews).
+# Candidate order: the remote git is ACTUALLY pushing to, then (ONLY when the destination is
+# unknown) origin, then the local ref (a repo with no remote, or a mirror whose remote-tracking
+# refs were never fetched, still reviews).
 # Fully-qualified refs/remotes/... on purpose: a bare "origin/main" would be ambiguous against a
 # local BRANCH literally named "origin/main". set -e DISCIPLINE: called from the pre-push FRONT,
 # which must NEVER abort a push — every step is an if/fi guard and the fallback printf exits 0.
+# Echoes "<sha> <refname>": the SHA is what callers must diff against (see the TOCTOU note below),
+# the name is for the human-facing diagnosis. Unresolvable -> "<BASE_REF> <BASE_REF>", which keeps
+# the old behavior of letting merge-base fail into the whole-tree path.
 trunk_ref(){
-  local _repo="$1" _remote="${2:-}" _c
-  for _c in ${_remote:+"refs/remotes/$_remote/$BASE_REF"} "refs/remotes/origin/$BASE_REF" "$BASE_REF"; do
-    if git -C "$_repo" rev-parse --verify --quiet "${_c}^{commit}" >/dev/null 2>&1; then
-      printf '%s' "$_c"; return 0
+  local _repo="$1" _remote="${2:-}" _noorigin="${3:-}" _c _sha
+  local -a _cand=()
+  [[ -n "$_remote" ]] && _cand+=("refs/remotes/$_remote/$BASE_REF")
+  # kilabz r1 MED + r2 P2: origin is a GUESS, only ever safe when the destination is unknown.
+  # Guessing it when we know the destination — either a named non-origin remote whose tracking
+  # ref isn't fetched yet, or a URL that maps to no configured remote — can move the base FORWARD
+  # (origin/main ahead of that destination) and silently DROP commits from the review, the one
+  # direction this file never accepts (cf. fold_walk: "may OVER-review, can never lose a range").
+  # Known destination therefore falls straight to the local trunk: stale, so it over-reviews.
+  [[ -z "$_remote" && -z "$_noorigin" ]] && _cand+=("refs/remotes/origin/$BASE_REF")
+  _cand+=("refs/heads/$BASE_REF" "$BASE_REF")        # qualified first (the ambiguity the comment above warns about)
+  for _c in "${_cand[@]}"; do
+    # NO 2>/dev/null: --quiet already silences the expected "not a valid ref", so suppressing
+    # stderr here would only ever hide a REAL git failure (corrupt repo, permissions) (oracle P3).
+    # Capture the SHA rather than echo the NAME: a concurrent `git fetch` can advance
+    # refs/remotes/origin/main between this verify and the caller's merge-base, moving the base
+    # forward mid-push (oracle TOCTOU). Pinning the sha here makes the range immune.
+    if _sha="$(git -C "$_repo" rev-parse --verify --quiet "${_c}^{commit}")" && [[ -n "$_sha" ]]; then
+      printf '%s %s' "$_sha" "$_c"; return 0
     fi
   done
-  printf '%s' "$BASE_REF"                            # nothing resolved: keep the old behavior, let merge-base fail
+  printf '%s %s' "$BASE_REF" "$BASE_REF"             # nothing resolved: keep the old behavior, let merge-base fail
+}
+
+# trunk_lag <repo> <base> <tip> — echo "N <trunkref>" when the range base..tip SWALLOWS N>0
+# already-merged trunk commits, else nothing (silent).
+# WHY this exists: on 2026-09-14 an over-cap abort reported only the line count it measured and
+# closed with "split the push or raise PLAY_MAX_DIFF_LINES". That prescription was wrong — the
+# range was 29 merged commits of stale-local-main fallout — but it looked right, so it was
+# approved and applied, and the real cause stayed hidden. An error that names a fix it has not
+# ruled out is worse than one that just reports. This adds the discriminator that was missing.
+# THE TEST IS NOT "is base behind the trunk" — a branch cut from an older fork point is behind
+# by design and its range is still branch-only. The pathology is specifically: the trunk tip is
+# ALREADY an ancestor of tip (so the trunk's commits sit INSIDE this range) AND base is behind
+# it. An incremental push (base = the branch's own remotesha) is not an ancestor of the trunk,
+# so it stays silent. Fully guarded: a diagnosis must never break the abort it is decorating.
+trunk_lag(){
+  local _repo="$1" _base="$2" _tip="$3" _t _ts _tn _n
+  _t="$(trunk_ref "$_repo" "" 2>/dev/null || true)"
+  _ts="${_t%% *}"; _tn="${_t#* }"
+  [[ "$_ts" =~ ^[0-9a-f]{40}$ ]] || return 0                                       # unresolved trunk -> no diagnosis
+  git -C "$_repo" merge-base --is-ancestor "$_ts" "$_tip" 2>/dev/null || return 0   # trunk inside the range?
+  git -C "$_repo" merge-base --is-ancestor "$_base" "$_ts" 2>/dev/null || return 0  # base behind the trunk?
+  _n="$(git -C "$_repo" rev-list --count "${_base}..${_ts}" 2>/dev/null || true)"
+  [[ "$_n" =~ ^[0-9]+$ ]] || return 0
+  [[ "$((10#$_n))" -gt 0 ]] || return 0
+  printf '%s %s' "$((10#$_n))" "$_tn"
 }
 
 # fold_walk <repo> <slug> <start_base> <localsha> — echo the folded base (unchanged when no
@@ -129,7 +173,18 @@ if [[ "${1:-}" != "--worker" ]]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$repo" ]] || exit 0                        # never abort a push by erroring
   remote_url="${2:-}"                               # git passes remote name as $1, URL as $2; the URL handles pushurl/direct-URL pushes
-  remote_name="${1:-}"                              # the remote NAME (for trunk_ref); empty on controller/direct dispatch
+  # githooks(5): git passes the remote NAME as $1 for `git push <remote>`, but the raw URL for an
+  # anonymous `git push <url>`. Forwarding a URL would expand to refs/remotes/<url>/main, never
+  # resolve, and fall silently through to origin — and if origin is AHEAD of the real destination
+  # that moves the base FORWARD and drops commits from the review (kilabz MED). So: accept $1 only
+  # when it's a configured remote, else map the URL back to one via `git remote -v` (matches both
+  # url and pushurl rows). Still unresolvable => the destination is provably NOT origin, so
+  # no_origin=1 forces the conservative local trunk (over-review, never under-review).
+  remote_name="${1:-}"; remote_noorigin=""
+  if [[ -n "$remote_name" ]] && ! git -C "$repo" config --get "remote.${remote_name}.url" >/dev/null 2>&1; then
+    remote_name="$(git -C "$repo" remote -v 2>/dev/null | awk -v u="$remote_name" '$2==u {print $1; exit}' || true)"
+    [[ -n "$remote_name" ]] || remote_noorigin=1
+  fi
   # Re-exec the long-lived WORKER from a FIXED installed path outside the repo when one
   # exists, so a push that modifies the worktree copy of this script can't run as the
   # worker (defense-in-depth for an untrusted worktree). Falls back to the worktree copy
@@ -158,11 +213,30 @@ if [[ "${1:-}" != "--worker" ]]; then
         _slug="${_rid//[^A-Za-z0-9._-]/-}-${remoteref//[^A-Za-z0-9._-]/-}"   # == worker marker_slug
         base="$(fold_walk "$repo" "$_slug" "$base" "$localsha")"
       fi
-    elif base="$(git -C "$repo" merge-base "$(trunk_ref "$repo" "$remote_name")" "$localsha" 2>/dev/null)" \
-         && [[ -n "$base" && "$base" != "$localsha" ]]; then
-      orig_base="$base"                                     # new branch: review vs its merge-base with the REMOTE trunk
     else
-      base="$EMPTY_TREE"; orig_base="$EMPTY_TREE"           # no base ref / root commit → whole-tree diff
+      _tro="$(trunk_ref "$repo" "$remote_name" "$remote_noorigin")"
+      _tr="${_tro%% *}"; _trn="${_tro#* }"                  # diff against the SHA, report the NAME (TOCTOU)
+      base=""
+      # merge-base's own 2>/dev/null STAYS: its failure is a DESIGNED branch (a repo with no trunk
+      # ref takes it on every push), so surfacing that fatal would be noise, not a hidden error.
+      if base="$(git -C "$repo" merge-base "$_tr" "$localsha" 2>/dev/null)" && [[ -n "$base" ]]; then :; else base=""; fi
+      if [[ -n "$base" && "$base" == "$localsha" && "$_trn" == refs/remotes/* ]]; then
+        # kilabz r2 P2: merge-base == the tip means the tip is ALREADY CONTAINED in the trunk — a
+        # branch cut at the remote trunk, or an already-merged branch re-pushed. The old guard
+        # lumped that in with resolution FAILURE and fell through to EMPTY_TREE: a whole-tree diff
+        # that re-reviews the entire repo and usually just aborts on the cap. Nothing here is new
+        # versus the SHARED trunk, and no range is lost — every commit in it is an ancestor of that
+        # trunk, so it was reviewed on its way in. Skip the ref.
+        continue
+      elif [[ -n "$base" && "$base" != "$localsha" ]]; then
+        orig_base="$base"                                   # new branch: review vs its merge-base with the REMOTE trunk
+      else
+        # Whole-tree, deliberately, in two cases: no trunk ref resolved at all (root commit / no
+        # remote), AND tip-contained-in-a-LOCAL-trunk. The second is the first-ever push of a repo,
+        # where the "trunk" is the very ref being pushed — self-comparison proves nothing about
+        # review coverage, so the whole tree is genuinely unreviewed. (Test 17 rides this path.)
+        base="$EMPTY_TREE"; orig_base="$EMPTY_TREE"
+      fi
     fi
     # arg 7 = the push's OWN base (pre-fold): the worker falls back to it if the folded range
     # busts a diff cap — the fold may only ADD coverage, never cost the push its own review.
@@ -582,6 +656,13 @@ while :; do
     backlog_base="$orig_base"
     base="$orig_base"
     continue
+  fi
+  # Lead with the LIKELY CAUSE when the range swallowed merged commits — the bare line-count
+  # message prescribes raising the cap, which is the exact wrong move here (it would spend a
+  # full reviewer call re-reviewing merged, already-outcome-labeled code instead of aborting).
+  _lag="$(trunk_lag "$repo" "$base" "$tip" || true)"
+  if [[ -n "$_lag" ]]; then
+    diff_fail="LIKELY CAUSE — NOT the cap: base ${base:0:12} is ${_lag%% *} commits behind ${_lag#* }, and that trunk is already an ancestor of the reviewed tip, so this range re-covers ${_lag%% *} ALREADY-MERGED commits. Fast-forward the local trunk (git fetch, then update $BASE_REF to ${_lag#* }) and re-push. Do NOT raise PLAY_MAX_DIFF_LINES for this — it would review merged code. [measured: $diff_fail]"
   fi
   abort diff "$diff_fail"
 done

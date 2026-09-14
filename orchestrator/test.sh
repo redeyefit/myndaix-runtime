@@ -69,6 +69,11 @@ git init -q "$REPO"
 git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
 printf 'def add(a,b): return a-b\n' > "$REPO/m.py"
 git -C "$REPO" add -A; git -C "$REPO" commit -qm init
+# PIN the branch name: `git init`'s initial branch follows init.defaultBranch, so on a `master`
+# box the local trunk play-review looks for ("main") would not exist and the trunk-resolution
+# cases (50c/50e) would silently stop testing what they claim to (kilabz LOW). -M, not `init -b`:
+# works on git < 2.28 too.
+git -C "$REPO" branch -M main
 TIP="$(git -C "$REPO" rev-parse HEAD)"
 EMPTY=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 INBOX="$FAKE/.myndaix/bridge/inbox/jefe"
@@ -97,7 +102,7 @@ run(){ env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/hea
 run_af(){ env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" \
             bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "${1:-}" 2>"$ROOT/stderr"; }
 af_repos(){ mkdir -p "$(dirname "$REPOS_JSON")"; printf '%s' "$1" > "$REPOS_JSON"; }
-wait_fixer(){ for _ in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
+wait_fixer(){ local _; for _ in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
 settle(){ sleep 0.6; }   # let a (possible) detached fire either land or prove absent
 latest(){ ls -t "$INBOX"/*.md 2>/dev/null | head -1; }
 ck(){ # ck <label> <substr> <file-or-empty>
@@ -411,7 +416,7 @@ front_push(){ # front_push <localsha> <remotesha> — one pre-push stdin line in
   rm -f "$FRONT_ARGV"
   ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/main "$1" refs/heads/main "$2" \
       | env HOME="$FAKE" bash "$SCRIPT" origin "stub://remote" ) >/dev/null 2>&1
-  for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
+  local _; for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
 front_base(){ sed -n 3p "$FRONT_ARGV" 2>/dev/null; }   # recorder argv: --worker repo BASE tip ref url orig
 
 # fixture commits: TIP -> TIP2 (the skipped push's tip) -> TIP3 (the retrigger push)
@@ -472,14 +477,23 @@ echo "50b. controller shape (EMPTY remote_url) never walks — ledger cursor sta
 # re-review of already-outcome-labeled code. Fixture: local main STALE at $TIP, remote trunk at
 # $TRUNKTIP, feature branch at $FEATTIP (descends from both).
 ZERO40=0000000000000000000000000000000000000000
-git -C "$REPO" commit -q --allow-empty -m trunk-advance; TRUNKTIP="$(git -C "$REPO" rev-parse HEAD)"
-git -C "$REPO" commit -q --allow-empty -m feature;       FEATTIP="$(git -C "$REPO" rev-parse HEAD)"
+# REAL content (not --allow-empty): 50h/50i need a diff that can actually breach the line cap —
+# an empty diff aborts on a different branch and would stop testing the cap path.
+printf 'trunk\n' > "$REPO/trunk.txt"; git -C "$REPO" add -A
+git -C "$REPO" commit -qm trunk-advance; TRUNKTIP="$(git -C "$REPO" rev-parse HEAD)"
+printf 'feat\n' > "$REPO/feat.txt";  git -C "$REPO" add -A
+git -C "$REPO" commit -qm feature;    FEATTIP="$(git -C "$REPO" rev-parse HEAD)"
 git -C "$REPO" reset -q --hard "$TIP"   # local main goes stale; objects stay reachable (same trick as 49)
+# CONFIGURED remotes: a real repo pushing to `origin` has remote.origin.url set, and the FRONT now
+# accepts $1 only when it resolves to a configured remote (else it treats $1 as a URL). Without
+# these the cases below would exercise the unknown-destination path, not the named-remote path.
+git -C "$REPO" remote add origin   stub://origin   2>/dev/null || true
+git -C "$REPO" remote add upstream stub://upstream 2>/dev/null || true
 front_push_new(){ # front_push_new <localsha> <remote_name> — NEW-branch push shape (remotesha=ZERO)
   rm -f "$FRONT_ARGV"
   ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/feat "$1" refs/heads/feat "$ZERO40" \
       | env HOME="$FAKE" bash "$SCRIPT" "$2" "stub://remote" ) >/dev/null 2>&1
-  for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
+  local _; for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
 
 echo "50c. new branch: a STALE local main is ignored in favor of refs/remotes/origin/main"; reset; install_front_recorder
   git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"
@@ -494,10 +508,46 @@ echo "50d. the remote actually being PUSHED TO outranks origin"; reset; install_
   if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: refs/remotes/upstream/main preferred over origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP (the upstream trunk)"; FAIL=$((FAIL+1)); fi
   git -C "$REPO" update-ref -d refs/remotes/upstream/main
 
-echo "50e. no remote-tracking trunk -> falls back to the LOCAL ref (no-remote repos still review)"; reset; install_front_recorder
+echo "50e. anonymous URL push resolves BACK to the configured remote (githooks: \$1 is the URL)"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/upstream/main "$TIP"   # upstream trunk differs from origin's ($TRUNKTIP)
+  front_push_new "$FEATTIP" "stub://upstream" || true           # git push <url> shape
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: URL mapped to upstream (not silently origin)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — a URL fell through to origin"; FAIL=$((FAIL+1)); fi
+
+echo "50f. push to an UNCONFIGURED url never guesses origin (no silently-dropped commits)"; reset; install_front_recorder
+  front_push_new "$FEATTIP" "stub://nowhere" || true            # destination is provably NOT origin
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: unknown destination -> conservative local trunk (over-review)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — guessed origin ($TRUNKTIP) and would DROP commits"; FAIL=$((FAIL+1)); fi
+  git -C "$REPO" update-ref -d refs/remotes/upstream/main
+
+echo "50g. no remote-tracking trunk -> falls back to the LOCAL ref (no-remote repos still review)"; reset; install_front_recorder
   git -C "$REPO" update-ref -d refs/remotes/origin/main
   front_push_new "$FEATTIP" origin || true
   if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: fell back to the local trunk"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP"; FAIL=$((FAIL+1)); fi
+
+echo "50j. a KNOWN non-origin destination with no tracking ref never borrows origin's trunk"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"                 # origin is AHEAD of the real destination
+  git -C "$REPO" update-ref -d refs/remotes/upstream/main 2>/dev/null || true    # upstream configured but never fetched
+  front_push_new "$FEATTIP" upstream || true
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: fell to the local trunk instead of guessing origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — borrowed origin ($TRUNKTIP), dropping $TIP..$TRUNKTIP from the review"; FAIL=$((FAIL+1)); fi
+
+echo "50k. a tip ALREADY contained in the trunk is skipped, not whole-tree diffed"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/origin/main "$FEATTIP"                  # merge-base(trunk,tip) == tip
+  if front_push_new "$FEATTIP" origin; then
+    echo "  FAIL: dispatched a worker (base=$(front_base); EMPTY_TREE = whole-tree re-review of the repo)"; FAIL=$((FAIL+1))
+  else echo "  ok: nothing new vs the trunk -> no review dispatched"; PASS=$((PASS+1)); fi
+
+echo "50h. an over-cap abort whose range SWALLOWS merged commits names that cause, not the cap"; reset
+  git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"   # trunk is an ancestor of $FEATTIP
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
+  ck "abort leads with the likely cause, not the measured line count" "LIKELY CAUSE — NOT the cap"
+  ck "names how far behind the trunk the base is" "commits behind refs/remotes/origin/main"
+  ck "explicitly counters the wrong prescription" "Do NOT raise PLAY_MAX_DIFF_LINES"
+  ck "still reports what it measured" "cap 0"
+
+echo "50i. a normal over-cap abort (trunk NOT inside the range) stays a plain cap message"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TRUNKTIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
+  ck "plain cap abort still delivered" "ABORTED — diff"
+  if [[ -n "$(latest)" ]] && grep -q "LIKELY CAUSE" "$(latest)" 2>/dev/null; then echo "  FAIL: false stale-trunk alarm on a clean range"; FAIL=$((FAIL+1)); else echo "  ok: no false alarm when the range holds no merged commits"; PASS=$((PASS+1)); fi
+  git -C "$REPO" update-ref -d refs/remotes/origin/main
 
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
   seq 1 5000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"   # over the line-cap default (see 7d)
