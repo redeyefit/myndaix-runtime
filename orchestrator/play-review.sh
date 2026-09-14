@@ -200,7 +200,8 @@ fold_walk(){
     # EMPTY_TREE (the whole-tree base written when no shared trunk resolved) is 40-hex so it passes
     # the regex, but it is a TREE — ^{commit} fails and STOPS the fold here. That is correct, not a
     # loss (kilabz r4): a whole-tree range has no incremental base to fold onto. The marker stays
-    # standing as backlog for skip-audit to surface; it is never silently dropped.
+    # standing as a recorded backlog marker on disk (surfaced by out-of-band coverage audits, never
+    # auto-pruned into a false "reviewed"); it is never silently dropped.
     if ! git -C "$_repo" cat-file -e "${_prev}^{commit}" 2>/dev/null; then break; fi
     if ! git -C "$_repo" merge-base --is-ancestor "$_prev" "$_local" 2>/dev/null; then break; fi
     _b="$_prev"; _hops=$((_hops+1))
