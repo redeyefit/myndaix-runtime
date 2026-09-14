@@ -513,21 +513,36 @@ echo "50e. anonymous URL push resolves BACK to the configured remote (githooks: 
   front_push_new "$FEATTIP" "stub://upstream" || true           # git push <url> shape
   if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: URL mapped to upstream (not silently origin)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — a URL fell through to origin"; FAIL=$((FAIL+1)); fi
 
+# 50f/50g/50j all land on the SAME post-F4 contract: whenever the resolved trunk is not a
+# refs/remotes/* ref, the base is EMPTY_TREE. They stay three tests because they arrive there by
+# three different routes (unknown URL, no tracking ref at all, known non-origin remote), and a
+# regression in any one route is invisible from the other two. Each still discriminates against
+# the specific wrong answer it was written for: borrowing origin's trunk yields $TRUNKTIP, which
+# is not EMPTY_TREE, so the assertion below fails exactly as loudly as it used to.
 echo "50f. push to an UNCONFIGURED url never guesses origin (no silently-dropped commits)"; reset; install_front_recorder
   front_push_new "$FEATTIP" "stub://nowhere" || true            # destination is provably NOT origin
-  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: unknown destination -> conservative local trunk (over-review)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — guessed origin ($TRUNKTIP) and would DROP commits"; FAIL=$((FAIL+1)); fi
+  if [[ "$(front_base)" == "$EMPTY" ]]; then echo "  ok: unknown destination -> whole-tree (over-review)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want EMPTY_TREE — guessed origin ($TRUNKTIP) or trusted local main ($TIP), either of which can DROP commits"; FAIL=$((FAIL+1)); fi
   git -C "$REPO" update-ref -d refs/remotes/upstream/main
 
-echo "50g. no remote-tracking trunk -> falls back to the LOCAL ref (no-remote repos still review)"; reset; install_front_recorder
+# kilabz r3 F4 regression — FAILS without the fix (old code answered $TIP, the local merge-base).
+# A local trunk proves NOTHING about what the destination contains. The old comment claimed the
+# local fallback merely over-reviews because local main is stale; that holds only when local main
+# is BEHIND the destination. When it is AHEAD — local commits not yet pushed, or another machine
+# fast-forwarded it — the merge-base moves FORWARD and every commit between the destination tip and
+# local main falls outside the range: a silently lost range, the one outcome this file forbids.
+# Nothing visible from inside the repo distinguishes ahead from behind, so whole-tree is the only
+# honest read. This fixture has local main BEHIND (the easy case) on purpose: the fix must hold
+# even when the old answer would have been harmless, because the FRONT cannot tell which case it is in.
+echo "50g. no remote-tracking trunk -> WHOLE-TREE, never the local ref (it may be AHEAD)"; reset; install_front_recorder
   git -C "$REPO" update-ref -d refs/remotes/origin/main
   front_push_new "$FEATTIP" origin || true
-  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: fell back to the local trunk"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP"; FAIL=$((FAIL+1)); fi
+  if [[ "$(front_base)" == "$EMPTY" ]]; then echo "  ok: local-only trunk -> whole-tree"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want EMPTY_TREE — trusted local main, which drops every commit the destination has that local main does not"; FAIL=$((FAIL+1)); fi
 
 echo "50j. a KNOWN non-origin destination with no tracking ref never borrows origin's trunk"; reset; install_front_recorder
   git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"                 # origin is AHEAD of the real destination
   git -C "$REPO" update-ref -d refs/remotes/upstream/main 2>/dev/null || true    # upstream configured but never fetched
   front_push_new "$FEATTIP" upstream || true
-  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: fell to the local trunk instead of guessing origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — borrowed origin ($TRUNKTIP), dropping $TIP..$TRUNKTIP from the review"; FAIL=$((FAIL+1)); fi
+  if [[ "$(front_base)" == "$EMPTY" ]]; then echo "  ok: whole-tree instead of guessing origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want EMPTY_TREE — borrowed origin ($TRUNKTIP), dropping $TIP..$TRUNKTIP from the review"; FAIL=$((FAIL+1)); fi
 
 echo "50k. a tip ALREADY contained in the trunk is skipped, not whole-tree diffed"; reset; install_front_recorder
   git -C "$REPO" update-ref refs/remotes/origin/main "$FEATTIP"                  # merge-base(trunk,tip) == tip
@@ -535,18 +550,26 @@ echo "50k. a tip ALREADY contained in the trunk is skipped, not whole-tree diffe
     echo "  FAIL: dispatched a worker (base=$(front_base); EMPTY_TREE = whole-tree re-review of the repo)"; FAIL=$((FAIL+1))
   else echo "  ok: nothing new vs the trunk -> no review dispatched"; PASS=$((PASS+1)); fi
 
-echo "50h. an over-cap abort whose range SWALLOWS merged commits names that cause, not the cap"; reset
+# kilabz r3 F5+F6 regression — FAILS against the version that PRESCRIBED a fast-forward here.
+# The same ancestry signal is emitted by a stale base AND by an ordinary incremental push to the
+# trunk, so the message must carry both readings and decide neither. The absence check at the end
+# is the load-bearing one: it is what stops a future edit from re-adding the confident diagnosis.
+echo "50h. an over-cap abort whose range CONTAINS trunk commits reports the ambiguity, not a cause"; reset
   git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"   # trunk is an ancestor of $FEATTIP
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
-  ck "abort leads with the likely cause, not the measured line count" "LIKELY CAUSE — NOT the cap"
-  ck "names how far behind the trunk the base is" "commits behind refs/remotes/origin/main"
-  ck "explicitly counters the wrong prescription" "Do NOT raise PLAY_MAX_DIFF_LINES"
+  ck "reports the containment observation" "are also contained in refs/remotes/origin/main"
+  ck "offers the stale-base reading" "the base is stale"
+  ck "offers the push-to-the-trunk reading" "push to the trunk itself"
+  ck "admits the signal cannot decide between them" "Ancestry cannot tell them apart"
   ck "still reports what it measured" "cap 0"
+  if [[ -n "$(latest)" ]] && grep -q "LIKELY CAUSE" "$(latest)" 2>/dev/null; then echo "  FAIL: prescribes a cause off an ambiguous signal (r3 F5+F6)"; FAIL=$((FAIL+1)); else echo "  ok: no prescription — the reader adjudicates"; PASS=$((PASS+1)); fi
 
 echo "50i. a normal over-cap abort (trunk NOT inside the range) stays a plain cap message"; reset
   env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TRUNKTIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
   ck "plain cap abort still delivered" "ABORTED — diff"
-  if [[ -n "$(latest)" ]] && grep -q "LIKELY CAUSE" "$(latest)" 2>/dev/null; then echo "  FAIL: false stale-trunk alarm on a clean range"; FAIL=$((FAIL+1)); else echo "  ok: no false alarm when the range holds no merged commits"; PASS=$((PASS+1)); fi
+  # greps the CURRENT marker text, not the retired "LIKELY CAUSE": a needle that no code path can
+  # emit would make this test pass even if trunk_lag stopped firing entirely.
+  if [[ -n "$(latest)" ]] && grep -q "OBSERVED:" "$(latest)" 2>/dev/null; then echo "  FAIL: false trunk-containment alarm on a clean range"; FAIL=$((FAIL+1)); else echo "  ok: no false alarm when the range holds no trunk commits"; PASS=$((PASS+1)); fi
   git -C "$REPO" update-ref -d refs/remotes/origin/main
 
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
@@ -644,6 +667,72 @@ echo "63. autofix_fire forwards the triggering remote as MYNDAIX_FIX_REMOTE (rev
   bareR="$ROOT/bare-remote63.git"; git init -q --bare "$bareR"; git -C "$REPO" push -q "$bareR" "$TIP:refs/heads/main" 2>/dev/null
   STUB_TRIAGE="1. fix it" run_af "$bareR"; wait_fixer
   if grep -q "REMOTE=$bareR" "$FAKE/.myndaix/fixer-env" 2>/dev/null; then echo "  ok: triggering remote forwarded to the fixer"; PASS=$((PASS+1)); else echo "  FAIL: MYNDAIX_FIX_REMOTE not forwarded (env: $(tr '\n' ' ' < "$FAKE/.myndaix/fixer-env" 2>/dev/null))"; FAIL=$((FAIL+1)); fi
+
+# ====================== skip-audit.sh (the review loop's own coverage check) ====================
+# skip-audit reads the skipped-* markers play-review.sh writes and classifies what the loop still
+# owes. It shipped unproven against fabricated state: the first live run found PHANTOM=0, so the
+# class that diagnoses the over-cap pathology had never once been observed firing. These fixtures
+# stage each class deliberately. The audit is READ-ONLY, so they assert on its stdout and exit code.
+SKIPAUDIT="$(cd "$(dirname "$0")" && pwd)/skip-audit.sh"
+SA_ROOT="$ROOT/sa"; SA_STATE="$SA_ROOT/state"; SA_CODE="$SA_ROOT/code"; SA_REPO="$SA_CODE/demo"
+mkdir -p "$SA_STATE" "$SA_CODE"
+git init -q "$SA_REPO"
+git -C "$SA_REPO" config user.email t@t; git -C "$SA_REPO" config user.name t
+printf 'a\n' > "$SA_REPO/a"; git -C "$SA_REPO" add -A; git -C "$SA_REPO" commit -qm one
+SA_B="$(git -C "$SA_REPO" rev-parse HEAD)"
+printf 'b\n' > "$SA_REPO/b"; git -C "$SA_REPO" add -A; git -C "$SA_REPO" commit -qm two
+SA_T="$(git -C "$SA_REPO" rev-parse HEAD)"
+printf 'c\n' > "$SA_REPO/c"; git -C "$SA_REPO" add -A; git -C "$SA_REPO" commit -qm three
+SA_F="$(git -C "$SA_REPO" rev-parse HEAD)"
+# set the trunk EXPLICITLY rather than relying on the default branch name: `git init` picks
+# master or main depending on init.defaultBranch, and trunk_of() only looks for main.
+git -C "$SA_REPO" update-ref refs/heads/main "$SA_T"
+sa(){ SA_OUT="$(env PLAY_STATE="$SA_STATE" SKIP_AUDIT_ROOTS="$SA_CODE" "$@" bash "$SKIPAUDIT" 2>&1)"; SA_RC=$?; }
+sack(){ if grep -q -- "$2" <<<"$SA_OUT"; then echo "  ok: $1"; PASS=$((PASS+1)); else echo "  FAIL: $1 (want '$2')"; FAIL=$((FAIL+1)); fi; }
+sarc(){ if [[ "$SA_RC" == "$2" ]]; then echo "  ok: $1"; PASS=$((PASS+1)); else echo "  FAIL: $1 — exit $SA_RC want $2"; FAIL=$((FAIL+1)); fi; }
+sareset(){ rm -f "$SA_STATE"/skipped-*; }
+
+echo "64. skip-audit: a tip already in the trunk is RETIRABLE, and retirable-only is not a finding"
+  sareset; printf '%s' "$SA_B" > "$SA_STATE/skipped-demo-refs-heads-done-$SA_T"
+  sa; sack "classified MERGED" "MERGED"; sack "named as retirable" "RETIRABLE — 1 marker"
+  sarc "exit 0 — nothing actionable" 0
+
+echo "65. skip-audit: PHANTOM names the merged commits the range re-covers (the over-cap cause)"
+  # base BELOW the trunk + tip ABOVE it: the range drags $SA_B..$SA_T back in, which is exactly how
+  # a 42-line branch measured 3625 lines and aborted on the cap.
+  sareset; printf '%s' "$SA_B" > "$SA_STATE/skipped-demo-refs-heads-feat-$SA_F"
+  sa; sack "classified PHANTOM" "PHANTOM"
+  sack "counts the swallowed commits" "swallows 1 merged commit"
+  sarc "exit 1 — actionable" 1
+
+echo "66. skip-audit: a marker filed under a WORKTREE name is reported as a strand, not an orphan"
+  sareset; git -C "$SA_REPO" worktree add -q --detach "$SA_ROOT/wt1" "$SA_F" 2>/dev/null
+  printf '%s' "$SA_T" > "$SA_STATE/skipped-wt1-refs-heads-feat-$SA_F"
+  sa; sack "classified WORKTREE_STRAND" "WORKTREE_STRAND"
+  sack "names the owning repo" "(worktree of demo)"
+  sarc "exit 1 — actionable" 1
+  git -C "$SA_REPO" worktree remove --force "$SA_ROOT/wt1" 2>/dev/null
+
+echo "67. skip-audit: junk markers are classified, never fatal (it must survive its own inputs)"
+  sareset; printf '%s' "$SA_T" > "$SA_STATE/skipped-nosuchrepo-refs-heads-x-$SA_F"
+  : > "$SA_STATE/skipped-not-a-marker"                        # trailing field is not a 40-hex sha
+  printf 'not-a-sha' > "$SA_STATE/skipped-demo-refs-heads-bad-$SA_F"   # parseable name, junk CONTENT
+  sa; sack "orphan slug reported" "ORPHAN SLUG"
+  sack "unparseable name survives" "UNPARSEABLE"
+  sack "junk content is CORRUPT, not a crash" "CORRUPT"
+  sack "all three counted" "3 markers"
+
+echo "68. skip-audit: environment errors exit 2 (distinct from 'found something')"
+  sareset
+  SA_OUT="$(env PLAY_STATE="$SA_ROOT/gone" SKIP_AUDIT_ROOTS="$SA_CODE" bash "$SKIPAUDIT" 2>&1)"; SA_RC=$?
+  sarc "missing state dir" 2
+  sa PLAY_PRUNE_DAYS=abc; sarc "non-numeric PLAY_PRUNE_DAYS" 2
+  # "08" passes the numeric regex but is INVALID octal: without the 10# normalization $(( )) dies
+  # with "value too great for base", killing the audit under set -e on a value a human would read
+  # as eight. The regex alone is not enough (rules/bash-scripts.md, the leading-zero trap).
+  sa PLAY_PRUNE_DAYS=08
+  sarc "leading-zero PLAY_PRUNE_DAYS runs normally" 0
+  if grep -q 'too great for base' <<<"$SA_OUT"; then echo "  FAIL: 08 parsed as octal (missing 10#)"; FAIL=$((FAIL+1)); else echo "  ok: 08 parsed base 10, no arithmetic fault"; PASS=$((PASS+1)); fi
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
