@@ -69,6 +69,11 @@ git init -q "$REPO"
 git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
 printf 'def add(a,b): return a-b\n' > "$REPO/m.py"
 git -C "$REPO" add -A; git -C "$REPO" commit -qm init
+# PIN the branch name: `git init`'s initial branch follows init.defaultBranch, so on a `master`
+# box the local trunk play-review looks for ("main") would not exist and the trunk-resolution
+# cases (50c/50e) would silently stop testing what they claim to (kilabz LOW). -M, not `init -b`:
+# works on git < 2.28 too.
+git -C "$REPO" branch -M main
 TIP="$(git -C "$REPO" rev-parse HEAD)"
 EMPTY=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 INBOX="$FAKE/.myndaix/bridge/inbox/jefe"
@@ -97,13 +102,21 @@ run(){ env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/hea
 run_af(){ env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" \
             bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main "${1:-}" 2>"$ROOT/stderr"; }
 af_repos(){ mkdir -p "$(dirname "$REPOS_JSON")"; printf '%s' "$1" > "$REPOS_JSON"; }
-wait_fixer(){ for _ in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
+wait_fixer(){ local _; for _ in $(seq 1 40); do [[ -f "$FAKE/.myndaix/fixer-argv" ]] && return 0; sleep 0.1; done; return 1; }
 settle(){ sleep 0.6; }   # let a (possible) detached fire either land or prove absent
 latest(){ ls -t "$INBOX"/*.md 2>/dev/null | head -1; }
 ck(){ # ck <label> <substr> <file-or-empty>
   local f="${3:-$(latest)}"
   if [[ -n "$f" && -f "$f" ]] && grep -q "$2" "$f"; then echo "  ok: $1"; PASS=$((PASS+1));
   else echo "  FAIL: $1 (want '$2')"; FAIL=$((FAIL+1)); fi
+}
+cknot(){ # cknot <label> <substr> <file-or-empty> — assert substr ABSENT; FAIL if the delivery is
+  # MISSING (oracle r4: a bare `grep -q ... 2>/dev/null` in the else-branch conflates a vanished
+  # file with a clean pass — positive proof the message exists is required before trusting absence).
+  local f="${3:-$(latest)}"
+  if [[ -z "$f" || ! -f "$f" ]]; then echo "  FAIL: $1 (no delivery to inspect)"; FAIL=$((FAIL+1));
+  elif grep -q "$2" "$f"; then echo "  FAIL: $1 (unwanted '$2')"; FAIL=$((FAIL+1));
+  else echo "  ok: $1"; PASS=$((PASS+1)); fi
 }
 ckfile(){ if [[ -e "$1" ]]; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2 (missing $1)"; FAIL=$((FAIL+1)); fi; }
 cknofile(){ if [[ ! -e "$1" ]]; then echo "  ok: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2 (exists $1)"; FAIL=$((FAIL+1)); fi; }
@@ -132,15 +145,17 @@ echo "7b. a ~100KB diff (over the OLD 64KB cap, under the new) now REVIEWS"; res
 echo "7c. PLAY_MAX_DIFF knob still caps (env override)"; reset; head -c 5000 /dev/zero | tr '\0' 'z' > "$REPO/small.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm small; SMTIP="$(git -C "$REPO" rev-parse HEAD)"
   env HOME="$FAKE" PLAY_MAX_DIFF=1000 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$SMTIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF=1000 caps a 5KB diff" "ABORTED — diff"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
-echo "7d. changed-LINES cap FAILs fast (many small lines, way under the byte cap)"; reset; seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm lines; LNTIP="$(git -C "$REPO" rev-parse HEAD)"
-  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "3000 changed lines abort at the 2000 default" "changed lines"
+# The fixture must stay OVER the PLAY_MAX_DIFF_LINES default — bump it in lockstep with any
+# default change, or 7d/7f assert nothing at all (an under-cap diff simply reviews).
+echo "7d. changed-LINES cap FAILs fast (many small lines, way under the byte cap)"; reset; seq 1 5000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm lines; LNTIP="$(git -C "$REPO" rev-parse HEAD)"
+  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "5000 changed lines abort at the 4000 default" "changed lines"
   git -C "$REPO" reset -q --hard "$TIP"   # restore (LNTIP object stays reachable for 7e/7f)
 echo "7e. PLAY_MAX_DIFF_LINES override raises the cap (same diff now reviews)"; reset
-  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=5000 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "5000-line cap lets the 3000-line diff review" "review PASS"
-echo "7f. non-numeric PLAY_MAX_DIFF_LINES falls back to the 2000 default"; reset
-  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=banana bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "garbage line cap still aborts the 3000-line diff" "changed lines"
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=9000 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "9000-line cap lets the 5000-line diff review" "review PASS"
+echo "7f. non-numeric PLAY_MAX_DIFF_LINES falls back to the 4000 default"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=banana bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "garbage line cap still aborts the 5000-line diff" "changed lines"
 echo "7g. leading-zero PLAY_MAX_DIFF_LINES is base-10, not octal (08 would crash [[ -le ]])"; reset
-  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 3000-line diff cleanly" "changed lines"
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 5000-line diff cleanly" "changed lines"
 echo "7h. leading-zero PLAY_MAX_DIFF is base-10 (08=8B, not octal); a normal diff aborts cleanly"; reset
   env HOME="$FAKE" PLAY_MAX_DIFF=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF '08' = 8B caps the diff (no octal crash)" "ABORTED — diff"
 echo "7i. leading-zero PLAY_DAILY_CAP is base-10 (09=9, not an octal [[ -ge ]] crash)"; reset; mkdir -p "$STATE"; printf 5 > "$STATE/count-repo-$(date +%Y%m%d)"
@@ -409,7 +424,7 @@ front_push(){ # front_push <localsha> <remotesha> — one pre-push stdin line in
   rm -f "$FRONT_ARGV"
   ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/main "$1" refs/heads/main "$2" \
       | env HOME="$FAKE" bash "$SCRIPT" origin "stub://remote" ) >/dev/null 2>&1
-  for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
+  local _; for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
 front_base(){ sed -n 3p "$FRONT_ARGV" 2>/dev/null; }   # recorder argv: --worker repo BASE tip ref url orig
 
 # fixture commits: TIP -> TIP2 (the skipped push's tip) -> TIP3 (the retrigger push)
@@ -462,8 +477,113 @@ echo "50b. controller shape (EMPTY remote_url) never walks — ledger cursor sta
   for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && break; sleep 0.1; done
   if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: empty remote_url -> no walk (base=remotesha)"; PASS=$((PASS+1)); else echo "  FAIL: controller-shape dispatch walked ($(front_base))"; FAIL=$((FAIL+1)); fi
 
+# ============ new-branch trunk resolution (the stale-local-main range blowup) ============
+# A new branch's first push carries remotesha=ZERO, so the base is merge-base(trunk, localsha).
+# That trunk must be the REMOTE-tracking ref: a local `main` left behind by a GitHub merge drags
+# the range back over every already-merged commit. 2026-09-14: local main sat 29 commits behind,
+# so a 42-line branch computed as 3625 lines and ABORTED on MAX_DIFF_LINES — while also being a
+# re-review of already-outcome-labeled code. Fixture: local main STALE at $TIP, remote trunk at
+# $TRUNKTIP, feature branch at $FEATTIP (descends from both).
+ZERO40=0000000000000000000000000000000000000000
+# REAL content (not --allow-empty): 50h/50i need a diff that can actually breach the line cap —
+# an empty diff aborts on a different branch and would stop testing the cap path.
+printf 'trunk\n' > "$REPO/trunk.txt"; git -C "$REPO" add -A
+git -C "$REPO" commit -qm trunk-advance; TRUNKTIP="$(git -C "$REPO" rev-parse HEAD)"
+printf 'feat\n' > "$REPO/feat.txt";  git -C "$REPO" add -A
+git -C "$REPO" commit -qm feature;    FEATTIP="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" reset -q --hard "$TIP"   # local main goes stale; objects stay reachable (same trick as 49)
+# CONFIGURED remotes: a real repo pushing to `origin` has remote.origin.url set, and the FRONT now
+# accepts $1 only when it resolves to a configured remote (else it treats $1 as a URL). Without
+# these the cases below would exercise the unknown-destination path, not the named-remote path.
+git -C "$REPO" remote add origin   stub://origin   2>/dev/null || true
+git -C "$REPO" remote add upstream stub://upstream 2>/dev/null || true
+front_push_new(){ # front_push_new <localsha> <remote_name> — NEW-branch push shape (remotesha=ZERO)
+  rm -f "$FRONT_ARGV"
+  ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/feat "$1" refs/heads/feat "$ZERO40" \
+      | env HOME="$FAKE" bash "$SCRIPT" "$2" "stub://remote" ) >/dev/null 2>&1
+  local _; for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
+
+echo "50c. new branch: a STALE local main is ignored in favor of refs/remotes/origin/main"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"
+  if front_push_new "$FEATTIP" origin; then
+    b="$(front_base)"
+    if [[ "$b" == "$TRUNKTIP" ]]; then echo "  ok: base = remote trunk (stale local main NOT used)"; PASS=$((PASS+1)); else echo "  FAIL: base=$b want $TRUNKTIP (stale local main is $TIP)"; FAIL=$((FAIL+1)); fi
+  else echo "  FAIL: front never dispatched a worker"; FAIL=$((FAIL+1)); fi
+
+echo "50d. the remote actually being PUSHED TO outranks origin"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/upstream/main "$TIP"   # differs from origin/main ($TRUNKTIP) -> discriminating
+  front_push_new "$FEATTIP" upstream || true
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: refs/remotes/upstream/main preferred over origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP (the upstream trunk)"; FAIL=$((FAIL+1)); fi
+  git -C "$REPO" update-ref -d refs/remotes/upstream/main
+
+echo "50e. anonymous URL push resolves BACK to the configured remote (githooks: \$1 is the URL)"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/upstream/main "$TIP"   # upstream trunk differs from origin's ($TRUNKTIP)
+  front_push_new "$FEATTIP" "stub://upstream" || true           # git push <url> shape
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: URL mapped to upstream (not silently origin)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP — a URL fell through to origin"; FAIL=$((FAIL+1)); fi
+
+# 50f/50g/50j all land on the SAME post-F4 contract: whenever the resolved trunk is not a
+# refs/remotes/* ref, the base is EMPTY_TREE. They stay three tests because they arrive there by
+# three different routes (unknown URL, no tracking ref at all, known non-origin remote), and a
+# regression in any one route is invisible from the other two. Each still discriminates against
+# the specific wrong answer it was written for: borrowing origin's trunk yields $TRUNKTIP, which
+# is not EMPTY_TREE, so the assertion below fails exactly as loudly as it used to.
+echo "50f. push to an UNCONFIGURED url never guesses origin (no silently-dropped commits)"; reset; install_front_recorder
+  front_push_new "$FEATTIP" "stub://nowhere" || true            # destination is provably NOT origin
+  if [[ "$(front_base)" == "$EMPTY" ]]; then echo "  ok: unknown destination -> whole-tree (over-review)"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want EMPTY_TREE — guessed origin ($TRUNKTIP) or trusted local main ($TIP), either of which can DROP commits"; FAIL=$((FAIL+1)); fi
+  git -C "$REPO" update-ref -d refs/remotes/upstream/main
+
+# kilabz r3 F4 regression — FAILS without the fix (old code answered $TIP, the local merge-base).
+# A local trunk proves NOTHING about what the destination contains. The old comment claimed the
+# local fallback merely over-reviews because local main is stale; that holds only when local main
+# is BEHIND the destination. When it is AHEAD — local commits not yet pushed, or another machine
+# fast-forwarded it — the merge-base moves FORWARD and every commit between the destination tip and
+# local main falls outside the range: a silently lost range, the one outcome this file forbids.
+# Nothing visible from inside the repo distinguishes ahead from behind, so whole-tree is the only
+# honest read. This fixture has local main BEHIND (the easy case) on purpose: the fix must hold
+# even when the old answer would have been harmless, because the FRONT cannot tell which case it is in.
+echo "50g. no remote-tracking trunk -> WHOLE-TREE, never the local ref (it may be AHEAD)"; reset; install_front_recorder
+  git -C "$REPO" update-ref -d refs/remotes/origin/main
+  front_push_new "$FEATTIP" origin || true
+  if [[ "$(front_base)" == "$EMPTY" ]]; then echo "  ok: local-only trunk -> whole-tree"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want EMPTY_TREE — trusted local main, which drops every commit the destination has that local main does not"; FAIL=$((FAIL+1)); fi
+
+echo "50j. a KNOWN non-origin destination with no tracking ref never borrows origin's trunk"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"                 # origin is AHEAD of the real destination
+  git -C "$REPO" update-ref -d refs/remotes/upstream/main 2>/dev/null || true    # upstream configured but never fetched
+  front_push_new "$FEATTIP" upstream || true
+  if [[ "$(front_base)" == "$EMPTY" ]]; then echo "  ok: whole-tree instead of guessing origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want EMPTY_TREE — borrowed origin ($TRUNKTIP), dropping $TIP..$TRUNKTIP from the review"; FAIL=$((FAIL+1)); fi
+
+echo "50k. a tip ALREADY contained in the trunk is skipped, not whole-tree diffed"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/origin/main "$FEATTIP"                  # merge-base(trunk,tip) == tip
+  if front_push_new "$FEATTIP" origin; then
+    echo "  FAIL: dispatched a worker (base=$(front_base); EMPTY_TREE = whole-tree re-review of the repo)"; FAIL=$((FAIL+1))
+  else echo "  ok: nothing new vs the trunk -> no review dispatched"; PASS=$((PASS+1)); fi
+
+# kilabz r3 F5+F6 regression — FAILS against the version that PRESCRIBED a fast-forward here.
+# The same ancestry signal is emitted by a stale base AND by an ordinary incremental push to the
+# trunk, so the message must carry both readings and decide neither. The POSITIVE checks below (both
+# readings + "cannot tell them apart") are the contract; the final cknot is a belt against a future
+# edit re-adding the specific retired "LIKELY CAUSE" phrasing (kilabz r4: a dead-string needle alone
+# is not the load-bearing assertion — the hedge is).
+echo "50h. an over-cap abort whose range CONTAINS trunk commits reports the ambiguity, not a cause"; reset
+  git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"   # trunk is an ancestor of $FEATTIP
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
+  ck "reports the containment observation" "are also contained in refs/remotes/origin/main"
+  ck "offers the stale-base reading" "the base is stale"
+  ck "offers the push-to-the-trunk reading" "push to the trunk itself"
+  ck "admits the signal cannot decide between them" "Ancestry cannot tell them apart"
+  ck "still reports what it measured" "cap 0"
+  cknot "no 'LIKELY CAUSE' prescription re-added — the reader adjudicates (r3 F5+F6)" "LIKELY CAUSE"
+
+echo "50i. a normal over-cap abort (trunk NOT inside the range) stays a plain cap message"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=0 bash "$SCRIPT" --worker "$REPO" "$TRUNKTIP" "$FEATTIP" refs/heads/main "" "" 2>/dev/null
+  ck "plain cap abort still delivered" "ABORTED — diff"
+  # greps the CURRENT marker text, not the retired "LIKELY CAUSE": a needle that no code path can
+  # emit would make this test pass even if trunk_lag stopped firing entirely.
+  cknot "no false trunk-containment alarm on a clean range" "OBSERVED:"
+  git -C "$REPO" update-ref -d refs/remotes/origin/main
+
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
-  seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"
+  seq 1 5000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"   # over the line-cap default (see 7d)
   printf 'x=1\n' > "$REPO/own.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm own; OWNTIP="$(git -C "$REPO" rev-parse HEAD)"   # own range = a REAL small diff
   # worker invoked as the FRONT would after a walk: base=$EMPTY (folded, over-cap), arg7=$FOLDTIP (own base, tiny diff)
   env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$OWNTIP" refs/heads/main "" "$FOLDTIP" 2>/dev/null
