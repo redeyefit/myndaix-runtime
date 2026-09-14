@@ -36,13 +36,21 @@ MAX_DIFF="${PLAY_MAX_DIFF:-262144}"                 # 256KB default, tunable per
 MAX_DIFF=$((10#$MAX_DIFF))                          # base-10: a leading-zero PLAY_MAX_DIFF ("0300000") would octal-shrink
                                                     # the cap, or (with an 8/9 digit) crash the [[ -le ]] test — same
                                                     # trap already closed for MAX_DIFF_LINES/RCT_PUSH below.
-MAX_DIFF_LINES="${PLAY_MAX_DIFF_LINES:-2000}"       # changed-lines cap (numstat added+deleted, binary files count 0): a
+MAX_DIFF_LINES="${PLAY_MAX_DIFF_LINES:-4000}"       # changed-lines cap (numstat added+deleted, binary files count 0): a
                                                     # ~3400-line range timed kilabz out at the full 600s REVIEW_CALL_TIMEOUT
-                                                    # (2026-07-02) — abort in SECONDS instead of burning canary + 600s. The
-                                                    # controller passes its own chunk budget here so the two caps can't
-                                                    # disagree; manual pushes get the 2000 default. MUST stay the same
-                                                    # metric as controller._diff_lines (numstat sum). Non-numeric -> default.
-[[ "$MAX_DIFF_LINES" =~ ^[0-9]+$ ]] || MAX_DIFF_LINES=2000
+                                                    # (2026-07-02) — abort in SECONDS instead of burning canary + 600s.
+                                                    # This default now applies to MANUAL pushes ONLY: the controller and the
+                                                    # automerge gate each pass their OWN budget (controller.MAX_REVIEW_LINES
+                                                    # 1500, automerge.REVIEW_MAX_DIFF_LINES 2000), so a looser default here
+                                                    # cannot loosen either automated lane. Raised 2000 -> 4000 on 2026-09-14:
+                                                    # the 2000 was sized against a 600s call budget, and RCT_PUSH has since
+                                                    # doubled to 1200s (2026-07-03), so the manual lane had ~2x the headroom
+                                                    # its cap assumed — a 3709-line FieldVision push aborted with budget to
+                                                    # spare. Automerge deliberately stays at 2000: it still runs its panel at
+                                                    # its own REVIEW_TIMEOUT=600, the budget that number was calibrated for.
+                                                    # MUST stay the same metric as controller._diff_lines (numstat sum).
+                                                    # Non-numeric -> default.
+[[ "$MAX_DIFF_LINES" =~ ^[0-9]+$ ]] || MAX_DIFF_LINES=4000
 MAX_DIFF_LINES=$((10#$MAX_DIFF_LINES))              # force base-10: a leading zero ("08"/"010") would
                                                     # make [[ -le ]] arithmetic parse it as (invalid) octal
 ERR_CAP=1000000

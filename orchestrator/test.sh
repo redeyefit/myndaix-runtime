@@ -132,15 +132,17 @@ echo "7b. a ~100KB diff (over the OLD 64KB cap, under the new) now REVIEWS"; res
 echo "7c. PLAY_MAX_DIFF knob still caps (env override)"; reset; head -c 5000 /dev/zero | tr '\0' 'z' > "$REPO/small.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm small; SMTIP="$(git -C "$REPO" rev-parse HEAD)"
   env HOME="$FAKE" PLAY_MAX_DIFF=1000 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$SMTIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF=1000 caps a 5KB diff" "ABORTED — diff"
   git -C "$REPO" reset -q --hard "$TIP"   # restore
-echo "7d. changed-LINES cap FAILs fast (many small lines, way under the byte cap)"; reset; seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm lines; LNTIP="$(git -C "$REPO" rev-parse HEAD)"
-  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "3000 changed lines abort at the 2000 default" "changed lines"
+# The fixture must stay OVER the PLAY_MAX_DIFF_LINES default — bump it in lockstep with any
+# default change, or 7d/7f assert nothing at all (an under-cap diff simply reviews).
+echo "7d. changed-LINES cap FAILs fast (many small lines, way under the byte cap)"; reset; seq 1 5000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm lines; LNTIP="$(git -C "$REPO" rev-parse HEAD)"
+  env HOME="$FAKE" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "5000 changed lines abort at the 4000 default" "changed lines"
   git -C "$REPO" reset -q --hard "$TIP"   # restore (LNTIP object stays reachable for 7e/7f)
 echo "7e. PLAY_MAX_DIFF_LINES override raises the cap (same diff now reviews)"; reset
-  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=5000 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "5000-line cap lets the 3000-line diff review" "review PASS"
-echo "7f. non-numeric PLAY_MAX_DIFF_LINES falls back to the 2000 default"; reset
-  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=banana bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "garbage line cap still aborts the 3000-line diff" "changed lines"
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=9000 STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "9000-line cap lets the 5000-line diff review" "review PASS"
+echo "7f. non-numeric PLAY_MAX_DIFF_LINES falls back to the 4000 default"; reset
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=banana bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "garbage line cap still aborts the 5000-line diff" "changed lines"
 echo "7g. leading-zero PLAY_MAX_DIFF_LINES is base-10, not octal (08 would crash [[ -le ]])"; reset
-  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 3000-line diff cleanly" "changed lines"
+  env HOME="$FAKE" PLAY_MAX_DIFF_LINES=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$LNTIP" refs/heads/main 2>/dev/null; ck "cap '08' = 8 aborts the 5000-line diff cleanly" "changed lines"
 echo "7h. leading-zero PLAY_MAX_DIFF is base-10 (08=8B, not octal); a normal diff aborts cleanly"; reset
   env HOME="$FAKE" PLAY_MAX_DIFF=08 bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/main 2>/dev/null; ck "PLAY_MAX_DIFF '08' = 8B caps the diff (no octal crash)" "ABORTED — diff"
 echo "7i. leading-zero PLAY_DAILY_CAP is base-10 (09=9, not an octal [[ -ge ]] crash)"; reset; mkdir -p "$STATE"; printf 5 > "$STATE/count-repo-$(date +%Y%m%d)"
@@ -463,7 +465,7 @@ echo "50b. controller shape (EMPTY remote_url) never walks — ledger cursor sta
   if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: empty remote_url -> no walk (base=remotesha)"; PASS=$((PASS+1)); else echo "  FAIL: controller-shape dispatch walked ($(front_base))"; FAIL=$((FAIL+1)); fi
 
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
-  seq 1 3000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"
+  seq 1 5000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"   # over the line-cap default (see 7d)
   printf 'x=1\n' > "$REPO/own.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm own; OWNTIP="$(git -C "$REPO" rev-parse HEAD)"   # own range = a REAL small diff
   # worker invoked as the FRONT would after a walk: base=$EMPTY (folded, over-cap), arg7=$FOLDTIP (own base, tiny diff)
   env HOME="$FAKE" STUB_TRIAGE="PLAY_PASS" bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$OWNTIP" refs/heads/main "" "$FOLDTIP" 2>/dev/null

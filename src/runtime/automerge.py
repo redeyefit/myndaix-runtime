@@ -71,7 +71,11 @@ AUTHOR_ALLOWLIST = _parse_authors(os.environ.get("MYNDAIX_AUTOMERGE_AUTHORS", "r
 GH_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_GH_TIMEOUT", 30)
 REVIEW_TIMEOUT = _int_env("MYNDAIX_AUTOMERGE_REVIEW_TIMEOUT", 600)
 REVIEW_MAX_DIFF = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF", 262144)  # match play-review PLAY_MAX_DIFF
-REVIEW_MAX_DIFF_LINES = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", 2000)  # match play-review PLAY_MAX_DIFF_LINES
+# Deliberately NO LONGER play-review's default (that one went 2000 -> 4000 on 2026-09-14 for the
+# manual-push lane, which runs at RCT_PUSH=1200). The gate runs its panel at REVIEW_TIMEOUT=600
+# above — the budget 2000 was calibrated against — so it stays 2000. Agreement with the worker is
+# kept by FORWARDING this value as PLAY_MAX_DIFF_LINES in _gate_env, not by the defaults matching.
+REVIEW_MAX_DIFF_LINES = _int_env("MYNDAIX_AUTOMERGE_MAX_DIFF_LINES", 2000)
 # ceiling on transient (infra/abort) re-reviews per PR HEAD. A transient verdict records NOTHING
 # (returns None) so the paid 3-agent gate re-runs EVERY tick — unlike the controller, which has a
 # blocked ceiling for exactly this. Without a bound, a persistently-transient docs PR (e.g. oracle
