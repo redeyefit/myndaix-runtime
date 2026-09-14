@@ -28,7 +28,9 @@ RUNS="$ORCH/runs"; STATE="$ORCH/state"
 INBOX="$HOME/.myndaix/bridge/inbox/jefe"           # human-only, no agent watcher
 IMESSAGE_TO="${PLAY_IMESSAGE_TO-}"                  # phone ping OFF by default (Jefe: no auto-texts); set PLAY_IMESSAGE_TO=addr to re-enable
 TARGET_GLOB="refs/heads/*"                          # review pushes to ANY branch (skip tags/deletes)
-BASE_REF="main"                                     # a new branch's first push is diffed against this
+BASE_REF="main"                                     # a new branch's first push is diffed against this trunk —
+                                                    # resolved through trunk_ref(), which prefers the REMOTE-tracking
+                                                    # copy (see the helper for why the LOCAL ref can't be trusted)
 MAX_DIFF="${PLAY_MAX_DIFF:-262144}"                 # 256KB default, tunable per-push: PLAY_MAX_DIFF=N git push. Over-cap
                                                     # FAILS fast. The models eat the input fine; the real ceiling is the
                                                     # ~300s/agent budget, so a giant push can still time out — split those.
@@ -75,6 +77,29 @@ cap_run()   { perl -e 'alarm shift; exec @ARGV or exit 127' "$CAPTURE_TIMEOUT" "
 ZERO=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
+# trunk_ref <repo> <remote_name> — echo the ref a NEW branch's first push is diffed against.
+# Prefers the REMOTE-tracking trunk over the local one. The local `main` goes stale the instant a
+# PR merges on GitHub without a local fast-forward, and merge-base then reaches back to wherever
+# that stale ref still points — so the "new branch" diff silently includes every already-merged,
+# already-reviewed, already-outcome-labeled commit in between. 2026-09-14: local main sat 29
+# commits behind origin/main, so a 42-line branch was computed as a 3625-line range and aborted
+# on MAX_DIFF_LINES. The remote ref is the right question ("what is new vs the shared trunk?")
+# and is fast-forwarded by the very push that triggers this hook.
+# Candidate order: the remote git is ACTUALLY pushing to, then origin, then the local ref (a repo
+# with no remote, or a mirror whose remote-tracking refs were never fetched, still reviews).
+# Fully-qualified refs/remotes/... on purpose: a bare "origin/main" would be ambiguous against a
+# local BRANCH literally named "origin/main". set -e DISCIPLINE: called from the pre-push FRONT,
+# which must NEVER abort a push — every step is an if/fi guard and the fallback printf exits 0.
+trunk_ref(){
+  local _repo="$1" _remote="${2:-}" _c
+  for _c in ${_remote:+"refs/remotes/$_remote/$BASE_REF"} "refs/remotes/origin/$BASE_REF" "$BASE_REF"; do
+    if git -C "$_repo" rev-parse --verify --quiet "${_c}^{commit}" >/dev/null 2>&1; then
+      printf '%s' "$_c"; return 0
+    fi
+  done
+  printf '%s' "$BASE_REF"                            # nothing resolved: keep the old behavior, let merge-base fail
+}
+
 # fold_walk <repo> <slug> <start_base> <localsha> — echo the folded base (unchanged when no
 # valid chain). Walks skipped-<slug>-<sha> markers (content = the skipped range's base) down
 # to the last sha that actually got reviewed. A PRESENT skip marker is the signal — a reviewed
@@ -104,6 +129,7 @@ if [[ "${1:-}" != "--worker" ]]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$repo" ]] || exit 0                        # never abort a push by erroring
   remote_url="${2:-}"                               # git passes remote name as $1, URL as $2; the URL handles pushurl/direct-URL pushes
+  remote_name="${1:-}"                              # the remote NAME (for trunk_ref); empty on controller/direct dispatch
   # Re-exec the long-lived WORKER from a FIXED installed path outside the repo when one
   # exists, so a push that modifies the worktree copy of this script can't run as the
   # worker (defense-in-depth for an untrusted worktree). Falls back to the worktree copy
@@ -132,9 +158,9 @@ if [[ "${1:-}" != "--worker" ]]; then
         _slug="${_rid//[^A-Za-z0-9._-]/-}-${remoteref//[^A-Za-z0-9._-]/-}"   # == worker marker_slug
         base="$(fold_walk "$repo" "$_slug" "$base" "$localsha")"
       fi
-    elif base="$(git -C "$repo" merge-base "$BASE_REF" "$localsha" 2>/dev/null)" \
+    elif base="$(git -C "$repo" merge-base "$(trunk_ref "$repo" "$remote_name")" "$localsha" 2>/dev/null)" \
          && [[ -n "$base" && "$base" != "$localsha" ]]; then
-      orig_base="$base"                                     # new branch: review vs its merge-base with main
+      orig_base="$base"                                     # new branch: review vs its merge-base with the REMOTE trunk
     else
       base="$EMPTY_TREE"; orig_base="$EMPTY_TREE"           # no base ref / root commit → whole-tree diff
     fi

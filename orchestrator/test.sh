@@ -464,6 +464,41 @@ echo "50b. controller shape (EMPTY remote_url) never walks — ledger cursor sta
   for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && break; sleep 0.1; done
   if [[ "$(front_base)" == "$TIP2" ]]; then echo "  ok: empty remote_url -> no walk (base=remotesha)"; PASS=$((PASS+1)); else echo "  FAIL: controller-shape dispatch walked ($(front_base))"; FAIL=$((FAIL+1)); fi
 
+# ============ new-branch trunk resolution (the stale-local-main range blowup) ============
+# A new branch's first push carries remotesha=ZERO, so the base is merge-base(trunk, localsha).
+# That trunk must be the REMOTE-tracking ref: a local `main` left behind by a GitHub merge drags
+# the range back over every already-merged commit. 2026-09-14: local main sat 29 commits behind,
+# so a 42-line branch computed as 3625 lines and ABORTED on MAX_DIFF_LINES — while also being a
+# re-review of already-outcome-labeled code. Fixture: local main STALE at $TIP, remote trunk at
+# $TRUNKTIP, feature branch at $FEATTIP (descends from both).
+ZERO40=0000000000000000000000000000000000000000
+git -C "$REPO" commit -q --allow-empty -m trunk-advance; TRUNKTIP="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" commit -q --allow-empty -m feature;       FEATTIP="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" reset -q --hard "$TIP"   # local main goes stale; objects stay reachable (same trick as 49)
+front_push_new(){ # front_push_new <localsha> <remote_name> — NEW-branch push shape (remotesha=ZERO)
+  rm -f "$FRONT_ARGV"
+  ( cd "$REPO" && printf '%s %s %s %s\n' refs/heads/feat "$1" refs/heads/feat "$ZERO40" \
+      | env HOME="$FAKE" bash "$SCRIPT" "$2" "stub://remote" ) >/dev/null 2>&1
+  for _ in $(seq 1 30); do [[ -f "$FRONT_ARGV" ]] && return 0; sleep 0.1; done; return 1; }
+
+echo "50c. new branch: a STALE local main is ignored in favor of refs/remotes/origin/main"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/origin/main "$TRUNKTIP"
+  if front_push_new "$FEATTIP" origin; then
+    b="$(front_base)"
+    if [[ "$b" == "$TRUNKTIP" ]]; then echo "  ok: base = remote trunk (stale local main NOT used)"; PASS=$((PASS+1)); else echo "  FAIL: base=$b want $TRUNKTIP (stale local main is $TIP)"; FAIL=$((FAIL+1)); fi
+  else echo "  FAIL: front never dispatched a worker"; FAIL=$((FAIL+1)); fi
+
+echo "50d. the remote actually being PUSHED TO outranks origin"; reset; install_front_recorder
+  git -C "$REPO" update-ref refs/remotes/upstream/main "$TIP"   # differs from origin/main ($TRUNKTIP) -> discriminating
+  front_push_new "$FEATTIP" upstream || true
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: refs/remotes/upstream/main preferred over origin"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP (the upstream trunk)"; FAIL=$((FAIL+1)); fi
+  git -C "$REPO" update-ref -d refs/remotes/upstream/main
+
+echo "50e. no remote-tracking trunk -> falls back to the LOCAL ref (no-remote repos still review)"; reset; install_front_recorder
+  git -C "$REPO" update-ref -d refs/remotes/origin/main
+  front_push_new "$FEATTIP" origin || true
+  if [[ "$(front_base)" == "$TIP" ]]; then echo "  ok: fell back to the local trunk"; PASS=$((PASS+1)); else echo "  FAIL: base=$(front_base) want $TIP"; FAIL=$((FAIL+1)); fi
+
 echo "51. over-cap fold falls back to the push's own range with a LOUD backlog banner"; reset
   seq 1 5000 > "$REPO/lines.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -qm bigfold; FOLDTIP="$(git -C "$REPO" rev-parse HEAD)"   # over the line-cap default (see 7d)
   printf 'x=1\n' > "$REPO/own.py"; git -C "$REPO" add -A; git -C "$REPO" commit -qm own; OWNTIP="$(git -C "$REPO" rev-parse HEAD)"   # own range = a REAL small diff
