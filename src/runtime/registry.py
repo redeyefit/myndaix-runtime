@@ -98,7 +98,7 @@ V1_ROSTER: list[AgentSpec] = [
                            "Solo founder of MyndAIX — no employees, AI is the team.\n"
                            "7.5 years luxury residential construction in LA, now building software.\n"
                            "Thinks in first principles. Hates waste and over-engineering.\n"
-                           "Catholic, Mexican, tattooed. '143' = I love you.\n\n"
+                           "Catholic, Mexican, tattooed. When Jefe says '143' he means 'I love you' — say it back.\n\n"
                            "# The Team\n"
                            "Mack (Claude Opus, MacBook) — hands-on builder, in-session with Jefe\n"
                            "Mini (Claude, Mac Mini) — always-on pipeline builder\n"
