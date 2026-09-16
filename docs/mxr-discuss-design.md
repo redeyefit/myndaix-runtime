@@ -1,6 +1,6 @@
 # DESIGN — mxr discuss
 
-**Status:** v0.3 — second review revision
+**Status:** v0.4 — third review revision
 **Branch:** feat/mxr-discuss
 
 ## What
@@ -73,22 +73,32 @@ class DiscussResult:
     error: str | None          # TIMEOUT | UNREACHABLE | EMPTY | SSH_ERROR | TRANSPORT_ERROR
 ```
 
-`reply` and `error` are mutually exclusive — a truthy reply always wins. Legal `(reply, error)`
-combinations:
+`reply` and `error` are mutually exclusive. Explicit precedence order (highest wins):
+1. Terminal marker (`MXR_DONE_EMPTY`, `MXR_SYNC_TIMEOUT`) — overrides body content
+2. SSH exit code (255 = transport; other non-zero = remote CLI failure)
+3. Truthy stdout body → success
+4. Per-task deadline expiry → TIMEOUT
+5. Subprocess creation / ledger failure → error
 
-| reply | error | meaning |
-|---|---|---|
-| str | None | success — agent replied |
-| None | "TIMEOUT" | timed out, job may be durable |
-| None | "EMPTY" | agent returned no body |
-| None | "UNREACHABLE" | SSH connect failed |
-| None | "SSH_ERROR" | SSH non-255 exit or remote CLI failure |
-| None | "TRANSPORT_ERROR" | SSH exit 255 (transport-level failure) |
+Legal `(reply, error, job_id)` states:
 
-The job handle is captured from `JOB_ID=<uuid>` on stderr *before* awaiting the reply, so
-a timeout after submission always carries the job ID. A timeout before submission (connection
-failure, queue rejection) produces `job_id=None` and `error="UNREACHABLE"` — the timeout
-notice omits the `mxr get` hint in that case, never promises unretrievable recovery.
+| reply | error | job_id | meaning |
+|---|---|---|---|
+| str | None | str | success — agent replied |
+| None | "TIMEOUT" | str | timed out after submission; reply durable |
+| None | "TIMEOUT" | None | timed out before submission confirmed |
+| None | "EMPTY" | str | agent returned no body |
+| None | "TRANSPORT_ERROR" | str? | SSH exit 255; job may be live on remote |
+| None | "SSH_ERROR" | None | SSH non-255 or remote CLI failure before ACK |
+| None | "UNREACHABLE" | None | SSH connect failed / auth error |
+| None | "SUBMIT_ERROR" | None | local ledger or subprocess creation failure |
+
+`job_id` is parsed from stderr `JOB_ID=<uuid>` before the reply wait — so a post-submission
+timeout always carries it. Pre-submission failures have `job_id=None`; the recovery notice
+never promises a retrievable handle in that case.
+
+The acknowledged ACK-loss residual (job committed but ACK lost → `job_id=None` despite
+active remote job) is documented in the edge cases table.
 
 ### SSH injection defense (oracle CRITICAL)
 
@@ -97,9 +107,11 @@ topic argument to prevent option injection:
 
 ```python
 import shlex
-remote_cmd = f"~/.local/bin/mxr {shlex.quote(agent)} -- {shlex.quote(topic)}"
+# `env` prefix ensures inline assignment works regardless of remote shell (fish/tcsh/zsh/bash).
+# `-T` disables PTY allocation so stdout and stderr remain separate streams.
+remote_cmd = f"env MXR_REVIEW_GATE_BYPASS=1 ~/.local/bin/mxr {shlex.quote(agent)} -- {shlex.quote(topic)}"
 proc = await asyncio.create_subprocess_exec(
-    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+    "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
     host, remote_cmd,
     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
 )
@@ -119,10 +131,11 @@ no `mxr` subprocess is spawned, so no PreToolUse hook fires. No bypass flag need
 **Remote path:** The SSH command string explicitly prepends `MXR_REVIEW_GATE_BYPASS=1`:
 
 ```python
-remote_cmd = f"MXR_REVIEW_GATE_BYPASS=1 ~/.local/bin/mxr {shlex.quote(agent)} -- {shlex.quote(topic)}"
+remote_cmd = f"env MXR_REVIEW_GATE_BYPASS=1 ~/.local/bin/mxr {shlex.quote(agent)} -- {shlex.quote(topic)}"
 ```
 
-This is safe: the bypass value is a literal constant, not derived from user input. The bypass
+This is safe: the bypass value is a literal constant, not derived from user input. `env`
+prefix ensures the assignment works on non-POSIX shells (fish, tcsh) on the remote host. The bypass
 is documented as the correct mechanism for non-review dispatches (commit-before-review.md).
 
 ### Barrier aggregation with per-task timeout
@@ -135,15 +148,26 @@ it and returns `DiscussResult(..., error="TIMEOUT", job_id=job_id)`. This ensure
 Total wall-clock ≈ 30 s (the per-task timeout; concurrent tasks race against the same wall
 clock). Cancellation cleanup time is additional and unbounded — this is a known limitation.
 
-Tasks are dispatched with `asyncio.as_completed()` (or equivalently
-`asyncio.wait(return_when=ALL_COMPLETED)`) so that results accumulated before a
-`KeyboardInterrupt` are preserved and printed, not discarded.
+Tasks are collected via `asyncio.as_completed()` into a local results list. Each completed
+task's result is appended immediately (before the next `await`), so completed results are
+available even if the event loop is cancelled mid-collection.
+
+#### Ctrl-C / SIGINT handling
+
+`asyncio.run()` responds to SIGINT by cancelling the main task. The `discuss` main coroutine
+wraps the `as_completed` loop in a `try/except (asyncio.CancelledError, KeyboardInterrupt)`
+block. In the except handler: cancel any still-pending participant tasks, drain their
+results (each task's exception is caught, not re-raised), print any completed results, then
+`exit(130)`. Participant tasks that are still running (not yet in `as_completed`) will have
+their coroutines cancelled — their internal `except CancelledError` blocks must terminate
+SSH subprocesses before re-raising.
 
 #### Subprocess teardown
 
-When a task's internal timeout fires: `proc.terminate()` → wait up to 5 s → `proc.kill()`
-→ `proc.wait()` (no further blocking). Stream readers are closed after process exit. This
-bound is best-effort — unbounded cancellation is acknowledged as a known limitation.
+When a task's internal timeout fires OR when cancelled: `proc.terminate()` → `await
+asyncio.wait_for(proc.wait(), 5)` → on timeout, `proc.kill()` → `await proc.wait()`. Stream
+readers are cancelled after process exit. This teardown is best-effort — the 5 s terminate
+window is bounded; the subsequent `kill` + `wait` is not (SIGKILL must succeed).
 
 ### Timeout recovery notices
 
@@ -174,30 +198,34 @@ participant gets its own inbound event row — no collision.
 
 ### Agent eligibility
 
-Only `Authority.RESPONDER` and `Authority.CONTROLLER` agents are eligible:
-- RESPONDER: oracle, kilabz, recon, lobster (as called via standard job submission)
-- CONTROLLER: lobster (lobster is dual-authority; job submission path does NOT grant it
-  the ability to spawn workspace-actor jobs via `discuss` — it receives the topic and replies
-  like a responder in this context)
+Eligible agents: `Authority.RESPONDER` **only** — oracle, kilabz, recon, lobster.
 
-Rejected outright: `WORKSPACE_ACTOR` (mini, curator, higgsfield, codex, mack) — workspace
-actors mutate state and should not be reached via a discussion prompt. The eligibility check
-is `agent.authority != WORKSPACE_ACTOR` rather than an explicit allowlist of
-`{RESPONDER, CONTROLLER}` — this way, any future authority tier that is not WORKSPACE_ACTOR
-is admitted without a code change, and the rejection is unambiguous regardless of any
-additional authority flags an agent may hold.
+Rationale for excluding CONTROLLER (lobster is `Authority.CONTROLLER`): CONTROLLER agents
+have the registered authority to spawn child jobs via `submit_job`. Nothing in the runner
+restricts that capability based on which command submitted the parent job. Rather than argue
+that `discuss` is safe with CONTROLLERs, we exclude them for v1. If lobster-as-discussant
+is needed, the right path is adding a `RESPONDER`-mode profile to lobster's registry entry.
+For now, lobster participates via `mxr lobster "..."` from the caller if desired.
 
-Preflight validates ALL agent names and authorities before submitting to ANY of them. A
-mixed roster (some eligible, some not) is rejected entirely with a clear error message before
-any dispatch. This prevents partial-submission state.
+Rejected explicitly: any authority value that is not `RESPONDER` — this is a positive
+allowlist, not a negative check. Unknown future authority values are rejected by default.
+
+Preflight validates ALL agent names and authorities before dispatching to ANY. A mixed
+roster is rejected atomically with a clear error before any submission.
 
 ### Authority × route combinations
 
-| Agent authority | host=None (local) | host="mini" (remote SSH) |
-|---|---|---|
-| RESPONDER | ✅ supported | ✅ supported |
-| CONTROLLER | ✅ supported | ✅ supported |
-| WORKSPACE_ACTOR | ❌ rejected at preflight | ❌ rejected at preflight |
+| Agent authority | Eligible? | host=None (local) | host="mini" (remote SSH) |
+|---|---|---|---|
+| RESPONDER | ✅ yes | ✅ | ✅ |
+| CONTROLLER | ❌ no | rejected at preflight | rejected at preflight |
+| WORKSPACE_ACTOR | ❌ no | rejected at preflight | rejected at preflight |
+| (unknown) | ❌ no | rejected at preflight | rejected at preflight |
+
+Remote eligibility is a v1 operational assumption: the Mini's registry is kept in sync via
+git pull. `discuss` validates locally and trusts the remote to reject jobs for unrecognized
+agents. A missing name surfaces as `error="SSH_ERROR"`. Future work: explicit remote health
+check before dispatch.
 
 Remote registry compatibility: `discuss` sends the same topic to the remote `mxr` using the
 agent name as declared in the local registry. The remote machine's registry must have a
@@ -217,27 +245,46 @@ The existing `mxr` CLI prints to stdout (reply text) and stderr (progress marker
 `MXR_DONE_EMPTY`, `MXR_SYNC_TIMEOUT`, `-> agent`). `_remote_fetch` captures both streams
 concurrently via `asyncio.create_task` readers:
 
-- **stderr**: scan for `JOB_ID=<uuid>` as it arrives (stream parse); store as `job_id`.
-  Also watch for `MXR_DONE_EMPTY` and `MXR_SYNC_TIMEOUT` to distinguish empty/timeout from
-  a reply. Capped at **32 KB** — anything beyond is truncated with a warning.
-- **stdout**: the complete reply body. Capped at **512 KB** — anything beyond is truncated
-  with a warning.
-- **Encoding**: `errors='replace'` on both streams — malformed bytes are replaced rather than
-  raising. Readers are closed and cancelled when the process exits or is killed.
-- **SSH exit code**: 0 = remote command exited 0; non-zero = remote command failed OR SSH
-  transport error (SSH exits 255 for transport errors specifically — log this distinction).
+- **Concurrent readers**: stdout and stderr are drained simultaneously via two
+  `asyncio.create_task` coroutines running in parallel. Sequential reads can deadlock if the
+  pipe fills while the other stream is being read.
+- **stderr**: scan for `JOB_ID=<uuid>` and terminal markers (`MXR_DONE_EMPTY`,
+  `MXR_SYNC_TIMEOUT`). Retained cap: **32 KB** — bytes beyond are *discarded* while reading
+  continues (to prevent pipe backpressure), but the retained window is scanned for markers.
+- **stdout**: reply body. Retained cap: **512 KB** — excess bytes are discarded while
+  reading continues. Truncation is noted in the DiscussResult if the body was capped.
+- **Encoding**: `errors='replace'` on both streams.
+- **Reader shutdown**: during normal exit, `await reader.read()` until EOF before closing.
+  During timeout/kill, readers are cancelled after `proc.kill()` + `proc.wait()` complete —
+  remaining buffered output is lost, which is acceptable post-kill.
+- **SSH exit code**: 0 = remote command exited 0 → use body + markers to determine result.
+  Non-zero: 255 = SSH transport error (`TRANSPORT_ERROR`); other = remote CLI failure
+  (`SSH_ERROR`). Log the distinction. Note: SSH propagates the remote command's exit status
+  directly, so exit 255 from the remote `mxr` would be misread as `TRANSPORT_ERROR` — this
+  is a known ambiguity; `mxr` does not currently exit 255.
+- **All unhandled exceptions** in `_remote_fetch` / `_submit_and_fetch` are caught and
+  mapped to `DiscussResult(error="SUBMIT_ERROR")` — no exception may escape a participant
+  task and abort the barrier.
 
 ### Labeled output trust boundary
 
 Reply text is sanitized before printing with a multi-pass strip:
 
 ```python
-# CSI sequences (cursor movement, colors, etc.)
+# CSI sequences: ESC [ ... final-byte (covers colors, cursor movement, erase, etc.)
 body = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', body)
-# OSC sequences (hyperlinks, window titles, etc.)
-body = re.sub(r'\x1b\][^\x07]*\x07', '', body)
-# Raw control characters (except \n and \t)
-body = re.sub(r'[\x00-\x08\x0b-\x1f]', '', body)
+# OSC sequences: ESC ] ... BEL  OR  ESC ] ... ESC \  (ST-terminated form)
+body = re.sub(r'\x1b\].*?(?:\x07|\x1b\\)', '', body, flags=re.DOTALL)
+# Other ESC-prefixed sequences (ESC followed by any single char, e.g. ESC M)
+body = re.sub(r'\x1b.', '', body)
+# C1 control characters (U+0080–U+009F)
+body = re.sub(r'[\x80-\x9f]', '', body)
+# DEL (U+007F)
+body = body.replace('\x7f', '')
+# Unicode bidi controls (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069)
+body = re.sub(r'[‎‏‪-‮⁦-⁩]', '', body)
+# Raw C0 controls (except \n \t)
+body = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', body)
 # Carriage returns
 body = body.replace('\r', '')
 ```
