@@ -27,6 +27,9 @@ class AgentSpec(BaseModel):
     # env_passthrough (cli): env vars THIS agent is allowed to inherit through the P2 scrub —
     # its own auth key(s) only. Everything else (sibling agents' secrets) is dropped. See runner._cli_env.
     adapter: dict[str, Any]
+    # host: None = run locally; "mini" = SSH-dispatch to the Mac Mini (discuss subcommand only).
+    # Registry-declared — callers cannot supply an arbitrary host via CLI flag.
+    host: Optional[str] = None
 
     @field_validator("agent_id")
     @classmethod
@@ -163,7 +166,7 @@ V1_ROSTER: list[AgentSpec] = [
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "env_passthrough": ["OPENAI_API_KEY"], "scratch_home": True}),
     AgentSpec(agent_id="oracle", reach=Reach.CLI, authority=Authority.RESPONDER,
-              model="gemini-3.1-pro", role="reviewer/vision",
+              model="gemini-3.1-pro", role="reviewer/vision", host="mini",
               # `agy` is the Gemini CLI (the standalone gemini-cli individual tier was retired).
               # PIN --model: the bare `agy -p` ran agy's DEFAULT (Gemini 3.5 Flash — fast but shallow),
               # NOT the gemini-3.1-pro this spec declares. Passing the model the picker lists gives

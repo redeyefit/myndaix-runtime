@@ -12,15 +12,12 @@ the current manual pattern of `MXR_REVIEW_GATE_BYPASS=1 mxr lobster "..."` × N 
 SSH-routing oracle by hand + collecting replies separately.
 
 ```
-$ mxr discuss "should we build the proposer now?" --with oracle kilabz recon
+$ mxr discuss "should we build the proposer now?" --with oracle kilabz
 
 ─── [oracle] ────────────────────────────────────
 ...reply...
 
 ─── [kilabz] ────────────────────────────────────
-...reply...
-
-─── [recon] ─────────────────────────────────────
 ...reply...
 ```
 
@@ -202,7 +199,7 @@ participant gets its own inbound event row — no collision.
 
 ### Agent eligibility
 
-Eligible agents: `Authority.RESPONDER` **only** — oracle, kilabz, recon.
+Eligible agents: `Authority.RESPONDER` **only** — oracle, kilabz. (recon is COMPOSITE and excluded in v1; see registry.py)
 
 Rationale for excluding CONTROLLER (lobster is `Authority.CONTROLLER`): CONTROLLER agents
 have the registered authority to spawn child jobs via `submit_job`. Nothing in the runner
@@ -302,7 +299,7 @@ application-generated section headers.
 ## Data flow
 
 ```
-mxr discuss "<topic>" --with oracle kilabz recon
+mxr discuss "<topic>" --with oracle kilabz
 
 1. Validate all agent names + authorities against REGISTRY — reject entire call if any invalid
 2. For each agent, build a DiscussTask:

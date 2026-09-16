@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import os
+import re
+import shlex
+import subprocess
 import sys
 import time
 import uuid
@@ -59,6 +63,265 @@ def _marker_safe(s: str) -> str:
     marker would forge the contract. Indent any MXR_-leading line by one space — content
     preserved for the human, the anchored match can no longer fire."""
     return "\n".join((" " + ln) if ln.startswith("MXR_") else ln for ln in s.splitlines())
+
+
+@dataclasses.dataclass
+class DiscussResult:
+    agent: str
+    reply: Optional[str]       # None = no usable reply
+    job_id: Optional[str]      # present if submission was acknowledged before timeout
+    ledger: str                # "local" | "<host>" — which machine holds the job
+    error: Optional[str]       # TIMEOUT | UNREACHABLE | EMPTY | SSH_ERROR | TRANSPORT_ERROR
+                               # | SUBMIT_ERROR | FAILED | None (success)
+
+
+def _sanitize_reply(body: str) -> str:
+    """Full ANSI+bidi sanitizer for discuss replies (untrusted multi-agent output).
+    Strips CSI/OSC/ESC sequences before delegating to _clean_reply for C0/C1/DEL."""
+    # CSI: ESC [ ... final-byte (colors, cursor, erase, etc.)
+    body = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', body)
+    # OSC: ESC ] ... BEL  OR  ESC ] ... ESC \  (ST-terminated)
+    body = re.sub(r'\x1b\].*?(?:\x07|\x1b\\)', '', body, flags=re.DOTALL)
+    # Other ESC two-char sequences (e.g. ESC M reverse-index)
+    body = re.sub(r'\x1b.', '', body)
+    # Bidi controls: U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+061C
+    body = re.sub('[‎‏‪-‮⁦-⁩؜]', '', body)
+    return _clean_reply(body)
+
+
+async def _submit_and_fetch(agent: str, topic: str, timeout_s: float) -> DiscussResult:
+    """Submit topic to the local ledger and poll for a reply. Does not print."""
+    try:
+        led = await PostgresLedger.connect(DSN)
+    except Exception as e:
+        return DiscussResult(agent=agent, reply=None, job_id=None,
+                             ledger="local", error=f"SUBMIT_ERROR: {e}")
+    job_id = None
+    try:
+        env = TransportEnvelope(transport="cli", account="cli", sender_id="operator",
+                                reply_target="cli:operator", dedupe_key=str(uuid.uuid4()))
+        event_id = await led.ingest_inbound(env, topic)
+        jid = await led.submit_job(to_agent=agent, prompt=topic, context={},
+                                   inbound_event_id=event_id, created_by="operator")
+        job_id = str(jid)
+        print(f"-> {agent}  (job {job_id[:8]})", file=sys.stderr, flush=True)
+        print(f"JOB_ID={jid}", file=sys.stderr, flush=True)
+
+        deadline = time.monotonic() + timeout_s
+        st = None
+        while time.monotonic() < deadline:
+            st = await led.get_status(jid)
+            if st and st["status"] in ("done", "failed", "dead"):
+                break
+            await asyncio.sleep(0.3)
+        else:
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger="local", error="TIMEOUT")
+
+        if st["status"] == "done":
+            bodies = [o.get("body") for o in (st.get("outbound") or []) if o.get("body")]
+            if not bodies:
+                return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                     ledger="local", error="EMPTY")
+            return DiscussResult(agent=agent, reply=_sanitize_reply(bodies[-1]),
+                                 job_id=job_id, ledger="local", error=None)
+
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger="local", error="FAILED")
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger="local", error=f"SUBMIT_ERROR: {e}")
+    finally:
+        await led.close()
+
+
+async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> DiscussResult:
+    """SSH-dispatch agent on remote host, capture stdout reply. Does not print."""
+    # Hard precondition: remote login shell must be POSIX-compatible (bash/zsh).
+    # Mini runs zsh — satisfied. shlex.quote() is unsafe on tcsh with newline-bearing topics.
+    quoted_agent = shlex.quote(agent)
+    quoted_topic = shlex.quote(topic)
+    remote_cmd = (f"env MXR_REVIEW_GATE_BYPASS=1 ~/.local/bin/mxr "
+                  f"{quoted_agent} -- {quoted_topic}")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            host, remote_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        return DiscussResult(agent=agent, reply=None, job_id=None,
+                             ledger=host, error="UNREACHABLE")
+
+    # stdout/stderr are always set: we pass PIPE above
+    assert proc.stdout is not None and proc.stderr is not None
+
+    async def _drain(stream: asyncio.StreamReader, limit: int) -> str:
+        buf = bytearray()
+        while True:
+            try:
+                chunk = await stream.read(4096)
+            except asyncio.CancelledError:
+                break
+            if not chunk:
+                break
+            if len(buf) < limit:
+                buf.extend(chunk[:limit - len(buf)])
+        return bytes(buf).decode("utf-8", errors="replace")
+
+    job_id = None
+    timed_out = False
+    stdout_t = asyncio.create_task(_drain(proc.stdout, 512 * 1024))
+    stderr_t = asyncio.create_task(_drain(proc.stderr, 32 * 1024))
+    proc_done_t = asyncio.create_task(proc.wait())
+
+    try:
+        done, _ = await asyncio.wait(
+            {proc_done_t, stdout_t, stderr_t}, timeout=timeout_s
+        )
+        if proc_done_t not in done:
+            # Timeout: process is still running — terminate it
+            timed_out = True
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+
+        # Cancel any readers still outstanding and collect their buffers
+        for t in (stdout_t, stderr_t):
+            if not t.done():
+                t.cancel()
+        gathered = await asyncio.gather(stdout_t, stderr_t, return_exceptions=True)
+        stdout_text = gathered[0] if isinstance(gathered[0], str) else ""
+        stderr_text = gathered[1] if isinstance(gathered[1], str) else ""
+
+    except asyncio.CancelledError:
+        # Outer task cancelled (Ctrl-C) — tear down subprocess cleanly
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        for t in (stdout_t, stderr_t, proc_done_t):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(stdout_t, stderr_t, proc_done_t, return_exceptions=True)
+        raise
+
+    # Parse JOB_ID= from stderr (present if remote mxr reached the submit step)
+    for line in stderr_text.splitlines():
+        if line.startswith("JOB_ID="):
+            job_id = line[7:].strip()
+            break
+
+    if timed_out:
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="TIMEOUT")
+
+    rc = proc.returncode
+    if rc == 255:
+        # SSH transport error (connection refused, host unreachable, etc.)
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="TRANSPORT_ERROR")
+    if rc != 0:
+        # Remote mxr itself failed (unknown agent, ledger down, etc.)
+        return DiscussResult(agent=agent, reply=None, job_id=None,
+                             ledger=host, error="SSH_ERROR")
+
+    # Terminal markers from the remote mxr — take precedence over body content
+    if "MXR_DONE_EMPTY" in stderr_text:
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="EMPTY")
+    if "MXR_SYNC_TIMEOUT" in stderr_text:
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="TIMEOUT")
+
+    body = stdout_text.strip()
+    if not body:
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="EMPTY")
+
+    return DiscussResult(agent=agent, reply=_sanitize_reply(body),
+                         job_id=job_id, ledger=host, error=None)
+
+
+def _print_discuss_result(result: DiscussResult) -> None:
+    bar = "─" * max(0, 48 - len(result.agent) - 2)
+    print(f"\n─── [{result.agent}] {bar}")
+    if result.reply:
+        for line in result.reply.splitlines():
+            print("    " + line)
+    elif result.error == "TIMEOUT":
+        if result.job_id:
+            getter = (f"ssh {result.ledger} mxr get {result.job_id} --reply"
+                      if result.ledger != "local" else f"mxr get {result.job_id} --reply")
+            print(f"    [TIMEOUT — reply may be durable: {getter}]")
+        else:
+            print("    [TIMEOUT — job not confirmed (connection may have failed)]")
+    elif result.error == "EMPTY":
+        print("    [EMPTY — agent produced no reply]")
+    elif result.error == "UNREACHABLE":
+        print("    [UNREACHABLE — SSH connect failed or auth error]")
+    elif result.error == "TRANSPORT_ERROR":
+        note = "    [TRANSPORT_ERROR — SSH exit 255"
+        if result.job_id:
+            note += f"; job may be live: mxr get {result.job_id} --reply on {result.ledger}"
+        print(note + "]")
+    elif result.error == "SSH_ERROR":
+        print("    [SSH_ERROR — remote mxr failed before reaching the agent]")
+    elif result.error == "FAILED":
+        jnote = f" (job {result.job_id})" if result.job_id else ""
+        print(f"    [FAILED — agent job failed or died{jnote}]")
+    elif result.error:
+        print(f"    [{result.error}]")
+    else:
+        print("    [no reply]")
+
+
+async def _discuss_main(agents_ordered: list, topic: str, timeout_s: float) -> int:
+    tasks = []
+    for ag in agents_ordered:
+        spec = REGISTRY[ag]
+        if spec.host:
+            coro = _remote_fetch(spec.host, ag, topic, timeout_s)
+        else:
+            coro = _submit_and_fetch(ag, topic, timeout_s)
+        tasks.append(asyncio.create_task(coro, name=ag))
+
+    results: dict = {}
+    try:
+        for fut in asyncio.as_completed(tasks):
+            result = await fut
+            results[result.agent] = result
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for ag in agents_ordered:
+            if ag in results:
+                _print_discuss_result(results[ag])
+        cancelled = len(agents_ordered) - len(results)
+        if cancelled:
+            print(f"\n[interrupted — {cancelled} agent(s) cancelled]", file=sys.stderr)
+        print()
+        sys.exit(130)
+
+    for ag in agents_ordered:
+        if ag in results:
+            _print_discuss_result(results[ag])
+    print()
+    return 0 if any(r.reply for r in results.values()) else 1
 
 
 def _resolve_sync_wait(agent: str) -> float:
@@ -442,6 +705,58 @@ def main(argv: Optional[list[str]] = None) -> int:
         sub = {"review-stage": "stage", "review-teardown": "teardown",
                "review-reap": "reap"}[raw[0]]
         return staging.main(["staging", sub, *raw[1:]])
+
+    # `mxr discuss "<topic>" --with <agent>...` — parallel fan-out to RESPONDER agents.
+    # Routes through Python directly (local) or SSH (host="mini"), so no hook fires here.
+    if raw and raw[0] == "discuss":
+        dp = argparse.ArgumentParser(prog="mxr discuss",
+                                     description="fan a topic to multiple agents in parallel")
+        dp.add_argument("topic", help="the question or topic to discuss")
+        dp.add_argument("--with", dest="agents", metavar="AGENT", nargs="+", required=True,
+                        help="agents to participate (RESPONDER authority only)")
+        dp.add_argument("--timeout", type=float, default=None,
+                        help="per-agent reply timeout in seconds (default: MXR_TIMEOUT_S or 300)")
+        dargs = dp.parse_args(raw[1:])
+
+        # Deduplicate while preserving order
+        seen: set = set()
+        agents_ordered = []
+        for ag in (dargs.agents or []):
+            if ag not in seen:
+                seen.add(ag)
+                agents_ordered.append(ag)
+
+        if not agents_ordered:
+            dp.error("--with requires at least one agent")
+
+        # Preflight: validate ALL agents before any dispatch (atomically reject mixed lists)
+        errors = []
+        for ag in agents_ordered:
+            if ag not in REGISTRY:
+                errors.append(f"  '{ag}': unknown (roster: {', '.join(sorted(REGISTRY))})")
+            elif REGISTRY[ag].authority.value != "responder":
+                errors.append(
+                    f"  '{ag}': authority={REGISTRY[ag].authority.value} — "
+                    f"only RESPONDER agents may participate in discuss"
+                )
+        if errors:
+            print("mxr discuss: agent validation failed:", file=sys.stderr)
+            for e in errors:
+                print(e, file=sys.stderr)
+            return 2
+
+        timeout_s = dargs.timeout
+        if timeout_s is None:
+            raw_t = os.environ.get("MXR_TIMEOUT_S") or ""
+            if raw_t:
+                try:
+                    timeout_s = float(raw_t)
+                except ValueError:
+                    pass
+            if timeout_s is None:
+                timeout_s = 300.0
+
+        return asyncio.run(_discuss_main(agents_ordered, dargs.topic, timeout_s))
 
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
