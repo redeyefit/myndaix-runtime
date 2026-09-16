@@ -1,6 +1,6 @@
 # DESIGN — mxr discuss
 
-**Status:** v0.4 — third review revision
+**Status:** v0.5 — fourth review revision
 **Branch:** feat/mxr-discuss
 
 ## What
@@ -12,15 +12,15 @@ the current manual pattern of `MXR_REVIEW_GATE_BYPASS=1 mxr lobster "..."` × N 
 SSH-routing oracle by hand + collecting replies separately.
 
 ```
-$ mxr discuss "should we build the proposer now?" --with lobster oracle kilabz
-
-─── [lobster] ───────────────────────────────────
-...reply...
+$ mxr discuss "should we build the proposer now?" --with oracle kilabz recon
 
 ─── [oracle] ────────────────────────────────────
 ...reply...
 
 ─── [kilabz] ────────────────────────────────────
+...reply...
+
+─── [recon] ─────────────────────────────────────
 ...reply...
 ```
 
@@ -117,8 +117,12 @@ proc = await asyncio.create_subprocess_exec(
 )
 ```
 
+**Hard precondition**: the remote login shell must be POSIX-compatible (bash or zsh). The
+Mini runs zsh — this is satisfied. `shlex.quote()` on tcsh would be unsafe for topics
+containing newlines; tcsh is not present on the Mini and is not a supported target.
+
 `shlex.quote()` wraps the value in single quotes and escapes internal single quotes —
-injection-safe for the remote shell. `--` terminates option parsing before the topic.
+injection-safe for POSIX-compatible remote shells. `--` terminates option parsing before the topic.
 `BatchMode=yes` disables password/host-key prompts (fails noninteractively instead).
 `ConnectTimeout=10` bounds the SSH handshake independently of the reply timeout.
 `stdin=DEVNULL` ensures the subprocess never inherits the parent's stdin.
@@ -198,7 +202,7 @@ participant gets its own inbound event row — no collision.
 
 ### Agent eligibility
 
-Eligible agents: `Authority.RESPONDER` **only** — oracle, kilabz, recon, lobster.
+Eligible agents: `Authority.RESPONDER` **only** — oracle, kilabz, recon.
 
 Rationale for excluding CONTROLLER (lobster is `Authority.CONTROLLER`): CONTROLLER agents
 have the registered authority to spawn child jobs via `submit_job`. Nothing in the runner
@@ -281,8 +285,10 @@ body = re.sub(r'\x1b.', '', body)
 body = re.sub(r'[\x80-\x9f]', '', body)
 # DEL (U+007F)
 body = body.replace('\x7f', '')
-# Unicode bidi controls (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069)
-body = re.sub(r'[‎‏‪-‮⁦-⁩]', '', body)
+# Unicode bidi controls: strip U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+061C.
+# Build the character class from explicit code-point escapes in implementation code —
+# do not embed bidi literals here (they are invisible and survive encoding drift).
+body = re.sub(bidi_pattern, '', body)
 # Raw C0 controls (except \n \t)
 body = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', body)
 # Carriage returns
@@ -296,7 +302,7 @@ application-generated section headers.
 ## Data flow
 
 ```
-mxr discuss "<topic>" --with lobster oracle kilabz
+mxr discuss "<topic>" --with oracle kilabz recon
 
 1. Validate all agent names + authorities against REGISTRY — reject entire call if any invalid
 2. For each agent, build a DiscussTask:
@@ -333,13 +339,12 @@ mxr discuss "<topic>" --with lobster oracle kilabz
 - **SSH injection**: mitigated via `shlex.quote()` + `--` option terminator (see above)
 - **No free-form host**: `host` is registry-declared, not caller-supplied
 - **Authority filtering**: WORKSPACE_ACTOR rejected at preflight
-- **Transitive delegation**: `discuss` submits a plain-text prompt to the agent via the
-  standard job submission path — identical to `mxr lobster "question"`. The agent's ability
-  to subsequently call `submit_job` is a property of its registered authority and the runner's
-  execution model, not of the `discuss` command. `discuss` does not grant new capabilities; it
-  is a parallel dispatch shortcut. If the team decides CONTROLLER agents should be restricted
-  from `discuss` in the future, that enforcement belongs in the runner's authority checks, not
-  in this command.
+- **Transitive delegation**: CONTROLLER authority is rejected at preflight — v1 does not
+  permit agents that can spawn child jobs via `submit_job`. `discuss` submits a plain-text
+  prompt to each agent via the standard job submission path and does not grant new
+  capabilities; it is a parallel dispatch shortcut. If a CONTROLLER-mode agent is needed
+  in the future (e.g. lobster), the right path is a `RESPONDER`-mode profile in that
+  agent's registry entry.
 - **BYPASS propagation**: explicit literal constant on SSH path; not derived from user input
 - **SSH unattended**: `BatchMode=yes`, `ConnectTimeout=10`, `stdin=DEVNULL`
 - **Gate bypass for review-flavored discusses**: `discuss` is a broadcast shortcut — it sends
@@ -386,7 +391,7 @@ No new files beyond the above, no schema changes, no new launchd services.
 - [x] Mixed eligible/ineligible roster rejected atomically
 - [x] ANSI/VT100/OSC/raw control chars stripped via multi-pass regex before printing
 - [x] Reply lines prefixed with 4-space indent to prevent forged header confusion
-- [x] WORKSPACE_ACTOR agents rejected at preflight (check = `!= WORKSPACE_ACTOR`)
+- [x] Only RESPONDER agents pass preflight (positive allowlist: `authority == RESPONDER`)
 - [x] No `shell=True` on any subprocess call
 - [x] `DiscussResult` (reply, error) state contract documented and mutually exclusive
 - [x] Internal timeout handling in `_remote_fetch`/`_submit_and_fetch` (no external wait_for)
