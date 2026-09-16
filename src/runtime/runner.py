@@ -89,6 +89,38 @@ def _cli_env(spec: AgentSpec) -> dict[str, str]:
 # env key alone does NOT auth (verified: 401), so we MUST seed it.
 _SCRATCH_HOME_SEED = {"codex": (".codex", ("auth.json", "config.toml"))}
 
+# Auth files agy needs from ~/.gemini/ when running under a per-invocation GEMINI_CONFIG_DIR.
+_GEMINI_AUTH_FILES = ("oauth_creds.json", "google_accounts.json", "state.json")
+
+
+def _setup_gemini_config(spec: AgentSpec, env: dict[str, str]) -> Optional[str]:
+    """For agents declaring adapter.gemini_deny_tools: create a per-invocation GEMINI_CONFIG_DIR
+    containing seeded OAuth auth + a settings.json that hard-denies the listed tools.
+    This closes the recurring 'oracle empty' bug: agy is agentic and tries read_file/command on
+    tool-inducing payloads (file paths, explicit 'read this file' instructions); headless auto-deny
+    makes it exit 0 with empty stdout and the diagnostic on stderr. The deny list makes agy produce
+    text output instead of silently dead-ending ('I cannot read the file' beats empty string).
+    The preamble stays as the MODEL-LEVEL nudge; this is the CONFIG-LEVEL hard backstop.
+    Returns the temp dir to clean up, or None if not applicable."""
+    deny = spec.adapter.get("gemini_deny_tools")
+    if not deny:
+        return None
+    config_dir = tempfile.mkdtemp(prefix="mdx-geminicfg-")
+    try:
+        real_gemini = os.path.join(os.path.expanduser("~"), ".gemini")
+        for fname in _GEMINI_AUTH_FILES:
+            src = os.path.join(real_gemini, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, config_dir)
+        import json as _json
+        with open(os.path.join(config_dir, "settings.json"), "w") as fh:
+            _json.dump({"permissions": {"deny": list(deny)}}, fh)
+        env["GEMINI_CONFIG_DIR"] = config_dir
+        return config_dir
+    except Exception:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        return None
+
 
 def _make_scratch_home(spec: AgentSpec, env: dict[str, str]) -> tuple[dict[str, str], Optional[str]]:
     """For an agent declaring adapter.scratch_home, run it under a private throwaway HOME so it
@@ -206,6 +238,9 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
     # throwaway HOME seeded with only its auth, so an injected fix-list can't make it read the
     # operator's ~/.ssh/~/.aws/~/.myndaix. No-op (scratch=None) for agents without the flag.
     env, scratch = _make_scratch_home(spec, _cli_env(spec))
+    # per-invocation GEMINI_CONFIG_DIR for oracle: hard-deny file/command tools so agy produces
+    # text output rather than silent empty when a tool-inducing payload triggers read_file.
+    gemini_cfg = _setup_gemini_config(spec, env)
     # A job without an explicit worktree must NOT inherit the serve process's cwd (the runtime
     # repo working tree, pinned at the default branch). A reviewer/triage agent that reads that
     # tree to "verify" a finding sees the BASE, not the reviewed head, and calls real diff-findings
@@ -312,11 +347,21 @@ async def invoke_cli(spec: AgentSpec, job: Job) -> Result:
             shutil.rmtree(scratch, ignore_errors=True)
         if scratch_cwd:                  # the empty scratch cwd is per-invocation — always remove it
             shutil.rmtree(scratch_cwd, ignore_errors=True)
+        if gemini_cfg:                   # per-invocation GEMINI_CONFIG_DIR (oracle) — always remove it
+            shutil.rmtree(gemini_cfg, ignore_errors=True)
 
     code = proc.returncode
     if code == 0:
-        return Result(status=ResultStatus.OK, text=_decode(out).strip(),
-                      exit_code=0, ms=_ms(started))
+        text = _decode(out).strip()
+        if not text:
+            # exit 0 + empty stdout is agy's headless tool-denial pattern ("jetski: no output
+            # produced" lands on stderr). Surface the diagnostic as a retryable error so the
+            # ledger records WHY oracle was empty rather than a silent ok with no text.
+            err_text = _decode(err).strip()
+            if err_text:
+                return Result(status=ResultStatus.ERROR, error_class=ErrorClass.RETRYABLE,
+                              text=f"[empty stdout] {err_text[:500]}", ms=_ms(started))
+        return Result(status=ResultStatus.OK, text=text, exit_code=0, ms=_ms(started))
     return Result(
         status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
         text=(_decode(err) or _decode(out)).strip(), exit_code=code, ms=_ms(started),
