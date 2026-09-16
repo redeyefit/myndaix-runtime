@@ -1,6 +1,6 @@
 # DESIGN — mxr discuss
 
-**Status:** v0.2 — post-review revision (oracle CRITICAL + 3 HIGHs addressed)
+**Status:** v0.3 — second review revision
 **Branch:** feat/mxr-discuss
 
 ## What
@@ -70,8 +70,20 @@ class DiscussResult:
     reply: str | None          # None = no usable reply
     job_id: str | None         # present if submission was acknowledged before timeout
     ledger: str                # "local" | "mini" — tells user which mxr get to run
-    error: str | None          # TIMEOUT | UNREACHABLE | EMPTY | SSH_ERROR
+    error: str | None          # TIMEOUT | UNREACHABLE | EMPTY | SSH_ERROR | TRANSPORT_ERROR
 ```
+
+`reply` and `error` are mutually exclusive — a truthy reply always wins. Legal `(reply, error)`
+combinations:
+
+| reply | error | meaning |
+|---|---|---|
+| str | None | success — agent replied |
+| None | "TIMEOUT" | timed out, job may be durable |
+| None | "EMPTY" | agent returned no body |
+| None | "UNREACHABLE" | SSH connect failed |
+| None | "SSH_ERROR" | SSH non-255 exit or remote CLI failure |
+| None | "TRANSPORT_ERROR" | SSH exit 255 (transport-level failure) |
 
 The job handle is captured from `JOB_ID=<uuid>` on stderr *before* awaiting the reply, so
 a timeout after submission always carries the job ID. A timeout before submission (connection
@@ -115,17 +127,23 @@ is documented as the correct mechanism for non-review dispatches (commit-before-
 
 ### Barrier aggregation with per-task timeout
 
-`asyncio.wait_for(coro, timeout=30)` wraps each participant. Python's `wait_for` re-raises
-`asyncio.TimeoutError` after the timeout, but the inner coroutine finishes cancellation
-before the caller proceeds — the 30 s is therefore NOT a hard wall-clock bound per task
-(acknowledged). Total wall-clock for N tasks = up to 30 s × N in the worst case. For typical
-3-agent discussions this is at most ~90 s; acceptable.
+Each `_remote_fetch`/`_submit_and_fetch` handles its own timeout internally — there is no
+external `asyncio.wait_for` wrapper. When the per-task deadline fires, the function catches
+it and returns `DiscussResult(..., error="TIMEOUT", job_id=job_id)`. This ensures the
+`job_id` captured before the wait is never lost to a `wait_for` cancellation.
 
-On `asyncio.TimeoutError`: attempt to terminate the SSH subprocess (`proc.terminate()`,
-then `proc.kill()` after 5 s). Reap with `await proc.wait()` with a short bound.
+Total wall-clock ≈ 30 s (the per-task timeout; concurrent tasks race against the same wall
+clock). Cancellation cleanup time is additional and unbounded — this is a known limitation.
 
-On `KeyboardInterrupt` / `asyncio.CancelledError`: same teardown path; deliver any replies
-already received before exiting.
+Tasks are dispatched with `asyncio.as_completed()` (or equivalently
+`asyncio.wait(return_when=ALL_COMPLETED)`) so that results accumulated before a
+`KeyboardInterrupt` are preserved and printed, not discarded.
+
+#### Subprocess teardown
+
+When a task's internal timeout fires: `proc.terminate()` → wait up to 5 s → `proc.kill()`
+→ `proc.wait()` (no further blocking). Stream readers are closed after process exit. This
+bound is best-effort — unbounded cancellation is acknowledged as a known limitation.
 
 ### Timeout recovery notices
 
@@ -163,7 +181,11 @@ Only `Authority.RESPONDER` and `Authority.CONTROLLER` agents are eligible:
   like a responder in this context)
 
 Rejected outright: `WORKSPACE_ACTOR` (mini, curator, higgsfield, codex, mack) — workspace
-actors mutate state and should not be reached via a discussion prompt.
+actors mutate state and should not be reached via a discussion prompt. The eligibility check
+is `agent.authority != WORKSPACE_ACTOR` rather than an explicit allowlist of
+`{RESPONDER, CONTROLLER}` — this way, any future authority tier that is not WORKSPACE_ACTOR
+is admitted without a code change, and the rejection is unambiguous regardless of any
+additional authority flags an agent may hold.
 
 Preflight validates ALL agent names and authorities before submitting to ANY of them. A
 mixed roster (some eligible, some not) is rejected entirely with a clear error message before
@@ -183,24 +205,46 @@ matching entry — verified trivially (oracle is the only remote agent, and the 
 is kept in sync with the main tree). If a name is missing on the remote, `mxr` returns a
 non-zero exit; `_remote_fetch` surfaces this as `error="SSH_ERROR"`.
 
+Remote eligibility is an operational assumption: the Mini's registry is kept in sync with the
+MacBook's via the standard git pull workflow. `discuss` validates locally and trusts the remote
+to reject jobs for unrecognized agents. If the remote agent name is missing, `mxr` returns
+non-zero; `_remote_fetch` surfaces this as `error='SSH_ERROR'`. This is a known v1 limitation
+— future work can add an explicit remote-registry health check.
+
 ### Remote result parsing
 
 The existing `mxr` CLI prints to stdout (reply text) and stderr (progress markers: `JOB_ID=`,
-`MXR_DONE_EMPTY`, `MXR_SYNC_TIMEOUT`, `-> agent`). `_remote_fetch` captures both streams:
+`MXR_DONE_EMPTY`, `MXR_SYNC_TIMEOUT`, `-> agent`). `_remote_fetch` captures both streams
+concurrently via `asyncio.create_task` readers:
 
 - **stderr**: scan for `JOB_ID=<uuid>` as it arrives (stream parse); store as `job_id`.
   Also watch for `MXR_DONE_EMPTY` and `MXR_SYNC_TIMEOUT` to distinguish empty/timeout from
-  a reply.
-- **stdout**: the complete reply body.
+  a reply. Capped at **32 KB** — anything beyond is truncated with a warning.
+- **stdout**: the complete reply body. Capped at **512 KB** — anything beyond is truncated
+  with a warning.
+- **Encoding**: `errors='replace'` on both streams — malformed bytes are replaced rather than
+  raising. Readers are closed and cancelled when the process exits or is killed.
 - **SSH exit code**: 0 = remote command exited 0; non-zero = remote command failed OR SSH
   transport error (SSH exits 255 for transport errors specifically — log this distinction).
 
 ### Labeled output trust boundary
 
-Reply text is sanitized before printing: strip ANSI/VT100 escape sequences
-(`re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', body)`). Section headers use a fixed-width frame
-(`─── [agent] ───...`) that is unlikely to collide with reply content; no additional framing
-is needed given we control the label format and the reply is rendered in a terminal context.
+Reply text is sanitized before printing with a multi-pass strip:
+
+```python
+# CSI sequences (cursor movement, colors, etc.)
+body = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', body)
+# OSC sequences (hyperlinks, window titles, etc.)
+body = re.sub(r'\x1b\][^\x07]*\x07', '', body)
+# Raw control characters (except \n and \t)
+body = re.sub(r'[\x00-\x08\x0b-\x1f]', '', body)
+# Carriage returns
+body = body.replace('\r', '')
+```
+
+Every reply line is prefixed with a 4-space indent before printing so that any forged
+`─── [agent]` headers embedded in reply text are visually distinguishable from the
+application-generated section headers.
 
 ## Data flow
 
@@ -211,9 +255,8 @@ mxr discuss "<topic>" --with lobster oracle kilabz
 2. For each agent, build a DiscussTask:
      host=None  → _submit_and_fetch(agent, topic)   [MacBook ledger]
      host="mini" → _remote_fetch("mini", agent, topic)  [ssh + stdout capture]
-3. results = await asyncio.gather(*[asyncio.wait_for(t, 30) for t in tasks],
-                                   return_exceptions=True)
-   — exceptions (TimeoutError, etc.) are caught per-task, not globally
+3. Each task handles its own internal timeout and returns DiscussResult(error="TIMEOUT") on expiry.
+   results collected via asyncio.as_completed() so partial results survive KeyboardInterrupt.
 4. For each result in --with order:
      if DiscussResult.reply: print header + reply
      else: print header + timeout/error notice
@@ -236,17 +279,27 @@ mxr discuss "<topic>" --with lobster oracle kilabz
 | Single agent in `--with` | Supported; functions as a bypass-free single dispatch |
 | Ctrl-C during wait | Terminate all SSH subprocesses; print received replies; exit 130 |
 | All agents fail/timeout | Exit 1 with per-agent notices |
+| Job committed but ACK lost (job_id=None despite active job) | v1 known residual: distinguishing known rejection from unknown acceptance is complex. Surfaces as `error='UNREACHABLE'` with `job_id=None`. Recovery requires inspecting the Mini's ledger manually. Future work: add a submission-confirm round-trip. |
 
 ## Security surface
 
 - **SSH injection**: mitigated via `shlex.quote()` + `--` option terminator (see above)
 - **No free-form host**: `host` is registry-declared, not caller-supplied
 - **Authority filtering**: WORKSPACE_ACTOR rejected at preflight
-- **Transitive delegation**: `discuss` submits a plain text prompt to the agent; the agent
-  cannot spawn workspace-actor jobs via this path (that requires `submit_job` with a
-  WORKSPACE_ACTOR `to_agent` — not triggered by a text reply)
+- **Transitive delegation**: `discuss` submits a plain-text prompt to the agent via the
+  standard job submission path — identical to `mxr lobster "question"`. The agent's ability
+  to subsequently call `submit_job` is a property of its registered authority and the runner's
+  execution model, not of the `discuss` command. `discuss` does not grant new capabilities; it
+  is a parallel dispatch shortcut. If the team decides CONTROLLER agents should be restricted
+  from `discuss` in the future, that enforcement belongs in the runner's authority checks, not
+  in this command.
 - **BYPASS propagation**: explicit literal constant on SSH path; not derived from user input
 - **SSH unattended**: `BatchMode=yes`, `ConnectTimeout=10`, `stdin=DEVNULL`
+- **Gate bypass for review-flavored discusses**: `discuss` is a broadcast shortcut — it sends
+  the topic as-is to each agent. Whether the topic happens to sound like a code review request
+  is the user's concern, not the command's. The review gate is a process-discipline tool applied
+  by the hook infrastructure, not a semantic filter on question content. `discuss` is exempt
+  because it produces no code artifact and has no diff context.
 
 ## Files to create / modify
 
@@ -284,6 +337,16 @@ No new files beyond the above, no schema changes, no new launchd services.
 - [x] Timeout notice shows correct `mxr get` target (mini vs local)
 - [x] All agents validated + authority-checked before any dispatch
 - [x] Mixed eligible/ineligible roster rejected atomically
-- [x] ANSI escape sequences stripped from reply text before printing
-- [x] WORKSPACE_ACTOR agents rejected at preflight
+- [x] ANSI/VT100/OSC/raw control chars stripped via multi-pass regex before printing
+- [x] Reply lines prefixed with 4-space indent to prevent forged header confusion
+- [x] WORKSPACE_ACTOR agents rejected at preflight (check = `!= WORKSPACE_ACTOR`)
 - [x] No `shell=True` on any subprocess call
+- [x] `DiscussResult` (reply, error) state contract documented and mutually exclusive
+- [x] Internal timeout handling in `_remote_fetch`/`_submit_and_fetch` (no external wait_for)
+- [x] `asyncio.as_completed()` used so partial results survive KeyboardInterrupt
+- [x] Subprocess teardown: terminate → 5 s → kill → wait (best-effort, bounded)
+- [x] stdout capped at 512 KB, stderr capped at 32 KB, encoding errors='replace'
+- [x] Stream readers cancelled after process exit
+- [x] Remote eligibility limitation documented (v1 known gap)
+- [x] ACK-loss / job_id=None case documented as v1 known residual
+- [x] Transitive delegation: no new capabilities; future restriction belongs in runner
