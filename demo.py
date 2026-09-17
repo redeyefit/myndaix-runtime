@@ -283,6 +283,34 @@ async def demo_api() -> None:
         await led.close()
 
 
+# The 4 agents in the discuss demo, with the provider each model comes from. Kept as
+# static demo copy (role text is demo-facing, not the registry's terse role field); the
+# --roster pane reads the LIVE model straight from REGISTRY so any registry re-pin shows.
+DISCUSS_ROSTER = [
+    ("recon",   "Perplexity",  "research — grounds the debate"),
+    ("kilabz",  "OpenAI",      "code reviewer — position A"),
+    ("oracle",  "Google",      "reviewer/vision — position B  [mini]"),
+    ("lobster", "Anthropic",   "orchestration — synthesis"),
+]
+
+DISCUSS_TOPIC = (
+    "In one direct paragraph: what is the hardest unsolved problem "
+    "in deploying multi-agent AI systems reliably in production — "
+    "the one most likely to cause silent failures at scale?"
+)
+
+
+def print_roster() -> None:
+    """Print the demo team table. Model column comes from the LIVE registry (no drift)."""
+    from runtime.registry import REGISTRY as REG  # noqa: PLC0415
+    print("== MyndAIX Team Runtime — the team ==\n")
+    print(f"{'AGENT':<8}  {'MODEL':<16}  {'PROVIDER':<12}  ROLE")
+    print("─" * 72)
+    for agent, provider, role in DISCUSS_ROSTER:
+        model = getattr(REG.get(agent), "model", "?")
+        print(f"{agent:<8}  {model:<16}  {provider:<12}  {role}")
+
+
 async def demo_discuss() -> None:
     """3-phase self-learning multi-agent demo against the live Postgres ledger.
 
@@ -303,25 +331,10 @@ async def demo_discuss() -> None:
     )
     from runtime.registry import REGISTRY as REG
 
-    TOPIC = (
-        "In one direct paragraph: what is the hardest unsolved problem "
-        "in deploying multi-agent AI systems reliably in production — "
-        "the one most likely to cause silent failures at scale?"
-    )
+    TOPIC = DISCUSS_TOPIC
     TIMEOUT = 300.0
 
-    ROSTER = [
-        ("recon",   "sonar-pro",       "Perplexity",  "research — grounds the debate"),
-        ("kilabz",  "gpt-6-astra",     "OpenAI",      "code reviewer — position A"),
-        ("oracle",  "gemini-3.1-pro",  "Google",      "reviewer/vision — position B  [mini]"),
-        ("lobster", "claude-sonnet",   "Anthropic",   "orchestration — synthesis"),
-    ]
-
-    print("== MyndAIX Team Runtime — self-learning multi-agent demo ==\n")
-    print(f"{'AGENT':<8}  {'MODEL':<20}  {'PROVIDER':<12}  ROLE")
-    print("─" * 72)
-    for agent, model, provider, role in ROSTER:
-        print(f"{agent:<8}  {model:<20}  {provider:<12}  {role}")
+    print_roster()
     print(f"\nTOPIC  \"{TOPIC}\"\n")
 
     # ── Phase 1: Research ────────────────────────────────────────────────────
@@ -411,6 +424,8 @@ async def main() -> None:
         await demo_api()
     elif arg == "--discuss":
         await demo_discuss()
+    elif arg == "--roster":
+        print_roster()          # static team pane for the 4-pane demo layout
     elif arg == "--isolate":
         await demo_isolated()
     else:
