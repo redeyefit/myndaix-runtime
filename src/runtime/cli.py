@@ -84,8 +84,11 @@ def _sanitize_reply(body: str) -> str:
     body = re.sub(r'\x1b\].*?(?:\x07|\x1b\\)', '', body, flags=re.DOTALL)
     # Other ESC two-char sequences (e.g. ESC M reverse-index)
     body = re.sub(r'\x1b.', '', body)
-    # Bidi controls: U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+061C
-    body = re.sub('[‎‏‪-‮⁦-⁩؜]', '', body)
+    # Bidi controls: U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+061C.
+    # EXPLICIT \u escapes, NEVER embedded literals (review P1): the literals are invisible,
+    # and a single bidi-unaware tool in the pipeline (editor/diff/git transport) collapses
+    # the class to [--] — silently disabling the strip AND eating every hyphen in the reply.
+    body = re.sub(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c]', '', body)
     return _clean_reply(body)
 
 
@@ -109,17 +112,38 @@ async def _submit_and_fetch(agent: str, topic: str, timeout_s: float) -> Discuss
 
         deadline = time.monotonic() + timeout_s
         st = None
-        while time.monotonic() < deadline:
-            st = await led.get_status(jid)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                     ledger="local", error="TIMEOUT")
+            try:
+                # BOUND each poll by the remaining deadline (review P2): get_status carries
+                # its own ~30s command timeout, so an unbounded await here overshoots the
+                # caller's --timeout — and _discuss_main's as_completed then stalls every
+                # OTHER agent's print behind this one slow participant.
+                st = await asyncio.wait_for(led.get_status(jid), timeout=remaining)
+            except asyncio.TimeoutError:
+                return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                     ledger="local", error="TIMEOUT")
             if st and st["status"] in ("done", "failed", "dead"):
                 break
-            await asyncio.sleep(0.3)
-        else:
-            return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                                 ledger="local", error="TIMEOUT")
+            await asyncio.sleep(min(0.3, max(0.0, deadline - time.monotonic())))
 
         if st["status"] == "done":
-            bodies = [o.get("body") for o in (st.get("outbound") or []) if o.get("body")]
+            outs = st.get("outbound") or []
+            # CAS pending->sent, mirroring run_job (r7 #1): a displayed-but-still-pending
+            # outbound row is eligible for a later transport to claim and RE-DELIVER.
+            # Best-effort — the body prints regardless and stays retrievable via
+            # `mxr get --reply`, so a bookkeeping error never sinks the discuss view.
+            for o in outs:
+                if o.get("status") == "pending" and o.get("id") is not None:
+                    try:
+                        if await led.mark_outbound_sent_inline(o["id"], f"cli-{o['id']}"):
+                            o["status"] = "sent"
+                    except Exception:
+                        pass
+            bodies = [o.get("body") for o in outs if o.get("body")]
             if not bodies:
                 return DiscussResult(agent=agent, reply=None, job_id=job_id,
                                      ledger="local", error="EMPTY")
@@ -138,14 +162,41 @@ async def _submit_and_fetch(agent: str, topic: str, timeout_s: float) -> Discuss
         await led.close()
 
 
+async def _drain(stream: asyncio.StreamReader, limit: int) -> tuple[str, bool]:
+    """Read up to `limit` bytes; keep draining past the cap so the pipe never blocks the
+    writer, but REPORT truncation (review P2) so a clipped reply is never presented as
+    complete. Returns (text, truncated). Module-level (not a _remote_fetch closure) so the
+    truncation contract is unit-testable."""
+    buf = bytearray()
+    truncated = False
+    while True:
+        try:
+            chunk = await stream.read(4096)
+        except asyncio.CancelledError:
+            break
+        if not chunk:
+            break
+        room = limit - len(buf)
+        if room > 0:
+            buf.extend(chunk[:room])
+            if len(chunk) > room:
+                truncated = True
+        else:
+            truncated = True
+    return bytes(buf).decode("utf-8", errors="replace"), truncated
+
+
 async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> DiscussResult:
     """SSH-dispatch agent on remote host, capture stdout reply. Does not print."""
     # Hard precondition: remote login shell must be POSIX-compatible (bash/zsh).
     # Mini runs zsh — satisfied. shlex.quote() is unsafe on tcsh with newline-bearing topics.
     quoted_agent = shlex.quote(agent)
     quoted_topic = shlex.quote(topic)
-    remote_cmd = (f"env MXR_REVIEW_GATE_BYPASS=1 ~/.local/bin/mxr "
-                  f"{quoted_agent} -- {quoted_topic}")
+    # Forward the resolved timeout so the REMOTE mxr's sync-wait matches the caller's
+    # --timeout (review P2): without it the remote resolves its OWN wait (oracle defaults
+    # to 360s), silently capping a `--timeout 900` request at ~360s.
+    remote_cmd = (f"env MXR_REVIEW_GATE_BYPASS=1 MXR_TIMEOUT_S={timeout_s:g} "
+                  f"~/.local/bin/mxr {quoted_agent} -- {quoted_topic}")
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -162,21 +213,9 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
     # stdout/stderr are always set: we pass PIPE above
     assert proc.stdout is not None and proc.stderr is not None
 
-    async def _drain(stream: asyncio.StreamReader, limit: int) -> str:
-        buf = bytearray()
-        while True:
-            try:
-                chunk = await stream.read(4096)
-            except asyncio.CancelledError:
-                break
-            if not chunk:
-                break
-            if len(buf) < limit:
-                buf.extend(chunk[:limit - len(buf)])
-        return bytes(buf).decode("utf-8", errors="replace")
-
     job_id = None
     timed_out = False
+    stdout_truncated = False
     stdout_t = asyncio.create_task(_drain(proc.stdout, 512 * 1024))
     stderr_t = asyncio.create_task(_drain(proc.stderr, 32 * 1024))
     proc_done_t = asyncio.create_task(proc.wait())
@@ -192,7 +231,14 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                proc.kill()
+                # kill() races the process's own exit in this 5s window; an already-reaped
+                # pid raises ProcessLookupError, which would otherwise propagate out and
+                # abort _discuss_main's as_completed loop — losing EVERY collected reply
+                # (review P2). Terminating an already-dead process is a no-op, not an error.
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
                 await proc.wait()
 
         # Cancel any readers still outstanding and collect their buffers
@@ -200,8 +246,10 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
             if not t.done():
                 t.cancel()
         gathered = await asyncio.gather(stdout_t, stderr_t, return_exceptions=True)
-        stdout_text = gathered[0] if isinstance(gathered[0], str) else ""
-        stderr_text = gathered[1] if isinstance(gathered[1], str) else ""
+        stdout_text, stdout_truncated = (
+            gathered[0] if isinstance(gathered[0], tuple) else ("", False))
+        stderr_text, _ = (
+            gathered[1] if isinstance(gathered[1], tuple) else ("", False))
 
     except asyncio.CancelledError:
         # Outer task cancelled (Ctrl-C) — tear down subprocess cleanly
@@ -210,12 +258,27 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                proc.kill()
+                # Same already-reaped race as the timeout path — never let kill() abort
+                # cleanup with ProcessLookupError (review P2).
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
                 await proc.wait()
         for t in (stdout_t, stderr_t, proc_done_t):
             if not t.done():
                 t.cancel()
-        await asyncio.gather(stdout_t, stderr_t, proc_done_t, return_exceptions=True)
+        gathered = await asyncio.gather(stdout_t, stderr_t, proc_done_t,
+                                        return_exceptions=True)
+        # The remote job keeps running in its ledger after we cancel; surface its JOB_ID
+        # recovery handle before re-raising (review P2) — otherwise the acknowledged id was
+        # gathered privately and the operator has no way to reconnect to the live job.
+        cerr = gathered[1][0] if isinstance(gathered[1], tuple) else ""
+        for line in cerr.splitlines():
+            if line.startswith("JOB_ID="):
+                print(f"[interrupted — {agent} job may be live on {host}: "
+                      f"ssh {host} mxr get {line[7:].strip()} --reply]", file=sys.stderr)
+                break
         raise
 
     # Parse JOB_ID= from stderr (present if remote mxr reached the submit step)
@@ -228,17 +291,10 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
         return DiscussResult(agent=agent, reply=None, job_id=job_id,
                              ledger=host, error="TIMEOUT")
 
-    rc = proc.returncode
-    if rc == 255:
-        # SSH transport error (connection refused, host unreachable, etc.)
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="TRANSPORT_ERROR")
-    if rc != 0:
-        # Remote mxr itself failed (unknown agent, ledger down, etc.)
-        return DiscussResult(agent=agent, reply=None, job_id=None,
-                             ledger=host, error="SSH_ERROR")
-
-    # Terminal markers from the remote mxr — take precedence over body content
+    # Terminal markers from the remote mxr take precedence over the rc gate (review P2):
+    # a remote job that ACKED (emitted JOB_ID), then hit its own sync-timeout or empty-done,
+    # exits NON-ZERO. Reading rc first would bury it as an opaque SSH_ERROR with job_id
+    # discarded, stranding a reply that is still recoverable via `mxr get --reply`.
     if "MXR_DONE_EMPTY" in stderr_text:
         return DiscussResult(agent=agent, reply=None, job_id=job_id,
                              ledger=host, error="EMPTY")
@@ -246,12 +302,31 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
         return DiscussResult(agent=agent, reply=None, job_id=job_id,
                              ledger=host, error="TIMEOUT")
 
+    rc = proc.returncode
+    if rc == 255:
+        # SSH transport error (connection refused, host unreachable, etc.)
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="TRANSPORT_ERROR")
+    if rc != 0:
+        # Remote mxr itself failed (unknown agent, ledger down, etc.). PRESERVE job_id
+        # (not None): if submission was acknowledged the job may be live — keep its
+        # recovery handle rather than forcing an unrecoverable SSH_ERROR (review P2).
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error="SSH_ERROR")
+
     body = stdout_text.strip()
     if not body:
         return DiscussResult(agent=agent, reply=None, job_id=job_id,
                              ledger=host, error="EMPTY")
 
-    return DiscussResult(agent=agent, reply=_sanitize_reply(body),
+    reply = _sanitize_reply(body)
+    if stdout_truncated:
+        # The reply hit the 512 KiB drain cap — flag it INLINE (review P2) so a clipped
+        # review is never presented as complete; the full text stays in the ledger.
+        handle = (f"ssh {host} mxr get {job_id} --reply" if job_id
+                  else "job id not captured — full reply unavailable")
+        reply += f"\n\n[reply truncated at 512 KiB — full text: {handle}]"
+    return DiscussResult(agent=agent, reply=reply,
                          job_id=job_id, ledger=host, error=None)
 
 

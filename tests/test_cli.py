@@ -507,6 +507,43 @@ def test_clean_reply_strips_c1_keeps_unicode():
     assert cli._clean_reply("esc\x1b[31m del\x7f") == "esc[31m del"  # C0/DEL still stripped
 
 
+def test_sanitize_reply_strips_ansi_bidi_preserves_text():
+    # review P1: the bidi class must strip via EXPLICIT \u escapes. The failure mode the
+    # fix guards is a collapsed [--] class (literals corrupted by a bidi-unaware tool) that
+    # would (a) pass bidi through and (b) EAT every hyphen. Pin both directions so a future
+    # edit reintroducing literals — or a wrong escape — is caught. chr() keeps this source
+    # ASCII (the bidi controls are invisible if typed literally).
+    rlo, pdi = chr(0x202e), chr(0x2069)                 # RIGHT-TO-LEFT OVERRIDE, POP DIR ISO
+    all_bidi = "".join(chr(c) for c in (0x200e, 0x200f, 0x061c, 0x2066))
+    assert cli._sanitize_reply(f"safe{rlo}RTL{pdi}here") == "safeRTLhere"    # bidi stripped
+    assert cli._sanitize_reply(all_bidi) == ""                              # full set gone
+    assert cli._sanitize_reply("well-formed - text") == "well-formed - text"  # hyphens kept
+    assert cli._sanitize_reply("x\x1b[31mred\x1b[0m") == "xred"               # CSI stripped
+    assert cli._sanitize_reply("café €100 🚀") == "café €100 🚀"             # unicode intact
+
+
+def test_drain_reports_truncation_at_cap():
+    # review P2: _drain must FLAG when a reply exceeds the byte cap so a clipped body is
+    # never presented as complete. Fails without the fix: the old _drain returned a bare
+    # str, so the (text, truncated) unpack below raises.
+    import asyncio
+
+    async def _run():
+        exact = asyncio.StreamReader()
+        exact.feed_data(b"x" * 100)
+        exact.feed_eof()
+        text, trunc = await cli._drain(exact, 100)
+        assert text == "x" * 100 and trunc is False      # exactly at cap = complete
+
+        over = asyncio.StreamReader()
+        over.feed_data(b"y" * 250)
+        over.feed_eof()
+        text2, trunc2 = await cli._drain(over, 100)
+        assert len(text2) == 100 and trunc2 is True       # beyond cap = flagged + clipped
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):
