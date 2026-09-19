@@ -378,13 +378,18 @@ note(){ jq -cn --arg p "$play" --arg s "$1" --arg n "${2:-}" \
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }   # strip C0 + DEL; keep \t \n
 
 deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits the fallback
-  local subj="$1" body="$2" msg f; f="$INBOX/$(date +%Y%m%d%H%M%S)-$play.md"
+  local subj="$1" body="$2" msg f repo_slug; repo_slug="$(basename -- "$repo" 2>/dev/null || true)"
+  # repo slug in BOTH the filename (grep/ls at a glance across the shared multi-repo inbox,
+  # no need to open every file) and the header (structured field once opened) — play-fix's
+  # deliver() already carries a repo: field; this closes the same gap here (review MED,
+  # user-reported: verdicts from different repos were visually indistinguishable in the inbox).
+  f="$INBOX/$(date +%Y%m%d%H%M%S)-${repo_slug:-unknown-repo}-$play.md"
   # strip C0/DEL (incl. ESC) from the reviewer/triage LLM output before it lands in the jefe
   # inbox file — the diff steering that text is untrusted, and the verdict is later cat'd/relayed
   # in a terminal, so an escape sequence could repaint/hide the report. Mirrors play-fix deliver().
   body="$(printf '%s' "$body" | clean)"
-  if ! printf '# %s\n\nplay: %s\nref: %s\nrange: %s..%s\n\n===BEGIN VERDICT nonce=%s===\n%s\n===END VERDICT nonce=%s===\n' \
-        "$subj" "$play" "$ref" "$base" "$tip" "$nonce" "$body" "$nonce" > "$f" 2>/dev/null; then
+  if ! printf '# %s\n\nplay: %s\nrepo: %s\nref: %s\nrange: %s..%s\n\n===BEGIN VERDICT nonce=%s===\n%s\n===END VERDICT nonce=%s===\n' \
+        "$subj" "$play" "${repo_slug:-unknown-repo}" "$ref" "$base" "$tip" "$nonce" "$body" "$nonce" > "$f" 2>/dev/null; then
     printf '[%s] INBOX WRITE FAILED — verdict follows:\n%s\n' "$play" "$body" >&2
     : > "$STATE/UNDELIVERED-$play" 2>/dev/null || true
     return 1                                          # durable write FAILED — caller must NOT mark done
@@ -816,11 +821,12 @@ outcomes_record(){
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
-  local kf; kf="$INBOX/$(date +%Y%m%d%H%M%S)-$play-outcomes.md"
+  local kf repo_slug; repo_slug="$(basename -- "$repo" 2>/dev/null || true)"
+  kf="$INBOX/$(date +%Y%m%d%H%M%S)-${repo_slug:-unknown-repo}-$play-outcomes.md"
   # all12 = the key12 column, space-joined — feeds the paste-ready batch hint (PR-A §2d)
   local all12; all12="$(printf '%s\n' "$out_keys" | cut -f1 | tr '\n' ' ' || true)"
-  { printf '# outcome keys — %s\n\nplay: %s\nref: %s\n\nEach recorded finding below. Label it: real (reviewer was RIGHT — ground truth), fp (reviewer was WRONG), or wontfix (right, but declining):\n\n' \
-      "$play" "$play" "$ref"
+  { printf '# outcome keys — %s\n\nplay: %s\nrepo: %s\nref: %s\n\nEach recorded finding below. Label it: real (reviewer was RIGHT — ground truth), fp (reviewer was WRONG), or wontfix (right, but declining):\n\n' \
+      "$play" "$play" "${repo_slug:-unknown-repo}" "$ref"
     printf '%s\n' "$out_keys" | while IFS=$'\t' read -r k12 fam tag path; do
       [[ -n "$k12" ]] || continue
       printf -- '- finding:%s @ %s  [%s]\n    mxr outcome %s real      # reviewer was RIGHT — confirmed ground truth\n    mxr outcome %s fp        # reviewer was WRONG\n    mxr outcome %s wontfix   # right, but declining\n' \
