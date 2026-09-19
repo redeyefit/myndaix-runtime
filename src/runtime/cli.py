@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import math
 import os
 import re
 import shlex
@@ -206,7 +207,9 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers e.g. an embedded NUL byte in remote_cmd (create_subprocess_exec
+        # rejects it) — must not escape and abort the whole discuss barrier (review LOW).
         return DiscussResult(agent=agent, reply=None, job_id=None,
                              ledger=host, error="UNREACHABLE")
 
@@ -281,53 +284,72 @@ async def _remote_fetch(host: str, agent: str, topic: str, timeout_s: float) -> 
                 break
         raise
 
-    # Parse JOB_ID= from stderr (present if remote mxr reached the submit step)
-    for line in stderr_text.splitlines():
-        if line.startswith("JOB_ID="):
-            job_id = line[7:].strip()
-            break
+    try:
+        # Parse JOB_ID= from stderr (present if remote mxr reached the submit step)
+        for line in stderr_text.splitlines():
+            if line.startswith("JOB_ID="):
+                job_id = line[7:].strip()
+                break
 
-    if timed_out:
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="TIMEOUT")
+        if timed_out:
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="TIMEOUT")
 
-    # Terminal markers from the remote mxr take precedence over the rc gate (review P2):
-    # a remote job that ACKED (emitted JOB_ID), then hit its own sync-timeout or empty-done,
-    # exits NON-ZERO. Reading rc first would bury it as an opaque SSH_ERROR with job_id
-    # discarded, stranding a reply that is still recoverable via `mxr get --reply`.
-    if "MXR_DONE_EMPTY" in stderr_text:
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="EMPTY")
-    if "MXR_SYNC_TIMEOUT" in stderr_text:
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="TIMEOUT")
+        # Terminal markers from the remote mxr take precedence over the rc gate (review P2):
+        # a remote job that ACKED (emitted JOB_ID), then hit its own sync-timeout or
+        # empty-done, exits NON-ZERO. Reading rc first would bury it as an opaque SSH_ERROR
+        # with job_id discarded, stranding a reply that is still recoverable via
+        # `mxr get --reply`. Matched LINE-ANCHORED (review MED), not by substring: a bare
+        # `in stderr_text` test lets agent reply text that merely MENTIONS a marker name
+        # forge the result — mirrors the documented marker contract (cli.py:35-46) and the
+        # phone wrapper's `grep -q '^MARKER$'`.
+        stderr_lines = stderr_text.splitlines()
+        if "MXR_DONE_EMPTY" in stderr_lines:
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="EMPTY")
+        if "MXR_SYNC_TIMEOUT" in stderr_lines:
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="TIMEOUT")
+        if "MXR_JOB_FAILED" in stderr_lines or "MXR_JOB_DEAD" in stderr_lines:
+            # The remote agent WAS reached and its job hit a terminal failed/dead state —
+            # distinct from SSH_ERROR (transport/mxr-launch failure BEFORE the agent ran).
+            # Falling through to the rc gate misreported this as SSH_ERROR, pointing the
+            # operator at the wrong layer (SSH) instead of the real one (review MED).
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="FAILED")
 
-    rc = proc.returncode
-    if rc == 255:
-        # SSH transport error (connection refused, host unreachable, etc.)
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="TRANSPORT_ERROR")
-    if rc != 0:
-        # Remote mxr itself failed (unknown agent, ledger down, etc.). PRESERVE job_id
-        # (not None): if submission was acknowledged the job may be live — keep its
-        # recovery handle rather than forcing an unrecoverable SSH_ERROR (review P2).
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="SSH_ERROR")
+        rc = proc.returncode
+        if rc == 255:
+            # SSH transport error (connection refused, host unreachable, etc.)
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="TRANSPORT_ERROR")
+        if rc != 0:
+            # Remote mxr itself failed (unknown agent, ledger down, etc.). PRESERVE job_id
+            # (not None): if submission was acknowledged the job may be live — keep its
+            # recovery handle rather than forcing an unrecoverable SSH_ERROR (review P2).
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="SSH_ERROR")
 
-    body = stdout_text.strip()
-    if not body:
-        return DiscussResult(agent=agent, reply=None, job_id=job_id,
-                             ledger=host, error="EMPTY")
+        body = stdout_text.strip()
+        if not body:
+            return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                                 ledger=host, error="EMPTY")
 
-    reply = _sanitize_reply(body)
-    if stdout_truncated:
-        # The reply hit the 512 KiB drain cap — flag it INLINE (review P2) so a clipped
-        # review is never presented as complete; the full text stays in the ledger.
-        handle = (f"ssh {host} mxr get {job_id} --reply" if job_id
-                  else "job id not captured — full reply unavailable")
-        reply += f"\n\n[reply truncated at 512 KiB — full text: {handle}]"
-    return DiscussResult(agent=agent, reply=reply,
-                         job_id=job_id, ledger=host, error=None)
+        reply = _sanitize_reply(body)
+        if stdout_truncated:
+            # The reply hit the 512 KiB drain cap — flag it INLINE (review P2) so a clipped
+            # review is never presented as complete; the full text stays in the ledger.
+            handle = (f"ssh {host} mxr get {job_id} --reply" if job_id
+                      else "job id not captured — full reply unavailable")
+            reply += f"\n\n[reply truncated at 512 KiB — full text: {handle}]"
+        return DiscussResult(agent=agent, reply=reply,
+                             job_id=job_id, ledger=host, error=None)
+    except Exception as e:
+        # No exception may escape a participant task and abort the whole discuss barrier
+        # (design contract, docs/mxr-discuss-design.md:266-268) — _submit_and_fetch already
+        # honors this; this closes the same gap on the remote path (review LOW).
+        return DiscussResult(agent=agent, reply=None, job_id=job_id,
+                             ledger=host, error=f"SUBMIT_ERROR: {e}")
 
 
 def _print_discuss_result(result: DiscussResult) -> None:
@@ -350,10 +372,19 @@ def _print_discuss_result(result: DiscussResult) -> None:
     elif result.error == "TRANSPORT_ERROR":
         note = "    [TRANSPORT_ERROR — SSH exit 255"
         if result.job_id:
-            note += f"; job may be live: mxr get {result.job_id} --reply on {result.ledger}"
+            # Runnable form (review MED): TRANSPORT_ERROR only fires on the remote path, so
+            # result.ledger is always a host here — "mxr get ... on <host>" is not a command
+            # the operator can paste; ssh there first, like every other remote recovery hint.
+            note += f"; job may be live: ssh {result.ledger} mxr get {result.job_id} --reply"
         print(note + "]")
     elif result.error == "SSH_ERROR":
-        print("    [SSH_ERROR — remote mxr failed before reaching the agent]")
+        note = "    [SSH_ERROR — remote mxr failed before reaching the agent"
+        if result.job_id:
+            # _remote_fetch deliberately PRESERVES job_id on this path (submission was
+            # acknowledged) — surface the same recovery handle every other job_id-bearing
+            # branch gets instead of silently dropping it (review MED).
+            note += f"; job may be live: ssh {result.ledger} mxr get {result.job_id} --reply"
+        print(note + "]")
     elif result.error == "FAILED":
         jnote = f" (job {result.job_id})" if result.job_id else ""
         print(f"    [FAILED — agent job failed or died{jnote}]")
@@ -363,14 +394,21 @@ def _print_discuss_result(result: DiscussResult) -> None:
         print("    [no reply]")
 
 
-async def _discuss_main(agents_ordered: list, topic: str, timeout_s: float) -> int:
+async def _discuss_main(agents_ordered: list, topic: str,
+                        timeout_s: Optional[float]) -> int:
     tasks = []
     for ag in agents_ordered:
         spec = REGISTRY[ag]
+        # timeout_s is None unless the operator passed an explicit --timeout/MXR_TIMEOUT_S
+        # (that value then applies uniformly, unchanged). Otherwise derive PER-AGENT via
+        # _resolve_sync_wait, mirroring run_job (review MED): a flat default shorter than a
+        # slow agent's exec cap (kilabz's profile resolves to 960s) strands its DONE reply
+        # behind a false TIMEOUT — the exact class _resolve_sync_wait exists to prevent.
+        agent_timeout = timeout_s if timeout_s is not None else _resolve_sync_wait(ag)
         if spec.host:
-            coro = _remote_fetch(spec.host, ag, topic, timeout_s)
+            coro = _remote_fetch(spec.host, ag, topic, agent_timeout)
         else:
-            coro = _submit_and_fetch(ag, topic, timeout_s)
+            coro = _submit_and_fetch(ag, topic, agent_timeout)
         tasks.append(asyncio.create_task(coro, name=ag))
 
     results: dict = {}
@@ -790,7 +828,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         dp.add_argument("--with", dest="agents", metavar="AGENT", nargs="+", required=True,
                         help="agents to participate (RESPONDER authority only)")
         dp.add_argument("--timeout", type=float, default=None,
-                        help="per-agent reply timeout in seconds (default: MXR_TIMEOUT_S or 300)")
+                        help="per-agent reply timeout in seconds "
+                             "(default: MXR_TIMEOUT_S or each agent's own profile wait)")
         dargs = dp.parse_args(raw[1:])
 
         # Deduplicate while preserving order
@@ -820,18 +859,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(e, file=sys.stderr)
             return 2
 
-        timeout_s = dargs.timeout
-        if timeout_s is None:
-            raw_t = os.environ.get("MXR_TIMEOUT_S") or ""
-            if raw_t:
-                try:
-                    timeout_s = float(raw_t)
-                except ValueError:
-                    pass
-            if timeout_s is None:
-                timeout_s = 300.0
+        # No manual MXR_TIMEOUT_S/flat-default resolution here (review MED): an explicit
+        # --timeout applies uniformly and wins over everything, same as before. When unset,
+        # None flows through to _discuss_main so each agent gets _resolve_sync_wait(ag) —
+        # which is where MXR_TIMEOUT_S-env-wins and the per-profile default already live,
+        # instead of a flat 300s that ignores a slow agent's profile (review MED).
+        if dargs.timeout is not None and not (math.isfinite(dargs.timeout)
+                                              and dargs.timeout > 0):
+            dp.error(f"--timeout must be a finite positive number, got {dargs.timeout!r}")
 
-        return asyncio.run(_discuss_main(agents_ordered, dargs.topic, timeout_s))
+        return asyncio.run(_discuss_main(agents_ordered, dargs.topic, dargs.timeout))
 
     p = argparse.ArgumentParser(
         prog="mxr", description='submit a task to the MyndAIX runtime',
