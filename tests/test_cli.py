@@ -507,6 +507,248 @@ def test_clean_reply_strips_c1_keeps_unicode():
     assert cli._clean_reply("esc\x1b[31m del\x7f") == "esc[31m del"  # C0/DEL still stripped
 
 
+def test_sanitize_reply_strips_ansi_bidi_preserves_text():
+    # review P1: the bidi class must strip via EXPLICIT \u escapes. The failure mode the
+    # fix guards is a collapsed [--] class (literals corrupted by a bidi-unaware tool) that
+    # would (a) pass bidi through and (b) EAT every hyphen. Pin both directions so a future
+    # edit reintroducing literals — or a wrong escape — is caught. chr() keeps this source
+    # ASCII (the bidi controls are invisible if typed literally).
+    rlo, pdi = chr(0x202e), chr(0x2069)                 # RIGHT-TO-LEFT OVERRIDE, POP DIR ISO
+    all_bidi = "".join(chr(c) for c in (0x200e, 0x200f, 0x061c, 0x2066))
+    assert cli._sanitize_reply(f"safe{rlo}RTL{pdi}here") == "safeRTLhere"    # bidi stripped
+    assert cli._sanitize_reply(all_bidi) == ""                              # full set gone
+    assert cli._sanitize_reply("well-formed - text") == "well-formed - text"  # hyphens kept
+    assert cli._sanitize_reply("x\x1b[31mred\x1b[0m") == "xred"               # CSI stripped
+    assert cli._sanitize_reply("café €100 🚀") == "café €100 🚀"             # unicode intact
+
+
+def _capture_discuss_main():
+    """Replace cli._discuss_main with an async stub recording its args; returns
+    (captured_dict, restore_fn). Isolates main()'s preflight/timeout-resolution logic
+    from the real dispatch (DB/SSH) the same way _capture_submit isolates cli.submit."""
+    captured: dict = {}
+
+    async def fake_discuss_main(agents_ordered, topic, timeout_s):
+        captured.update(agents_ordered=agents_ordered, topic=topic, timeout_s=timeout_s)
+        return 0
+
+    orig = cli._discuss_main
+    cli._discuss_main = fake_discuss_main
+    return captured, (lambda: setattr(cli, "_discuss_main", orig))
+
+
+def test_discuss_preflight_rejects_unknown_agent():
+    assert cli.main(["discuss", "topic", "--with", "no-such-agent"]) == 2
+
+
+def test_discuss_preflight_rejects_non_responder_agent():
+    # mack is WORKSPACE_ACTOR — discuss is RESPONDER-only (a workspace-mutating agent must
+    # never be fanned into a read-only multi-agent gut-check).
+    assert cli.main(["discuss", "topic", "--with", "mack"]) == 2
+
+
+def test_discuss_preflight_accepts_responders_and_dedups():
+    captured, restore = _capture_discuss_main()
+    try:
+        rc = cli.main(["discuss", "topic", "--with", "kilabz", "kilabz", "librarian"])
+        assert rc == 0
+        assert captured["agents_ordered"] == ["kilabz", "librarian"]
+    finally:
+        restore()
+
+
+def test_discuss_unset_timeout_flows_through_as_none():
+    # review MED (discuss-flat-300-ignores-profile-syncwait): main() must NOT pre-resolve a
+    # flat 300s default — None has to reach _discuss_main so it can derive a per-agent wait.
+    captured, restore = _capture_discuss_main()
+    try:
+        cli.main(["discuss", "topic", "--with", "kilabz"])
+        assert captured["timeout_s"] is None
+    finally:
+        restore()
+
+
+def test_discuss_explicit_timeout_flows_through_unchanged():
+    captured, restore = _capture_discuss_main()
+    try:
+        cli.main(["discuss", "topic", "--with", "kilabz", "--timeout", "42"])
+        assert captured["timeout_s"] == 42.0
+    finally:
+        restore()
+
+
+def test_discuss_timeout_rejects_nan_inf_negative_zero():
+    for bad in ("nan", "inf", "-5", "0"):
+        try:
+            cli.main(["discuss", "topic", "--with", "kilabz", "--timeout", bad])
+        except SystemExit as e:
+            assert e.code == 2, f"--timeout {bad} exited {e.code!r}, want 2"
+        else:
+            assert False, f"--timeout {bad} should have exited"
+
+
+def test_discuss_main_resolves_per_agent_timeout_when_unset():
+    # review MED: a flat default shorter than a slow agent's exec cap strands its DONE
+    # reply behind a false TIMEOUT. kilabz (profile timeout_s=900 -> sync_wait 960) and
+    # librarian (timeout_s=120 -> sync_wait 180) must each get THEIR OWN derived wait, not
+    # a shared flat value, when no --timeout/MXR_TIMEOUT_S is given.
+    import asyncio as _asyncio
+    seen = {}
+
+    async def fake_submit_and_fetch(agent, topic, timeout_s):
+        seen[agent] = timeout_s
+        return cli.DiscussResult(agent=agent, reply="ok", job_id=None,
+                                 ledger="local", error=None)
+
+    orig = cli._submit_and_fetch
+    cli._submit_and_fetch = fake_submit_and_fetch
+    try:
+        _with_env("MXR_TIMEOUT_S", None, lambda: _asyncio.run(
+            cli._discuss_main(["kilabz", "librarian"], "t", None)))
+        assert seen["kilabz"] == 960.0
+        assert seen["librarian"] == 180.0
+    finally:
+        cli._submit_and_fetch = orig
+
+
+def test_discuss_main_explicit_timeout_applies_uniformly():
+    import asyncio as _asyncio
+    seen = {}
+
+    async def fake_submit_and_fetch(agent, topic, timeout_s):
+        seen[agent] = timeout_s
+        return cli.DiscussResult(agent=agent, reply="ok", job_id=None,
+                                 ledger="local", error=None)
+
+    orig = cli._submit_and_fetch
+    cli._submit_and_fetch = fake_submit_and_fetch
+    try:
+        _asyncio.run(cli._discuss_main(["kilabz", "librarian"], "t", 42.0))
+        assert seen["kilabz"] == 42.0 and seen["librarian"] == 42.0
+    finally:
+        cli._submit_and_fetch = orig
+
+
+class _FakeProc:
+    """Duck-types asyncio.subprocess.Process closely enough for _remote_fetch: real
+    StreamReaders (so _drain's .read(4096) works unmodified) + an async wait()."""
+
+    def __init__(self, returncode, stdout_bytes=b"", stderr_bytes=b""):
+        self.returncode = returncode
+        self.stdout = __import__("asyncio").StreamReader()
+        self.stdout.feed_data(stdout_bytes)
+        self.stdout.feed_eof()
+        self.stderr = __import__("asyncio").StreamReader()
+        self.stderr.feed_data(stderr_bytes)
+        self.stderr.feed_eof()
+
+    async def wait(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def _patch_create_subprocess_exec(proc):
+    import asyncio as _asyncio
+
+    async def fake(*args, **kwargs):
+        return proc
+
+    orig = _asyncio.create_subprocess_exec
+    _asyncio.create_subprocess_exec = fake
+    return lambda: setattr(_asyncio, "create_subprocess_exec", orig)
+
+
+def test_remote_fetch_marker_line_anchored_not_substring():
+    # review MED (remote-marker-substring-not-anchored): a bare `in stderr_text` test fires
+    # on agent reply text that merely MENTIONS a marker name mid-line. Reproduces the
+    # review's own repro — the REAL terminal marker on its own line is MXR_JOB_FAILED, but
+    # the stderr blob also contains prose naming MXR_SYNC_TIMEOUT/MXR_DONE_EMPTY mid-sentence.
+    import asyncio as _asyncio
+
+    async def _run():
+        stderr_blob = (
+            "JOB_ID=deadbeef-0000-4000-8000-000000000001\n"
+            "the model quoted our docs, mentioning MXR_SYNC_TIMEOUT and MXR_DONE_EMPTY "
+            "mid-sentence while reviewing this file\n"
+            "MXR_JOB_FAILED\n"
+        )
+        proc = _FakeProc(returncode=1, stderr_bytes=stderr_blob.encode())
+        restore = _patch_create_subprocess_exec(proc)
+        try:
+            return await cli._remote_fetch("mini", "oracle", "topic", 5.0)
+        finally:
+            restore()
+
+    result = _asyncio.run(_run())
+    assert result.error == "FAILED"
+    assert result.job_id == "deadbeef-0000-4000-8000-000000000001"
+
+
+def test_remote_fetch_done_empty_marker_beats_nonzero_rc():
+    # The fix's own suggested check: rc!=0 AND a genuine MXR_DONE_EMPTY line must classify
+    # as EMPTY (recoverable), not fall through to the opaque SSH_ERROR rc gate.
+    import asyncio as _asyncio
+
+    async def _run():
+        stderr_blob = "JOB_ID=deadbeef-0000-4000-8000-000000000002\nMXR_DONE_EMPTY\n"
+        proc = _FakeProc(returncode=1, stderr_bytes=stderr_blob.encode())
+        restore = _patch_create_subprocess_exec(proc)
+        try:
+            return await cli._remote_fetch("mini", "librarian", "topic", 5.0)
+        finally:
+            restore()
+
+    result = _asyncio.run(_run())
+    assert result.error == "EMPTY"
+    assert result.job_id == "deadbeef-0000-4000-8000-000000000002"
+
+
+def test_remote_fetch_unrecognized_failure_falls_to_ssh_error_with_job_id():
+    # No recognized marker: still falls back to SSH_ERROR, and still PRESERVES job_id
+    # (review MED: _print_discuss_result now surfaces this handle instead of dropping it).
+    import asyncio as _asyncio
+
+    async def _run():
+        stderr_blob = "JOB_ID=deadbeef-0000-4000-8000-000000000003\nsome other crash\n"
+        proc = _FakeProc(returncode=1, stderr_bytes=stderr_blob.encode())
+        restore = _patch_create_subprocess_exec(proc)
+        try:
+            return await cli._remote_fetch("mini", "kilabz", "topic", 5.0)
+        finally:
+            restore()
+
+    result = _asyncio.run(_run())
+    assert result.error == "SSH_ERROR"
+    assert result.job_id == "deadbeef-0000-4000-8000-000000000003"
+
+
+def test_drain_reports_truncation_at_cap():
+    # review P2: _drain must FLAG when a reply exceeds the byte cap so a clipped body is
+    # never presented as complete. Fails without the fix: the old _drain returned a bare
+    # str, so the (text, truncated) unpack below raises.
+    import asyncio
+
+    async def _run():
+        exact = asyncio.StreamReader()
+        exact.feed_data(b"x" * 100)
+        exact.feed_eof()
+        text, trunc = await cli._drain(exact, 100)
+        assert text == "x" * 100 and trunc is False      # exactly at cap = complete
+
+        over = asyncio.StreamReader()
+        over.feed_data(b"y" * 250)
+        over.feed_eof()
+        text2, trunc2 = await cli._drain(over, 100)
+        assert len(text2) == 100 and trunc2 is True       # beyond cap = flagged + clipped
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     passed = 0
     for _name, _fn in sorted(globals().items()):

@@ -6,6 +6,11 @@
     PYTHONPATH=src python3 demo.py --postgres  # the SAME flow, but state lives in Postgres
                                                # (needs: brew services start postgresql@16
                                                #  && createdb runtime_test)
+    PYTHONPATH=src python3 demo.py --discuss   # 3-phase self-learning loop: recon researches,
+                                               # kilabz (GPT-6-Astra) + oracle (Gemini 3.1 Pro)
+                                               # debate head-to-head, lobster (Claude Sonnet)
+                                               # synthesizes — 4 agents, 3 providers, 1 ledger.
+                                               # Requires: live runtime serve + Mini reachable.
 
 The `--isolate` and `--postgres` runs call the SAME worker.drain() - only the
 ledger differs. That is the whole thesis: persistence swaps behind the contract.
@@ -278,6 +283,135 @@ async def demo_api() -> None:
         await led.close()
 
 
+# The 4 agents in the discuss demo, with the provider each model comes from. Kept as
+# static demo copy (role text is demo-facing, not the registry's terse role field); the
+# --roster pane reads the LIVE model straight from REGISTRY so any registry re-pin shows.
+DISCUSS_ROSTER = [
+    ("recon",   "Perplexity",  "research — grounds the debate"),
+    ("kilabz",  "OpenAI",      "code reviewer — position A"),
+    ("oracle",  "Google",      "reviewer/vision — position B  [mini]"),
+    ("lobster", "Anthropic",   "orchestration — synthesis"),
+]
+
+DISCUSS_TOPIC = (
+    "In one direct paragraph: what is the hardest unsolved problem "
+    "in deploying multi-agent AI systems reliably in production — "
+    "the one most likely to cause silent failures at scale?"
+)
+
+
+def print_roster() -> None:
+    """Print the demo team table. Model column comes from the LIVE registry (no drift)."""
+    from runtime.registry import REGISTRY as REG  # noqa: PLC0415
+    print("== MyndAIX Team Runtime — the team ==\n")
+    print(f"{'AGENT':<8}  {'MODEL':<16}  {'PROVIDER':<12}  ROLE")
+    print("─" * 72)
+    for agent, provider, role in DISCUSS_ROSTER:
+        model = getattr(REG.get(agent), "model", "?")
+        print(f"{agent:<8}  {model:<16}  {provider:<12}  {role}")
+
+
+async def demo_discuss() -> None:
+    """3-phase self-learning multi-agent demo against the live Postgres ledger.
+
+    Phase 1 — recon (Perplexity sonar-pro) grounds the topic with live research.
+    Phase 2 — kilabz (GPT-6-Astra) and oracle (Gemini 3.1 Pro) debate head-to-head,
+              running concurrently through the ledger on two different machines/providers.
+    Phase 3 — lobster (Claude Sonnet) reads both positions and synthesizes a final answer
+              — the "self-learning" step: the system improves its answer through structured debate.
+
+    All jobs are durable Postgres rows. Any result is recoverable with: mxr get <job-id>
+    Requires: `python3 -m runtime.serve` running + Mac Mini reachable via SSH (for oracle).
+    """
+    # Import the live-ledger dispatch helpers from cli.py — same contract mxr uses.
+    from runtime.cli import (  # noqa: PLC0415
+        _print_discuss_result,
+        _remote_fetch,
+        _submit_and_fetch,
+    )
+    from runtime.registry import REGISTRY as REG
+
+    TOPIC = DISCUSS_TOPIC
+    TIMEOUT = 300.0
+
+    print_roster()
+    print(f"\nTOPIC  \"{TOPIC}\"\n")
+
+    # ── Phase 1: Research ────────────────────────────────────────────────────
+    print("── Phase 1  recon / Perplexity sonar-pro ───────────────────────────")
+    print("   grounding the question with live research\n")
+    research = await _submit_and_fetch("recon", TOPIC, TIMEOUT)
+    if research.job_id:
+        print(f"   job {research.job_id[:8]}", end="")
+        print(f"  -> {('done' if research.reply else research.error)}\n")
+    if research.reply:
+        for line in research.reply.splitlines():
+            print("   " + line)
+    else:
+        print(f"   [recon: {research.error}]")
+    print()
+
+    # ── Phase 2: Debate (parallel) ───────────────────────────────────────────
+    print("── Phase 2  kilabz (GPT-6-Astra) ⟷ oracle (Gemini 3.1 Pro) ────────")
+    print("   dispatched concurrently — different models, different machines\n")
+
+    debate_topic = TOPIC
+    if research.reply:
+        debate_topic = (
+            f"Background (live research):\n{research.reply}\n\n"
+            f"Given this context, answer directly and specifically: {TOPIC}"
+        )
+
+    oracle_host = (REG.get("oracle") or type("_", (), {"host": "mini"})()).host
+    kilabz_task = asyncio.create_task(
+        _submit_and_fetch("kilabz", debate_topic, TIMEOUT), name="kilabz"
+    )
+    oracle_task = asyncio.create_task(
+        _remote_fetch(oracle_host, "oracle", debate_topic, TIMEOUT), name="oracle"
+    )
+    kilabz_result, oracle_result = await asyncio.gather(kilabz_task, oracle_task)
+
+    _print_discuss_result(kilabz_result)
+    _print_discuss_result(oracle_result)
+    print()
+
+    # ── Phase 3: Synthesis (self-learning) ───────────────────────────────────
+    print("── Phase 3  lobster / Claude Sonnet — synthesis ────────────────────")
+    print("   reading both positions, producing a single learned answer\n")
+
+    kilabz_pos = kilabz_result.reply or "[no reply from kilabz]"
+    oracle_pos = oracle_result.reply or "[no reply from oracle]"
+    synthesis_prompt = (
+        f"Question posed to two reviewers: {TOPIC}\n\n"
+        f"GPT-6-Astra answered:\n{kilabz_pos}\n\n"
+        f"Gemini 3.1 Pro answered:\n{oracle_pos}\n\n"
+        "Synthesize both positions in two paragraphs: "
+        "(1) where they agreed and why that convergence matters, "
+        "(2) where they diverged and which view is stronger. "
+        "Close with the single most accurate answer to the original question."
+    )
+    synthesis = await _submit_and_fetch("lobster", synthesis_prompt, TIMEOUT)
+    if synthesis.job_id:
+        print(f"   job {synthesis.job_id[:8]}", end="")
+        print(f"  -> {('done' if synthesis.reply else synthesis.error)}\n")
+    if synthesis.reply:
+        for line in synthesis.reply.splitlines():
+            print("   " + line)
+    else:
+        print(f"   [lobster: {synthesis.error}]")
+    print()
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    all_results = [research, kilabz_result, oracle_result, synthesis]
+    job_ids = [r.job_id for r in all_results if r.job_id]
+    succeeded = sum(1 for r in all_results if r.reply)
+    print(f"{'OK' if succeeded == 4 else 'PARTIAL'} — {succeeded}/4 agents replied. "
+          f"{len(job_ids)} durable job row(s) in Postgres. "
+          f"Any result recoverable with: mxr get <job-id> --reply")
+    if job_ids:
+        print("   job ids: " + "  ".join(jid[:8] for jid in job_ids))
+
+
 async def main() -> None:
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg == "--postgres":
@@ -288,6 +422,10 @@ async def main() -> None:
         await demo_terminal()
     elif arg == "--api":
         await demo_api()
+    elif arg == "--discuss":
+        await demo_discuss()
+    elif arg == "--roster":
+        print_roster()          # static team pane for the 4-pane demo layout
     elif arg == "--isolate":
         await demo_isolated()
     else:
