@@ -308,7 +308,7 @@ fi
 # WORKER: canary -> review -> triage -> deliver. Bounded. Spine is the ledger.
 # ===========================================================================
 repo="$2"; base="$3"; tip="$4"; ref="$5"; remote_url="${6:-}"; orig_base="${7:-}"   # $7: pre-fold base (empty on direct/gate calls)
-repo_id="$(basename "$repo")"                        # repo bucket for per-repo concurrency (PR-2); review jobs carry it, canary stays cap-exempt
+repo_id="$(basename -- "$repo")"                        # repo bucket for per-repo concurrency (PR-2); review jobs carry it, canary stays cap-exempt
 # transient-marker scope — must derive IDENTICALLY to controller._transient_marker: repo basename
 # + ref, slugged like python _slug (every char outside [A-Za-z0-9._-] -> '-', so refs/heads/main
 # -> refs-heads-main). A bare transient-<tip> was GLOBAL: two watched repos sharing a commit sha
@@ -378,7 +378,7 @@ note(){ jq -cn --arg p "$play" --arg s "$1" --arg n "${2:-}" \
 clean(){ LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'; }   # strip C0 + DEL; keep \t \n
 
 deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits the fallback
-  local subj="$1" body="$2" msg f repo_slug; repo_slug="$(basename -- "$repo" 2>/dev/null || true)"
+  local subj="$1" body="$2" msg f repo_slug; repo_slug="$(basename -- "$repo" 2>/dev/null | clean | tr -d '\n/' || true)"
   # repo slug in BOTH the filename (grep/ls at a glance across the shared multi-repo inbox,
   # no need to open every file) and the header (structured field once opened) — play-fix's
   # deliver() already carries a repo: field; this closes the same gap here (review MED,
@@ -821,7 +821,7 @@ outcomes_record(){
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
-  local kf repo_slug; repo_slug="$(basename -- "$repo" 2>/dev/null || true)"
+  local kf repo_slug; repo_slug="$(basename -- "$repo" 2>/dev/null | clean | tr -d '\n/' || true)"
   kf="$INBOX/$(date +%Y%m%d%H%M%S)-${repo_slug:-unknown-repo}-$play-outcomes.md"
   # all12 = the key12 column, space-joined — feeds the paste-ready batch hint (PR-A §2d)
   local all12; all12="$(printf '%s\n' "$out_keys" | cut -f1 | tr '\n' ' ' || true)"
