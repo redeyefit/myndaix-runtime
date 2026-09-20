@@ -87,6 +87,13 @@ RATE_FLOOR = _int_env("MYNDAIX_AUTOMERGE_RATE_FLOOR", 100)
 DRY_RUN = os.environ.get("MYNDAIX_AUTOMERGE_DRY_RUN") == "1"
 TEST_MODE = os.environ.get("MYNDAIX_AUTOMERGE_TEST_MODE") == "1"
 MERGE_OVERRIDE = os.environ.get("MYNDAIX_AUTOMERGE_MERGE_OVERRIDE", "")  # test seam: record, don't merge
+# SHADOW_CODE: bypasses the docs-only gate to shadow-evaluate code PRs. Forces DRY_RUN — never
+# merges. Deduplicates per PR head via a state file so the paid 3-agent review runs ONCE per
+# head, not every 30-min tick. Records nothing in the DB so code PRs remain evaluable when the
+# real code gate is eventually armed (no stale "skipped" records to clear).
+SHADOW_CODE = os.environ.get("MYNDAIX_AUTOMERGE_SHADOW_CODE") == "1"
+if SHADOW_CODE:
+    DRY_RUN = True
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # strict git diff --raw status grammar: A/D/M bare; R/C with a 0-100 similarity score.
@@ -498,7 +505,9 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
         return ("skipped", f"unparseable diff ({ex}) — human")
     ok, why = classify_diff(entries)
     if not ok:
-        return ("skipped", f"not docs-only: {why} — human")
+        if not SHADOW_CODE:
+            return ("skipped", f"not docs-only: {why} — human")
+        log(f"PR#{n}: SHADOW bypassing docs-only gate ({why})")
 
     # a docs diff over play-review's content cap would make the review ABORT (exit 2) every tick —
     # head-terminal, so pre-cap it here and record a human skip (codex MAJOR mirror-wedge).
@@ -548,6 +557,13 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
     if not DRY_RUN and _count(_day(f"-author-{author}")) >= MAX_PER_AUTHOR_DAY:
         log(f"PR#{n}: author {author} daily cap — defer"); return None
 
+    # shadow dedup: one review per head, not one per tick (the 30-min cadence would burn paid
+    # reviews repeatedly on every open code PR). No DB record — code PRs stay undeeded so they
+    # get properly evaluated when the real code gate is armed later.
+    if SHADOW_CODE:
+        _sf = STATE / f"shadow-{rid}-{n}-{H[:16]}"
+        if _sf.exists():
+            return None
     # gate 5: synchronous review — pass / needs_fix(terminal) / transient(defer, but ceiling-bounded)
     rev = _review_pass(repo, B, H)
     if rev == "transient":
@@ -563,7 +579,12 @@ def evaluate_pr(repo: dict, pr: dict, budget: list) -> Optional[tuple]:
         return ("needs_fix", "review did not PASS — human")
 
     if DRY_RUN:
-        log(f"PR#{n} @ {H[:8]}: DRY-RUN would MERGE (docs-only + CI green + review PASS)")
+        if SHADOW_CODE:
+            _sf = STATE / f"shadow-{rid}-{n}-{H[:16]}"
+            _sf.touch()
+            log(f"PR#{n} @ {H[:8]}: SHADOW would MERGE (code PR + CI green + review PASS)")
+        else:
+            log(f"PR#{n} @ {H[:8]}: DRY-RUN would MERGE (docs-only + CI green + review PASS)")
         return None
     if TEST_MODE and MERGE_OVERRIDE:
         with open(MERGE_OVERRIDE, "a") as fh:
