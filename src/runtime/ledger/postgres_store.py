@@ -34,6 +34,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -66,22 +67,33 @@ def _json(obj: dict) -> dict:
     return obj
 
 
+# The two things a str can carry that a strict-UTF-8 wire codec (asyncpg bind) or a
+# Postgres 'text' column rejects at bind: a lone surrogate (the FULL D800–DFFF range)
+# and NUL. Both must degrade, not abort.
+_UNSTORABLE_RE = re.compile("[\x00\ud800-\udfff]")
+
+
 def _utf8_safe(s: str) -> str:
-    """Repair a str carrying lone surrogates so the strict-UTF-8 wire codec
-    (asyncpg's bind, json.dumps) can encode it. A poison byte in an UNTRUSTED
-    diff — a lone 0xE2, a source file mis-decoded upstream — reaches here as a
-    \\udcXX surrogate; asyncpg then raises DataError at bind and the WHOLE review
-    aborts at ingest, stranding the reply (the 2026-09-20 kilabz-abort class:
-    3 FieldVision reviews died before the reviewer ever ran). Degrade the one
-    bad byte to U+FFFD instead — a diff with one replacement char is still fully
-    reviewable. Fast path: a clean str (the 99% case) round-trips untouched, so
-    this is free on every normal ingest. surrogateescape re-materializes the
-    original bytes, then replace drops only the truly-undecodable ones."""
+    """Make an UNTRUSTED string storable so a poison byte can't abort a review at
+    ingest. Two failure modes, both seen as a review aborted BEFORE the reviewer ran
+    (the 2026-09-20 kilabz-abort class: 3 FieldVision reviews died at ingest):
+      * a lone surrogate (\\udcXX) — an undecodable byte smuggled through argv/JSON.
+        s.encode('utf-8') raises DataError at bind. NOTE: surrogateescape recovers
+        only U+DC80–U+DCFF, so a HIGH surrogate (\\ud800) or a low one below DC80
+        would raise a SECOND time — hence replace the WHOLE D800–DFFF range
+        (cross-family review P2), never lean on surrogateescape.
+      * a NUL (\\x00) — valid UTF-8, so it slips the encode check, but Postgres
+        'text' rejects it and asyncpg aborts ingest all the same (review P1).
+    Both degrade to U+FFFD; the diff stays fully reviewable. Fast path: a clean str
+    with no NUL (the 99% case) round-trips untouched, so this is free on a normal
+    ingest — the regex runs only when there is actually something to repair."""
     try:
-        s.encode("utf-8")
-        return s
+        s.encode("utf-8")            # detects lone surrogates without a full regex scan
+        if "\x00" not in s:
+            return s                 # clean + no NUL -> unchanged
     except UnicodeEncodeError:
-        return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+        pass
+    return _UNSTORABLE_RE.sub("�", s)
 
 
 class PostgresLedger:
