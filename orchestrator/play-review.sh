@@ -375,14 +375,15 @@ write_verdict(){ # write_verdict <PASS|NEEDS-FIX>
 note(){ jq -cn --arg p "$play" --arg s "$1" --arg n "${2:-}" \
         '{play:$p,ts:(now|floor),stage:$s,note:$n}' >> "$run/play.jsonl" 2>/dev/null || true; }
 
-clean(){ LC_ALL=C tr -d '\000-\010\013-\037\177'; }   # strip C0 + DEL (incl \r); keep \t \n
+clean(){ LC_ALL=C tr -d '\000-\010\013-\037\177\200-\237'; }   # strip C0+DEL+C1 (incl \r,ESC,0x9B CSI); keep \t \n
 
 deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits the fallback
-  local subj="$1" body="$2" msg f repo_slug; repo_slug="$(basename -- "$repo" | clean | tr -d '\n/' || true)"
+  local subj="$1" body="$2" msg f repo_slug; repo_slug="$(basename -- "$repo" | clean | tr -d '\n/' | cut -c1-64 || true)"
   # repo slug in BOTH the filename (grep/ls at a glance across the shared multi-repo inbox,
   # no need to open every file) and the header (structured field once opened) — play-fix's
   # deliver() already carries a repo: field; this closes the same gap here (review MED,
   # user-reported: verdicts from different repos were visually indistinguishable in the inbox).
+  # slug capped at 64 chars — date+play prefix/suffix consume ~39 bytes; 255-byte limit on APFS
   f="$INBOX/$(date +%Y%m%d%H%M%S)-${repo_slug:-unknown-repo}-$play.md"
   # strip C0/DEL (incl. ESC) from the reviewer/triage LLM output before it lands in the jefe
   # inbox file — the diff steering that text is untrusted, and the verdict is later cat'd/relayed
@@ -821,7 +822,7 @@ outcomes_record(){
   # SEPARATE follow-up inbox file next to the verdict — the verdict is already written, so the keys
   # can't be annotated in-place (design delivery-order fold). Fail-open: a failed write never breaks
   # the review. out_keys is TSV "<key12>\t<family>\t<tag>\t<path>" per line from outcome-record.
-  local kf repo_slug; repo_slug="$(basename -- "$repo" | clean | tr -d '\n/' || true)"
+  local kf repo_slug; repo_slug="$(basename -- "$repo" | clean | tr -d '\n/' | cut -c1-64 || true)"
   kf="$INBOX/$(date +%Y%m%d%H%M%S)-${repo_slug:-unknown-repo}-$play-outcomes.md"
   # all12 = the key12 column, space-joined — feeds the paste-ready batch hint (PR-A §2d)
   local all12; all12="$(printf '%s\n' "$out_keys" | cut -f1 | tr '\n' ' ' || true)"
