@@ -66,6 +66,24 @@ def _json(obj: dict) -> dict:
     return obj
 
 
+def _utf8_safe(s: str) -> str:
+    """Repair a str carrying lone surrogates so the strict-UTF-8 wire codec
+    (asyncpg's bind, json.dumps) can encode it. A poison byte in an UNTRUSTED
+    diff — a lone 0xE2, a source file mis-decoded upstream — reaches here as a
+    \\udcXX surrogate; asyncpg then raises DataError at bind and the WHOLE review
+    aborts at ingest, stranding the reply (the 2026-09-20 kilabz-abort class:
+    3 FieldVision reviews died before the reviewer ever ran). Degrade the one
+    bad byte to U+FFFD instead — a diff with one replacement char is still fully
+    reviewable. Fast path: a clean str (the 99% case) round-trips untouched, so
+    this is free on every normal ingest. surrogateescape re-materializes the
+    original bytes, then replace drops only the truly-undecodable ones."""
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 class PostgresLedger:
     # policy constants - NOT part of the Protocol; tuned at construction
     # LEASE + HEARTBEAT set TOGETHER (design M4 structure). LEASE_SECONDS is the window a
@@ -182,6 +200,7 @@ class PostgresLedger:
         """Create an inbound_event; dedupe on envelope.dedupe_key (exactly-once
         ingest). A duplicate returns the ORIGINAL id and raises nothing - the
         loser must not go on to submit a second job."""
+        body = _utf8_safe(body)                      # untrusted diff -> never abort ingest on a bad byte
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
                 """INSERT INTO inbound_event (id, transport, envelope, body, dedupe_key)
@@ -205,6 +224,7 @@ class PostgresLedger:
         FOR UPDATE lock on the parent row, so concurrent siblings funnel one at a
         time and the limit holds under load. Rejected -> a 'dead' job + dead_letter
         (returns a real id get_status can report)."""
+        prompt = _utf8_safe(prompt)                  # same belt as ingest: prompt is the same untrusted body
         jid = _new_id()
         async with self._pool.acquire() as con:
             async with con.transaction():

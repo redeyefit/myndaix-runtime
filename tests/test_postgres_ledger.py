@@ -145,6 +145,26 @@ async def test_ingest_dedupe(led: PostgresLedger) -> None:
     assert n == 1, f"expected 1 inbound_event, got {n}"
 
 
+# -- 2026-09-20 regression: a surrogate byte in an UNTRUSTED diff must NOT abort
+# ingest. Before the _utf8_safe belt, asyncpg raised DataError at bind ('utf-8'
+# codec can't encode '\udcXX': surrogates not allowed) and the WHOLE review died
+# at ingest — 3 FieldVision reviews stranded before the reviewer ever ran. The
+# reviewer must still receive a reviewable body with the one bad byte -> U+FFFD.
+async def test_ingest_repairs_surrogate_body(led: PostgresLedger) -> None:
+    await _truncate(led)
+    poison = "OBJECTIVE: review\n" + b"\xe2".decode("utf-8", "surrogateescape") + "\ntail"
+    ev = await led.ingest_inbound(_env("surr-1"), poison)          # must NOT raise
+    async with led._pool.acquire() as con:
+        stored = await con.fetchval("SELECT body FROM inbound_event WHERE id=$1", ev)
+    assert "�" in stored, "the poison byte must degrade to U+FFFD"
+    assert "OBJECTIVE: review" in stored and "tail" in stored, "surrounding text kept"
+    # submit_job carries the same untrusted body via prompt -> same belt
+    jid = await led.submit_job(to_agent="kilabz", prompt=poison, inbound_event_id=ev)
+    async with led._pool.acquire() as con:
+        jbody = await con.fetchval("SELECT body FROM job WHERE id=$1", jid)
+    assert "�" in jbody, "submit_job prompt must be repaired too"
+
+
 # -- invariant 4a: each outbound row is claimed by at most one sender -----------
 async def test_outbound_single_claim(led: PostgresLedger) -> None:
     await _truncate(led)
