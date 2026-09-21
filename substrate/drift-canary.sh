@@ -156,10 +156,15 @@ if [[ -n "${DEV_TREE:-}" ]]; then
   # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
   # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
   # tree's first alert (cross-family review). Reset state whenever the recorded path differs.
+  # ORDER + die are load-bearing: record the NEW identity FIRST, clear old state only after it
+  # succeeds, and a failed identity write dies LOUD (like canary_emit's streak write). The old
+  # warn-and-continue cleared the streak BEFORE writing, so a persistently failing write re-cleared
+  # it every run — DEV-tree alerts silently suppressed forever while the tick exited 0 (review
+  # 2164 #3: liveness saw a healthy canary the whole time).
   if [[ "$(cat "$DT_WATCHED_FILE" 2>/dev/null || true)" != "$DEV_TREE" ]]; then
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE"
     { printf '%s\n' "$DEV_TREE" > "$DT_WATCHED_FILE.tmp" && mv -f "$DT_WATCHED_FILE.tmp" "$DT_WATCHED_FILE"; } \
-      || log "canary: WARN could not record dev-tree identity"
+      || die "could not record dev-tree identity ($DT_WATCHED_FILE)"
+    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE"
   fi
   dt_reason="$(dev_tree_drift "$DEV_TREE")"
   if [[ -n "$dt_reason" ]]; then

@@ -1177,6 +1177,20 @@ dtcfg "$TREE_OFF"; rm -f "$DTW/inbox"/*                               # repoint 
 dtrun >/dev/null; dtrun >/dev/null
 ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: RETARGETING DEV_TREE resets the latch so the new tree's drift still alerts"
 
+# Identity-write FAILURE at retarget must die LOUD, not warn-and-continue: the old code cleared the
+# streak BEFORE the write, so a persistently failing write re-cleared it every run — alerts silently
+# suppressed while the tick exited 0 and liveness saw healthy (review 2164 #3). Also assert the
+# already-accumulated streak SURVIVES the failed run (write-before-reset ordering).
+dtcfg "$TREE_DIRTY"; dtrun >/dev/null                                  # records identity=DIRTY, streak=1
+dtcfg "$TREE_AHEAD"                                                    # retarget -> identity mismatch
+chmod 555 "$DTW/state"
+dtout="$(dtrun)"; dtrc=$?
+chmod 755 "$DTW/state"
+ok '[[ "$dtrc" -ne 0 ]]' "DEV-tree: identity-write failure exits NONZERO (liveness sees an unhealthy tick, not silent success)"
+ok 'grep -q "could not record dev-tree identity" <<<"$dtout"' "DEV-tree: identity-write failure names itself loudly"
+ok '[[ "$(cat "$DTW/state/dev-tree-streak" 2>/dev/null)" == 1 ]]' "DEV-tree: the old streak SURVIVES a failed identity write (write-first ordering — no reset loop)"
+dtreset; rm -f "$DTW/state/dev-tree-watched"
+
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
 # per-machine wrappers are hand-copied from it). Wrap it with a test PYTHONPATH + a PASSTHROUGH
