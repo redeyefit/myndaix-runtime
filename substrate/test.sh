@@ -1257,6 +1257,31 @@ else
 fi
 ok 'grep -q "RESET_REQUIRED sentinel raised" "$SUB/drift-canary.sh" && grep -q "SINGLE-INSTANCE INVARIANT" "$SUB/drift-canary.sh"' "DEV-tree: RESET_REQUIRED-sentinel-on-failed-clear + documented single-instance invariant (structural)"
 
+# DISABLE path must fail LOUD and must NOT drop a pending sentinel on a partial failure (review
+# 13355 P1). Sequence: raise a sentinel via a failed clean-clear, THEN disable (unset DEV_TREE)
+# while state/ is still unwritable — the old single `rm A B C SENTINEL || log` removed the sentinel
+# from the writable parent while the state/ files survived, so a re-enable of the same tree found a
+# matching identity + stale latch and stayed muted. Non-root only (dir perms).
+if [[ "$(id -u)" -ne 0 ]]; then
+  TREE_DIS="$TMP/tree-dis"; mk_clone "$TREE_DIS"; printf 'dis\n' >> "$TREE_DIS/src/x.py"
+  dtcfg "$TREE_DIS"; dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
+  dtrun >/dev/null; dtrun >/dev/null                                   # latch set for DIS
+  ( cd "$TREE_DIS" && git checkout -q -- src/x.py )                    # tree goes CLEAN
+  chmod 555 "$DTW/state"; dtrun >/dev/null 2>&1 || true; chmod 755 "$DTW/state"   # clean-clear fails -> sentinel raised
+  ok '[[ -e "$DTW/.dev-tree-reset-required" ]]' "DEV-tree disable: (setup) a failed clean-clear raised a pending sentinel"
+  printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\n' "$DTW" "$DTW" > "$DTW/config.env"   # DEV_TREE unset = disable
+  chmod 555 "$DTW/state"; dtrun >/dev/null; disrc=$?; chmod 755 "$DTW/state"
+  ok '[[ "$disrc" -ne 0 ]]' "DEV-tree disable: cannot-clear-state while disabling exits NONZERO (loud, not fell-soft)"
+  ok '[[ -e "$DTW/.dev-tree-reset-required" ]]' "DEV-tree disable: a pending sentinel is NOT dropped by a partial disable failure (removed only after state clears)"
+  printf 'redrift\n' >> "$TREE_DIS/src/x.py"; dtcfg "$TREE_DIS"; rm -f "$DTW/inbox"/*   # perms recovered; re-enable same drifting tree
+  dtrun >/dev/null; dtrun >/dev/null
+  ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "dirty working tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree disable: re-enable after a recovered disable-failure still ALERTS (pending sentinel survived the disable and forced the reset)"
+  dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
+else
+  echo "  --: SKIP dev-tree disable-while-unwritable test (running as root — dir perms ignored)"
+fi
+ok 'grep -q "could not clear disabled dev-tree streak/latch/identity" "$SUB/drift-canary.sh"' "DEV-tree: disable path clears state then sentinel, dying loud on each (structural — review 13355 P1)"
+
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
 # per-machine wrappers are hand-copied from it). Wrap it with a test PYTHONPATH + a PASSTHROUGH

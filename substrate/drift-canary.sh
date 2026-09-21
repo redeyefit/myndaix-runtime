@@ -181,9 +181,15 @@ DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/
 # One level up is writable in the state/-scoped failure (review 68864/54862 P1: identity-poison
 # recovery depended on the poison rm succeeding; a dir-wide state/ failure fails BOTH the latch
 # clear AND the poison rm, leaving a matching identity + stale latch that muted the NEXT drift
-# episode on the same tree indefinitely). Residual: if $MYNDAIX_HOME itself is unwritable the
-# sentinel can't be raised either — but then canary_emit's own streak writes are already dying loud
-# every tick, so the monitor is screaming, not silently muted.
+# episode on the same tree indefinitely). state/ and $MYNDAIX_HOME are INDEPENDENT dirs — a chmod
+# of state/ (the tested, realistic case) does not touch the parent, so the sentinel raises there.
+# Accepted residual (review 13355 P1#2): if BOTH state/ AND $MYNDAIX_HOME are unwritable at the
+# clean-transition instant, no sentinel can be raised; after both recover the stale latch mutes the
+# next same-tree episode. That needs simultaneous write-loss on the state dir AND its parent (two
+# chmods, or a volume/FS failure that would also kill any third-location fallback like $TMPDIR), so
+# a fallback buys ~nothing realistic and is rejected to keep this recovery code simple. DURING the
+# unwritable window the tick dies loud anyway (canary_emit's own streak write fails), so the
+# operator IS alerted then; only the post-recovery same-tree re-drift is the gap.
 DT_RESET_FILE="$MYNDAIX_HOME/.dev-tree-reset-required"
 if [[ -n "${DEV_TREE:-}" ]]; then
   # UNCONDITIONAL reset gate — runs BEFORE the identity check so a MATCHING identity can never skip
@@ -236,12 +242,20 @@ if [[ -n "${DEV_TREE:-}" ]]; then
     }
   fi
 else
-  # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity (AND a pending
-  # RESET_REQUIRED sentinel) so a LATER re-enable starts fresh — a standing latch from a prior
-  # watched tree would otherwise suppress the re-enabled watch's first alert (cross-family review:
-  # the disable path must not preserve state), and a stale sentinel would force a spurious reset.
-  rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" "$DT_RESET_FILE" \
-    || log "canary: WARN could not clear disabled dev-tree state"
+  # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity so a LATER re-enable
+  # starts fresh — a standing latch from a prior watched tree would otherwise suppress the
+  # re-enabled watch's first alert. die LOUD (NOT warn-and-continue) on failure — the same
+  # silent-mute class as the active paths: a fell-soft failure here left a stale latch that a
+  # re-enable of the same tree inherited and dedup-suppressed (review 13355 P1). Remove the
+  # RESET_REQUIRED sentinel LAST, only after the state files are gone: a single `rm A B C SENTINEL`
+  # would drop the sentinel from the writable PARENT even when the state/ removals fail, losing a
+  # pending-reset signal so the re-enable finds a matching identity + stale latch and stays muted
+  # (review 13355 P1, the precise finding). Two steps, die on each, keeps the sentinel alive across
+  # a partial failure so the re-enable's reset gate still fires.
+  rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
+    || die "could not clear disabled dev-tree streak/latch/identity (state dir write-blocked?)"
+  rm -f "$DT_RESET_FILE" \
+    || die "cleared disabled dev-tree state but could not remove RESET_REQUIRED sentinel ($DT_RESET_FILE)"
 fi
 
 # ---- config-drift watch -------------------------------------------------------------------
