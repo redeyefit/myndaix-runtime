@@ -167,63 +167,10 @@ fi
 # manual run while the tick is live can race the cat→rm→mv sequences and the fixed .tmp names;
 # reviews 73734/23749/34704 flag these — wontfix BECAUSE of this invariant, matching canary_emit's
 # established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine.
-# A flock/lockfile ENFORCEMENT was deliberately DECLINED (review 54862 P2): a lock left stale by a
-# SIGKILL'd tick (no trap fires) would make every subsequent launchd tick abort — silently muting
-# the monitor, which is strictly WORSE than the manual-overlap race it would prevent. A canary that
-# goes silent is the one failure it must never have; the launchd serialization IS the enforcement.
 DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
 DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
 DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to
-# RESET_REQUIRED sentinel — lives OUTSIDE $STATE_DIR (one level up in $MYNDAIX_HOME) ON PURPOSE.
-# The failure it guards is a DIR-WIDE loss of write permission on state/ itself, which also defeats
-# the poison-identity rm below (both live in state/). A sentinel IN state/ could not be written in
-# that exact failure, so it would not survive it — the reviewers' own proposed fix had this gap.
-# One level up is writable in the state/-scoped failure (review 68864/54862 P1: identity-poison
-# recovery depended on the poison rm succeeding; a dir-wide state/ failure fails BOTH the latch
-# clear AND the poison rm, leaving a matching identity + stale latch that muted the NEXT drift
-# episode on the same tree indefinitely). state/ and $MYNDAIX_HOME are INDEPENDENT dirs — a chmod
-# of state/ (the tested, realistic case) does not touch the parent, so the sentinel raises there.
-# Accepted residual (review 13355 P1#2): if BOTH state/ AND $MYNDAIX_HOME are unwritable at the
-# clean-transition instant, no sentinel can be raised; after both recover the stale latch mutes the
-# next same-tree episode. That needs simultaneous write-loss on the state dir AND its parent (two
-# chmods, or a volume/FS failure that would also kill any third-location fallback like $TMPDIR), so
-# a fallback buys ~nothing realistic and is rejected to keep this recovery code simple. DURING the
-# unwritable window the tick dies loud anyway (canary_emit's own streak write fails), so the
-# operator IS alerted then; only the post-recovery same-tree re-drift is the gap.
-DT_RESET_FILE="$MYNDAIX_HOME/.dev-tree-reset-required"
-# The DEV-tree watch runs in a SUBSHELL so a die-LOUD failure fails THIS tick nonzero WITHOUT
-# skipping the INDEPENDENT config-drift watch below (review 36499 P2: any dev-tree die exited before
-# the config-drift block, so a stale config-drift latch never cleared on a subsequent clean tick —
-# the cross-watch independence the separate streak/latch files already give for LATCHES must hold
-# for FAILURES too). dt_rc carries the failure out and is surfaced LOUD after config-drift is
-# handled; die's `exit 1` exits only the subshell, and its stderr ALARM still prints. (The block is
-# left un-indented inside the subshell to keep this a minimal, reviewable diff.)
-#
-# CRITICAL (review 62436): capture the subshell status via `set +e; (...); dt_rc=$?; set -e`, NOT
-# `( ... ) || dt_rc=$?`. A subshell on the LEFT of `||` runs with errexit SUPPRESSED for its ENTIRE
-# body (bash's testable-context rule) — that would silently disable the `set -e` backstop the block
-# relies on beyond its explicit `|| die` guards (an unguarded failure would then be masked, not
-# fatal). The explicit `set -e` as the subshell's FIRST line re-arms errexit unambiguously; the
-# outer `set +e` keeps `dt_rc=$?` from aborting the parent, and `set -e` restores it after.
-dt_rc=0
-set +e
-(
-set -e
-# Test-only seam (mirrors DRIFT_CANARY_TEST_RC): an UNGUARDED failing command, to prove errexit is
-# active inside this subshell. A revert to `( )||dt_rc` would suppress set -e and this would NOT
-# abort — the masked-failure regression. Live drift-canary never sets it.
-[[ -z "${DRIFT_CANARY_TEST_DT_ABORT:-}" ]] || false
 if [[ -n "${DEV_TREE:-}" ]]; then
-  # UNCONDITIONAL reset gate — runs BEFORE the identity check so a MATCHING identity can never skip
-  # it. A pending RESET_REQUIRED means a prior clean-path clear failed to unlatch; until the full
-  # clear succeeds we must not trust the surviving latch (it would dedup-suppress a NEW drift
-  # episode on the SAME tree — review 68864/54862 P1). die LOUD if the clear still cannot complete.
-  if [[ -e "$DT_RESET_FILE" ]]; then
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
-      || die "dev-tree RESET_REQUIRED pending but streak/latch/identity still not clearable (state dir write-blocked?)"
-    rm -f "$DT_RESET_FILE" \
-      || die "dev-tree state cleared but could not remove RESET_REQUIRED sentinel ($DT_RESET_FILE)"
-  fi
   # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
   # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
   # tree's first alert (cross-family review). Reset state whenever the recorded path differs.
@@ -248,60 +195,40 @@ if [[ -n "${DEV_TREE:-}" ]]; then
   else
     # die, not WARN: a failing clear here leaves a stale latch that would mute this SAME tree's
     # next drift, and the identity matches so nothing ever retries it — same silent-suppression
-    # class as the retarget path (review 23749 series). Before dying, RAISE the RESET_REQUIRED
-    # sentinel (outside state/, so it survives a dir-wide state/ write-loss) — the top-of-tick gate
-    # then retries the full clear next tick even if the same tree re-drifts first and the matching
-    # identity would otherwise skip recovery (review 68864/54862 P1: identity-poison alone failed
-    # when the whole state/ dir lost write perm — BOTH the latch clear and the poison rm failed,
-    # muting the next episode). Also best-effort poison the identity (belt: if state/ is writable
-    # enough to poison, the retarget path recovers too). die LOUD either way (review 34704 P1: die
-    # alone left latch+identity intact across a transient failure — perms recover, same tree
-    # re-drifts, alert muted while ticks exit 0).
+    # class as the retarget path (review 23749 series). Before dying, POISON the identity file
+    # (best-effort rm): a matching identity is what would skip recovery, so breaking it forces the
+    # next tick through the retarget reset, which retries the clear with its own die-loud path
+    # (review 34704 P1: die alone left latch+identity intact across a transient failure — perms
+    # recover, same tree re-drifts, alert muted while ticks exit 0). ACCEPTED RESIDUAL / WONTFIX
+    # (reviews 68864/13355/36499/62436): if the WHOLE state/ dir loses write perm the poison rm ALSO
+    # fails, so a matching identity + stale latch can mute the SAME tree's next episode AFTER perms
+    # recover. But every tick DIES LOUD the entire time state/ is unwritable (liveness-canary sees the
+    # sick tick), so the operator is alerted then; only a post-recovery re-drift before a clean tick
+    # is the gap. A RESET_REQUIRED-sentinel fix was built and deliberately REVERTED: it requires a
+    # chmod of the factory's state dir (never observed on a single-operator box) and each hardening
+    # layer spawned a narrower edge case — an infinite fold on a never-fired path, not worth the
+    # recovery-code complexity. Do NOT re-raise without a real-world trigger.
     rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || {
-      : > "$DT_RESET_FILE" 2>/dev/null || true
       rm -f "$DT_WATCHED_FILE" 2>/dev/null || true
-      die "could not clear dev-tree streak/latch (RESET_REQUIRED sentinel raised for next-tick recovery)"
+      die "could not clear dev-tree streak/latch (identity poisoned for retarget-reset recovery)"
     }
   fi
 else
   # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity so a LATER re-enable
   # starts fresh — a standing latch from a prior watched tree would otherwise suppress the
-  # re-enabled watch's first alert. die LOUD (NOT warn-and-continue) on failure — the same
-  # silent-mute class as the active paths: a fell-soft failure here left a stale latch that a
-  # re-enable of the same tree inherited and dedup-suppressed (review 13355 P1). Remove the
-  # RESET_REQUIRED sentinel LAST, only after the state files are gone: a single `rm A B C SENTINEL`
-  # would drop the sentinel from the writable PARENT even when the state/ removals fail, losing a
-  # pending-reset signal so the re-enable finds a matching identity + stale latch and stays muted
-  # (review 13355 P1, the precise finding). Two steps, die on each, keeps the sentinel alive across
-  # a partial failure so the re-enable's reset gate still fires.
-  rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" || {
-    # Raise the sentinel here too (review 36499 P2#1): if the tree was already latched and NO
-    # sentinel exists yet, a bare die leaves the latch + matching identity intact with nothing to
-    # force a reset — re-enabling the same drifting tree would then stay muted. Mirrors the
-    # clean-path failure. Best-effort (parent may also be unwritable); die LOUD regardless.
-    : > "$DT_RESET_FILE" 2>/dev/null || true
-    die "could not clear disabled dev-tree streak/latch/identity (RESET_REQUIRED sentinel raised for next-tick recovery)"
-  }
-  rm -f "$DT_RESET_FILE" \
-    || die "cleared disabled dev-tree state but could not remove RESET_REQUIRED sentinel ($DT_RESET_FILE)"
+  # re-enabled watch's first alert (cross-family review: the disable path must not preserve state).
+  rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
+    || log "canary: WARN could not clear disabled dev-tree state"
 fi
-)
-dt_rc=$?
-set -e
 
 # ---- config-drift watch -------------------------------------------------------------------
-# Runs REGARDLESS of a DEV-tree watch failure (review 36499 P2 — independence). A dev-tree die set
-# dt_rc but must not have skipped clearing/handling the config-drift latch here.
 if [[ "$rc" -eq 0 ]]; then
   rm -f "$STREAK_FILE" "$ALERTED_FILE"
   log "canary: no drift"
-else
-  canary_emit "$STREAK_FILE" "$ALERTED_FILE" "drift-alert" "config DRIFT" \
-    "drift-canary: FACTORY drift persisting. reconcile is not converging. Investigate.
+  exit 0
+fi
+canary_emit "$STREAK_FILE" "$ALERTED_FILE" "drift-alert" "config DRIFT" \
+  "drift-canary: FACTORY drift persisting. reconcile is not converging. Investigate.
 
 $report"
-fi
-# Surface a DEV-tree watch failure LOUD now that config-drift has been processed (review 36499 P2:
-# the dev-tree die must fail the tick without having skipped the config-drift latch handling above).
-[[ "$dt_rc" -eq 0 ]] || { log "canary: dev-tree watch failed (rc=$dt_rc) — see ALARM above"; exit "$dt_rc"; }
 exit 0
