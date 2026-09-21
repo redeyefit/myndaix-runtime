@@ -1261,8 +1261,66 @@ g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" --help 2>/dev
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: help is exempt"
 g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LABH" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: LAB role is NEVER gated (its dev tree is dirty by design)"
-g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>"$TMP/g.norole.warn")"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unknown role (no config.env) fails OPEN -> not gated"
+ok 'grep -q "WARNING.*freshness guard skipped" "$TMP/g.norole.warn"' "guard: absent config.env emits a WARNING on stderr (guard skip is observable — review 67726 P2)"
+# Nonempty but unrecognized role (e.g. a 'factroy' typo) must REFUSE — it bypasses the factory
+# check (not factory) and the empty-role check (not empty), dispatching silently on the exact
+# machine the guard protects. Only 'lab' is a recognized bypass (review 67726 P1).
+BADROLE="$TMP/guard-badrole"; mkdir -p "$BADROLE"; printf 'MACHINE_ROLE=factroy\n' > "$BADROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BADROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.badrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: unrecognized nonempty role ('factroy' typo) -> REFUSED fail-closed (review 67726 P1)"
+ok 'grep -q "REFUSING" "$TMP/g.badrole.err"' "guard: unrecognized-role refusal is loud on stderr"
+# The echoed role must be sanitized: an ANSI escape smuggled through config.env must not reach
+# the terminal raw (it could clear the screen or hide the refusal — review 6838 P2). Still 78.
+ESCROLE="$TMP/guard-escrole"; mkdir -p "$ESCROLE"; printf 'MACHINE_ROLE=fac\033[2Jtroy\n' > "$ESCROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$ESCROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.escrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: role with embedded ANSI escape still REFUSED fail-closed"
+ESCBYTE=$'\033'
+ok 'grep -q "REFUSING" "$TMP/g.escrole.err" && ! grep -qF "$ESCBYTE" "$TMP/g.escrole.err"' "guard: refusal stderr carries NO raw ESC byte (role sanitized to printables — review 6838 P2)"
+# A LITERAL backslash-033 in the role is printable and survives tr; under xpg_echo, `echo` would
+# convert it to a real ESC on output — the refusal must use a constant-format printf so the text
+# stays literal (review 48310 F1). bash -O xpg_echo turns the option on for the guard run.
+LITROLE="$TMP/guard-litrole"; mkdir -p "$LITROLE"; printf 'MACHINE_ROLE=bad\\033[2Jrole\n' > "$LITROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LITROLE" bash -O xpg_echo "$GUARD" kilabz >/dev/null 2>"$TMP/g.litrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: literal-backslash-escape role still REFUSED fail-closed"
+ok 'grep -q "REFUSING" "$TMP/g.litrole.err" && ! grep -qF "$ESCBYTE" "$TMP/g.litrole.err"' "guard: under xpg_echo a literal backslash-033 is NOT re-interpreted (printf constant format — review 48310 F1)"
+# Non-UTF-8 bytes in the role must reach the SANITIZER branch (not an earlier extraction-failure
+# refusal). With the single-read + LC_ALL=C parse, a binary role survives extraction as a nonempty
+# non-'lab' value -> the unrecognized-role branch -> the sanitizer strips the bytes to 'factroy'.
+# Run under a UTF-8 locale + xpg_echo (the hostile combo) and ASSERT the sanitized role string is
+# present in the refusal — proving the sanitizer ran, not just that some 78 was returned (review
+# 60298 F3: the old test passed on the extraction-failure branch and never exercised the sanitizer;
+# review 48310 F2: LC_ALL=C keeps tr from aborting on the illegal byte sequence).
+BINROLE="$TMP/guard-binrole"; mkdir -p "$BINROLE"; printf 'MACHINE_ROLE=fac\xff\xfetroy\n' > "$BINROLE/config.env"
+LC_ALL=en_US.UTF-8 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BINROLE" bash -O xpg_echo "$GUARD" kilabz >/dev/null 2>"$TMP/g.binrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: role with non-UTF-8 bytes still REFUSED fail-closed (single-read + LC_ALL=C parse — review 60298 F3)"
+ok 'grep -q "MACHINE_ROLE='"'"'factroy'"'"'" "$TMP/g.binrole.err"' "guard: non-UTF-8 role REACHES the sanitizer (refusal shows sanitized '\''factroy'\'', not an extraction-failure message — review 60298 F3)"
+ok '! grep -qF "$ESCBYTE" "$TMP/g.binrole.err"' "guard: non-UTF-8-role refusal carries no raw non-printable byte"
+# Present-but-empty config (role unresolvable) must take the fail-CLOSED branch, never the
+# absent-config warn: -f is true -> present=1 -> empty-role-present -> refuse.
+EMPTYCFG="$TMP/guard-emptycfg"; mkdir -p "$EMPTYCFG"; : > "$EMPTYCFG/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$EMPTYCFG" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.emptycfg.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: present-but-empty config.env (role unresolvable) -> fail-CLOSED, not the absent-config warn"
+ok 'grep -q "could not be resolved" "$TMP/g.emptycfg.err"' "guard: empty-config refusal names the unresolvable-role cause (present-branch reached via -f)"
+# Present-but-UNREADABLE config must fail CLOSED, NOT read as absent-and-warn (review 79562 P1: the
+# round-3 cat-presence "fix" made a permission-denied config fail OPEN on the factory). Skipped
+# under root, which ignores file perms — probe read access first.
+UNRDCFG="$TMP/guard-unrdcfg"; mkdir -p "$UNRDCFG"; printf 'MACHINE_ROLE=factory\n' > "$UNRDCFG/config.env"; chmod 000 "$UNRDCFG/config.env"
+if ! cat "$UNRDCFG/config.env" >/dev/null 2>&1; then
+  MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$UNRDCFG" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.unrdcfg.err"; r=$?
+  ok '[[ "$r" -eq 78 ]]' "guard: present-but-UNREADABLE config.env -> fail-CLOSED (not absent-warn — review 79562 P1)"
+  ok 'grep -q "could not be resolved" "$TMP/g.unrdcfg.err"' "guard: unreadable-config refusal names the unresolvable-role cause (-f saw it present)"
+else
+  echo "  --: SKIP unreadable-config test (running as root — perms ignored)"
+fi
+chmod 644 "$UNRDCFG/config.env"
+# MACHINE_ROLE as the LAST line with NO trailing newline must still extract: printf '%s\n' feeds
+# sed a newline-terminated line so BSD/macOS sed does not drop it (review 79562 P2). Use role=lab:
+# extracted -> PASSTHROUGH; dropped -> empty role + present -> fail-closed 78. PASSTHROUGH proves it.
+NONLCFG="$TMP/guard-nonl"; mkdir -p "$NONLCFG"; printf 'MACHINE_ROLE=lab' > "$NONLCFG/config.env"   # deliberately no trailing \n
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NONLCFG" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: last-line MACHINE_ROLE with NO trailing newline still extracts (BSD sed last-line drop — review 79562 P2)"
 # Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
 # defeat the equality check (that would silently fail-OPEN on a real factory).
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"
