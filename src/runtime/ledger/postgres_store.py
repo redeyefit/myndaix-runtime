@@ -77,22 +77,18 @@ def _utf8_safe(s: str) -> str:
     """Make an UNTRUSTED string storable so a poison byte can't abort a review at
     ingest. Two failure modes, both seen as a review aborted BEFORE the reviewer ran
     (the 2026-09-20 kilabz-abort class: 3 FieldVision reviews died at ingest):
-      * a lone surrogate (\\udcXX) — an undecodable byte smuggled through argv/JSON.
-        s.encode('utf-8') raises DataError at bind. NOTE: surrogateescape recovers
-        only U+DC80–U+DCFF, so a HIGH surrogate (\\ud800) or a low one below DC80
-        would raise a SECOND time — hence replace the WHOLE D800–DFFF range
-        (cross-family review P2), never lean on surrogateescape.
-      * a NUL (\\x00) — valid UTF-8, so it slips the encode check, but Postgres
+      * a lone surrogate (\\udcXX) — an undecodable byte smuggled through argv/JSON;
+        s.encode('utf-8') would raise DataError at bind. The FULL D800–DFFF range is
+        replaced, not just surrogateescape's U+DC80–U+DCFF (which would leave a HIGH
+        surrogate like \\ud800 to re-raise — cross-family review P2).
+      * a NUL (\\x00) — valid UTF-8, so an encode check would miss it, but Postgres
         'text' rejects it and asyncpg aborts ingest all the same (review P1).
-    Both degrade to U+FFFD; the diff stays fully reviewable. Fast path: a clean str
-    with no NUL (the 99% case) round-trips untouched, so this is free on a normal
-    ingest — the regex runs only when there is actually something to repair."""
-    try:
-        s.encode("utf-8")            # detects lone surrogates without a full regex scan
-        if "\x00" not in s:
-            return s                 # clean + no NUL -> unchanged
-    except UnicodeEncodeError:
-        pass
+    Both degrade to U+FFFD; the diff stays fully reviewable. One C-level regex scan
+    detects either: a clean str (the 99% case) returns untouched with NO transient
+    bytes copy (review P3 — an encode() would double RSS on a large diff), and the
+    sub pass runs only when there is actually something to repair."""
+    if not _UNSTORABLE_RE.search(s):
+        return s
     return _UNSTORABLE_RE.sub("�", s)
 
 
