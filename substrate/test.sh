@@ -1261,8 +1261,16 @@ g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" --help 2>/dev
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: help is exempt"
 g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LABH" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: LAB role is NEVER gated (its dev tree is dirty by design)"
-g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>"$TMP/g.norole.warn")"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unknown role (no config.env) fails OPEN -> not gated"
+ok 'grep -q "WARNING.*freshness guard skipped" "$TMP/g.norole.warn"' "guard: absent config.env emits a WARNING on stderr (guard skip is observable — review 67726 P2)"
+# Nonempty but unrecognized role (e.g. a 'factroy' typo) must REFUSE — it bypasses the factory
+# check (not factory) and the empty-role check (not empty), dispatching silently on the exact
+# machine the guard protects. Only 'lab' is a recognized bypass (review 67726 P1).
+BADROLE="$TMP/guard-badrole"; mkdir -p "$BADROLE"; printf 'MACHINE_ROLE=factroy\n' > "$BADROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BADROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.badrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: unrecognized nonempty role ('factroy' typo) -> REFUSED fail-closed (review 67726 P1)"
+ok 'grep -q "REFUSING" "$TMP/g.badrole.err"' "guard: unrecognized-role refusal is loud on stderr"
 # Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
 # defeat the equality check (that would silently fail-OPEN on a real factory).
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"

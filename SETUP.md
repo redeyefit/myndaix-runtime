@@ -257,11 +257,21 @@ case "${1:-}" in
         # config.env EXISTS but MACHINE_ROLE did not resolve — the extraction pipeline itself failed
         # (missing binary / OOM) OR the key is absent from a present config. We cannot rule out that
         # THIS is the factory, so the guard above would be SILENTLY SKIPPED on the exact machine it
-        # protects. Fail CLOSED (review 68864 P3). config.env being ABSENT does NOT take this branch
-        # (the `-f` test is false) and stays fail-open: an unconfigured machine is not the
-        # factory-ships-wrong-code case, and killing every fresh-install wrapper would be worse.
+        # protects. Fail CLOSED (review 68864 P3).
         echo "mxr: REFUSING dispatch — config.env present ($_mxr_cfg) but MACHINE_ROLE could not be resolved (unparsable config or missing key). Cannot confirm this is not the factory; failing closed. Fix MACHINE_ROLE, or set MXR_ALLOW_DIRTY=1 to override." >&2
         exit 78
+      elif [ -n "$_mxr_role" ] && [ "$_mxr_role" != lab ]; then
+        # config.env present with a NONEMPTY but UNRECOGNIZED role (not 'factory', not 'lab'): a
+        # typo like 'factroy' bypasses the factory branch above and the empty-role branch above,
+        # dispatching with zero freshness inspection. Only 'lab' is a known bypass; anything else
+        # is unrecognized and cannot be trusted as a non-factory role. Fail CLOSED (review 67726 P1).
+        echo "mxr: REFUSING dispatch — MACHINE_ROLE='$_mxr_role' is unrecognized (expected 'factory' or 'lab'); failing closed. Fix config.env or set MXR_ALLOW_DIRTY=1 to override." >&2
+        exit 78
+      elif [ -z "$_mxr_role" ] && [ ! -f "$_mxr_cfg" ]; then
+        # config.env ABSENT and role therefore empty — an unconfigured machine, not the
+        # factory-ships-wrong-code case: fail-open but WARN so the guard skip is observable,
+        # matching the PYTHONPATH-unset branch's visibility contract (review 67726 P2).
+        echo "mxr: WARNING — config.env absent ($_mxr_cfg); freshness guard skipped (unconfigured install?). The drift-canary DEV-tree watch is the backstop." >&2
       fi
     fi
     ;;
