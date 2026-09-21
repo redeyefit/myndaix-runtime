@@ -62,18 +62,21 @@ canary_emit() {
 # (a normal push updates that ref locally, so it is honest for the factory's own commits). Always
 # returns 0 (the caller drives the alert). ALWAYS runs in the caller's $(...) subshell, so the
 # GIT_* unset below is scoped and never leaks to the main canary.
-#   - Validity via `git rev-parse --is-inside-work-tree`, NOT `[[ -d "$dir/.git" ]]`: a linked
-#     git WORKTREE stores .git as a FILE, so the old test falsely called valid worktrees "missing"
-#     (cross-family review MED). A missing/non-git dir is still itself a drift reason.
+#   - Validity requires `git rev-parse --is-inside-work-tree` to print exactly `true`, NOT just
+#     exit 0 and NOT `[[ -d "$dir/.git" ]]`: a linked git WORKTREE stores .git as a FILE (the old
+#     dir-test falsely called it "missing"), while a BARE repo prints `false` with EXIT 0 (a bare
+#     dir would then swallow the later status error and read as clean — cross-family review R2
+#     regression). A missing / non-git / bare dir is itself a drift reason.
 #   - GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE unset so an inherited hook env can't redirect the probe
 #     to a DIFFERENT repo (cross-family review). status is --untracked-files=all (a config
 #     status.showUntrackedFiles=no would otherwise hide stray untracked runtime code) and
-#     --no-optional-locks (strict read-only; never take the index lock).
+#     --no-optional-locks (strict read-only; never take the index lock); a status ERROR (nonzero
+#     rc) is reported as drift, never silently read as clean (cross-family review #2).
 dev_tree_drift() {
-  local dir="$1" branch ahead
+  local dir="$1" branch ahead st strc
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-    || { printf 'is missing or not a git checkout (%s)' "$dir"; return 0; }
+  [[ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]] \
+    || { printf 'is missing, bare, or not a git work tree (%s)' "$dir"; return 0; }
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached HEAD)')"
   if [[ "$branch" != "main" ]]; then
     printf 'is on %s, not main' "$branch"; return 0
@@ -83,7 +86,11 @@ dev_tree_drift() {
   if (( 10#$ahead > 0 )); then
     printf 'is %s commit(s) ahead of origin/main (unpushed local commits)' "$ahead"; return 0
   fi
-  if [[ -n "$(git -C "$dir" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
+  st="$(git -C "$dir" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; strc=$?
+  if [[ "$strc" -ne 0 ]]; then
+    printf 'git status errored (rc=%s) — tree state unverifiable' "$strc"; return 0
+  fi
+  if [[ -n "$st" ]]; then
     printf 'has uncommitted changes (dirty working tree)'; return 0
   fi
   return 0   # clean at origin/main — no reason emitted

@@ -163,6 +163,8 @@ cat > ~/.local/bin/mxr <<'EOF'
 #!/bin/bash
 export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://localhost/runtime}"
 export PYTHONPATH="/path/to/your/myndaix-runtime/src"   # <- set to YOUR clone's path
+export PYTHONSAFEPATH=1   # don't prepend CWD to sys.path — else running mxr from inside another
+                          # checkout's dir could shadow-import a DIFFERENT runtime (ignored <3.11)
 
 # --- runtime-tree freshness guard (FACTORY only) -----------------------------------------
 # The pool runs the code at $PYTHONPATH; on the FACTORY that path is a live DEV checkout, so a
@@ -189,18 +191,22 @@ case "${1:-}" in
       if [ "$_mxr_role" = factory ]; then
         unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
         _mxr_tree="${PYTHONPATH%/src}"
-        if [ -z "$_mxr_tree" ] || ! git -C "$_mxr_tree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-          # Bad/unexpected PYTHONPATH (e.g. a venv install that dropped it): we cannot resolve the
-          # runtime checkout, so fail OPEN with a loud warning rather than brick every factory
-          # dispatch with a misleading "not on clean main" (cross-family review). The drift-canary
-          # DEV-tree watch still alerts on a genuinely missing/drifted tree.
-          echo "mxr: WARNING — cannot resolve the runtime git tree from PYTHONPATH ($PYTHONPATH); freshness guard skipped. Point PYTHONPATH at <clone>/src (or set MXR_ALLOW_DIRTY=1 to silence)." >&2
+        # Require `true` (not just exit 0): a BARE repo prints `false`/exit-0, and would else pass
+        # here then read as clean-main (cross-family review R2). A non-repo prints nothing.
+        if [ -z "$_mxr_tree" ] || [ "$(git -C "$_mxr_tree" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]; then
+          # Bad/unexpected PYTHONPATH (e.g. a venv install that dropped it, or a bare repo): we
+          # cannot resolve a runtime WORK TREE, so fail OPEN with a loud warning rather than brick
+          # every factory dispatch with a misleading "not on clean main" (cross-family review). The
+          # drift-canary DEV-tree watch still alerts on a genuinely missing/bare/drifted tree.
+          echo "mxr: WARNING — cannot resolve the runtime git work tree from PYTHONPATH ($PYTHONPATH); freshness guard skipped. Point PYTHONPATH at <clone>/src (or set MXR_ALLOW_DIRTY=1 to silence)." >&2
         else
           _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
           _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
           case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=0 ;; esac
-          if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ -n "$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" ]; then
-            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
+          _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; _mxr_strc=$?
+          # A status ERROR (rc!=0) is treated as drift (fail-CLOSED), never silently clean (review #2).
+          if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
+            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
         fi

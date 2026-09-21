@@ -1140,10 +1140,16 @@ ok 'grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: 
 # would falsely call it "missing" (cross-family review). It must be recognized as a real checkout.
 git -C "$TREE_CLEAN" worktree add -q "$TMP/tree-wt" -b wt-branch >/dev/null 2>&1
 dtcfg "$TMP/tree-wt"; dtreset; dtrun >/dev/null; dtrun >/dev/null
-ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null && ! grep -q "not a git checkout" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null' "DEV-tree: a linked git WORKTREE (.git is a FILE) is recognized as a checkout, not falsely 'missing'"
+ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null && ! grep -q "not a git" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null' "DEV-tree: a linked git WORKTREE (.git is a FILE) is recognized as a checkout, not falsely 'missing'"
+
+# A BARE repo prints `false` with EXIT 0 from rev-parse --is-inside-work-tree — validating on exit
+# status alone would let it pass then read as clean (cross-family review R2 regression). Require `true`.
+git init -q --bare -b main "$TMP/tree-bare.git"
+dtcfg "$TMP/tree-bare.git"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "missing, bare, or not a git work tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a BARE repo (rev-parse prints false/exit-0) is NOT read as a clean checkout"
 
 dtcfg "$TREE_GONE"; dtreset; dtrun >/dev/null; dtrun >/dev/null
-ok 'grep -q "missing or not a git checkout" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing DEV_TREE checkout is itself a drift reason"
+ok 'grep -q "missing, bare, or not a git work tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing DEV_TREE checkout is itself a drift reason"
 
 printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$DTW" "$DTW" "$REPO" > "$DTW/config.env"
 dtreset; dtrun >/dev/null; dtrun >/dev/null
@@ -1208,7 +1214,11 @@ mkdir -p "$TMP/not-a-repo"
 g="$(MXR_TEST_TREE="$TMP/not-a-repo" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>"$TMP/g.warn")"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unresolvable runtime tree fails OPEN (guard-config error must not brick the factory)"
 ok 'grep -qi "cannot resolve" "$TMP/g.warn"' "guard: unresolvable tree warns loudly on stderr"
+# A BARE repo must NOT pass the guard as clean-main (rev-parse prints false/exit-0) — fail OPEN+warn.
+g="$(MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: a BARE repo is unresolvable -> fail OPEN (not read as clean-main)"
 ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
+ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"
 ok 'grep -q "exit 78" "$REPO/SETUP.md" && grep -q "MXR_ALLOW_DIRTY" "$REPO/SETUP.md" && grep -q "MACHINE_ROLE" "$REPO/SETUP.md"' "guard: SETUP.md heredoc carries the canonical guard (structural)"
 
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
