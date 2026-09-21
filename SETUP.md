@@ -227,13 +227,21 @@ case "${1:-}" in
           # reaches the arithmetic when the value is verified numeric.
           _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || true)"
           case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=unverifiable ;; esac
+          # BEHIND origin/main is stale too (review 68864 P2): a clean tree fetched-but-not-pulled
+          # sits on an OLDER main and would ship stale code — the ahead-only count read it as clean.
+          # origin/main resolved above, so this only fails on corruption; empty/garbage normalizes
+          # to unverifiable (refuse), and the `||` chain reaches arithmetic only when numeric.
+          _mxr_behind="$(git -C "$_mxr_tree" rev-list --count HEAD..origin/main 2>/dev/null || true)"
+          case "$_mxr_behind" in ''|*[!0-9]*) _mxr_behind=unverifiable ;; esac
           # A status ERROR (rc!=0) is treated as drift (fail-CLOSED), never silently clean (review #2).
           # NOT `"$(... || true)"; _mxr_strc=$?` — that reads the rc of the ALWAYS-0 compound and
           # would silently disable this check (a reviewer-proposed fix with exactly that bug, R6).
           _mxr_strc=0
           _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" || _mxr_strc=$?
-          if [ "$_mxr_branch" != main ] || [ "$_mxr_ahead" = unverifiable ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
-            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
+          if [ "$_mxr_branch" != main ] || [ "$_mxr_ahead" = unverifiable ] || [ "$((10#$_mxr_ahead))" -gt 0 ] \
+             || [ "$_mxr_behind" = unverifiable ] || [ "$((10#$_mxr_behind))" -gt 0 ] \
+             || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
+            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead behind=$_mxr_behind status_rc=$_mxr_strc). The factory would ship WRONG (stale or unpushed) code. Converge the tree (git status; git pull --ff-only) or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
         ) || _mxr_grc=$?
@@ -245,6 +253,15 @@ case "${1:-}" in
           [ "$_mxr_grc" -ne 78 ] && echo "mxr: REFUSING dispatch — freshness inspection aborted unexpectedly (rc=$_mxr_grc); failing closed. Set MXR_ALLOW_DIRTY=1 to override." >&2
           exit 78
         fi
+      elif [ -z "$_mxr_role" ] && [ -f "$_mxr_cfg" ]; then
+        # config.env EXISTS but MACHINE_ROLE did not resolve — the extraction pipeline itself failed
+        # (missing binary / OOM) OR the key is absent from a present config. We cannot rule out that
+        # THIS is the factory, so the guard above would be SILENTLY SKIPPED on the exact machine it
+        # protects. Fail CLOSED (review 68864 P3). config.env being ABSENT does NOT take this branch
+        # (the `-f` test is false) and stays fail-open: an unconfigured machine is not the
+        # factory-ships-wrong-code case, and killing every fresh-install wrapper would be worse.
+        echo "mxr: REFUSING dispatch — config.env present ($_mxr_cfg) but MACHINE_ROLE could not be resolved (unparsable config or missing key). Cannot confirm this is not the factory; failing closed. Fix MACHINE_ROLE, or set MXR_ALLOW_DIRTY=1 to override." >&2
+        exit 78
       fi
     fi
     ;;

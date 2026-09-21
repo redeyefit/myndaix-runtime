@@ -1104,6 +1104,13 @@ TREE_OFF="$TMP/tree-off";     mk_clone "$TREE_OFF";   ( cd "$TREE_OFF" && git ch
 TREE_AHEAD="$TMP/tree-ahead"; mk_clone "$TREE_AHEAD"; ( cd "$TREE_AHEAD" && printf 'local\n' >> src/x.py && git add -A && git commit -qm local ) >/dev/null 2>&1
 TREE_NOREF="$TMP/tree-noref"; mk_clone "$TREE_NOREF"; git -C "$TREE_NOREF" update-ref -d refs/remotes/origin/main   # origin/main ref GONE -> ahead-ness unverifiable
 TREE_GONE="$TMP/tree-gone"    # deliberately never created
+# BEHIND fixture (review 68864 P2): clone CLEAN, then advance origin/main past this clone's HEAD and
+# `fetch` (updates the local origin/main ref) WITHOUT pulling — a clean tree sitting on an OLDER main.
+# The advance is AFTER all pre-advance clones above (their un-fetched origin/main stays == HEAD, still
+# clean); later mk_clone calls fetch the advanced main fresh, so they too stay clean at HEAD==origin.
+TREE_BEHIND="$TMP/tree-behind"; mk_clone "$TREE_BEHIND"
+( cd "$TMP/dt-seed" && printf 'advance\n' >> src/x.py && git add -A && git commit -qm advance && git push -q origin main ) >/dev/null 2>&1
+git -C "$TREE_BEHIND" fetch -q origin 2>/dev/null   # origin/main ref advances; HEAD stays 1 commit behind
 
 # --- piece 1: the DEV-tree watch inside drift-canary (behavioral, via the TEST_RC seam) ---
 DTW="$TMP/dtw-home"; DTFH="$TMP/dtw-fakehome"
@@ -1136,6 +1143,12 @@ ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: off-main che
 
 dtcfg "$TREE_AHEAD"; dtreset; dtrun >/dev/null; dtrun >/dev/null
 ok 'grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: unpushed local commit alerts with an 'ahead' reason"
+
+# BEHIND: a CLEAN checkout on an OLDER main (fetched, never pulled) is stale drift too — the
+# ahead-only count read it as clean (review 68864 P2). Must alert as behind, NOT as dirty/ahead.
+dtcfg "$TREE_BEHIND"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "behind origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a clean-but-BEHIND checkout alerts as stale (never pulled) — the ahead-only gap"
+ok '! grep -qE "dirty working tree|ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: the behind alert is not misreported as dirty or ahead"
 
 # A linked git WORKTREE stores .git as a FILE, not a dir — the old `[[ -d "$dir/.git" ]]` check
 # would falsely call it "missing" (cross-family review). It must be recognized as a real checkout.
@@ -1273,6 +1286,16 @@ ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "PYTHONPATH unset" "$TMP
 # origin/main ref GONE -> ahead-ness unverifiable -> REFUSE (R4 P2: `|| echo 0` read it as clean).
 MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.noref.err"; r=$?
 ok '[[ "$r" -eq 78 ]] && grep -q "ahead=unverifiable" "$TMP/g.noref.err"' "guard: missing origin/main ref -> REFUSED as unverifiable (rev-list failure never reads as 0-ahead)"
+# BEHIND origin/main (clean but never pulled) -> REFUSE — the ahead-only count read it as clean
+# (review 68864 P2). TREE_BEHIND is otherwise clean, so behind is the ONLY reason it refuses.
+MXR_TEST_TREE="$TREE_BEHIND" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.behind.err"; r=$?
+ok '[[ "$r" -eq 78 ]] && grep -q "behind=1" "$TMP/g.behind.err"' "guard: factory + clean-but-BEHIND tree -> REFUSED as stale (never pulled) — the ahead-only gap (68864 P2)"
+# config.env PRESENT but MACHINE_ROLE unresolvable (pipeline crash / missing key) must fail CLOSED,
+# NOT be treated like the absent-config unknown-role fail-open (review 68864 P3). TREE_CLEAN so the
+# tree is fine — the unresolvable role is the sole reason to refuse.
+FACBAD="$TMP/guard-fac-noresolve"; mkdir -p "$FACBAD"; printf 'SOME_OTHER=x\n' > "$FACBAD/config.env"
+MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FACBAD" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.badrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]] && grep -q "MACHINE_ROLE could not be resolved" "$TMP/g.badrole.err"' "guard: config.env present but MACHINE_ROLE unresolvable -> REFUSED (fail-closed; distinct from absent-config fail-open)"
 # R4 P1: the parent must fail CLOSED on ANY non-zero subshell status, not only exactly 78 — a
 # killed/crashed inspection (SIGTERM=143, error=1) must refuse, not fall through to dispatch.
 ok 'grep -q "aborted unexpectedly" "$REPO/SETUP.md" && grep -qE "\-ne 0" "$REPO/SETUP.md"' "guard: parent refuses on ANY abnormal inspection exit, not only 78 (fail-closed crash window) (structural)"
@@ -1289,6 +1312,8 @@ MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz >/dev/null
 ok '[[ "$r" -eq 78 ]]' "guard under set -euo pipefail: unverifiable ahead still refuses 78"
 g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARDE" kilabz 2>/dev/null)"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard under set -euo pipefail: missing config.env falls through fail-open (no rc=2 wrapper death)"
+MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FACBAD" bash "$GUARDE" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard under set -euo pipefail: config present + unresolvable role still fails CLOSED 78 (elif survives -e; not a stray death or fall-through)"
 ok 'grep -q "strc=\$?" "$SUB/drift-canary.sh"' "watch: status rc captured via ||-disarm (canary set -e cannot abort the tick mid-probe) (structural)"
 ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
 ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"

@@ -73,7 +73,7 @@ canary_emit() {
 #     --no-optional-locks (strict read-only; never take the index lock); a status ERROR (nonzero
 #     rc) is reported as drift, never silently read as clean (cross-family review #2).
 dev_tree_drift() {
-  local dir="$1" branch ahead st strc
+  local dir="$1" branch ahead behind st strc
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
   [[ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]] \
     || { printf 'is missing, bare, or not a git work tree (%s)' "$dir"; return 0; }
@@ -89,6 +89,18 @@ dev_tree_drift() {
   fi
   if (( 10#$ahead > 0 )); then
     printf 'is %s commit(s) ahead of origin/main (unpushed local commits)' "$ahead"; return 0
+  fi
+  # BEHIND origin/main is drift too: a clean checkout sitting on an OLDER commit of main (ahead=0)
+  # still ships STALE code — the "clean but never pulled" gap the ahead-only check missed (review
+  # 68864 P2: origin/main..HEAD counts only ahead, so a fetched-not-pulled tree read as clean).
+  # origin/main is already known-resolvable here (the ahead rev-list above would have failed and
+  # returned otherwise), so this only fails on real corruption; non-numeric output ⇒ drift reason.
+  behind="$(git -C "$dir" rev-list --count HEAD..origin/main 2>/dev/null || true)"
+  if ! [[ "$behind" =~ ^[0-9]+$ ]]; then
+    printf 'has no verifiable origin/main (rev-list failed — remote ref missing or repo corrupt)'; return 0
+  fi
+  if (( 10#$behind > 0 )); then
+    printf 'is %s commit(s) behind origin/main (stale — a clean tree that was never pulled)' "$behind"; return 0
   fi
   # `|| strc=$?` disarms this script's set -e AND records the real rc — a bare `; strc=$?` would
   # never run: under set -e a failing substitution-assignment kills the $() subshell mid-function,
@@ -187,8 +199,15 @@ if [[ -n "${DEV_TREE:-}" ]]; then
     # (best-effort rm): a matching identity is what would skip recovery, so breaking it forces the
     # next tick through the retarget reset, which retries the clear with its own die-loud path
     # (review 34704 P1: die alone left latch+identity intact across a transient failure — perms
-    # recover, same tree re-drifts, alert muted while ticks exit 0). If the poison rm ALSO fails
-    # (dir-wide breakage), every tick keeps dying loudly until the operator fixes it.
+    # recover, same tree re-drifts, alert muted while ticks exit 0). ACCEPTED RESIDUAL / WONTFIX
+    # (reviews 68864/13355/36499/62436): if the WHOLE state/ dir loses write perm the poison rm ALSO
+    # fails, so a matching identity + stale latch can mute the SAME tree's next episode AFTER perms
+    # recover. But every tick DIES LOUD the entire time state/ is unwritable (liveness-canary sees the
+    # sick tick), so the operator is alerted then; only a post-recovery re-drift before a clean tick
+    # is the gap. A RESET_REQUIRED-sentinel fix was built and deliberately REVERTED: it requires a
+    # chmod of the factory's state dir (never observed on a single-operator box) and each hardening
+    # layer spawned a narrower edge case — an infinite fold on a never-fired path, not worth the
+    # recovery-code complexity. Do NOT re-raise without a real-world trigger.
     rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || {
       rm -f "$DT_WATCHED_FILE" 2>/dev/null || true
       die "could not clear dev-tree streak/latch (identity poisoned for retarget-reset recovery)"
