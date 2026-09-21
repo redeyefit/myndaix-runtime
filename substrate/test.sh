@@ -1271,6 +1271,13 @@ BADROLE="$TMP/guard-badrole"; mkdir -p "$BADROLE"; printf 'MACHINE_ROLE=factroy\
 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BADROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.badrole.err"; r=$?
 ok '[[ "$r" -eq 78 ]]' "guard: unrecognized nonempty role ('factroy' typo) -> REFUSED fail-closed (review 67726 P1)"
 ok 'grep -q "REFUSING" "$TMP/g.badrole.err"' "guard: unrecognized-role refusal is loud on stderr"
+# The echoed role must be sanitized: an ANSI escape smuggled through config.env must not reach
+# the terminal raw (it could clear the screen or hide the refusal — review 6838 P2). Still 78.
+ESCROLE="$TMP/guard-escrole"; mkdir -p "$ESCROLE"; printf 'MACHINE_ROLE=fac\033[2Jtroy\n' > "$ESCROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$ESCROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.escrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: role with embedded ANSI escape still REFUSED fail-closed"
+ESCBYTE=$'\033'
+ok 'grep -q "REFUSING" "$TMP/g.escrole.err" && ! grep -qF "$ESCBYTE" "$TMP/g.escrole.err"' "guard: refusal stderr carries NO raw ESC byte (role sanitized to printables — review 6838 P2)"
 # Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
 # defeat the equality check (that would silently fail-OPEN on a real factory).
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"
