@@ -6,6 +6,11 @@
 # liveness-fire: every run logs >=1 stdout line unconditionally ("no drift" / "DRIFT"), so
 # this job's .out mtime is execution evidence for liveness-canary's freshness check.
 set -euo pipefail
+# EXECUTE-ONLY: this script owns its shell options (set -euo pipefail above, and a bare set +e /
+# set -e bracket around the DEV-tree subshell below). Sourcing it would clobber the caller's
+# options, so refuse (review 28330 P3 — the alternative, save-and-restore of prior errexit state,
+# buys nothing for a script that is only ever run by launchd and test.sh).
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then echo "drift-canary.sh must be executed, not sourced" >&2; return 1; fi
 SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=substrate/lib.sh
 source "$SUBSTRATE_DIR/lib.sh"
@@ -175,13 +180,22 @@ DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/
 # the config-drift block, so a stale config-drift latch never cleared on a subsequent clean tick —
 # the cross-watch independence the separate streak/latch files give for LATCHES must hold for
 # FAILURES too). dt_rc carries the failure out; die's `exit 1` exits only the subshell.
-# set -e at the top keeps errexit active — the ()|| form suppresses it for the entire body,
-# masking unguarded failures (review 62436).
+# The capture is DECOUPLED from the subshell (set +e / bare subshell / dt_rc=$? / set -e) — a
+# subshell on the left of `||` (or any tested position) has errexit suppressed for its ENTIRE
+# body, inner `set -e` included, so the ()||dt_rc=$? form silently continued past unguarded
+# failures (review 98003 F1; also review 62436). The bare set -e restore is safe: the top-of-file
+# guard refuses sourcing, so this script owns its own options.
 dt_rc=0
+set +e
 (
 set -e
-# Test-only seam: inject an unguarded failure to prove errexit is active inside the subshell.
-[[ -z "${DRIFT_CANARY_TEST_DT_ABORT:-}" ]] || die "DT_ABORT seam: unguarded failure to verify errexit active"
+# Test-only seam: an stderr marker then a BARE false. `die` exits explicitly and would pass the
+# abort test even with errexit dead — only an unguarded plain-command failure proves errexit is
+# live inside the subshell (review 98003 F1).
+if [[ -n "${DRIFT_CANARY_TEST_DT_ABORT:-}" ]]; then
+  echo "DT_ABORT seam: injecting unguarded failure (errexit must abort the tick)" >&2
+  false
+fi
 if [[ -n "${DEV_TREE:-}" ]]; then
   # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
   # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
@@ -232,7 +246,9 @@ else
   rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
     || die "could not clear disabled dev-tree state (stale latch/streak left intact — re-enable may be suppressed)"
 fi
-) || dt_rc=$?
+)
+dt_rc=$?
+set -e
 
 # ---- config-drift watch (runs regardless of DEV-tree outcome) ----------------------------
 if [[ "$rc" -eq 0 ]]; then

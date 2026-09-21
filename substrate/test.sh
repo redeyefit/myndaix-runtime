@@ -1248,12 +1248,18 @@ dtreset; rm -f "$DTW/state/dev-tree-watched"
 # Independence: a DEV-tree watch failure must NOT suppress the config-drift alert.
 # Use the DT_ABORT seam (DRIFT_CANARY_TEST_DT_ABORT=1) with a drifting config
 # (DRIFT_CANARY_TEST_RC=1) and assert that the config-drift alert was written despite the failure.
-dtcfg "$TREE_CLEAN"; dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/inbox"/*
+# TWO drifting ticks: the config-drift THRESHOLD is 2 (drift-canary.sh:18), so one tick only
+# raises the streak to 1 and a single-tick assert would fail on a CORRECT implementation
+# (review 98003 F2 — kilabz caught the threshold-unreachable assert).
+dtcfg "$TREE_CLEAN"; dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/inbox"/* \
+  "$DTW/state/drift-streak" "$DTW/state/drift-alerted"
 MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_TEST_DT_ABORT=1 \
   /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>/dev/null; indep_rc=$?
-ok '[[ "$indep_rc" -ne 0 ]]' "DEV-tree independence: DEV-tree failure exits NONZERO (tick is sick)"
-ok 'ls "$DTW/inbox"/drift-alert-*.md >/dev/null 2>&1' "DEV-tree independence: config-drift alert fires DESPITE DEV-tree watch failure (review 36499 P2)"
-dtreset; rm -f "$DTW/inbox"/* "$DTW/state/dev-tree-watched"
+MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_TEST_DT_ABORT=1 \
+  /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>/dev/null; indep_rc2=$?
+ok '[[ "$indep_rc" -ne 0 && "$indep_rc2" -ne 0 ]]' "DEV-tree independence: DEV-tree failure exits NONZERO on both ticks (tick is sick)"
+ok 'ls "$DTW/inbox"/drift-alert-*.md >/dev/null 2>&1' "DEV-tree independence: config-drift alert fires at threshold DESPITE DEV-tree watch failure (review 36499 P2 / 98003 F2)"
+dtreset; rm -f "$DTW/inbox"/* "$DTW/state/dev-tree-watched" "$DTW/state/drift-streak" "$DTW/state/drift-alerted"
 
 # Disable-path die: when DEV_TREE is unset and state/ is unwritable, the clear must die LOUD
 # (not warn-and-continue) — warn-and-continue leaves a stale latch that suppresses the next
