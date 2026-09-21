@@ -90,7 +90,11 @@ dev_tree_drift() {
   if (( 10#$ahead > 0 )); then
     printf 'is %s commit(s) ahead of origin/main (unpushed local commits)' "$ahead"; return 0
   fi
-  st="$(git -C "$dir" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; strc=$?
+  # `|| strc=$?` disarms this script's set -e AND records the real rc — a bare `; strc=$?` would
+  # never run: under set -e a failing substitution-assignment kills the $() subshell mid-function,
+  # aborting the whole canary tick instead of reporting drift (review R6, verified live-reachable).
+  strc=0
+  st="$(git -C "$dir" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" || strc=$?
   if [[ "$strc" -ne 0 ]]; then
     printf 'git status errored (rc=%s) — tree state unverifiable' "$strc"; return 0
   fi

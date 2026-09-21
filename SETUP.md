@@ -189,7 +189,11 @@ case "${1:-}" in
   *)
     if [ "${MXR_ALLOW_DIRTY:-}" != 1 ]; then
       _mxr_cfg="${MYNDAIX_HOME:-$HOME/.myndaix}/config.env"
-      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]')"
+      # `|| true` / `|| rc=$?` throughout: the canonical template sets no -e, but live wrappers get
+      # hand-edited and the house style adds `set -euo pipefail` — every substitution must survive
+      # that without dying mid-guard (review R6; a missing config.env must fall through to
+      # unknown-role fail-open, not kill the wrapper with a bare rc=2).
+      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
       if [ "$_mxr_role" = factory ]; then
         _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
         # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
@@ -197,6 +201,7 @@ case "${1:-}" in
         # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE from the runtime — drift-canary's dev_tree_drift avoids
         # this by running in a $()-subshell; the wrapper must too). The subshell exits 78 on drift;
         # any other status (clean, or fail-open warn) falls through to dispatch.
+        _mxr_grc=0
         ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
           if [ -z "${PYTHONPATH:-}" ]; then
             # PYTHONPATH legitimately unset/empty (editable-venv install) — there is no tree to
@@ -220,19 +225,22 @@ case "${1:-}" in
           # UNVERIFIABLE -> refuse, never as "0 ahead = clean" (review R4 P2: `|| echo 0` swallowed
           # it). Empty/garbage output normalizes to unverifiable too; the `||` chain below only
           # reaches the arithmetic when the value is verified numeric.
-          _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null)"
+          _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || true)"
           case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=unverifiable ;; esac
           # A status ERROR (rc!=0) is treated as drift (fail-CLOSED), never silently clean (review #2).
-          _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; _mxr_strc=$?
+          # NOT `"$(... || true)"; _mxr_strc=$?` — that reads the rc of the ALWAYS-0 compound and
+          # would silently disable this check (a reviewer-proposed fix with exactly that bug, R6).
+          _mxr_strc=0
+          _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" || _mxr_strc=$?
           if [ "$_mxr_branch" != main ] || [ "$_mxr_ahead" = unverifiable ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
             echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
-        )
+        ) || _mxr_grc=$?
         # Fail CLOSED on ANYTHING except the subshell's explicit clean-pass 0 (review R4 P1: an
         # `-eq 78`-only check let a killed/crashed inspection — SIGTERM=143, error=1 — fall through
-        # to dispatch). 78 stays silent (the subshell already printed its reason).
-        _mxr_grc=$?
+        # to dispatch). 78 stays silent (the subshell already printed its reason). The `||` capture
+        # on the subshell (not a following `$?`) keeps this correct under an added `set -e`.
         if [ "$_mxr_grc" -ne 0 ]; then
           [ "$_mxr_grc" -ne 78 ] && echo "mxr: REFUSING dispatch — freshness inspection aborted unexpectedly (rc=$_mxr_grc); failing closed. Set MXR_ALLOW_DIRTY=1 to override." >&2
           exit 78

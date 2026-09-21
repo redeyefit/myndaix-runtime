@@ -1235,6 +1235,20 @@ ok '[[ "$r" -eq 78 ]] && grep -q "ahead=unverifiable" "$TMP/g.noref.err"' "guard
 # R4 P1: the parent must fail CLOSED on ANY non-zero subshell status, not only exactly 78 — a
 # killed/crashed inspection (SIGTERM=143, error=1) must refuse, not fall through to dispatch.
 ok 'grep -q "aborted unexpectedly" "$REPO/SETUP.md" && grep -qE "\-ne 0" "$REPO/SETUP.md"' "guard: parent refuses on ANY abnormal inspection exit, not only 78 (fail-closed crash window) (structural)"
+# R6: live wrappers get hand-edited toward house style (`set -euo pipefail`) — the guard must keep
+# its exact semantics under it: clean passes, drift refuses 78 (not a stray -e death), a missing
+# config.env still falls through to unknown-role fail-open instead of killing the wrapper.
+GUARDE="$TMP/mxr-guard-strict"
+{ printf '#!/bin/bash\nset -euo pipefail\nexport PYTHONPATH="${MXR_TEST_TREE}/src"\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARDE"; chmod +x "$GUARDE"
+g="$(MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard under set -euo pipefail: clean main still dispatches"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard under set -euo pipefail: dirty tree still refuses with the CONTRACT exit 78 (not a stray -e death)"
+MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard under set -euo pipefail: unverifiable ahead still refuses 78"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARDE" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard under set -euo pipefail: missing config.env falls through fail-open (no rc=2 wrapper death)"
+ok 'grep -q "strc=\$?" "$SUB/drift-canary.sh"' "watch: status rc captured via ||-disarm (canary set -e cannot abort the tick mid-probe) (structural)"
 ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
 ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"
 # The GIT_* unset must be SCOPED to the git-probe subshell, NOT leak to the exec'd python child
