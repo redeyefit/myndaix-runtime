@@ -160,22 +160,24 @@ exports, before the guard) and tail (the `exec ... python -m runtime.cli` line),
 block between the markers:
 
 ```bash
-# 1. extract the new guard from SETUP.md on the MacBook:
+# 1. extract the new guard from SETUP.md on the MacBook (mktemp — a predictable /tmp name on a
+#    shared box is a symlink-clobber target):
 set -euo pipefail
+GUARD=$(mktemp)
 awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
-  SETUP.md > /tmp/new-guard.txt
-[ -s /tmp/new-guard.txt ] && grep -q '^# --- runtime-tree freshness guard' /tmp/new-guard.txt \
-  && grep -q '^# -----' /tmp/new-guard.txt \
+  SETUP.md > "$GUARD"
+[ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
+  && grep -q '^# -----' "$GUARD" \
   || { echo "Guard markers missing in SETUP.md" >&2; exit 1; }
 
-# 2. copy to Mini + splice on the Mini (assembly + parse-check + atomic-swap, same filesystem):
-scp /tmp/new-guard.txt mini:/tmp/new-guard.txt
+# 2. stream to the Mini over ssh stdin (no shared /tmp handoff at all) + splice there:
+#    assembly + parse-check + atomic-swap in a mktemp stage on the same filesystem as the target.
 ssh mini '
   set -euo pipefail
   stage=$(mktemp -d ~/.local/bin/mxr.XXXXXXXX)
   trap "rm -rf -- \"$stage\"" EXIT
   cp ~/.local/bin/mxr "$stage/mxr.snap"
-  cp /tmp/new-guard.txt "$stage/guard"
+  cat > "$stage/guard"
   [ -s "$stage/guard" ] && grep -q "^# --- runtime-tree freshness guard" "$stage/guard" \
     && grep -q "^# -----" "$stage/guard" \
     || { echo "Guard markers missing" >&2; exit 1; }
@@ -187,10 +189,10 @@ ssh mini '
   cat "$stage/guard" >> "$stage/mxr.new"
   tail -n +$((N2+1)) "$stage/mxr.snap" >> "$stage/mxr.new"
   bash -n "$stage/mxr.new"
-  cp "$stage/mxr.snap" /tmp/mxr-$(date +%Y%m%d%H%M%S).bak
+  cp "$stage/mxr.snap" ~/.local/bin/mxr.bak.$(date +%Y%m%d%H%M%S)   # backup outside /tmp AND outside the auto-removed stage
   chmod +x "$stage/mxr.new"
   mv -f "$stage/mxr.new" ~/.local/bin/mxr
-'
+' < "$GUARD"
 ```
 
 **Verify it PASSES on clean main WITHOUT dispatching a job** (extract the guard from the now-live
@@ -199,10 +201,13 @@ dispatch; `REFUSING` = it would block):
 
 ```bash
 ssh mini '
-awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > /tmp/gbody.sh
-[ -s /tmp/gbody.sh ] || { echo "GUARD NOT FOUND — markers missing in live mxr"; exit 1; }
-{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat /tmp/gbody.sh; printf "echo PASSTHROUGH\n"; } > /tmp/grun.sh
-MYNDAIX_HOME=$HOME/.myndaix bash /tmp/grun.sh kilabz'    # factory + clean main -> PASSTHROUGH
+set -euo pipefail
+g=$(mktemp); run=$(mktemp)
+trap "rm -f -- \"$g\" \"$run\"" EXIT
+awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > "$g"
+[ -s "$g" ] || { echo "GUARD NOT FOUND — markers missing in live mxr"; exit 1; }
+{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat "$g"; printf "echo PASSTHROUGH\n"; } > "$run"
+MYNDAIX_HOME=$HOME/.myndaix bash "$run" kilabz'    # factory + clean main -> PASSTHROUGH
 ```
 
 The guard's LOGIC is covered by `substrate/test.sh` (extracted from `SETUP.md`, fixture repos: clean
