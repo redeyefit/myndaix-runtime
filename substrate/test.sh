@@ -1208,19 +1208,30 @@ ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unknown role (no config.env
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"
 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FACC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
 ok '[[ "$r" -eq 78 ]]' "guard: factory role with an inline #comment + CRLF still ENFORCES (robust extraction, not fail-open)"
-# Unresolvable runtime tree (bad/venv PYTHONPATH): fail OPEN with a loud warning, NOT a misleading
-# exit-78 that bricks every factory dispatch (cross-family review MED). Piece 1's canary backstops.
+# PYTHONPATH SET but unresolvable (tree deleted/moved, or not a repo): REFUSE — the source may
+# still be importable, so dispatching would run code of unverifiable provenance (oracle finding:
+# fail-open here was a .git-delete bypass; Jefe call 09-21 = fail-closed).
 mkdir -p "$TMP/not-a-repo"
-g="$(MXR_TEST_TREE="$TMP/not-a-repo" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>"$TMP/g.warn")"; r=$?
-ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unresolvable runtime tree fails OPEN (guard-config error must not brick the factory)"
-ok 'grep -qi "cannot resolve" "$TMP/g.warn"' "guard: unresolvable tree warns loudly on stderr"
-# A BARE repo must NOT pass the guard as clean-main (rev-parse prints false/exit-0) — fail OPEN+warn.
-# Assert the WARNING, not just passthrough: the OLD exit-status-only guard ALSO passed a bare repo
-# (silently), so only the warning distinguishes the fix from the bug (cross-family review R3).
-g="$(MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>"$TMP/g.bare.err")"; r=$?
-ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "cannot resolve" "$TMP/g.bare.err"' "guard: a BARE repo fails OPEN *and WARNS* (warning proves the ==true fix, not the old silent pass)"
+MXR_TEST_TREE="$TMP/not-a-repo" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.warn"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: PYTHONPATH set but unresolvable tree -> REFUSED (unverifiable code must not dispatch)"
+ok 'grep -qi "does not resolve to a git work tree" "$TMP/g.warn"' "guard: unresolvable-tree refusal names the real cause (not a misleading 'not on clean main')"
+# A BARE repo is equally unresolvable (rev-parse prints false/exit-0 — the ==true check catches it) -> REFUSE.
+MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.bare.err"; r=$?
+ok '[[ "$r" -eq 78 ]] && grep -qi "does not resolve" "$TMP/g.bare.err"' "guard: a BARE repo is REFUSED (not read as clean-main via false/exit-0)"
+# PYTHONPATH legitimately UNSET (editable-venv install): the ONE fail-open branch — warn + dispatch.
+GUARD3="$TMP/mxr-guard-nopypath"
+{ printf '#!/bin/bash\nunset PYTHONPATH\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARD3"; chmod +x "$GUARD3"
+g="$(MYNDAIX_HOME="$FAC" bash "$GUARD3" kilabz 2>"$TMP/g.nopy.err")"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "PYTHONPATH unset" "$TMP/g.nopy.err"' "guard: PYTHONPATH unset (venv install) is the ONLY fail-open branch — warns + dispatches"
 ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
 ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"
+# The GIT_* unset must be SCOPED to the git-probe subshell, NOT leak to the exec'd python child
+# (oracle MED). A second guard variant whose tail echoes GIT_DIR: on a clean tree the guard falls
+# through, and GIT_DIR set in the parent env must SURVIVE (a global unset would blank it).
+GUARD2="$TMP/mxr-guard-gitenv"
+{ printf '#!/bin/bash\nexport PYTHONPATH="${MXR_TEST_TREE}/src"\n'; cat "$GUARDBODY"; printf 'printf "PASS GITDIR=[%%s]\\n" "${GIT_DIR:-}"\n'; } > "$GUARD2"; chmod +x "$GUARD2"
+g="$(GIT_DIR=/tmp/x.git MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FAC" bash "$GUARD2" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == *"GITDIR=[/tmp/x.git]"* ]]' "guard: GIT_* unset is SCOPED to the probe subshell — does NOT leak to the exec'd runtime child (oracle MED)"
 ok 'grep -q "exit 78" "$REPO/SETUP.md" && grep -q "MXR_ALLOW_DIRTY" "$REPO/SETUP.md" && grep -q "MACHINE_ROLE" "$REPO/SETUP.md"' "guard: SETUP.md heredoc carries the canonical guard (structural)"
 
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="

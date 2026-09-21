@@ -177,11 +177,13 @@ export PYTHONSAFEPATH=1   # don't prepend CWD to sys.path — else running mxr f
 # INLINE by design: a guard sourced from the tree would rot WITH the tree it guards. config.env is
 # READ, never sourced — the role token is only compared, never executed.
 # Cross-family review hardening: the role sed strips inline `#comments` + ALL whitespace (a CRLF or
-# `factory # note` config would else fail-OPEN); GIT_* are unset so an inherited hook env can't
-# redirect the probe; the tree is VALIDATED as a git work tree (a bad PYTHONPATH fails OPEN with a
-# loud warning, never a misleading exit-78 brick — piece 1's drift-canary is the paired belt); the
-# status probe is --untracked-files=all + --no-optional-locks. NB: this is a point-in-time tripwire
-# at dispatch, not a running-pool integrity guarantee (a concurrent checkout can still race it).
+# `factory # note` config would else fail-OPEN); GIT_* are unset INSIDE the probe subshell so an
+# inherited hook env can't redirect the probe yet the exec'd runtime child still sees them; the tree
+# is VALIDATED as a git work tree — PYTHONPATH set-but-unresolvable REFUSES (a deleted/moved .git
+# must not dispatch unverifiable code; that fail-open was a .git-delete bypass), while PYTHONPATH
+# unset/empty (editable-venv install) is the one fail-open+warn branch; the status probe is
+# --untracked-files=all + --no-optional-locks. NB: this is a point-in-time tripwire at dispatch,
+# not a running-pool integrity guarantee (a concurrent checkout can still race it).
 case "${1:-}" in
   get|help|--help|-h) : ;;
   *)
@@ -189,27 +191,41 @@ case "${1:-}" in
       _mxr_cfg="${MYNDAIX_HOME:-$HOME/.myndaix}/config.env"
       _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]')"
       if [ "$_mxr_role" = factory ]; then
-        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-        _mxr_tree="${PYTHONPATH%/src}"
-        # Require `true` (not just exit 0): a BARE repo prints `false`/exit-0, and would else pass
-        # here then read as clean-main (cross-family review R2). A non-repo prints nothing.
-        if [ -z "$_mxr_tree" ] || [ "$(git -C "$_mxr_tree" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]; then
-          # Bad/unexpected PYTHONPATH (e.g. a venv install that dropped it, or a bare repo): we
-          # cannot resolve a runtime WORK TREE, so fail OPEN with a loud warning rather than brick
-          # every factory dispatch with a misleading "not on clean main" (cross-family review). The
-          # drift-canary DEV-tree watch still alerts on a genuinely missing/bare/drifted tree.
-          echo "mxr: WARNING — cannot resolve the runtime git work tree from PYTHONPATH ($PYTHONPATH); freshness guard skipped. Point PYTHONPATH at <clone>/src (or set MXR_ALLOW_DIRTY=1 to silence)." >&2
-        else
+        _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
+        # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
+        # the exec'd python child below (oracle MED: a global unset would strip
+        # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE from the runtime — drift-canary's dev_tree_drift avoids
+        # this by running in a $()-subshell; the wrapper must too). The subshell exits 78 on drift;
+        # any other status (clean, or fail-open warn) falls through to dispatch.
+        ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          if [ -z "${PYTHONPATH:-}" ]; then
+            # PYTHONPATH legitimately unset/empty (editable-venv install) — there is no tree to
+            # verify, so fail OPEN with a warning. This is the ONLY fail-open branch.
+            echo "mxr: WARNING — PYTHONPATH unset; freshness guard skipped (editable-venv install?). The drift-canary DEV-tree watch is the backstop." >&2
+            exit 0
+          fi
+          # Require `true` (not just exit 0): a BARE repo prints `false`/exit-0 and would else read as
+          # clean-main (cross-family review R2); a non-repo/missing dir prints nothing.
+          if [ "$(git -C "$_mxr_tree" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]; then
+            # PYTHONPATH is SET but does not resolve to a git work tree: the tree was deleted/moved
+            # or its .git vanished — yet the source may STILL be importable, so dispatching would run
+            # code of unverifiable provenance (the exact 09-14 class this guard exists for). Fail
+            # CLOSED (oracle finding: fail-open here was a .git-delete bypass). MXR_ALLOW_DIRTY=1 is
+            # the one-command recovery if this ever fires on a legitimate config quirk.
+            echo "mxr: REFUSING dispatch — PYTHONPATH ($PYTHONPATH) does not resolve to a git work tree (tree deleted/moved, or bare?). Cannot verify the runtime code the factory would ship. Fix PYTHONPATH / restore the clone, or set MXR_ALLOW_DIRTY=1 to override." >&2
+            exit 78
+          fi
           _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
           _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
           case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=0 ;; esac
-          _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; _mxr_strc=$?
           # A status ERROR (rc!=0) is treated as drift (fail-CLOSED), never silently clean (review #2).
+          _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; _mxr_strc=$?
           if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
             echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
-        fi
+        )
+        [ $? -eq 78 ] && exit 78
       fi
     fi
     ;;
