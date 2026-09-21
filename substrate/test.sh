@@ -1278,6 +1278,19 @@ MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$ESCROLE" bash "$GUARD" kilabz >/dev/n
 ok '[[ "$r" -eq 78 ]]' "guard: role with embedded ANSI escape still REFUSED fail-closed"
 ESCBYTE=$'\033'
 ok 'grep -q "REFUSING" "$TMP/g.escrole.err" && ! grep -qF "$ESCBYTE" "$TMP/g.escrole.err"' "guard: refusal stderr carries NO raw ESC byte (role sanitized to printables — review 6838 P2)"
+# A LITERAL backslash-033 in the role is printable and survives tr; under xpg_echo, `echo` would
+# convert it to a real ESC on output — the refusal must use a constant-format printf so the text
+# stays literal (review 48310 F1). bash -O xpg_echo turns the option on for the guard run.
+LITROLE="$TMP/guard-litrole"; mkdir -p "$LITROLE"; printf 'MACHINE_ROLE=bad\\033[2Jrole\n' > "$LITROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LITROLE" bash -O xpg_echo "$GUARD" kilabz >/dev/null 2>"$TMP/g.litrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: literal-backslash-escape role still REFUSED fail-closed"
+ok 'grep -q "REFUSING" "$TMP/g.litrole.err" && ! grep -qF "$ESCBYTE" "$TMP/g.litrole.err"' "guard: under xpg_echo a literal backslash-033 is NOT re-interpreted (printf constant format — review 48310 F1)"
+# Non-UTF-8 bytes in the role: BSD tr without LC_ALL=C aborts on an illegal byte sequence and the
+# sanitize substitution dies mid-guard (review 48310 F2). Must still refuse 78 with a message.
+BINROLE="$TMP/guard-binrole"; mkdir -p "$BINROLE"; printf 'MACHINE_ROLE=fac\xff\xfetroy\n' > "$BINROLE/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BINROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.binrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: role with non-UTF-8 bytes still REFUSED fail-closed (LC_ALL=C tr — review 48310 F2)"
+ok 'grep -q "REFUSING" "$TMP/g.binrole.err"' "guard: non-UTF-8-role refusal still emits its message (tr did not abort the pipeline)"
 # Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
 # defeat the equality check (that would silently fail-OPEN on a real factory).
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"

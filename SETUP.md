@@ -194,6 +194,12 @@ case "${1:-}" in
       # that without dying mid-guard (review R6; a missing config.env must fall through to
       # unknown-role fail-open, not kill the wrapper with a bare rc=2).
       _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
+      # Snapshot config.env existence ONCE, next to the extraction that read it — the elif chain
+      # below branches on this variable, never on a fresh -f. Re-testing the filesystem per-branch
+      # was a TOCTOU: a config landed (or deleted) by deploy tooling between two elifs made the
+      # chain see a state the extraction never read, skipping the refuse/warn that matched the
+      # extracted role (review 48310 F3, both reviewers; supersedes the round-1 wontfix).
+      _mxr_cfg_present=0; [ -f "$_mxr_cfg" ] && _mxr_cfg_present=1
       if [ "$_mxr_role" = factory ]; then
         _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
         # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
@@ -253,11 +259,11 @@ case "${1:-}" in
           [ "$_mxr_grc" -ne 78 ] && echo "mxr: REFUSING dispatch — freshness inspection aborted unexpectedly (rc=$_mxr_grc); failing closed. Set MXR_ALLOW_DIRTY=1 to override." >&2
           exit 78
         fi
-      elif [ -z "$_mxr_role" ] && [ -f "$_mxr_cfg" ]; then
-        # config.env EXISTS but MACHINE_ROLE did not resolve — the extraction pipeline itself failed
-        # (missing binary / OOM) OR the key is absent from a present config. We cannot rule out that
-        # THIS is the factory, so the guard above would be SILENTLY SKIPPED on the exact machine it
-        # protects. Fail CLOSED (review 68864 P3).
+      elif [ -z "$_mxr_role" ] && [ "$_mxr_cfg_present" -eq 1 ]; then
+        # config.env EXISTED at extraction but MACHINE_ROLE did not resolve — the extraction
+        # pipeline itself failed (missing binary / OOM) OR the key is absent from a present config.
+        # We cannot rule out that THIS is the factory, so the guard above would be SILENTLY SKIPPED
+        # on the exact machine it protects. Fail CLOSED (review 68864 P3).
         echo "mxr: REFUSING dispatch — config.env present ($_mxr_cfg) but MACHINE_ROLE could not be resolved (unparsable config or missing key). Cannot confirm this is not the factory; failing closed. Fix MACHINE_ROLE, or set MXR_ALLOW_DIRTY=1 to override." >&2
         exit 78
       elif [ -n "$_mxr_role" ] && [ "$_mxr_role" != "lab" ]; then
@@ -265,21 +271,23 @@ case "${1:-}" in
         # typo like 'factroy' bypasses the factory branch above and the empty-role branch above,
         # dispatching with zero freshness inspection. Only 'lab' is a known bypass; anything else
         # is unrecognized and cannot be trusted as a non-factory role. Fail CLOSED (review 67726 P1).
-        # The echoed role is SANITIZED to printable chars: config.env is disk data, and a raw echo
-        # would let ANSI escapes in a corrupted/malicious value rewrite or hide this refusal
-        # message on the operator's terminal (review 6838 P2).
-        _mxr_role_p="$(printf '%s' "$_mxr_role" | tr -cd '[:print:]')"
-        echo "mxr: REFUSING dispatch — MACHINE_ROLE='$_mxr_role_p' is unrecognized (expected 'factory' or 'lab'); failing closed. Fix config.env or set MXR_ALLOW_DIRTY=1 to override." >&2
+        # The echoed role is SANITIZED to printables (LC_ALL=C: BSD tr aborts on non-UTF-8 bytes
+        # without it — review 48310 F2) and emitted via printf with a constant format — echo under
+        # xpg_echo re-interprets a LITERAL backslash-033 that tr passes through as printable,
+        # re-creating the terminal-escape injection the sanitize exists to stop (review 48310 F1;
+        # original raw-ESC finding review 6838 P2). `|| true` inside: survives hand-added set -e
+        # (the R6 wrapper convention).
+        _mxr_role_p="$(printf '%s' "$_mxr_role" | LC_ALL=C tr -cd '[:print:]' || true)"
+        printf '%s\n' "mxr: REFUSING dispatch — MACHINE_ROLE='$_mxr_role_p' is unrecognized (expected 'factory' or 'lab'); failing closed. Fix config.env or set MXR_ALLOW_DIRTY=1 to override." >&2
         exit 78
-      elif [ -z "$_mxr_role" ] && [ ! -f "$_mxr_cfg" ]; then
-        # config.env ABSENT and role therefore empty — an unconfigured machine, not the
+      elif [ -z "$_mxr_role" ]; then
+        # Role empty and config.env was ABSENT at extraction (the present-but-empty case was
+        # consumed by the fail-closed branch above) — an unconfigured machine, not the
         # factory-ships-wrong-code case: fail-open but WARN so the guard skip is observable,
         # matching the PYTHONPATH-unset branch's visibility contract (review 67726 P2).
-        # DECLINED hardenings (review 6838, wontfix): (P1) requiring MXR_ALLOW_DIRTY=1 here would
+        # DECLINED hardening (review 6838 P1, wontfix): requiring MXR_ALLOW_DIRTY=1 here would
         # kill every fresh-install wrapper to close a deploy-deletes-config.env edge the warning +
-        # drift-canary DEV-tree watch already surface. (P3) re-testing -f here is a TOCTOU only if
-        # config.env is deleted BETWEEN two elifs of the same shell process — sub-millisecond, needs
-        # an external actor, and the loser is one warning line, not the guard.
+        # drift-canary DEV-tree watch already surface.
         echo "mxr: WARNING — config.env absent ($_mxr_cfg); freshness guard skipped (unconfigured install?). The drift-canary DEV-tree watch is the backstop." >&2
       fi
     fi
