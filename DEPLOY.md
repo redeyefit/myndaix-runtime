@@ -128,15 +128,26 @@ until [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null || true)" == "$TARGET" 
   (( SECONDS < deadline )) || { echo "Timed out waiting for convergence to $TARGET; inspect reconcile.out" >&2; exit 1; }
   echo "waiting…"; sleep 5
 done
-# 3. force one watcher tick; read only newly appended output:
+# 3. force one watcher tick; wait for its verdict in newly appended output, FAIL on any drift.
+#    "canary: no drift" is ONLY the config sub-check (drift-canary.sh:253-256); the DEV-tree
+#    failure trailer prints AFTER it (:265) — so match every verdict variant and fail closed:
 LOG=~/.myndaix/state/drift-canary.out
+touch "$LOG"    # fresh host: the log may not exist yet and the offset read would die under set -e
 offset=$(wc -c < "$LOG")
 launchctl kickstart -k gui/$(id -u)/ai.myndaix.drift-canary
 deadline=$((SECONDS + 120))
-until tail -c +$((offset + 1)) "$LOG" | grep -E 'canary: (no drift|config DRIFT)'; do
+until tail -c +$((offset + 1)) "$LOG" | grep -qE 'canary: (no drift|config DRIFT)|dev-tree watch failed|liveness-watch DRIFT|ALARM'; do
   (( SECONDS < deadline )) || { echo "Timed out waiting for a fresh canary verdict; inspect $LOG" >&2; exit 1; }
   sleep 2
-done   # expect "canary: no drift"; config DRIFT requires investigation
+done
+sleep 2    # let the post-"no drift" dev-tree trailer land before judging the tick
+fresh=$(tail -c +$((offset + 1)) "$LOG")
+if grep -qE 'DRIFT|ALARM|watch failed' <<<"$fresh"; then
+  echo "canary reported drift/failure — investigate before trusting this deploy:" >&2
+  grep -E 'DRIFT|ALARM|watch failed' <<<"$fresh" >&2
+  exit 1
+fi
+grep -q 'canary: no drift' <<<"$fresh"   # the healthy verdict must be PRESENT, not merely nothing bad
 ```
 
 The `~/code/active` tree is updated first — the controller imports from it and the
@@ -164,6 +175,7 @@ block between the markers:
 #    shared box is a symlink-clobber target):
 set -euo pipefail
 GUARD=$(mktemp)
+trap 'rm -f -- "$GUARD"' EXIT
 awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
   SETUP.md > "$GUARD"
 [ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
