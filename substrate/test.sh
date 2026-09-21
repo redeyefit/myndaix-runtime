@@ -1282,6 +1282,47 @@ else
 fi
 ok 'grep -q "could not clear disabled dev-tree streak/latch/identity" "$SUB/drift-canary.sh"' "DEV-tree: disable path clears state then sentinel, dying loud on each (structural — review 13355 P1)"
 
+# P2#1 (review 36499): a disable-path state-clear failure with a latch but NO PRIOR sentinel must
+# still RAISE one, else re-enabling the same drifting tree stays muted. (The 13355 disable test
+# pre-raised a sentinel — this covers the no-prior-sentinel case the reviewer flagged.) Non-root.
+if [[ "$(id -u)" -ne 0 ]]; then
+  TREE_DIS2="$TMP/tree-dis2"; mk_clone "$TREE_DIS2"; printf 'dis2\n' >> "$TREE_DIS2/src/x.py"
+  dtcfg "$TREE_DIS2"; dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
+  dtrun >/dev/null; dtrun >/dev/null                                   # latch set for DIS2; NO sentinel raised
+  ok '[[ -e "$DTW/state/dev-tree-alerted" && ! -e "$DTW/.dev-tree-reset-required" ]]' "DEV-tree disable P2#1: (setup) latched, no prior sentinel"
+  printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\n' "$DTW" "$DTW" > "$DTW/config.env"   # disable
+  chmod 555 "$DTW/state"; dtrun >/dev/null; disrc2=$?; chmod 755 "$DTW/state"
+  ok '[[ "$disrc2" -ne 0 ]]' "DEV-tree disable P2#1: state-clear failure exits nonzero (loud)"
+  ok '[[ -e "$DTW/.dev-tree-reset-required" ]]' "DEV-tree disable P2#1: sentinel RAISED on disable state-clear failure even with no prior sentinel"
+  printf 'redrift2\n' >> "$TREE_DIS2/src/x.py"; dtcfg "$TREE_DIS2"; rm -f "$DTW/inbox"/*   # perms recovered; re-enable same drifting tree
+  dtrun >/dev/null; dtrun >/dev/null
+  ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "dirty working tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree disable P2#1: re-enable after recovery still ALERTS (the raised sentinel forced the reset)"
+  dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
+else
+  echo "  --: SKIP dev-tree disable P2#1 test (running as root)"
+fi
+
+# P2#2 (review 36499): a DEV-tree die must NOT skip the INDEPENDENT config-drift watch. Reproduce
+# the sentinel-removal die (pending sentinel + parent $MYNDAIX_HOME unwritable while state/ stays
+# writable) on a disable tick where config is CLEAN and a config-drift latch was previously set —
+# the stale config latch must still clear (the dev-tree watch runs in a subshell now). Non-root.
+if [[ "$(id -u)" -ne 0 ]]; then
+  dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
+  : > "$DTW/state/drift-streak"; : > "$DTW/state/drift-alerted"        # fake a prior CONFIG-drift latch
+  : > "$DTW/.dev-tree-reset-required"                                  # pending dev-tree sentinel (so the 2nd rm has a target)
+  printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\n' "$DTW" "$DTW" > "$DTW/config.env"   # disable
+  chmod 555 "$DTW"                                                     # parent unwritable; $DTW/state (755) stays writable
+  MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=0 /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1; cfgrc=$?
+  chmod 755 "$DTW"
+  ok '[[ "$cfgrc" -ne 0 ]]' "config-drift independence: a dev-tree sentinel-removal die still exits the tick nonzero (loud)"
+  ok '[[ ! -e "$DTW/state/drift-alerted" ]]' "config-drift independence: a dev-tree die does NOT skip clearing the config-drift latch on a clean tick (36499 P2)"
+  rm -f "$DTW/state/drift-streak" "$DTW/state/drift-alerted" "$DTW/.dev-tree-reset-required"
+  dtreset; rm -f "$DTW/state/dev-tree-watched"
+else
+  echo "  --: SKIP config-drift independence test (running as root)"
+fi
+ok 'grep -qE "^\) \|\| dt_rc=" "$SUB/drift-canary.sh"' "config-drift independence: DEV-tree watch wrapped in a subshell so its die can't skip config-drift (structural — review 36499 P2)"
+
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
 # per-machine wrappers are hand-copied from it). Wrap it with a test PYTHONPATH + a PASSTHROUGH
