@@ -1321,7 +1321,18 @@ if [[ "$(id -u)" -ne 0 ]]; then
 else
   echo "  --: SKIP config-drift independence test (running as root)"
 fi
-ok 'grep -qE "^\) \|\| dt_rc=" "$SUB/drift-canary.sh"' "config-drift independence: DEV-tree watch wrapped in a subshell so its die can't skip config-drift (structural — review 36499 P2)"
+# Structural: the subshell is captured via the set +e / dt_rc=$? / set -e bracket (review 62436),
+# NOT the `( ) || dt_rc=$?` form that suppresses errexit inside the subshell.
+ok 'grep -qxF "set +e" "$SUB/drift-canary.sh" && grep -qxF "dt_rc=\$?" "$SUB/drift-canary.sh"' "config-drift independence: DEV-tree subshell captured via the col-0 set+e / dt_rc=\$? bracket, not ()|| (structural — review 62436)"
+
+# errexit MUST stay active INSIDE the DEV-tree subshell (review 62436): a subshell on the left of
+# `||` silently disables set -e for its whole body, masking unguarded failures. The DT_ABORT seam
+# injects an unguarded failure; with errexit active it aborts the tick (nonzero), and — via the
+# 36499 P2 decouple — config-drift still ran first. No perms needed; runs everywhere.
+dtcfg "$TREE_CLEAN"; dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
+MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=0 DRIFT_CANARY_TEST_DT_ABORT=1 /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1; abrc=$?
+ok '[[ "$abrc" -ne 0 ]]' "DEV-tree subshell: an unguarded failure inside ABORTS the tick — errexit stays active (guards against ()|| set -e suppression, review 62436)"
+dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/.dev-tree-reset-required"
 
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live

@@ -198,8 +198,21 @@ DT_RESET_FILE="$MYNDAIX_HOME/.dev-tree-reset-required"
 # for FAILURES too). dt_rc carries the failure out and is surfaced LOUD after config-drift is
 # handled; die's `exit 1` exits only the subshell, and its stderr ALARM still prints. (The block is
 # left un-indented inside the subshell to keep this a minimal, reviewable diff.)
+#
+# CRITICAL (review 62436): capture the subshell status via `set +e; (...); dt_rc=$?; set -e`, NOT
+# `( ... ) || dt_rc=$?`. A subshell on the LEFT of `||` runs with errexit SUPPRESSED for its ENTIRE
+# body (bash's testable-context rule) — that would silently disable the `set -e` backstop the block
+# relies on beyond its explicit `|| die` guards (an unguarded failure would then be masked, not
+# fatal). The explicit `set -e` as the subshell's FIRST line re-arms errexit unambiguously; the
+# outer `set +e` keeps `dt_rc=$?` from aborting the parent, and `set -e` restores it after.
 dt_rc=0
+set +e
 (
+set -e
+# Test-only seam (mirrors DRIFT_CANARY_TEST_RC): an UNGUARDED failing command, to prove errexit is
+# active inside this subshell. A revert to `( )||dt_rc` would suppress set -e and this would NOT
+# abort — the masked-failure regression. Live drift-canary never sets it.
+[[ -z "${DRIFT_CANARY_TEST_DT_ABORT:-}" ]] || false
 if [[ -n "${DEV_TREE:-}" ]]; then
   # UNCONDITIONAL reset gate — runs BEFORE the identity check so a MATCHING identity can never skip
   # it. A pending RESET_REQUIRED means a prior clean-path clear failed to unlatch; until the full
@@ -272,7 +285,9 @@ else
   rm -f "$DT_RESET_FILE" \
     || die "cleared disabled dev-tree state but could not remove RESET_REQUIRED sentinel ($DT_RESET_FILE)"
 fi
-) || dt_rc=$?
+)
+dt_rc=$?
+set -e
 
 # ---- config-drift watch -------------------------------------------------------------------
 # Runs REGARDLESS of a DEV-tree watch failure (review 36499 P2 — independence). A dev-tree die set
