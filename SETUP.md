@@ -163,12 +163,107 @@ cat > ~/.local/bin/mxr <<'EOF'
 #!/bin/bash
 export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://localhost/runtime}"
 export PYTHONPATH="/path/to/your/myndaix-runtime/src"   # <- set to YOUR clone's path
+export PYTHONSAFEPATH=1   # don't prepend CWD to sys.path — else running mxr from inside another
+                          # checkout's dir could shadow-import a DIFFERENT runtime (ignored <3.11)
+
+# --- runtime-tree freshness guard (FACTORY only) -----------------------------------------
+# The pool runs the code at $PYTHONPATH; on the FACTORY that path is a live DEV checkout, so a
+# tree off clean main silently dispatches WRONG runtime code (the 09-14 six-day drift). Refuse
+# LOUD so a human converges the tree instead of the factory shipping stale code. The LAB is a dev
+# machine (its tree is dirty/branched by design) → the guard enforces ONLY when this machine's
+# MACHINE_ROLE is `factory`. Read-only / recovery verbs (get, help) are NEVER gated — `mxr get
+# <jid> --reply` must recover a stranded reply mid-drift (the exemption is first-positional-arg
+# only, by design: `mxr <agent> --help` is a dispatch and is gated). Override with MXR_ALLOW_DIRTY=1.
+# INLINE by design: a guard sourced from the tree would rot WITH the tree it guards. config.env is
+# READ, never sourced — the role token is only compared, never executed.
+# Cross-family review hardening: the role sed strips inline `#comments` + ALL whitespace (a CRLF or
+# `factory # note` config would else fail-OPEN); GIT_* are unset INSIDE the probe subshell so an
+# inherited hook env can't redirect the probe yet the exec'd runtime child still sees them; the tree
+# is VALIDATED as a git work tree — PYTHONPATH set-but-unresolvable REFUSES (a deleted/moved .git
+# must not dispatch unverifiable code; that fail-open was a .git-delete bypass), while PYTHONPATH
+# unset/empty (editable-venv install) is the one fail-open+warn branch; the status probe is
+# --untracked-files=all + --no-optional-locks. NB: this is a point-in-time tripwire at dispatch,
+# not a running-pool integrity guarantee (a concurrent checkout can still race it).
+case "${1:-}" in
+  get|help|--help|-h) : ;;
+  *)
+    if [ "${MXR_ALLOW_DIRTY:-}" != 1 ]; then
+      _mxr_cfg="${MYNDAIX_HOME:-$HOME/.myndaix}/config.env"
+      # `|| true` / `|| rc=$?` throughout: the canonical template sets no -e, but live wrappers get
+      # hand-edited and the house style adds `set -euo pipefail` — every substitution must survive
+      # that without dying mid-guard (review R6; a missing config.env must fall through to
+      # unknown-role fail-open, not kill the wrapper with a bare rc=2).
+      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
+      if [ "$_mxr_role" = factory ]; then
+        _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
+        # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
+        # the exec'd python child below (oracle MED: a global unset would strip
+        # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE from the runtime — drift-canary's dev_tree_drift avoids
+        # this by running in a $()-subshell; the wrapper must too). The subshell exits 78 on drift;
+        # any other status (clean, or fail-open warn) falls through to dispatch.
+        _mxr_grc=0
+        ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          if [ -z "${PYTHONPATH:-}" ]; then
+            # PYTHONPATH legitimately unset/empty (editable-venv install) — there is no tree to
+            # verify, so fail OPEN with a warning. This is the ONLY fail-open branch.
+            echo "mxr: WARNING — PYTHONPATH unset; freshness guard skipped (editable-venv install?). The drift-canary DEV-tree watch is the backstop." >&2
+            exit 0
+          fi
+          # Require `true` (not just exit 0): a BARE repo prints `false`/exit-0 and would else read as
+          # clean-main (cross-family review R2); a non-repo/missing dir prints nothing.
+          if [ "$(git -C "$_mxr_tree" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]; then
+            # PYTHONPATH is SET but does not resolve to a git work tree: the tree was deleted/moved
+            # or its .git vanished — yet the source may STILL be importable, so dispatching would run
+            # code of unverifiable provenance (the exact 09-14 class this guard exists for). Fail
+            # CLOSED (oracle finding: fail-open here was a .git-delete bypass). MXR_ALLOW_DIRTY=1 is
+            # the one-command recovery if this ever fires on a legitimate config quirk.
+            echo "mxr: REFUSING dispatch — PYTHONPATH ($PYTHONPATH) does not resolve to a git work tree (tree deleted/moved, or bare?). Cannot verify the runtime code the factory would ship. Fix PYTHONPATH / restore the clone, or set MXR_ALLOW_DIRTY=1 to override." >&2
+            exit 78
+          fi
+          _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
+          # rev-list FAILURE (origin/main ref missing: never fetched / deleted) must read as
+          # UNVERIFIABLE -> refuse, never as "0 ahead = clean" (review R4 P2: `|| echo 0` swallowed
+          # it). Empty/garbage output normalizes to unverifiable too; the `||` chain below only
+          # reaches the arithmetic when the value is verified numeric.
+          _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || true)"
+          case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=unverifiable ;; esac
+          # A status ERROR (rc!=0) is treated as drift (fail-CLOSED), never silently clean (review #2).
+          # NOT `"$(... || true)"; _mxr_strc=$?` — that reads the rc of the ALWAYS-0 compound and
+          # would silently disable this check (a reviewer-proposed fix with exactly that bug, R6).
+          _mxr_strc=0
+          _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" || _mxr_strc=$?
+          if [ "$_mxr_branch" != main ] || [ "$_mxr_ahead" = unverifiable ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
+            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
+            exit 78
+          fi
+        ) || _mxr_grc=$?
+        # Fail CLOSED on ANYTHING except the subshell's explicit clean-pass 0 (review R4 P1: an
+        # `-eq 78`-only check let a killed/crashed inspection — SIGTERM=143, error=1 — fall through
+        # to dispatch). 78 stays silent (the subshell already printed its reason). The `||` capture
+        # on the subshell (not a following `$?`) keeps this correct under an added `set -e`.
+        if [ "$_mxr_grc" -ne 0 ]; then
+          [ "$_mxr_grc" -ne 78 ] && echo "mxr: REFUSING dispatch — freshness inspection aborted unexpectedly (rc=$_mxr_grc); failing closed. Set MXR_ALLOW_DIRTY=1 to override." >&2
+          exit 78
+        fi
+      fi
+    fi
+    ;;
+esac
+# -----------------------------------------------------------------------------------------
+
 exec python3 -m runtime.cli "$@"
 EOF
 chmod +x ~/.local/bin/mxr
 
 mxr recon "latest stable Python release"
 ```
+
+> **The freshness guard is INLINE per-machine, not shipped from the repo.** The block above is the
+> canonical source; each machine's live `~/.local/bin/mxr` carries its own copy (they differ in
+> `PYTHONPATH` / venv python). On the FACTORY, keep it in sync when this template changes — a guard
+> sourced from the tree would rot with the very tree it guards. Its logic is covered by
+> `substrate/test.sh` (fixture repos: clean-main passes, off-main / ahead / dirty are refused,
+> `MXR_ALLOW_DIRTY=1` and a non-factory role bypass, `get`/`help` are exempt).
 
 `recon` needs `PERPLEXITY_API_KEY` in the **pool's** environment (step 4) — the shell you run `mxr` in
 doesn't matter, since the agent runs inside `serve`. Export the key where `serve` runs and restart it.

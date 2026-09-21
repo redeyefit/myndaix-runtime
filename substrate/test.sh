@@ -1089,6 +1089,218 @@ ok 'ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2 inverse: config drift 
 ok '! ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2 inverse: a FRESH liveness watcher does not false-alert the reverse watch"
 ok 'grep -q "canary_emit" "$SUB/drift-canary.sh" && grep -q "LW_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "LW_ALERTED_FILE" "$SUB/drift-canary.sh"' "P2: drift-canary uses SEPARATE streak+latch files for the liveness-watch (structural)"
 
+echo "== drift-canary: DEV-tree drift watch (piece 1) + mxr freshness guard (piece 2) =="
+# A bare origin + a real work clone give us a tree we can push a clean 'main' to, then move OFF
+# main / AHEAD / dirty to exercise every drift reason the Mini's 09-14 six-day drift hit.
+DTO="$TMP/devtree-origin.git"; git init -q --bare -b main "$DTO"   # -b main: portable to hosts whose init.defaultBranch=master (else pushed 'main' dangles the origin HEAD and clones don't check it out)
+git clone -q "$DTO" "$TMP/dt-seed" 2>/dev/null
+( cd "$TMP/dt-seed" && git config user.email t@t && git config user.name t && mkdir -p src \
+  && printf 'x\n' > src/x.py && printf 'r\n' > README && git add -A && git commit -qm init \
+  && git branch -M main && git push -q origin main ) >/dev/null 2>&1
+mk_clone(){ git clone -q "$DTO" "$1" 2>/dev/null; ( cd "$1" && git config user.email t@t && git config user.name t ) >/dev/null 2>&1; }
+TREE_CLEAN="$TMP/tree-clean"; mk_clone "$TREE_CLEAN"
+TREE_DIRTY="$TMP/tree-dirty"; mk_clone "$TREE_DIRTY"; printf 'edit\n' >> "$TREE_DIRTY/src/x.py"
+TREE_OFF="$TMP/tree-off";     mk_clone "$TREE_OFF";   ( cd "$TREE_OFF" && git checkout -q -b feature/wip ) >/dev/null 2>&1
+TREE_AHEAD="$TMP/tree-ahead"; mk_clone "$TREE_AHEAD"; ( cd "$TREE_AHEAD" && printf 'local\n' >> src/x.py && git add -A && git commit -qm local ) >/dev/null 2>&1
+TREE_NOREF="$TMP/tree-noref"; mk_clone "$TREE_NOREF"; git -C "$TREE_NOREF" update-ref -d refs/remotes/origin/main   # origin/main ref GONE -> ahead-ness unverifiable
+TREE_GONE="$TMP/tree-gone"    # deliberately never created
+
+# --- piece 1: the DEV-tree watch inside drift-canary (behavioral, via the TEST_RC seam) ---
+DTW="$TMP/dtw-home"; DTFH="$TMP/dtw-fakehome"
+mkdir -p "$DTW/state" "$DTW/inbox" "$DTFH/Library/LaunchAgents"
+touch "$DTW/state/liveness-canary.out"   # no liveness plist in DTFH -> reverse-watch stays quiet
+dtcfg(){ printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\nDEV_TREE=%s\nDEV_TREE_DRIFT_THRESHOLD=2\n' "$DTW" "$DTW" "$REPO" "$1" > "$DTW/config.env"; }
+dtrun(){ MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=0 /bin/bash "$SUB/drift-canary.sh" 2>&1; }
+dtreset(){ rm -f "$DTW/inbox"/* "$DTW/state/dev-tree-streak" "$DTW/state/dev-tree-alerted"; }
+
+dtcfg "$TREE_CLEAN"; dtreset
+dtrun >/dev/null; dtrun >/dev/null; dtrun >/dev/null
+ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: clean main never alerts (even past threshold)"
+ok '[[ ! -e "$DTW/state/dev-tree-streak" ]]' "DEV-tree: clean main leaves no streak file"
+
+dtcfg "$TREE_DIRTY"; dtreset
+dtrun >/dev/null
+ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: one dirty check below threshold(2) -> no alert yet (live-dev grace)"
+dtrun >/dev/null
+ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: dirty tree persisting to threshold -> ALERT"
+ok 'grep -q "dirty working tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: alert names the dirty reason"
+ok 'grep -q "$TREE_DIRTY" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: alert names the offending tree path"
+ok 'grep -q "loud-only" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: alert states it never mutates the tree"
+ok '! ls "$DTW/inbox"/drift-alert-*.md >/dev/null 2>&1' "DEV-tree: fires on its OWN latch while config drift is CLEAN (independent — deep-audit P2 class)"
+
+dtcfg "$TREE_CLEAN"; dtrun >/dev/null
+ok '[[ ! -e "$DTW/state/dev-tree-streak" && ! -e "$DTW/state/dev-tree-alerted" ]]' "DEV-tree: returning to clean main clears the streak+latch"
+
+dtcfg "$TREE_OFF"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: off-main checkout alerts with a 'not main' reason (the 09-14 root cause)"
+
+dtcfg "$TREE_AHEAD"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: unpushed local commit alerts with an 'ahead' reason"
+
+# A linked git WORKTREE stores .git as a FILE, not a dir — the old `[[ -d "$dir/.git" ]]` check
+# would falsely call it "missing" (cross-family review). It must be recognized as a real checkout.
+git -C "$TREE_CLEAN" worktree add -q "$TMP/tree-wt" -b wt-branch >/dev/null 2>&1
+dtcfg "$TMP/tree-wt"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null && ! grep -q "not a git" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null' "DEV-tree: a linked git WORKTREE (.git is a FILE) is recognized as a checkout, not falsely 'missing'"
+
+# A BARE repo prints `false` with EXIT 0 from rev-parse --is-inside-work-tree — validating on exit
+# status alone would let it pass then read as clean (cross-family review R2 regression). Require `true`.
+git init -q --bare -b main "$TMP/tree-bare.git"
+dtcfg "$TMP/tree-bare.git"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "missing, bare, or not a git work tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a BARE repo (rev-parse prints false/exit-0) is NOT read as a clean checkout"
+
+dtcfg "$TREE_GONE"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "missing, bare, or not a git work tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing DEV_TREE checkout is itself a drift reason"
+
+# origin/main ref GONE: rev-list fails — must read as DRIFT ("unverifiable"), never as "0 ahead"
+# (review R4 P2: `|| echo 0` swallowed exactly this).
+dtcfg "$TREE_NOREF"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "no verifiable origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing origin/main ref alerts as UNVERIFIABLE (rev-list failure is never read as clean)"
+
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$DTW" "$DTW" "$REPO" > "$DTW/config.env"
+dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: unset DEV_TREE = watch OFF (labs never set it -> never nagged)"
+ok 'grep -q "DT_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "dev_tree_drift" "$SUB/drift-canary.sh"' "DEV-tree: separate streak/latch + dev_tree_drift helper (structural)"
+
+# Stale-latch on DISABLE: a latch from a prior watched tree must be CLEARED when DEV_TREE is unset,
+# else a later re-enable is suppressed (cross-family review). NOTE: no dtreset before the unset run.
+dtcfg "$TREE_DIRTY"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok '[[ -e "$DTW/state/dev-tree-alerted" ]]' "DEV-tree: (setup) a persisting dirty tree left a latch"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\n' "$DTW" "$DTW" > "$DTW/config.env"
+dtrun >/dev/null
+ok '[[ ! -e "$DTW/state/dev-tree-alerted" && ! -e "$DTW/state/dev-tree-streak" && ! -e "$DTW/state/dev-tree-watched" ]]' "DEV-tree: unsetting DEV_TREE CLEARS the stale streak+latch+identity (no suppression on re-enable)"
+
+# Stale-latch on RETARGET: repoint DEV_TREE from a latched tree A to a DIFFERENT drifting tree B —
+# B's first alert must NOT be suppressed by A's latch (streak/latch are identity-bound to the path).
+dtcfg "$TREE_DIRTY"; dtreset; dtrun >/dev/null; dtrun >/dev/null      # A (dirty) latched
+dtcfg "$TREE_OFF"; rm -f "$DTW/inbox"/*                               # repoint to B; KEEP streak/latch state
+dtrun >/dev/null; dtrun >/dev/null
+ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: RETARGETING DEV_TREE resets the latch so the new tree's drift still alerts"
+
+# State-clear FAILURE at retarget must die LOUD with the identity left UNCOMMITTED, so the next
+# run retries the FULL reset (review 2164 #3: warn-and-continue silently suppressed alerts; review
+# 23749: the write-identity-FIRST variant committed the marker then tore, leaving the new tree
+# suppressed under the old latch with a MATCHING identity — no retry path ever fired).
+dtcfg "$TREE_DIRTY"; dtrun >/dev/null                                  # identity=DIRTY, streak=1 exists
+dtcfg "$TREE_AHEAD"                                                    # retarget -> identity mismatch
+chmod 555 "$DTW/state"
+dtout="$(dtrun)"; dtrc=$?
+chmod 755 "$DTW/state"
+ok '[[ "$dtrc" -ne 0 ]]' "DEV-tree: state-clear failure at retarget exits NONZERO (liveness sees a sick tick, not silent success)"
+ok 'grep -q "could not clear dev-tree streak/latch for retarget" <<<"$dtout"' "DEV-tree: retarget cleanup failure names itself loudly"
+ok '[[ "$(cat "$DTW/state/dev-tree-watched" 2>/dev/null)" != "$TREE_AHEAD" ]]' "DEV-tree: identity stays UNCOMMITTED on a failed reset (marker committed LAST -> next run retries the reset)"
+rm -f "$DTW/inbox"/*
+dtrun >/dev/null; dtrun >/dev/null                                     # recovery: reset retried in full, then B accrues
+ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: after the failed reset recovers, the NEW tree's drift still alerts (no inherited suppression)"
+dtreset; rm -f "$DTW/state/dev-tree-watched"
+
+# SAME-TREE flap with a transient clear failure (review 34704 P1): latch set -> tree goes clean ->
+# the latch unlink fails -> the identity must be POISONED (removed) before dying, else when perms
+# recover and the SAME tree re-drifts, the matching identity skips recovery and the stale latch
+# mutes the new alert forever. chflags uchg fails ONE file's unlink without root (macOS-only —
+# skipped on Linux CI like the shellcheck gate; the poison branch itself is structurally asserted).
+if command -v chflags >/dev/null 2>&1; then
+  TREE_FLAP="$TMP/tree-flap"; mk_clone "$TREE_FLAP"; printf 'flap\n' >> "$TREE_FLAP/src/x.py"
+  dtcfg "$TREE_FLAP"; dtreset; rm -f "$DTW/state/dev-tree-watched"
+  dtrun >/dev/null; dtrun >/dev/null                                   # latch set for FLAP
+  ( cd "$TREE_FLAP" && git checkout -q -- src/x.py )                   # tree goes CLEAN
+  chflags uchg "$DTW/state/dev-tree-alerted"
+  dtout="$(dtrun)"; dtrc=$?
+  chflags nouchg "$DTW/state/dev-tree-alerted"
+  ok '[[ "$dtrc" -ne 0 ]]' "DEV-tree flap: clean-path clear failure exits NONZERO (sick tick)"
+  ok '[[ ! -e "$DTW/state/dev-tree-watched" ]]' "DEV-tree flap: identity POISONED on failed clear (forces retarget-reset recovery next tick)"
+  printf 'flap2\n' >> "$TREE_FLAP/src/x.py"; rm -f "$DTW/inbox"/*      # SAME tree re-drifts post-recovery
+  dtrun >/dev/null; dtrun >/dev/null
+  ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "dirty working tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree flap: renewed drift on the SAME tree still alerts (stale latch could not mute it)"
+  dtreset; rm -f "$DTW/state/dev-tree-watched"
+else
+  echo "  --: SKIP dev-tree flap tests (chflags unavailable)"
+fi
+ok 'grep -q "identity poisoned" "$SUB/drift-canary.sh" && grep -q "SINGLE-INSTANCE INVARIANT" "$SUB/drift-canary.sh"' "DEV-tree: poison-on-failed-clear + documented single-instance invariant (structural)"
+
+# --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
+# Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
+# per-machine wrappers are hand-copied from it). Wrap it with a test PYTHONPATH + a PASSTHROUGH
+# tail: if the guard falls through, PASSTHROUGH prints; if it refuses, it exits 78 before that.
+GUARDBODY="$TMP/guardbody.sh"
+awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' "$REPO/SETUP.md" > "$GUARDBODY"
+GUARD="$TMP/mxr-guard-test"
+{ printf '#!/bin/bash\nexport PYTHONPATH="${MXR_TEST_TREE}/src"\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARD"; chmod +x "$GUARD"
+ok '[[ -s "$GUARDBODY" ]] && grep -q "exit 78" "$GUARDBODY"' "guard: extracted a non-empty guard block from SETUP.md (canonical source under test)"
+FAC="$TMP/guard-fac"; mkdir -p "$FAC"; printf 'MACHINE_ROLE=factory\n' > "$FAC/config.env"
+LABH="$TMP/guard-lab"; mkdir -p "$LABH"; printf 'MACHINE_ROLE=lab\n' > "$LABH/config.env"
+NOROLE="$TMP/guard-norole"; mkdir -p "$NOROLE"   # no config.env -> role unknown
+
+g="$(MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: factory + clean main -> dispatch proceeds"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory + dirty tree -> REFUSED (exit 78)"
+ok 'grep -q "REFUSING dispatch" "$TMP/g.err"' "guard: refusal is loud on stderr and names the reason"
+MXR_TEST_TREE="$TREE_OFF" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory + off-main tree -> REFUSED"
+MXR_TEST_TREE="$TREE_AHEAD" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory + unpushed-ahead tree -> REFUSED"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" MXR_ALLOW_DIRTY=1 bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: MXR_ALLOW_DIRTY=1 overrides on a dirty factory tree"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" get 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: 'get' (stranded-reply recovery) is EXEMPT even mid-drift"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" --help 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: help is exempt"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LABH" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: LAB role is NEVER gated (its dev tree is dirty by design)"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unknown role (no config.env) fails OPEN -> not gated"
+# Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
+# defeat the equality check (that would silently fail-OPEN on a real factory).
+FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FACC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory role with an inline #comment + CRLF still ENFORCES (robust extraction, not fail-open)"
+# PYTHONPATH SET but unresolvable (tree deleted/moved, or not a repo): REFUSE — the source may
+# still be importable, so dispatching would run code of unverifiable provenance (oracle finding:
+# fail-open here was a .git-delete bypass; Jefe call 09-21 = fail-closed).
+mkdir -p "$TMP/not-a-repo"
+MXR_TEST_TREE="$TMP/not-a-repo" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.warn"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: PYTHONPATH set but unresolvable tree -> REFUSED (unverifiable code must not dispatch)"
+ok 'grep -qi "does not resolve to a git work tree" "$TMP/g.warn"' "guard: unresolvable-tree refusal names the real cause (not a misleading 'not on clean main')"
+# A BARE repo is equally unresolvable (rev-parse prints false/exit-0 — the ==true check catches it) -> REFUSE.
+MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.bare.err"; r=$?
+ok '[[ "$r" -eq 78 ]] && grep -qi "does not resolve" "$TMP/g.bare.err"' "guard: a BARE repo is REFUSED (not read as clean-main via false/exit-0)"
+# PYTHONPATH legitimately UNSET (editable-venv install): the ONE fail-open branch — warn + dispatch.
+GUARD3="$TMP/mxr-guard-nopypath"
+{ printf '#!/bin/bash\nunset PYTHONPATH\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARD3"; chmod +x "$GUARD3"
+g="$(MYNDAIX_HOME="$FAC" bash "$GUARD3" kilabz 2>"$TMP/g.nopy.err")"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "PYTHONPATH unset" "$TMP/g.nopy.err"' "guard: PYTHONPATH unset (venv install) is the ONLY fail-open branch — warns + dispatches"
+# origin/main ref GONE -> ahead-ness unverifiable -> REFUSE (R4 P2: `|| echo 0` read it as clean).
+MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.noref.err"; r=$?
+ok '[[ "$r" -eq 78 ]] && grep -q "ahead=unverifiable" "$TMP/g.noref.err"' "guard: missing origin/main ref -> REFUSED as unverifiable (rev-list failure never reads as 0-ahead)"
+# R4 P1: the parent must fail CLOSED on ANY non-zero subshell status, not only exactly 78 — a
+# killed/crashed inspection (SIGTERM=143, error=1) must refuse, not fall through to dispatch.
+ok 'grep -q "aborted unexpectedly" "$REPO/SETUP.md" && grep -qE "\-ne 0" "$REPO/SETUP.md"' "guard: parent refuses on ANY abnormal inspection exit, not only 78 (fail-closed crash window) (structural)"
+# R6: live wrappers get hand-edited toward house style (`set -euo pipefail`) — the guard must keep
+# its exact semantics under it: clean passes, drift refuses 78 (not a stray -e death), a missing
+# config.env still falls through to unknown-role fail-open instead of killing the wrapper.
+GUARDE="$TMP/mxr-guard-strict"
+{ printf '#!/bin/bash\nset -euo pipefail\nexport PYTHONPATH="${MXR_TEST_TREE}/src"\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARDE"; chmod +x "$GUARDE"
+g="$(MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard under set -euo pipefail: clean main still dispatches"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard under set -euo pipefail: dirty tree still refuses with the CONTRACT exit 78 (not a stray -e death)"
+MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARDE" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard under set -euo pipefail: unverifiable ahead still refuses 78"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARDE" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard under set -euo pipefail: missing config.env falls through fail-open (no rc=2 wrapper death)"
+ok 'grep -q "strc=\$?" "$SUB/drift-canary.sh"' "watch: status rc captured via ||-disarm (canary set -e cannot abort the tick mid-probe) (structural)"
+ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
+ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"
+# The GIT_* unset must be SCOPED to the git-probe subshell, NOT leak to the exec'd python child
+# (oracle MED). A second guard variant whose tail echoes GIT_DIR: on a clean tree the guard falls
+# through, and GIT_DIR set in the parent env must SURVIVE (a global unset would blank it).
+GUARD2="$TMP/mxr-guard-gitenv"
+{ printf '#!/bin/bash\nexport PYTHONPATH="${MXR_TEST_TREE}/src"\n'; cat "$GUARDBODY"; printf 'printf "PASS GITDIR=[%%s]\\n" "${GIT_DIR:-}"\n'; } > "$GUARD2"; chmod +x "$GUARD2"
+g="$(GIT_DIR=/tmp/x.git MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FAC" bash "$GUARD2" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == *"GITDIR=[/tmp/x.git]"* ]]' "guard: GIT_* unset is SCOPED to the probe subshell — does NOT leak to the exec'd runtime child (oracle MED)"
+ok 'grep -q "exit 78" "$REPO/SETUP.md" && grep -q "MXR_ALLOW_DIRTY" "$REPO/SETUP.md" && grep -q "MACHINE_ROLE" "$REPO/SETUP.md"' "guard: SETUP.md heredoc carries the canonical guard (structural)"
+
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see
