@@ -34,6 +34,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -64,6 +65,31 @@ def _new_id() -> str:
 def _json(obj: dict) -> dict:
     """Pass-through; the jsonb codec (registered per connection) does json.dumps."""
     return obj
+
+
+# The two things a str can carry that a strict-UTF-8 wire codec (asyncpg bind) or a
+# Postgres 'text' column rejects at bind: a lone surrogate (the FULL D800–DFFF range)
+# and NUL. Both must degrade, not abort.
+_UNSTORABLE_RE = re.compile("[\x00\ud800-\udfff]")
+
+
+def _utf8_safe(s: str) -> str:
+    """Make an UNTRUSTED string storable so a poison byte can't abort a review at
+    ingest. Two failure modes, both seen as a review aborted BEFORE the reviewer ran
+    (the 2026-09-20 kilabz-abort class: 3 FieldVision reviews died at ingest):
+      * a lone surrogate (\\udcXX) — an undecodable byte smuggled through argv/JSON;
+        s.encode('utf-8') would raise DataError at bind. The FULL D800–DFFF range is
+        replaced, not just surrogateescape's U+DC80–U+DCFF (which would leave a HIGH
+        surrogate like \\ud800 to re-raise — cross-family review P2).
+      * a NUL (\\x00) — valid UTF-8, so an encode check would miss it, but Postgres
+        'text' rejects it and asyncpg aborts ingest all the same (review P1).
+    Both degrade to U+FFFD; the diff stays fully reviewable. One C-level regex scan
+    detects either: a clean str (the 99% case) returns untouched with NO transient
+    bytes copy (review P3 — an encode() would double RSS on a large diff), and the
+    sub pass runs only when there is actually something to repair."""
+    if not _UNSTORABLE_RE.search(s):
+        return s
+    return _UNSTORABLE_RE.sub("�", s)
 
 
 class PostgresLedger:
@@ -182,6 +208,7 @@ class PostgresLedger:
         """Create an inbound_event; dedupe on envelope.dedupe_key (exactly-once
         ingest). A duplicate returns the ORIGINAL id and raises nothing - the
         loser must not go on to submit a second job."""
+        body = _utf8_safe(body)                      # untrusted diff -> never abort ingest on a bad byte
         async with self._pool.acquire() as con:
             row = await con.fetchrow(
                 """INSERT INTO inbound_event (id, transport, envelope, body, dedupe_key)
@@ -205,6 +232,7 @@ class PostgresLedger:
         FOR UPDATE lock on the parent row, so concurrent siblings funnel one at a
         time and the limit holds under load. Rejected -> a 'dead' job + dead_letter
         (returns a real id get_status can report)."""
+        prompt = _utf8_safe(prompt)                  # same belt as ingest: prompt is the same untrusted body
         jid = _new_id()
         async with self._pool.acquire() as con:
             async with con.transaction():

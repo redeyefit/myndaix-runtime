@@ -145,6 +145,41 @@ async def test_ingest_dedupe(led: PostgresLedger) -> None:
     assert n == 1, f"expected 1 inbound_event, got {n}"
 
 
+# -- 2026-09-20 regression: a surrogate byte in an UNTRUSTED diff must NOT abort
+# ingest. Before the _utf8_safe belt, asyncpg raised DataError at bind ('utf-8'
+# codec can't encode '\udcXX': surrogates not allowed) and the WHOLE review died
+# at ingest — 3 FieldVision reviews stranded before the reviewer ever ran. The
+# reviewer must still receive a reviewable body with the one bad byte -> U+FFFD.
+async def test_ingest_repairs_surrogate_body(led: PostgresLedger) -> None:
+    await _truncate(led)
+    # every str a strict-UTF-8 codec / PG 'text' column rejects at bind. surrogateescape
+    # covers only U+DC80–U+DCFF, so high/low-non-DC8x surrogates + NUL are the cases a
+    # naive belt misses (cross-family review P1/P2) — assert ALL of them survive ingest.
+    poisons = {
+        "low-DC8x":  "\udce2",          # byte-smuggle (the original prod abort)
+        "high-surr": "\ud800",          # surrogateescape can't encode -> would re-raise
+        "low-DC00":  "\udc00",          # below DC80, also outside surrogateescape
+        "nul":       "\x00",            # valid UTF-8, slips encode, PG rejects it
+        "mixed":     chr(0xd834) + chr(0xdd1e),  # lone surrogates, outside surrogateescape
+    }
+    for i, (name, ch) in enumerate(poisons.items()):
+        body = "OBJECTIVE: review " + ch + " tail"
+        ev = await led.ingest_inbound(_env(f"surr-{i}"), body)     # must NOT raise
+        async with led._pool.acquire() as con:
+            stored = await con.fetchval("SELECT body FROM inbound_event WHERE id=$1", ev)
+        assert "�" in stored, f"{name}: poison must degrade to U+FFFD"
+        assert stored.startswith("OBJECTIVE: review ") and stored.endswith(" tail"), \
+            f"{name}: surrounding text must be kept"
+        assert "\x00" not in stored and not any(0xd800 <= ord(c) <= 0xdfff for c in stored), \
+            f"{name}: stored value must be strictly storable"
+    # submit_job carries the same untrusted body via prompt -> same belt (surrogate + NUL)
+    ev2 = await led.ingest_inbound(_env("surr-submit"), "clean")
+    jid = await led.submit_job(to_agent="kilabz", prompt="p\udce2\x00q", inbound_event_id=ev2)
+    async with led._pool.acquire() as con:
+        jbody = await con.fetchval("SELECT body FROM job WHERE id=$1", jid)
+    assert "�" in jbody and "\x00" not in jbody, "submit_job prompt must be repaired too"
+
+
 # -- invariant 4a: each outbound row is claimed by at most one sender -----------
 async def test_outbound_single_claim(led: PostgresLedger) -> None:
     await _truncate(led)
