@@ -1102,6 +1102,7 @@ TREE_CLEAN="$TMP/tree-clean"; mk_clone "$TREE_CLEAN"
 TREE_DIRTY="$TMP/tree-dirty"; mk_clone "$TREE_DIRTY"; printf 'edit\n' >> "$TREE_DIRTY/src/x.py"
 TREE_OFF="$TMP/tree-off";     mk_clone "$TREE_OFF";   ( cd "$TREE_OFF" && git checkout -q -b feature/wip ) >/dev/null 2>&1
 TREE_AHEAD="$TMP/tree-ahead"; mk_clone "$TREE_AHEAD"; ( cd "$TREE_AHEAD" && printf 'local\n' >> src/x.py && git add -A && git commit -qm local ) >/dev/null 2>&1
+TREE_NOREF="$TMP/tree-noref"; mk_clone "$TREE_NOREF"; git -C "$TREE_NOREF" update-ref -d refs/remotes/origin/main   # origin/main ref GONE -> ahead-ness unverifiable
 TREE_GONE="$TMP/tree-gone"    # deliberately never created
 
 # --- piece 1: the DEV-tree watch inside drift-canary (behavioral, via the TEST_RC seam) ---
@@ -1150,6 +1151,11 @@ ok 'grep -q "missing, bare, or not a git work tree" "$DTW"/inbox/dev-tree-alert-
 
 dtcfg "$TREE_GONE"; dtreset; dtrun >/dev/null; dtrun >/dev/null
 ok 'grep -q "missing, bare, or not a git work tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing DEV_TREE checkout is itself a drift reason"
+
+# origin/main ref GONE: rev-list fails — must read as DRIFT ("unverifiable"), never as "0 ahead"
+# (review R4 P2: `|| echo 0` swallowed exactly this).
+dtcfg "$TREE_NOREF"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "no verifiable origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing origin/main ref alerts as UNVERIFIABLE (rev-list failure is never read as clean)"
 
 printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$DTW" "$DTW" "$REPO" > "$DTW/config.env"
 dtreset; dtrun >/dev/null; dtrun >/dev/null
@@ -1223,6 +1229,12 @@ GUARD3="$TMP/mxr-guard-nopypath"
 { printf '#!/bin/bash\nunset PYTHONPATH\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARD3"; chmod +x "$GUARD3"
 g="$(MYNDAIX_HOME="$FAC" bash "$GUARD3" kilabz 2>"$TMP/g.nopy.err")"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "PYTHONPATH unset" "$TMP/g.nopy.err"' "guard: PYTHONPATH unset (venv install) is the ONLY fail-open branch — warns + dispatches"
+# origin/main ref GONE -> ahead-ness unverifiable -> REFUSE (R4 P2: `|| echo 0` read it as clean).
+MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.noref.err"; r=$?
+ok '[[ "$r" -eq 78 ]] && grep -q "ahead=unverifiable" "$TMP/g.noref.err"' "guard: missing origin/main ref -> REFUSED as unverifiable (rev-list failure never reads as 0-ahead)"
+# R4 P1: the parent must fail CLOSED on ANY non-zero subshell status, not only exactly 78 — a
+# killed/crashed inspection (SIGTERM=143, error=1) must refuse, not fall through to dispatch.
+ok 'grep -q "aborted unexpectedly" "$REPO/SETUP.md" && grep -qE "\-ne 0" "$REPO/SETUP.md"' "guard: parent refuses on ANY abnormal inspection exit, not only 78 (fail-closed crash window) (structural)"
 ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
 ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"
 # The GIT_* unset must be SCOPED to the git-probe subshell, NOT leak to the exec'd python child

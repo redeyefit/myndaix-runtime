@@ -81,8 +81,12 @@ dev_tree_drift() {
   if [[ "$branch" != "main" ]]; then
     printf 'is on %s, not main' "$branch"; return 0
   fi
-  ahead="$(git -C "$dir" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
-  [[ "$ahead" =~ ^[0-9]+$ ]] || ahead=0
+  # rev-list FAILURE (origin/main ref missing) must read as DRIFT, never as "0 ahead = clean"
+  # (review R4 P2: `|| echo 0` swallowed an unverifiable state). Non-numeric output ⇒ drift reason.
+  ahead="$(git -C "$dir" rev-list --count origin/main..HEAD 2>/dev/null || true)"
+  if ! [[ "$ahead" =~ ^[0-9]+$ ]]; then
+    printf 'has no verifiable origin/main (rev-list failed — remote ref missing or repo corrupt)'; return 0
+  fi
   if (( 10#$ahead > 0 )); then
     printf 'is %s commit(s) ahead of origin/main (unpushed local commits)' "$ahead"; return 0
   fi

@@ -216,16 +216,27 @@ case "${1:-}" in
             exit 78
           fi
           _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
-          _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
-          case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=0 ;; esac
+          # rev-list FAILURE (origin/main ref missing: never fetched / deleted) must read as
+          # UNVERIFIABLE -> refuse, never as "0 ahead = clean" (review R4 P2: `|| echo 0` swallowed
+          # it). Empty/garbage output normalizes to unverifiable too; the `||` chain below only
+          # reaches the arithmetic when the value is verified numeric.
+          _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null)"
+          case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=unverifiable ;; esac
           # A status ERROR (rc!=0) is treated as drift (fail-CLOSED), never silently clean (review #2).
           _mxr_dirty="$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)"; _mxr_strc=$?
-          if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
-            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
+          if [ "$_mxr_branch" != main ] || [ "$_mxr_ahead" = unverifiable ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
+            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead status_rc=$_mxr_strc). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
         )
-        [ $? -eq 78 ] && exit 78
+        # Fail CLOSED on ANYTHING except the subshell's explicit clean-pass 0 (review R4 P1: an
+        # `-eq 78`-only check let a killed/crashed inspection — SIGTERM=143, error=1 — fall through
+        # to dispatch). 78 stays silent (the subshell already printed its reason).
+        _mxr_grc=$?
+        if [ "$_mxr_grc" -ne 0 ]; then
+          [ "$_mxr_grc" -ne 78 ] && echo "mxr: REFUSING dispatch — freshness inspection aborted unexpectedly (rc=$_mxr_grc); failing closed. Set MXR_ALLOW_DIRTY=1 to override." >&2
+          exit 78
+        fi
       fi
     fi
     ;;
