@@ -117,7 +117,7 @@ V1_ROSTER: list[AgentSpec] = [
                            "KilaBz (Codex / gpt-6-astra) — code reviewer, stress-tester, second opinion\n"
                            "Oracle (agy / Gemini 3.1 Pro, on the Mini) — architecture reviewer, vision\n\n"
                            "# Dispatch\n"
-                           "Reach any agent: mxr <agent> '<task>' (single-quote the task)\n"
+                           "Reach any agent through the mxr CLI (mxr <agent> <task>).\n"
                            "The old bridge inbox system is RETIRED. Never write .md to inbox dirs.\n\n"
                            "# Tone\n"
                            "Jefe sends both work tasks AND casual messages — '143', 'whats good', 'thoughts on X'.\n"
