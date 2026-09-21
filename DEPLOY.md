@@ -118,11 +118,14 @@ ships like this, after the PR merges to `main`:
 ```bash
 # 1. advance the deploy clone (ships the new substrate scripts):
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
-# 2. verify the clone reached the merge sha (poll — reconcile is async):
-git -C ~/.myndaix/deploy/myndaix-runtime rev-parse --short HEAD
-# 3. force one watcher tick now (read-only: reconcile --dry-run + git status; only drops alerts):
+# 2. wait for the clone to reach the merge sha (reconcile is async — poll; ~30s):
+TARGET=$(git -C ~/code/active/myndaix-runtime rev-parse --short HEAD)
+until [[ "$(git -C ~/.myndaix/deploy/myndaix-runtime rev-parse --short HEAD)" == "$TARGET" ]]; do
+  echo "waiting…"; sleep 5
+done
+# 3. force one watcher tick; wait for the tick to finish before reading the log:
 launchctl kickstart -k gui/$(id -u)/ai.myndaix.drift-canary
-tail -4 ~/.myndaix/state/drift-canary.out          # expect "canary: no drift"
+sleep 2 && tail -4 ~/.myndaix/state/drift-canary.out   # expect "canary: no drift"
 ```
 
 Advance the `~/code/active` tree too (`git pull --ff-only`) — the controller imports from it and the
@@ -146,15 +149,24 @@ exports, before the guard) and tail (the `exec ... python -m runtime.cli` line),
 block between the markers:
 
 ```bash
-# 1. extract the new guard from SETUP.md (the SAME awk substrate/test.sh uses to test it):
-awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' SETUP.md > /tmp/new-guard.txt
-# 2. find this machine's head/tail boundaries (do NOT hard-code line numbers — they drift):
-ssh mini 'grep -n "runtime-tree freshness guard\|^# ----" ~/.local/bin/mxr'
-# 3. assemble head + new-guard.txt + tail into /tmp/new-mxr, then verify it PARSES:
-bash -n /tmp/new-mxr
-# 4. back up + atomic-swap on the target:
-scp -q /tmp/new-mxr mini:/tmp/mxr.new
-ssh mini 'cp ~/.local/bin/mxr /tmp/mxr-$(date +%Y%m%d%H%M%S).bak && chmod +x /tmp/mxr.new && mv -f /tmp/mxr.new ~/.local/bin/mxr'
+# 1. extract the new guard from SETUP.md on the MacBook:
+awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
+  SETUP.md > /tmp/new-guard.txt
+
+# 2. copy to Mini + splice on the Mini (assembly + parse-check + atomic-swap, same filesystem):
+scp /tmp/new-guard.txt mini:/tmp/new-guard.txt
+ssh mini '
+  set -euo pipefail
+  N1=$(awk "/# --- runtime-tree freshness guard/{print NR; exit}" ~/.local/bin/mxr)
+  N2=$(awk -v n="$N1" "NR>n && /^# -----/{print NR; exit}" ~/.local/bin/mxr)
+  head -n $((N1-1))      ~/.local/bin/mxr  > ~/.local/bin/mxr.new
+  cat /tmp/new-guard.txt                   >> ~/.local/bin/mxr.new
+  tail -n +$((N2+1))     ~/.local/bin/mxr  >> ~/.local/bin/mxr.new
+  bash -n ~/.local/bin/mxr.new
+  cp ~/.local/bin/mxr /tmp/mxr-$(date +%Y%m%d%H%M%S).bak
+  chmod +x ~/.local/bin/mxr.new
+  mv -f ~/.local/bin/mxr.new ~/.local/bin/mxr
+'
 ```
 
 **Verify it PASSES on clean main WITHOUT dispatching a job** (extract the guard from the now-live
@@ -162,9 +174,11 @@ wrapper, add a PASSTHROUGH tail, point it at the real tree — `PASSTHROUGH` = g
 dispatch; `REFUSING` = it would block):
 
 ```bash
-ssh mini 'awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > /tmp/gbody.sh
+ssh mini '
+awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > /tmp/gbody.sh
+[ -s /tmp/gbody.sh ] || { echo "GUARD NOT FOUND — markers missing in live mxr"; exit 1; }
 { printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat /tmp/gbody.sh; printf "echo PASSTHROUGH\n"; } > /tmp/grun.sh
-MYNDAIX_HOME=$HOME/.myndaix bash /tmp/grun.sh kilabz'      # factory + clean main -> PASSTHROUGH
+MYNDAIX_HOME=$HOME/.myndaix bash /tmp/grun.sh kilabz'    # factory + clean main -> PASSTHROUGH
 ```
 
 The guard's LOGIC is covered by `substrate/test.sh` (extracted from `SETUP.md`, fixture repos: clean
