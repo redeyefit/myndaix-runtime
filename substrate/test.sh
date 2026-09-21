@@ -1297,13 +1297,30 @@ LC_ALL=en_US.UTF-8 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BINROLE" bash -O x
 ok '[[ "$r" -eq 78 ]]' "guard: role with non-UTF-8 bytes still REFUSED fail-closed (single-read + LC_ALL=C parse — review 60298 F3)"
 ok 'grep -q "MACHINE_ROLE='"'"'factroy'"'"'" "$TMP/g.binrole.err"' "guard: non-UTF-8 role REACHES the sanitizer (refusal shows sanitized '\''factroy'\'', not an extraction-failure message — review 60298 F3)"
 ok '! grep -qF "$ESCBYTE" "$TMP/g.binrole.err"' "guard: non-UTF-8-role refusal carries no raw non-printable byte"
-# TOCTOU: presence derives from the SAME cat that read the content — an empty-but-PRESENT config
-# (role unresolvable) must take the fail-CLOSED branch, never the absent-config warn (review 60298
-# F1: a separate -f snapshot after extraction could race a deletion into the fail-open path).
+# Present-but-empty config (role unresolvable) must take the fail-CLOSED branch, never the
+# absent-config warn: -f is true -> present=1 -> empty-role-present -> refuse.
 EMPTYCFG="$TMP/guard-emptycfg"; mkdir -p "$EMPTYCFG"; : > "$EMPTYCFG/config.env"
 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$EMPTYCFG" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.emptycfg.err"; r=$?
-ok '[[ "$r" -eq 78 ]]' "guard: present-but-empty config.env (role unresolvable) -> fail-CLOSED, not the absent-config warn (review 60298 F1)"
-ok 'grep -q "could not be resolved" "$TMP/g.emptycfg.err"' "guard: empty-config refusal names the unresolvable-role cause (present-branch reached via same-read presence)"
+ok '[[ "$r" -eq 78 ]]' "guard: present-but-empty config.env (role unresolvable) -> fail-CLOSED, not the absent-config warn"
+ok 'grep -q "could not be resolved" "$TMP/g.emptycfg.err"' "guard: empty-config refusal names the unresolvable-role cause (present-branch reached via -f)"
+# Present-but-UNREADABLE config must fail CLOSED, NOT read as absent-and-warn (review 79562 P1: the
+# round-3 cat-presence "fix" made a permission-denied config fail OPEN on the factory). Skipped
+# under root, which ignores file perms — probe read access first.
+UNRDCFG="$TMP/guard-unrdcfg"; mkdir -p "$UNRDCFG"; printf 'MACHINE_ROLE=factory\n' > "$UNRDCFG/config.env"; chmod 000 "$UNRDCFG/config.env"
+if ! cat "$UNRDCFG/config.env" >/dev/null 2>&1; then
+  MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$UNRDCFG" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.unrdcfg.err"; r=$?
+  ok '[[ "$r" -eq 78 ]]' "guard: present-but-UNREADABLE config.env -> fail-CLOSED (not absent-warn — review 79562 P1)"
+  ok 'grep -q "could not be resolved" "$TMP/g.unrdcfg.err"' "guard: unreadable-config refusal names the unresolvable-role cause (-f saw it present)"
+else
+  echo "  --: SKIP unreadable-config test (running as root — perms ignored)"
+fi
+chmod 644 "$UNRDCFG/config.env"
+# MACHINE_ROLE as the LAST line with NO trailing newline must still extract: printf '%s\n' feeds
+# sed a newline-terminated line so BSD/macOS sed does not drop it (review 79562 P2). Use role=lab:
+# extracted -> PASSTHROUGH; dropped -> empty role + present -> fail-closed 78. PASSTHROUGH proves it.
+NONLCFG="$TMP/guard-nonl"; mkdir -p "$NONLCFG"; printf 'MACHINE_ROLE=lab' > "$NONLCFG/config.env"   # deliberately no trailing \n
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NONLCFG" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: last-line MACHINE_ROLE with NO trailing newline still extracts (BSD sed last-line drop — review 79562 P2)"
 # Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
 # defeat the equality check (that would silently fail-OPEN on a real factory).
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"

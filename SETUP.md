@@ -193,17 +193,22 @@ case "${1:-}" in
       # hand-edited and the house style adds `set -euo pipefail` — every substitution must survive
       # that without dying mid-guard (review R6; a missing config.env must fall through to
       # unknown-role fail-open, not kill the wrapper with a bare rc=2).
-      # SINGLE READ: cat config.env ONCE; presence is THAT cat's exit status (0 = the file was
-      # read, even if empty; nonzero = absent), so presence and content come from the same open —
-      # no separate `-f` stat can race a mid-guard deletion (review 60298 F1: a snapshot taken
-      # AFTER extraction let a delete between the two lines flip fail-closed -> fail-open). The
-      # `if _var="$(...)"; then` form is set -e-safe (a condition never triggers errexit). Role is
-      # parsed from the captured bytes under LC_ALL=C so non-UTF-8 bytes cannot abort a sed/tr
-      # mid-pipeline (review 60298 F3 / 48310 F2: extraction itself lacked LC_ALL=C, so a binary
-      # role aborted BEFORE the sanitizer branch was ever reached). `|| true` keeps a hand-added
-      # set -e from killing the wrapper mid-guard (review R6).
-      if _mxr_cfg_raw="$(cat "$_mxr_cfg" 2>/dev/null)"; then _mxr_cfg_present=1; else _mxr_cfg_present=0; fi
-      _mxr_role="$( export LC_ALL=C; printf '%s' "$_mxr_cfg_raw" | sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
+      # PRESENCE via -f, READ separately, PARSE locale-safe. Presence keys on `-f`, NOT the read's
+      # exit status: -f is true for a present-but-UNREADABLE config (perms/ownership), so an
+      # unreadable factory config yields an empty role WITH _mxr_cfg_present=1 -> the fail-CLOSED
+      # empty-role-present branch, never the absent-config warn (review 79562 P1: keying presence on
+      # `cat` made a permission-denied config read as ABSENT and fail OPEN on the factory — strictly
+      # worse than the theoretical race below). The read is a SEPARATE step; the -f/read TOCTOU
+      # (config deleted between the two adjacent statements) is ACCEPTED WONTFIX — it needs an
+      # external actor deleting config.env in a sub-millisecond window on a single-operator box, and
+      # the loser is one guard tick, vs. the fail-OPEN that chasing it (review 60298 F1 -> the
+      # cat-presence "fix") actually caused. Do NOT re-raise the -f/read race without a real trigger.
+      # `printf '%s\n'` (not '%s') gives sed a NEWLINE-terminated line so BSD/macOS sed does not drop
+      # a last-line MACHINE_ROLE (review 79562 P2). LC_ALL=C keeps sed/tr from aborting on non-UTF-8
+      # bytes (review 48310 F2 / 60298 F3). `|| true` survives a hand-added set -e (review R6).
+      _mxr_cfg_present=0; [ -f "$_mxr_cfg" ] && _mxr_cfg_present=1
+      _mxr_cfg_raw="$(cat "$_mxr_cfg" 2>/dev/null || true)"
+      _mxr_role="$( export LC_ALL=C; printf '%s\n' "$_mxr_cfg_raw" | sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
       if [ "$_mxr_role" = factory ]; then
         _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
         # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
