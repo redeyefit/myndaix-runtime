@@ -170,23 +170,39 @@ export PYTHONPATH="/path/to/your/myndaix-runtime/src"   # <- set to YOUR clone's
 # LOUD so a human converges the tree instead of the factory shipping stale code. The LAB is a dev
 # machine (its tree is dirty/branched by design) → the guard enforces ONLY when this machine's
 # MACHINE_ROLE is `factory`. Read-only / recovery verbs (get, help) are NEVER gated — `mxr get
-# <jid> --reply` must recover a stranded reply mid-drift. Override with MXR_ALLOW_DIRTY=1.
+# <jid> --reply` must recover a stranded reply mid-drift (the exemption is first-positional-arg
+# only, by design: `mxr <agent> --help` is a dispatch and is gated). Override with MXR_ALLOW_DIRTY=1.
 # INLINE by design: a guard sourced from the tree would rot WITH the tree it guards. config.env is
-# READ (one token via sed), never sourced — the value is only compared, never executed.
+# READ, never sourced — the role token is only compared, never executed.
+# Cross-family review hardening: the role sed strips inline `#comments` + ALL whitespace (a CRLF or
+# `factory # note` config would else fail-OPEN); GIT_* are unset so an inherited hook env can't
+# redirect the probe; the tree is VALIDATED as a git work tree (a bad PYTHONPATH fails OPEN with a
+# loud warning, never a misleading exit-78 brick — piece 1's drift-canary is the paired belt); the
+# status probe is --untracked-files=all + --no-optional-locks. NB: this is a point-in-time tripwire
+# at dispatch, not a running-pool integrity guarantee (a concurrent checkout can still race it).
 case "${1:-}" in
   get|help|--help|-h) : ;;
   *)
     if [ "${MXR_ALLOW_DIRTY:-}" != 1 ]; then
       _mxr_cfg="${MYNDAIX_HOME:-$HOME/.myndaix}/config.env"
-      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | tr -d "\"' " | head -1)"
+      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]')"
       if [ "$_mxr_role" = factory ]; then
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
         _mxr_tree="${PYTHONPATH%/src}"
-        _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
-        _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
-        case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=0 ;; esac
-        if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ -n "$(git -C "$_mxr_tree" status --porcelain 2>/dev/null)" ]; then
-          echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
-          exit 78
+        if [ -z "$_mxr_tree" ] || ! git -C "$_mxr_tree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          # Bad/unexpected PYTHONPATH (e.g. a venv install that dropped it): we cannot resolve the
+          # runtime checkout, so fail OPEN with a loud warning rather than brick every factory
+          # dispatch with a misleading "not on clean main" (cross-family review). The drift-canary
+          # DEV-tree watch still alerts on a genuinely missing/drifted tree.
+          echo "mxr: WARNING — cannot resolve the runtime git tree from PYTHONPATH ($PYTHONPATH); freshness guard skipped. Point PYTHONPATH at <clone>/src (or set MXR_ALLOW_DIRTY=1 to silence)." >&2
+        else
+          _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
+          _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+          case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=0 ;; esac
+          if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ -n "$(git -C "$_mxr_tree" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" ]; then
+            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
+            exit 78
+          fi
         fi
       fi
     fi

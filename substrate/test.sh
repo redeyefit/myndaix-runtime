@@ -1092,7 +1092,7 @@ ok 'grep -q "canary_emit" "$SUB/drift-canary.sh" && grep -q "LW_STREAK_FILE" "$S
 echo "== drift-canary: DEV-tree drift watch (piece 1) + mxr freshness guard (piece 2) =="
 # A bare origin + a real work clone give us a tree we can push a clean 'main' to, then move OFF
 # main / AHEAD / dirty to exercise every drift reason the Mini's 09-14 six-day drift hit.
-DTO="$TMP/devtree-origin.git"; git init -q --bare "$DTO"
+DTO="$TMP/devtree-origin.git"; git init -q --bare -b main "$DTO"   # -b main: portable to hosts whose init.defaultBranch=master (else pushed 'main' dangles the origin HEAD and clones don't check it out)
 git clone -q "$DTO" "$TMP/dt-seed" 2>/dev/null
 ( cd "$TMP/dt-seed" && git config user.email t@t && git config user.name t && mkdir -p src \
   && printf 'x\n' > src/x.py && printf 'r\n' > README && git add -A && git commit -qm init \
@@ -1136,6 +1136,12 @@ ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: off-main che
 dtcfg "$TREE_AHEAD"; dtreset; dtrun >/dev/null; dtrun >/dev/null
 ok 'grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: unpushed local commit alerts with an 'ahead' reason"
 
+# A linked git WORKTREE stores .git as a FILE, not a dir — the old `[[ -d "$dir/.git" ]]` check
+# would falsely call it "missing" (cross-family review). It must be recognized as a real checkout.
+git -C "$TREE_CLEAN" worktree add -q "$TMP/tree-wt" -b wt-branch >/dev/null 2>&1
+dtcfg "$TMP/tree-wt"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null && ! grep -q "not a git checkout" "$DTW"/inbox/dev-tree-alert-*.md 2>/dev/null' "DEV-tree: a linked git WORKTREE (.git is a FILE) is recognized as a checkout, not falsely 'missing'"
+
 dtcfg "$TREE_GONE"; dtreset; dtrun >/dev/null; dtrun >/dev/null
 ok 'grep -q "missing or not a git checkout" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing DEV_TREE checkout is itself a drift reason"
 
@@ -1143,6 +1149,21 @@ printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.
 dtreset; dtrun >/dev/null; dtrun >/dev/null
 ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: unset DEV_TREE = watch OFF (labs never set it -> never nagged)"
 ok 'grep -q "DT_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "dev_tree_drift" "$SUB/drift-canary.sh"' "DEV-tree: separate streak/latch + dev_tree_drift helper (structural)"
+
+# Stale-latch on DISABLE: a latch from a prior watched tree must be CLEARED when DEV_TREE is unset,
+# else a later re-enable is suppressed (cross-family review). NOTE: no dtreset before the unset run.
+dtcfg "$TREE_DIRTY"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok '[[ -e "$DTW/state/dev-tree-alerted" ]]' "DEV-tree: (setup) a persisting dirty tree left a latch"
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\n' "$DTW" "$DTW" > "$DTW/config.env"
+dtrun >/dev/null
+ok '[[ ! -e "$DTW/state/dev-tree-alerted" && ! -e "$DTW/state/dev-tree-streak" && ! -e "$DTW/state/dev-tree-watched" ]]' "DEV-tree: unsetting DEV_TREE CLEARS the stale streak+latch+identity (no suppression on re-enable)"
+
+# Stale-latch on RETARGET: repoint DEV_TREE from a latched tree A to a DIFFERENT drifting tree B —
+# B's first alert must NOT be suppressed by A's latch (streak/latch are identity-bound to the path).
+dtcfg "$TREE_DIRTY"; dtreset; dtrun >/dev/null; dtrun >/dev/null      # A (dirty) latched
+dtcfg "$TREE_OFF"; rm -f "$DTW/inbox"/*                               # repoint to B; KEEP streak/latch state
+dtrun >/dev/null; dtrun >/dev/null
+ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: RETARGETING DEV_TREE resets the latch so the new tree's drift still alerts"
 
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
@@ -1176,6 +1197,18 @@ g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LABH" bash "$GUARD" kilabz 2>/de
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: LAB role is NEVER gated (its dev tree is dirty by design)"
 g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unknown role (no config.env) fails OPEN -> not gated"
+# Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
+# defeat the equality check (that would silently fail-OPEN on a real factory).
+FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FACC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory role with an inline #comment + CRLF still ENFORCES (robust extraction, not fail-open)"
+# Unresolvable runtime tree (bad/venv PYTHONPATH): fail OPEN with a loud warning, NOT a misleading
+# exit-78 that bricks every factory dispatch (cross-family review MED). Piece 1's canary backstops.
+mkdir -p "$TMP/not-a-repo"
+g="$(MXR_TEST_TREE="$TMP/not-a-repo" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>"$TMP/g.warn")"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unresolvable runtime tree fails OPEN (guard-config error must not brick the factory)"
+ok 'grep -qi "cannot resolve" "$TMP/g.warn"' "guard: unresolvable tree warns loudly on stderr"
+ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
 ok 'grep -q "exit 78" "$REPO/SETUP.md" && grep -q "MXR_ALLOW_DIRTY" "$REPO/SETUP.md" && grep -q "MACHINE_ROLE" "$REPO/SETUP.md"' "guard: SETUP.md heredoc carries the canonical guard (structural)"
 
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="

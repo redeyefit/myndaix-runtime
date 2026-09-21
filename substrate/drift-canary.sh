@@ -56,14 +56,24 @@ canary_emit() {
 
 # dev_tree_drift DIR — echo a one-line human reason if the DEV tree is drifted (off main / ahead of
 # origin/main / dirty), or NOTHING if it is clean at origin/main. READ-ONLY: only git symbolic-ref /
-# rev-list / status --porcelain, never a mutation, and NO fetch — a network fetch could hang the
-# canary hot path (lib.sh deliberately keeps the canary offline), so "ahead" is judged against the
-# LAST-KNOWN origin/main ref, which is the honest local truth. A missing/non-git dir is itself a
-# drift reason (the tree the factory runs from is not where it should be). Never exits nonzero
-# (the caller drives the alert); returns 0 always.
+# rev-list / status, never a mutation, and NO explicit fetch here — the surrounding reconcile
+# --dry-run already refreshed the deploy clone's origin this run, and a second network fetch in a
+# DIFFERENT repo could hang the canary; "ahead" is judged against DEV_TREE's LAST-KNOWN origin/main
+# (a normal push updates that ref locally, so it is honest for the factory's own commits). Always
+# returns 0 (the caller drives the alert). ALWAYS runs in the caller's $(...) subshell, so the
+# GIT_* unset below is scoped and never leaks to the main canary.
+#   - Validity via `git rev-parse --is-inside-work-tree`, NOT `[[ -d "$dir/.git" ]]`: a linked
+#     git WORKTREE stores .git as a FILE, so the old test falsely called valid worktrees "missing"
+#     (cross-family review MED). A missing/non-git dir is still itself a drift reason.
+#   - GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE unset so an inherited hook env can't redirect the probe
+#     to a DIFFERENT repo (cross-family review). status is --untracked-files=all (a config
+#     status.showUntrackedFiles=no would otherwise hide stray untracked runtime code) and
+#     --no-optional-locks (strict read-only; never take the index lock).
 dev_tree_drift() {
   local dir="$1" branch ahead
-  [[ -d "$dir/.git" ]] || { printf 'is missing or not a git checkout (no %s/.git)' "$dir"; return 0; }
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || { printf 'is missing or not a git checkout (%s)' "$dir"; return 0; }
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached HEAD)')"
   if [[ "$branch" != "main" ]]; then
     printf 'is on %s, not main' "$branch"; return 0
@@ -73,7 +83,7 @@ dev_tree_drift() {
   if (( 10#$ahead > 0 )); then
     printf 'is %s commit(s) ahead of origin/main (unpushed local commits)' "$ahead"; return 0
   fi
-  if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+  if [[ -n "$(git -C "$dir" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
     printf 'has uncommitted changes (dirty working tree)'; return 0
   fi
   return 0   # clean at origin/main — no reason emitted
@@ -124,9 +134,18 @@ fi
 # hand-edit gets live-dev grace; only PERSISTENT drift alerts. Gated on DEV_TREE being configured —
 # labs never set it (their working tree is dirty by design), and drift-canary is a factory-only tick
 # anyway, so in practice this runs only on the Mini. Runs regardless of the config-drift outcome.
+DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
+DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
+DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to
 if [[ -n "${DEV_TREE:-}" ]]; then
-  DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
-  DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
+  # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
+  # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
+  # tree's first alert (cross-family review). Reset state whenever the recorded path differs.
+  if [[ "$(cat "$DT_WATCHED_FILE" 2>/dev/null || true)" != "$DEV_TREE" ]]; then
+    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE"
+    { printf '%s\n' "$DEV_TREE" > "$DT_WATCHED_FILE.tmp" && mv -f "$DT_WATCHED_FILE.tmp" "$DT_WATCHED_FILE"; } \
+      || log "canary: WARN could not record dev-tree identity"
+  fi
   dt_reason="$(dev_tree_drift "$DEV_TREE")"
   if [[ -n "$dt_reason" ]]; then
     canary_emit "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "dev-tree-alert" "DEV-tree DRIFT" \
@@ -135,6 +154,12 @@ if [[ -n "${DEV_TREE:-}" ]]; then
   else
     rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || log "canary: WARN could not clear dev-tree streak/latch"
   fi
+else
+  # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity so a LATER re-enable
+  # starts fresh — a standing latch from a prior watched tree would otherwise suppress the
+  # re-enabled watch's first alert (cross-family review: the disable path must not preserve state).
+  rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
+    || log "canary: WARN could not clear disabled dev-tree state"
 fi
 
 # ---- config-drift watch -------------------------------------------------------------------
