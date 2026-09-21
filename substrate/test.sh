@@ -1194,6 +1194,30 @@ dtrun >/dev/null; dtrun >/dev/null                                     # recover
 ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: after the failed reset recovers, the NEW tree's drift still alerts (no inherited suppression)"
 dtreset; rm -f "$DTW/state/dev-tree-watched"
 
+# SAME-TREE flap with a transient clear failure (review 34704 P1): latch set -> tree goes clean ->
+# the latch unlink fails -> the identity must be POISONED (removed) before dying, else when perms
+# recover and the SAME tree re-drifts, the matching identity skips recovery and the stale latch
+# mutes the new alert forever. chflags uchg fails ONE file's unlink without root (macOS-only —
+# skipped on Linux CI like the shellcheck gate; the poison branch itself is structurally asserted).
+if command -v chflags >/dev/null 2>&1; then
+  TREE_FLAP="$TMP/tree-flap"; mk_clone "$TREE_FLAP"; printf 'flap\n' >> "$TREE_FLAP/src/x.py"
+  dtcfg "$TREE_FLAP"; dtreset; rm -f "$DTW/state/dev-tree-watched"
+  dtrun >/dev/null; dtrun >/dev/null                                   # latch set for FLAP
+  ( cd "$TREE_FLAP" && git checkout -q -- src/x.py )                   # tree goes CLEAN
+  chflags uchg "$DTW/state/dev-tree-alerted"
+  dtout="$(dtrun)"; dtrc=$?
+  chflags nouchg "$DTW/state/dev-tree-alerted"
+  ok '[[ "$dtrc" -ne 0 ]]' "DEV-tree flap: clean-path clear failure exits NONZERO (sick tick)"
+  ok '[[ ! -e "$DTW/state/dev-tree-watched" ]]' "DEV-tree flap: identity POISONED on failed clear (forces retarget-reset recovery next tick)"
+  printf 'flap2\n' >> "$TREE_FLAP/src/x.py"; rm -f "$DTW/inbox"/*      # SAME tree re-drifts post-recovery
+  dtrun >/dev/null; dtrun >/dev/null
+  ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "dirty working tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree flap: renewed drift on the SAME tree still alerts (stale latch could not mute it)"
+  dtreset; rm -f "$DTW/state/dev-tree-watched"
+else
+  echo "  --: SKIP dev-tree flap tests (chflags unavailable)"
+fi
+ok 'grep -q "identity poisoned" "$SUB/drift-canary.sh" && grep -q "SINGLE-INSTANCE INVARIANT" "$SUB/drift-canary.sh"' "DEV-tree: poison-on-failed-clear + documented single-instance invariant (structural)"
+
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
 # per-machine wrappers are hand-copied from it). Wrap it with a test PYTHONPATH + a PASSTHROUGH

@@ -149,6 +149,12 @@ fi
 # hand-edit gets live-dev grace; only PERSISTENT drift alerts. Gated on DEV_TREE being configured —
 # labs never set it (their working tree is dirty by design), and drift-canary is a factory-only tick
 # anyway, so in practice this runs only on the Mini. Runs regardless of the config-drift outcome.
+# SINGLE-INSTANCE INVARIANT (all streak/latch/identity read-modify-write in this script relies on
+# it): drift-canary runs ONLY as the launchd job ai.myndaix.drift-canary — launchd never overlaps
+# invocations of a label, so ticks are serialized. Do NOT run concurrent manual instances (a
+# manual run while the tick is live can race the cat→rm→mv sequences and the fixed .tmp names;
+# reviews 73734/23749/34704 flag these — wontfix BECAUSE of this invariant, matching canary_emit's
+# established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine.
 DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
 DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
 DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to
@@ -177,8 +183,16 @@ if [[ -n "${DEV_TREE:-}" ]]; then
   else
     # die, not WARN: a failing clear here leaves a stale latch that would mute this SAME tree's
     # next drift, and the identity matches so nothing ever retries it — same silent-suppression
-    # class as the retarget path (review 23749 series). A sick tick is the recoverable outcome.
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || die "could not clear dev-tree streak/latch"
+    # class as the retarget path (review 23749 series). Before dying, POISON the identity file
+    # (best-effort rm): a matching identity is what would skip recovery, so breaking it forces the
+    # next tick through the retarget reset, which retries the clear with its own die-loud path
+    # (review 34704 P1: die alone left latch+identity intact across a transient failure — perms
+    # recover, same tree re-drifts, alert muted while ticks exit 0). If the poison rm ALSO fails
+    # (dir-wide breakage), every tick keeps dying loudly until the operator fixes it.
+    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || {
+      rm -f "$DT_WATCHED_FILE" 2>/dev/null || true
+      die "could not clear dev-tree streak/latch (identity poisoned for retarget-reset recovery)"
+    }
   fi
 else
   # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity so a LATER re-enable
