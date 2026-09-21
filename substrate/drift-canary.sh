@@ -170,6 +170,18 @@ fi
 DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
 DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
 DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to
+# The DEV-tree watch runs in a SUBSHELL so a die-LOUD failure fails THIS tick nonzero WITHOUT
+# skipping the INDEPENDENT config-drift watch below (review 36499 P2: any dev-tree die exited before
+# the config-drift block, so a stale config-drift latch never cleared on a subsequent clean tick —
+# the cross-watch independence the separate streak/latch files give for LATCHES must hold for
+# FAILURES too). dt_rc carries the failure out; die's `exit 1` exits only the subshell.
+# set -e at the top keeps errexit active — the ()|| form suppresses it for the entire body,
+# masking unguarded failures (review 62436).
+dt_rc=0
+(
+set -e
+# Test-only seam: inject an unguarded failure to prove errexit is active inside the subshell.
+[[ -z "${DRIFT_CANARY_TEST_DT_ABORT:-}" ]] || die "DT_ABORT seam: unguarded failure to verify errexit active"
 if [[ -n "${DEV_TREE:-}" ]]; then
   # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
   # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
@@ -218,17 +230,21 @@ else
   # starts fresh — a standing latch from a prior watched tree would otherwise suppress the
   # re-enabled watch's first alert (cross-family review: the disable path must not preserve state).
   rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
-    || log "canary: WARN could not clear disabled dev-tree state"
+    || die "could not clear disabled dev-tree state (stale latch/streak left intact — re-enable may be suppressed)"
 fi
+) || dt_rc=$?
 
-# ---- config-drift watch -------------------------------------------------------------------
+# ---- config-drift watch (runs regardless of DEV-tree outcome) ----------------------------
 if [[ "$rc" -eq 0 ]]; then
   rm -f "$STREAK_FILE" "$ALERTED_FILE"
   log "canary: no drift"
-  exit 0
-fi
-canary_emit "$STREAK_FILE" "$ALERTED_FILE" "drift-alert" "config DRIFT" \
-  "drift-canary: FACTORY drift persisting. reconcile is not converging. Investigate.
+else
+  canary_emit "$STREAK_FILE" "$ALERTED_FILE" "drift-alert" "config DRIFT" \
+    "drift-canary: FACTORY drift persisting. reconcile is not converging. Investigate.
 
 $report"
+fi
+# Surface a DEV-tree watch failure LOUD now that config-drift has been processed (review 36499 P2:
+# the dev-tree die must fail the tick without having skipped the config-drift latch handling above).
+[[ "$dt_rc" -eq 0 ]] || { log "canary: dev-tree watch failed (rc=$dt_rc) — see ALARM above"; exit "$dt_rc"; }
 exit 0

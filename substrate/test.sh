@@ -1148,7 +1148,7 @@ ok 'grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: 
 # ahead-only count read it as clean (review 68864 P2). Must alert as behind, NOT as dirty/ahead.
 dtcfg "$TREE_BEHIND"; dtreset; dtrun >/dev/null; dtrun >/dev/null
 ok 'grep -q "behind origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a clean-but-BEHIND checkout alerts as stale (never pulled) — the ahead-only gap"
-ok '! grep -qE "dirty working tree|ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: the behind alert is not misreported as dirty or ahead"
+ok 'ls "$DTW"/inbox/dev-tree-alert-*.md >/dev/null 2>&1 && ! grep -qE "dirty working tree|ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: the behind alert is not misreported as dirty or ahead"
 
 # A linked git WORKTREE stores .git as a FILE, not a dir — the old `[[ -d "$dir/.git" ]]` check
 # would falsely call it "missing" (cross-family review). It must be recognized as a real checkout.
@@ -1230,6 +1230,44 @@ else
   echo "  --: SKIP dev-tree flap tests (chflags unavailable)"
 fi
 ok 'grep -q "identity poisoned" "$SUB/drift-canary.sh" && grep -q "SINGLE-INSTANCE INVARIANT" "$SUB/drift-canary.sh"' "DEV-tree: poison-on-failed-clear + documented single-instance invariant (structural)"
+ok 'grep -q "dt_rc=0" "$SUB/drift-canary.sh" && grep -q "dt_rc=\$?" "$SUB/drift-canary.sh"' "DEV-tree: subshell + dt_rc capture present (config-drift independence structural — review 36499 P2)"
+
+# DT_ABORT seam: verify errexit is active INSIDE the DEV-tree subshell (review 62436).
+# An unguarded `false` inside the subshell should abort the tick nonzero.  Silencing all output
+# and asserting only `abrc != 0` is not sufficient — any crash/syntax-error also exits nonzero
+# and the test passes for the wrong reason (review 28330 P2). Capture stderr and assert on the
+# seam's specific alarm message so only the INTENDED path passes.
+dtcfg "$TREE_CLEAN"; dtreset; rm -f "$DTW/state/dev-tree-watched"
+dtabort_err="$( MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=0 DRIFT_CANARY_TEST_DT_ABORT=1 \
+  /bin/bash "$SUB/drift-canary.sh" 2>&1 >/dev/null )"
+abrc=$?
+ok '[[ "$abrc" -ne 0 ]]' "DEV-tree subshell: DT_ABORT seam exits NONZERO (errexit active inside subshell)"
+ok 'echo "$dtabort_err" | grep -q "DT_ABORT seam"' "DEV-tree subshell: DT_ABORT alarm names the seam (not just any nonzero exit)"
+dtreset; rm -f "$DTW/state/dev-tree-watched"
+
+# Independence: a DEV-tree watch failure must NOT suppress the config-drift alert.
+# Use the DT_ABORT seam (DRIFT_CANARY_TEST_DT_ABORT=1) with a drifting config
+# (DRIFT_CANARY_TEST_RC=1) and assert that the config-drift alert was written despite the failure.
+dtcfg "$TREE_CLEAN"; dtreset; rm -f "$DTW/state/dev-tree-watched" "$DTW/inbox"/*
+MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_TEST_DT_ABORT=1 \
+  /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>/dev/null; indep_rc=$?
+ok '[[ "$indep_rc" -ne 0 ]]' "DEV-tree independence: DEV-tree failure exits NONZERO (tick is sick)"
+ok 'ls "$DTW/inbox"/drift-alert-*.md >/dev/null 2>&1' "DEV-tree independence: config-drift alert fires DESPITE DEV-tree watch failure (review 36499 P2)"
+dtreset; rm -f "$DTW/inbox"/* "$DTW/state/dev-tree-watched"
+
+# Disable-path die: when DEV_TREE is unset and state/ is unwritable, the clear must die LOUD
+# (not warn-and-continue) — warn-and-continue leaves a stale latch that suppresses the next
+# re-enable's first alert (review 13355 / 36499 disable-path finding).
+dtcfg "$TREE_DIRTY"; dtreset; dtrun >/dev/null; dtrun >/dev/null  # leave a latch
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' \
+  "$DTW" "$DTW" "$REPO" > "$DTW/config.env"                        # remove DEV_TREE from config
+chmod 555 "$DTW/state"
+disable_out="$( MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=0 \
+  /bin/bash "$SUB/drift-canary.sh" 2>&1 )"; disable_rc=$?
+chmod 755 "$DTW/state"
+ok '[[ "$disable_rc" -ne 0 ]]' "DEV-tree disable: unwritable state dir exits NONZERO (die-loud, not log-WARN)"
+ok 'echo "$disable_out" | grep -qi "ALARM"' "DEV-tree disable: state-clear failure emits ALARM (not a silent warn)"
+dtreset; rm -f "$DTW/state/dev-tree-watched"
 
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
