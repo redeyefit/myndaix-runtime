@@ -1177,18 +1177,21 @@ dtcfg "$TREE_OFF"; rm -f "$DTW/inbox"/*                               # repoint 
 dtrun >/dev/null; dtrun >/dev/null
 ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: RETARGETING DEV_TREE resets the latch so the new tree's drift still alerts"
 
-# Identity-write FAILURE at retarget must die LOUD, not warn-and-continue: the old code cleared the
-# streak BEFORE the write, so a persistently failing write re-cleared it every run — alerts silently
-# suppressed while the tick exited 0 and liveness saw healthy (review 2164 #3). Also assert the
-# already-accumulated streak SURVIVES the failed run (write-before-reset ordering).
-dtcfg "$TREE_DIRTY"; dtrun >/dev/null                                  # records identity=DIRTY, streak=1
+# State-clear FAILURE at retarget must die LOUD with the identity left UNCOMMITTED, so the next
+# run retries the FULL reset (review 2164 #3: warn-and-continue silently suppressed alerts; review
+# 23749: the write-identity-FIRST variant committed the marker then tore, leaving the new tree
+# suppressed under the old latch with a MATCHING identity — no retry path ever fired).
+dtcfg "$TREE_DIRTY"; dtrun >/dev/null                                  # identity=DIRTY, streak=1 exists
 dtcfg "$TREE_AHEAD"                                                    # retarget -> identity mismatch
 chmod 555 "$DTW/state"
 dtout="$(dtrun)"; dtrc=$?
 chmod 755 "$DTW/state"
-ok '[[ "$dtrc" -ne 0 ]]' "DEV-tree: identity-write failure exits NONZERO (liveness sees an unhealthy tick, not silent success)"
-ok 'grep -q "could not record dev-tree identity" <<<"$dtout"' "DEV-tree: identity-write failure names itself loudly"
-ok '[[ "$(cat "$DTW/state/dev-tree-streak" 2>/dev/null)" == 1 ]]' "DEV-tree: the old streak SURVIVES a failed identity write (write-first ordering — no reset loop)"
+ok '[[ "$dtrc" -ne 0 ]]' "DEV-tree: state-clear failure at retarget exits NONZERO (liveness sees a sick tick, not silent success)"
+ok 'grep -q "could not clear dev-tree streak/latch for retarget" <<<"$dtout"' "DEV-tree: retarget cleanup failure names itself loudly"
+ok '[[ "$(cat "$DTW/state/dev-tree-watched" 2>/dev/null)" != "$TREE_AHEAD" ]]' "DEV-tree: identity stays UNCOMMITTED on a failed reset (marker committed LAST -> next run retries the reset)"
+rm -f "$DTW/inbox"/*
+dtrun >/dev/null; dtrun >/dev/null                                     # recovery: reset retried in full, then B accrues
+ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1 && grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: after the failed reset recovers, the NEW tree's drift still alerts (no inherited suppression)"
 dtreset; rm -f "$DTW/state/dev-tree-watched"
 
 # --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------

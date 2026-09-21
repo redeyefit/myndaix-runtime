@@ -156,15 +156,18 @@ if [[ -n "${DEV_TREE:-}" ]]; then
   # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
   # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
   # tree's first alert (cross-family review). Reset state whenever the recorded path differs.
-  # ORDER + die are load-bearing: record the NEW identity FIRST, clear old state only after it
-  # succeeds, and a failed identity write dies LOUD (like canary_emit's streak write). The old
-  # warn-and-continue cleared the streak BEFORE writing, so a persistently failing write re-cleared
-  # it every run — DEV-tree alerts silently suppressed forever while the tick exited 0 (review
-  # 2164 #3: liveness saw a healthy canary the whole time).
+  # ORDER + die are load-bearing: CLEAR FIRST, COMMIT IDENTITY LAST — the identity file is the
+  # "reset complete" marker, so ANY interruption (kill, failed write) leaves it mismatched and the
+  # next run retries the whole reset (rm -f is idempotent). Both steps die LOUD on failure (like
+  # canary_emit's streak write): warn-and-continue silently suppressed alerts while ticking exit-0
+  # (review 2164 #3), and the write-identity-FIRST variant tore the other way — identity committed
+  # + old latch left behind = the new tree's alerts suppressed under a matching identity (review
+  # 23749: never commit the marker before the state it vouches for is actually clean).
   if [[ "$(cat "$DT_WATCHED_FILE" 2>/dev/null || true)" != "$DEV_TREE" ]]; then
+    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" \
+      || die "could not clear dev-tree streak/latch for retarget"
     { printf '%s\n' "$DEV_TREE" > "$DT_WATCHED_FILE.tmp" && mv -f "$DT_WATCHED_FILE.tmp" "$DT_WATCHED_FILE"; } \
       || die "could not record dev-tree identity ($DT_WATCHED_FILE)"
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE"
   fi
   dt_reason="$(dev_tree_drift "$DEV_TREE")"
   if [[ -n "$dt_reason" ]]; then
@@ -172,7 +175,10 @@ if [[ -n "${DEV_TREE:-}" ]]; then
       "drift-canary DEV-tree watch: $DEV_TREE $dt_reason. The factory runs mxr / controller / orchestrator scripts from this checkout — while it is off clean main the factory may ship WRONG code and the librarian recall-gate fail-OPENs. Converge it by hand: cd $DEV_TREE && git status; then restore a clean main at origin (git stash / commit+push, or git checkout main && git pull --ff-only). This alert is loud-only — nothing here mutates the tree." \
       "${DEV_TREE_DRIFT_THRESHOLD:-5}"
   else
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || log "canary: WARN could not clear dev-tree streak/latch"
+    # die, not WARN: a failing clear here leaves a stale latch that would mute this SAME tree's
+    # next drift, and the identity matches so nothing ever retries it — same silent-suppression
+    # class as the retarget path (review 23749 series). A sick tick is the recoverable outcome.
+    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || die "could not clear dev-tree streak/latch"
   fi
 else
   # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity so a LATER re-enable
