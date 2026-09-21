@@ -1,12 +1,17 @@
 # Deploying myndaix-runtime
 
-There are **two deploy targets**, and a change can touch either or both:
+There are **three deploy targets**, and a change can touch any or all:
 1. **`serve`** — the worker pool + API (Python under `src/`, run as a launchd service). Covered
    just below.
 2. **the orchestrator** — the autonomous review loop (`play-review.sh` + the `controller`). It has
    its OWN deploy surfaces; see [Orchestrator deploy](#orchestrator-deploy-the-review-loop). A change
    to `orchestrator/play-review.sh` does NOT ship by pulling code + restarting serve — the worker
    runs a TRUSTED INSTALLED COPY, not the repo tree.
+3. **the substrate** — the GitOps watchers (`substrate/drift-canary.sh`, `liveness-canary.sh`,
+   `reconcile.sh`) and the inline **mxr freshness guard**. These have their OWN paths too; see
+   [Substrate deploy](#substrate-deploy-the-gitops-watchers--the-mxr-guard). A `drift-canary.sh`
+   change does NOT ship by restarting serve — the watchers run from the DEPLOY CLONE, and the guard
+   is a per-machine hand-splice from `SETUP.md`.
 
 ## TL;DR (serve)
 
@@ -89,6 +94,82 @@ the repo `src/runtime/controller.py` AND in BOTH installed workers (`$ORCH/play-
 `$ORCH/play-fix.sh`), and a fresh serve pid (`launchctl print gui/$(id -u)/ai.myndaix.runtime | grep
 pid`). A claimed deploy that skipped the `cp` runs the OLD worker(s); one that skipped the branch/pull
 runs the OLD controller.
+
+## Substrate deploy (the GitOps watchers + the mxr guard)
+
+The substrate scripts and the inline **mxr freshness guard** ship on paths the serve one-liner does
+NOT cover. This was reverse-engineered from scratch twice (2026-09-21, PRs #162/#163); documented
+here so it isn't a third time. Substrate is **FACTORY-only** — the MacBook lab runs none of these
+launchd jobs and its `mxr` wrapper is deliberately NOT gated (its dev tree is dirty by design).
+
+### Watchers (`drift-canary` / `liveness-canary`) — via the DEPLOY CLONE
+
+On the Mini the substrate launchd jobs execute the script from the **deploy clone**, NOT the
+`~/code/active` tree:
+
+```
+/Users/jefe/.myndaix/deploy/myndaix-runtime/substrate/drift-canary.sh   # <- what ai.myndaix.drift-canary runs
+```
+
+`ai.myndaix.reconcile` is the ONLY thing that advances that clone (fetch → health-gate on
+`to_regclass(migration_head.txt)` → the clone tracks origin/main). So a substrate script change
+ships like this, after the PR merges to `main`:
+
+```bash
+# 1. advance the deploy clone (ships the new substrate scripts):
+launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
+# 2. verify the clone reached the merge sha (poll — reconcile is async):
+git -C ~/.myndaix/deploy/myndaix-runtime rev-parse --short HEAD
+# 3. force one watcher tick now (read-only: reconcile --dry-run + git status; only drops alerts):
+launchctl kickstart -k gui/$(id -u)/ai.myndaix.drift-canary
+tail -4 ~/.myndaix/state/drift-canary.out          # expect "canary: no drift"
+```
+
+Advance the `~/code/active` tree too (`git pull --ff-only`) — the controller imports from it and the
+play-script `cp` sources from it, per [Orchestrator deploy](#orchestrator-deploy-the-review-loop).
+
+### The inline mxr freshness guard — hand-spliced per machine from `SETUP.md`
+
+`SETUP.md` is the CANONICAL source of the guard block. Each machine's live `~/.local/bin/mxr`
+carries a hand-copied copy — a guard sourced from the tree would rot with the very tree it guards.
+The machine-specific lines (`PYTHONPATH`/venv-python) live OUTSIDE the guard, so the guard block
+itself is machine-independent. The block is delimited by these two markers:
+
+```
+# --- runtime-tree freshness guard (FACTORY only) ...      <- first line of the block
+...
+# -----------------------------------------------------     <- last line of the block
+```
+
+To deploy a guard change to the FACTORY (Mini), splice — keep the live wrapper's head (shebang +
+exports, before the guard) and tail (the `exec ... python -m runtime.cli` line), replace ONLY the
+block between the markers:
+
+```bash
+# 1. extract the new guard from SETUP.md (the SAME awk substrate/test.sh uses to test it):
+awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' SETUP.md > /tmp/new-guard.txt
+# 2. find this machine's head/tail boundaries (do NOT hard-code line numbers — they drift):
+ssh mini 'grep -n "runtime-tree freshness guard\|^# ----" ~/.local/bin/mxr'
+# 3. assemble head + new-guard.txt + tail into /tmp/new-mxr, then verify it PARSES:
+bash -n /tmp/new-mxr
+# 4. back up + atomic-swap on the target:
+scp -q /tmp/new-mxr mini:/tmp/mxr.new
+ssh mini 'cp ~/.local/bin/mxr /tmp/mxr-$(date +%Y%m%d%H%M%S).bak && chmod +x /tmp/mxr.new && mv -f /tmp/mxr.new ~/.local/bin/mxr'
+```
+
+**Verify it PASSES on clean main WITHOUT dispatching a job** (extract the guard from the now-live
+wrapper, add a PASSTHROUGH tail, point it at the real tree — `PASSTHROUGH` = guard fell through to
+dispatch; `REFUSING` = it would block):
+
+```bash
+ssh mini 'awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > /tmp/gbody.sh
+{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat /tmp/gbody.sh; printf "echo PASSTHROUGH\n"; } > /tmp/grun.sh
+MYNDAIX_HOME=$HOME/.myndaix bash /tmp/grun.sh kilabz'      # factory + clean main -> PASSTHROUGH
+```
+
+The guard's LOGIC is covered by `substrate/test.sh` (extracted from `SETUP.md`, fixture repos: clean
+passes, off-main/ahead/behind/dirty/unreadable-role refused), so a merge is safe — this splice just
+ships the reviewed text to the live per-machine wrapper.
 
 ## Phone surface deploy (`mxr-phone`)
 
