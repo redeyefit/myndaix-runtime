@@ -1089,6 +1089,95 @@ ok 'ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2 inverse: config drift 
 ok '! ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2 inverse: a FRESH liveness watcher does not false-alert the reverse watch"
 ok 'grep -q "canary_emit" "$SUB/drift-canary.sh" && grep -q "LW_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "LW_ALERTED_FILE" "$SUB/drift-canary.sh"' "P2: drift-canary uses SEPARATE streak+latch files for the liveness-watch (structural)"
 
+echo "== drift-canary: DEV-tree drift watch (piece 1) + mxr freshness guard (piece 2) =="
+# A bare origin + a real work clone give us a tree we can push a clean 'main' to, then move OFF
+# main / AHEAD / dirty to exercise every drift reason the Mini's 09-14 six-day drift hit.
+DTO="$TMP/devtree-origin.git"; git init -q --bare "$DTO"
+git clone -q "$DTO" "$TMP/dt-seed" 2>/dev/null
+( cd "$TMP/dt-seed" && git config user.email t@t && git config user.name t && mkdir -p src \
+  && printf 'x\n' > src/x.py && printf 'r\n' > README && git add -A && git commit -qm init \
+  && git branch -M main && git push -q origin main ) >/dev/null 2>&1
+mk_clone(){ git clone -q "$DTO" "$1" 2>/dev/null; ( cd "$1" && git config user.email t@t && git config user.name t ) >/dev/null 2>&1; }
+TREE_CLEAN="$TMP/tree-clean"; mk_clone "$TREE_CLEAN"
+TREE_DIRTY="$TMP/tree-dirty"; mk_clone "$TREE_DIRTY"; printf 'edit\n' >> "$TREE_DIRTY/src/x.py"
+TREE_OFF="$TMP/tree-off";     mk_clone "$TREE_OFF";   ( cd "$TREE_OFF" && git checkout -q -b feature/wip ) >/dev/null 2>&1
+TREE_AHEAD="$TMP/tree-ahead"; mk_clone "$TREE_AHEAD"; ( cd "$TREE_AHEAD" && printf 'local\n' >> src/x.py && git add -A && git commit -qm local ) >/dev/null 2>&1
+TREE_GONE="$TMP/tree-gone"    # deliberately never created
+
+# --- piece 1: the DEV-tree watch inside drift-canary (behavioral, via the TEST_RC seam) ---
+DTW="$TMP/dtw-home"; DTFH="$TMP/dtw-fakehome"
+mkdir -p "$DTW/state" "$DTW/inbox" "$DTFH/Library/LaunchAgents"
+touch "$DTW/state/liveness-canary.out"   # no liveness plist in DTFH -> reverse-watch stays quiet
+dtcfg(){ printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\nDEV_TREE=%s\nDEV_TREE_DRIFT_THRESHOLD=2\n' "$DTW" "$DTW" "$REPO" "$1" > "$DTW/config.env"; }
+dtrun(){ MYNDAIX_HOME="$DTW" HOME="$DTFH" DRIFT_CANARY_TEST_RC=0 /bin/bash "$SUB/drift-canary.sh" 2>&1; }
+dtreset(){ rm -f "$DTW/inbox"/* "$DTW/state/dev-tree-streak" "$DTW/state/dev-tree-alerted"; }
+
+dtcfg "$TREE_CLEAN"; dtreset
+dtrun >/dev/null; dtrun >/dev/null; dtrun >/dev/null
+ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: clean main never alerts (even past threshold)"
+ok '[[ ! -e "$DTW/state/dev-tree-streak" ]]' "DEV-tree: clean main leaves no streak file"
+
+dtcfg "$TREE_DIRTY"; dtreset
+dtrun >/dev/null
+ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: one dirty check below threshold(2) -> no alert yet (live-dev grace)"
+dtrun >/dev/null
+ok 'ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: dirty tree persisting to threshold -> ALERT"
+ok 'grep -q "dirty working tree" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: alert names the dirty reason"
+ok 'grep -q "$TREE_DIRTY" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: alert names the offending tree path"
+ok 'grep -q "loud-only" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: alert states it never mutates the tree"
+ok '! ls "$DTW/inbox"/drift-alert-*.md >/dev/null 2>&1' "DEV-tree: fires on its OWN latch while config drift is CLEAN (independent — deep-audit P2 class)"
+
+dtcfg "$TREE_CLEAN"; dtrun >/dev/null
+ok '[[ ! -e "$DTW/state/dev-tree-streak" && ! -e "$DTW/state/dev-tree-alerted" ]]' "DEV-tree: returning to clean main clears the streak+latch"
+
+dtcfg "$TREE_OFF"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "not main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: off-main checkout alerts with a 'not main' reason (the 09-14 root cause)"
+
+dtcfg "$TREE_AHEAD"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "ahead of origin/main" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: unpushed local commit alerts with an 'ahead' reason"
+
+dtcfg "$TREE_GONE"; dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok 'grep -q "missing or not a git checkout" "$DTW"/inbox/dev-tree-alert-*.md' "DEV-tree: a missing DEV_TREE checkout is itself a drift reason"
+
+printf 'MACHINE_ROLE=factory\nMYNDAIX_HOME=%s\nMYNDAIX_DSN=postgresql://127.0.0.1/runtime\nOPERATOR_INBOX=%s/inbox\nAUTHOR_ALLOWLIST=bot\nDEPLOY_CLONE=%s\n' "$DTW" "$DTW" "$REPO" > "$DTW/config.env"
+dtreset; dtrun >/dev/null; dtrun >/dev/null
+ok '! ls "$DTW/inbox"/dev-tree-alert-*.md >/dev/null 2>&1' "DEV-tree: unset DEV_TREE = watch OFF (labs never set it -> never nagged)"
+ok 'grep -q "DT_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "dev_tree_drift" "$SUB/drift-canary.sh"' "DEV-tree: separate streak/latch + dev_tree_drift helper (structural)"
+
+# --- piece 2: the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
+# Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live
+# per-machine wrappers are hand-copied from it). Wrap it with a test PYTHONPATH + a PASSTHROUGH
+# tail: if the guard falls through, PASSTHROUGH prints; if it refuses, it exits 78 before that.
+GUARDBODY="$TMP/guardbody.sh"
+awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' "$REPO/SETUP.md" > "$GUARDBODY"
+GUARD="$TMP/mxr-guard-test"
+{ printf '#!/bin/bash\nexport PYTHONPATH="${MXR_TEST_TREE}/src"\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARD"; chmod +x "$GUARD"
+ok '[[ -s "$GUARDBODY" ]] && grep -q "exit 78" "$GUARDBODY"' "guard: extracted a non-empty guard block from SETUP.md (canonical source under test)"
+FAC="$TMP/guard-fac"; mkdir -p "$FAC"; printf 'MACHINE_ROLE=factory\n' > "$FAC/config.env"
+LABH="$TMP/guard-lab"; mkdir -p "$LABH"; printf 'MACHINE_ROLE=lab\n' > "$LABH/config.env"
+NOROLE="$TMP/guard-norole"; mkdir -p "$NOROLE"   # no config.env -> role unknown
+
+g="$(MXR_TEST_TREE="$TREE_CLEAN" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: factory + clean main -> dispatch proceeds"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory + dirty tree -> REFUSED (exit 78)"
+ok 'grep -q "REFUSING dispatch" "$TMP/g.err"' "guard: refusal is loud on stderr and names the reason"
+MXR_TEST_TREE="$TREE_OFF" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory + off-main tree -> REFUSED"
+MXR_TEST_TREE="$TREE_AHEAD" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>&1; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: factory + unpushed-ahead tree -> REFUSED"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" MXR_ALLOW_DIRTY=1 bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: MXR_ALLOW_DIRTY=1 overrides on a dirty factory tree"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" get 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: 'get' (stranded-reply recovery) is EXEMPT even mid-drift"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$FAC" bash "$GUARD" --help 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: help is exempt"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LABH" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: LAB role is NEVER gated (its dev tree is dirty by design)"
+g="$(MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$NOROLE" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unknown role (no config.env) fails OPEN -> not gated"
+ok 'grep -q "exit 78" "$REPO/SETUP.md" && grep -q "MXR_ALLOW_DIRTY" "$REPO/SETUP.md" && grep -q "MACHINE_ROLE" "$REPO/SETUP.md"' "guard: SETUP.md heredoc carries the canonical guard (structural)"
+
 echo "== shell hygiene: bash -n + shellcheck clean on the production substrate scripts =="
 # The production scripts must be pristine. test.sh itself is exempt from the strict SC2034 gate
 # (its ok '<cmd>' harness uses vars only inside single-quoted eval strings shellcheck can't see

@@ -129,6 +129,19 @@ def _days(key: str, val: str) -> int:
     return int(val, 10)
 
 
+def _drift_threshold(key: str, val: str) -> int:
+    """Consecutive drifting checks before the DEV-tree watch alerts (drift-canary). Base-10,
+    floor 1 (0 would alert on the very first transient-dirty check — no live-dev grace). By
+    convention set LARGER than the config-drift THRESHOLD=2, since the DEV tree may be briefly
+    hand-edited; only PERSISTENT drift (streak >= this) is worth an alert."""
+    if not re.fullmatch(r"[0-9]+", val):
+        _err(f"{key}: must be a base-10 integer (got {val!r})")
+    n = int(val)
+    if n < 1:
+        _err(f"{key}: drift threshold floor is 1 (got {n})")
+    return n
+
+
 def _email_or_empty(key: str, val: str) -> str:
     """A single email address, or empty = feature off. INBOX_DRIVE_ACCOUNT membership
     in INBOX_ACCOUNTS is checked by the component at runtime, not here."""
@@ -162,6 +175,12 @@ _SCHEMA = {
     "AGENT_CLI_PATH":   (_cli_path,  False, False),
     "POLL_INTERVAL_S":  (_poll,      False, False),
     "DEPLOY_CLONE":     (_abspath,   False, False),  # override; default derived below
+    # DEV-tree drift watch (drift-canary) — FACTORY-only in practice: the Mini runs mxr /
+    # controller / orchestrator scripts from a checkout at DEV_TREE (NOT the pull-only deploy
+    # clone), so a DEV_TREE off clean main silently ships WRONG code (the 09-14 six-day drift).
+    # Absent DEV_TREE = watch OFF (labs never set it — their tree is dirty by design).
+    "DEV_TREE":                 (_abspath,         False, False),
+    "DEV_TREE_DRIFT_THRESHOLD": (_drift_threshold, False, False),
     # Inbox Assistant — ALL optional on every role (labs and unconfigured factories
     # must keep converging). Absent INBOX_ACCOUNTS = component off, never an error.
     "INBOX_ACCOUNTS":      (_email_list,     False, False),
@@ -172,7 +191,8 @@ _SCHEMA = {
     "INBOX_IMESSAGE_TO":   (_e164,           False, False),
 }
 
-_DEFAULTS = {"POLL_INTERVAL_S": 900, "INBOX_OP_VAULT": "Automation", "INBOX_BACKFILL_DAYS": 90}
+_DEFAULTS = {"POLL_INTERVAL_S": 900, "INBOX_OP_VAULT": "Automation", "INBOX_BACKFILL_DAYS": 90,
+             "DEV_TREE_DRIFT_THRESHOLD": 5}
 
 
 def _unquote(key: str, raw: str) -> str:

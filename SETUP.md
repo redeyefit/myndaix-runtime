@@ -163,12 +163,50 @@ cat > ~/.local/bin/mxr <<'EOF'
 #!/bin/bash
 export MYNDAIX_DSN="${MYNDAIX_DSN:-postgresql://localhost/runtime}"
 export PYTHONPATH="/path/to/your/myndaix-runtime/src"   # <- set to YOUR clone's path
+
+# --- runtime-tree freshness guard (FACTORY only) -----------------------------------------
+# The pool runs the code at $PYTHONPATH; on the FACTORY that path is a live DEV checkout, so a
+# tree off clean main silently dispatches WRONG runtime code (the 09-14 six-day drift). Refuse
+# LOUD so a human converges the tree instead of the factory shipping stale code. The LAB is a dev
+# machine (its tree is dirty/branched by design) → the guard enforces ONLY when this machine's
+# MACHINE_ROLE is `factory`. Read-only / recovery verbs (get, help) are NEVER gated — `mxr get
+# <jid> --reply` must recover a stranded reply mid-drift. Override with MXR_ALLOW_DIRTY=1.
+# INLINE by design: a guard sourced from the tree would rot WITH the tree it guards. config.env is
+# READ (one token via sed), never sourced — the value is only compared, never executed.
+case "${1:-}" in
+  get|help|--help|-h) : ;;
+  *)
+    if [ "${MXR_ALLOW_DIRTY:-}" != 1 ]; then
+      _mxr_cfg="${MYNDAIX_HOME:-$HOME/.myndaix}/config.env"
+      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | tr -d "\"' " | head -1)"
+      if [ "$_mxr_role" = factory ]; then
+        _mxr_tree="${PYTHONPATH%/src}"
+        _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
+        _mxr_ahead="$(git -C "$_mxr_tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+        case "$_mxr_ahead" in ''|*[!0-9]*) _mxr_ahead=0 ;; esac
+        if [ "$_mxr_branch" != main ] || [ "$((10#$_mxr_ahead))" -gt 0 ] || [ -n "$(git -C "$_mxr_tree" status --porcelain 2>/dev/null)" ]; then
+          echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not on clean main (branch=$_mxr_branch ahead=$_mxr_ahead). The factory would ship WRONG code. Converge the tree (git status) or set MXR_ALLOW_DIRTY=1 to override." >&2
+          exit 78
+        fi
+      fi
+    fi
+    ;;
+esac
+# -----------------------------------------------------------------------------------------
+
 exec python3 -m runtime.cli "$@"
 EOF
 chmod +x ~/.local/bin/mxr
 
 mxr recon "latest stable Python release"
 ```
+
+> **The freshness guard is INLINE per-machine, not shipped from the repo.** The block above is the
+> canonical source; each machine's live `~/.local/bin/mxr` carries its own copy (they differ in
+> `PYTHONPATH` / venv python). On the FACTORY, keep it in sync when this template changes — a guard
+> sourced from the tree would rot with the very tree it guards. Its logic is covered by
+> `substrate/test.sh` (fixture repos: clean-main passes, off-main / ahead / dirty are refused,
+> `MXR_ALLOW_DIRTY=1` and a non-factory role bypass, `get`/`help` are exempt).
 
 `recon` needs `PERPLEXITY_API_KEY` in the **pool's** environment (step 4) — the shell you run `mxr` in
 doesn't matter, since the agent runs inside `serve`. Export the key where `serve` runs and restart it.
