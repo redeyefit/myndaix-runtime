@@ -1215,8 +1215,10 @@ g="$(MXR_TEST_TREE="$TMP/not-a-repo" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>
 ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: unresolvable runtime tree fails OPEN (guard-config error must not brick the factory)"
 ok 'grep -qi "cannot resolve" "$TMP/g.warn"' "guard: unresolvable tree warns loudly on stderr"
 # A BARE repo must NOT pass the guard as clean-main (rev-parse prints false/exit-0) — fail OPEN+warn.
-g="$(MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>/dev/null)"; r=$?
-ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]]' "guard: a BARE repo is unresolvable -> fail OPEN (not read as clean-main)"
+# Assert the WARNING, not just passthrough: the OLD exit-status-only guard ALSO passed a bare repo
+# (silently), so only the warning distinguishes the fix from the bug (cross-family review R3).
+g="$(MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz 2>"$TMP/g.bare.err")"; r=$?
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "cannot resolve" "$TMP/g.bare.err"' "guard: a BARE repo fails OPEN *and WARNS* (warning proves the ==true fix, not the old silent pass)"
 ok 'grep -q "untracked-files=all" "$REPO/SETUP.md" && grep -q "no-optional-locks" "$SUB/drift-canary.sh"' "guard/watch: status probes hardened (-uall, --no-optional-locks) (structural)"
 ok 'grep -q "PYTHONSAFEPATH" "$REPO/SETUP.md"' "guard: PYTHONSAFEPATH=1 in the wrapper (no CWD shadow-import of a different runtime)"
 ok 'grep -q "exit 78" "$REPO/SETUP.md" && grep -q "MXR_ALLOW_DIRTY" "$REPO/SETUP.md" && grep -q "MACHINE_ROLE" "$REPO/SETUP.md"' "guard: SETUP.md heredoc carries the canonical guard (structural)"
