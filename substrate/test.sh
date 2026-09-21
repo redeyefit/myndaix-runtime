@@ -1285,12 +1285,25 @@ LITROLE="$TMP/guard-litrole"; mkdir -p "$LITROLE"; printf 'MACHINE_ROLE=bad\\033
 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$LITROLE" bash -O xpg_echo "$GUARD" kilabz >/dev/null 2>"$TMP/g.litrole.err"; r=$?
 ok '[[ "$r" -eq 78 ]]' "guard: literal-backslash-escape role still REFUSED fail-closed"
 ok 'grep -q "REFUSING" "$TMP/g.litrole.err" && ! grep -qF "$ESCBYTE" "$TMP/g.litrole.err"' "guard: under xpg_echo a literal backslash-033 is NOT re-interpreted (printf constant format — review 48310 F1)"
-# Non-UTF-8 bytes in the role: BSD tr without LC_ALL=C aborts on an illegal byte sequence and the
-# sanitize substitution dies mid-guard (review 48310 F2). Must still refuse 78 with a message.
+# Non-UTF-8 bytes in the role must reach the SANITIZER branch (not an earlier extraction-failure
+# refusal). With the single-read + LC_ALL=C parse, a binary role survives extraction as a nonempty
+# non-'lab' value -> the unrecognized-role branch -> the sanitizer strips the bytes to 'factroy'.
+# Run under a UTF-8 locale + xpg_echo (the hostile combo) and ASSERT the sanitized role string is
+# present in the refusal — proving the sanitizer ran, not just that some 78 was returned (review
+# 60298 F3: the old test passed on the extraction-failure branch and never exercised the sanitizer;
+# review 48310 F2: LC_ALL=C keeps tr from aborting on the illegal byte sequence).
 BINROLE="$TMP/guard-binrole"; mkdir -p "$BINROLE"; printf 'MACHINE_ROLE=fac\xff\xfetroy\n' > "$BINROLE/config.env"
-MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BINROLE" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.binrole.err"; r=$?
-ok '[[ "$r" -eq 78 ]]' "guard: role with non-UTF-8 bytes still REFUSED fail-closed (LC_ALL=C tr — review 48310 F2)"
-ok 'grep -q "REFUSING" "$TMP/g.binrole.err"' "guard: non-UTF-8-role refusal still emits its message (tr did not abort the pipeline)"
+LC_ALL=en_US.UTF-8 MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$BINROLE" bash -O xpg_echo "$GUARD" kilabz >/dev/null 2>"$TMP/g.binrole.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: role with non-UTF-8 bytes still REFUSED fail-closed (single-read + LC_ALL=C parse — review 60298 F3)"
+ok 'grep -q "MACHINE_ROLE='"'"'factroy'"'"'" "$TMP/g.binrole.err"' "guard: non-UTF-8 role REACHES the sanitizer (refusal shows sanitized '\''factroy'\'', not an extraction-failure message — review 60298 F3)"
+ok '! grep -qF "$ESCBYTE" "$TMP/g.binrole.err"' "guard: non-UTF-8-role refusal carries no raw non-printable byte"
+# TOCTOU: presence derives from the SAME cat that read the content — an empty-but-PRESENT config
+# (role unresolvable) must take the fail-CLOSED branch, never the absent-config warn (review 60298
+# F1: a separate -f snapshot after extraction could race a deletion into the fail-open path).
+EMPTYCFG="$TMP/guard-emptycfg"; mkdir -p "$EMPTYCFG"; : > "$EMPTYCFG/config.env"
+MXR_TEST_TREE="$TREE_DIRTY" MYNDAIX_HOME="$EMPTYCFG" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.emptycfg.err"; r=$?
+ok '[[ "$r" -eq 78 ]]' "guard: present-but-empty config.env (role unresolvable) -> fail-CLOSED, not the absent-config warn (review 60298 F1)"
+ok 'grep -q "could not be resolved" "$TMP/g.emptycfg.err"' "guard: empty-config refusal names the unresolvable-role cause (present-branch reached via same-read presence)"
 # Robust role extraction (cross-family review): an inline `#comment` + a CRLF line-ending must NOT
 # defeat the equality check (that would silently fail-OPEN on a real factory).
 FACC="$TMP/guard-fac-comment"; mkdir -p "$FACC"; printf 'MACHINE_ROLE=factory # the mini\r\n' > "$FACC/config.env"

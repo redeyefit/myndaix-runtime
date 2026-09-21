@@ -193,13 +193,17 @@ case "${1:-}" in
       # hand-edited and the house style adds `set -euo pipefail` — every substitution must survive
       # that without dying mid-guard (review R6; a missing config.env must fall through to
       # unknown-role fail-open, not kill the wrapper with a bare rc=2).
-      _mxr_role="$(sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' "$_mxr_cfg" 2>/dev/null | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
-      # Snapshot config.env existence ONCE, next to the extraction that read it — the elif chain
-      # below branches on this variable, never on a fresh -f. Re-testing the filesystem per-branch
-      # was a TOCTOU: a config landed (or deleted) by deploy tooling between two elifs made the
-      # chain see a state the extraction never read, skipping the refuse/warn that matched the
-      # extracted role (review 48310 F3, both reviewers; supersedes the round-1 wontfix).
-      _mxr_cfg_present=0; [ -f "$_mxr_cfg" ] && _mxr_cfg_present=1
+      # SINGLE READ: cat config.env ONCE; presence is THAT cat's exit status (0 = the file was
+      # read, even if empty; nonzero = absent), so presence and content come from the same open —
+      # no separate `-f` stat can race a mid-guard deletion (review 60298 F1: a snapshot taken
+      # AFTER extraction let a delete between the two lines flip fail-closed -> fail-open). The
+      # `if _var="$(...)"; then` form is set -e-safe (a condition never triggers errexit). Role is
+      # parsed from the captured bytes under LC_ALL=C so non-UTF-8 bytes cannot abort a sed/tr
+      # mid-pipeline (review 60298 F3 / 48310 F2: extraction itself lacked LC_ALL=C, so a binary
+      # role aborted BEFORE the sanitizer branch was ever reached). `|| true` keeps a hand-added
+      # set -e from killing the wrapper mid-guard (review R6).
+      if _mxr_cfg_raw="$(cat "$_mxr_cfg" 2>/dev/null)"; then _mxr_cfg_present=1; else _mxr_cfg_present=0; fi
+      _mxr_role="$( export LC_ALL=C; printf '%s' "$_mxr_cfg_raw" | sed -n 's/^[[:space:]]*MACHINE_ROLE[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/#.*//' | tr -d "\"'" | tr -d '[:space:]' || true)"
       if [ "$_mxr_role" = factory ]; then
         _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
         # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
@@ -223,7 +227,7 @@ case "${1:-}" in
             # code of unverifiable provenance (the exact 09-14 class this guard exists for). Fail
             # CLOSED (oracle finding: fail-open here was a .git-delete bypass). MXR_ALLOW_DIRTY=1 is
             # the one-command recovery if this ever fires on a legitimate config quirk.
-            echo "mxr: REFUSING dispatch — PYTHONPATH ($PYTHONPATH) does not resolve to a git work tree (tree deleted/moved, or bare?). Cannot verify the runtime code the factory would ship. Fix PYTHONPATH / restore the clone, or set MXR_ALLOW_DIRTY=1 to override." >&2
+            printf '%s\n' "mxr: REFUSING dispatch — PYTHONPATH ($PYTHONPATH) does not resolve to a git work tree (tree deleted/moved, or bare?). Cannot verify the runtime code the factory would ship. Fix PYTHONPATH / restore the clone, or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
           _mxr_branch="$(git -C "$_mxr_tree" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
@@ -247,7 +251,7 @@ case "${1:-}" in
           if [ "$_mxr_branch" != main ] || [ "$_mxr_ahead" = unverifiable ] || [ "$((10#$_mxr_ahead))" -gt 0 ] \
              || [ "$_mxr_behind" = unverifiable ] || [ "$((10#$_mxr_behind))" -gt 0 ] \
              || [ "$_mxr_strc" -ne 0 ] || [ -n "$_mxr_dirty" ]; then
-            echo "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead behind=$_mxr_behind status_rc=$_mxr_strc). The factory would ship WRONG (stale or unpushed) code. Converge the tree (git status; git pull --ff-only) or set MXR_ALLOW_DIRTY=1 to override." >&2
+            printf '%s\n' "mxr: REFUSING dispatch — runtime tree $_mxr_tree is not verifiably on clean main (branch=$_mxr_branch ahead=$_mxr_ahead behind=$_mxr_behind status_rc=$_mxr_strc). The factory would ship WRONG (stale or unpushed) code. Converge the tree (git status; git pull --ff-only) or set MXR_ALLOW_DIRTY=1 to override." >&2
             exit 78
           fi
         ) || _mxr_grc=$?
@@ -264,7 +268,7 @@ case "${1:-}" in
         # pipeline itself failed (missing binary / OOM) OR the key is absent from a present config.
         # We cannot rule out that THIS is the factory, so the guard above would be SILENTLY SKIPPED
         # on the exact machine it protects. Fail CLOSED (review 68864 P3).
-        echo "mxr: REFUSING dispatch — config.env present ($_mxr_cfg) but MACHINE_ROLE could not be resolved (unparsable config or missing key). Cannot confirm this is not the factory; failing closed. Fix MACHINE_ROLE, or set MXR_ALLOW_DIRTY=1 to override." >&2
+        printf '%s\n' "mxr: REFUSING dispatch — config.env present ($_mxr_cfg) but MACHINE_ROLE could not be resolved (unparsable config or missing key). Cannot confirm this is not the factory; failing closed. Fix MACHINE_ROLE, or set MXR_ALLOW_DIRTY=1 to override." >&2
         exit 78
       elif [ -n "$_mxr_role" ] && [ "$_mxr_role" != "lab" ]; then
         # config.env present with a NONEMPTY but UNRECOGNIZED role (not 'factory', not 'lab'): a
@@ -288,7 +292,7 @@ case "${1:-}" in
         # DECLINED hardening (review 6838 P1, wontfix): requiring MXR_ALLOW_DIRTY=1 here would
         # kill every fresh-install wrapper to close a deploy-deletes-config.env edge the warning +
         # drift-canary DEV-tree watch already surface.
-        echo "mxr: WARNING — config.env absent ($_mxr_cfg); freshness guard skipped (unconfigured install?). The drift-canary DEV-tree watch is the backstop." >&2
+        printf '%s\n' "mxr: WARNING — config.env absent ($_mxr_cfg); freshness guard skipped (unconfigured install?). The drift-canary DEV-tree watch is the backstop." >&2
       fi
     fi
     ;;
