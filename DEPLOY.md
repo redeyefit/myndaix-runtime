@@ -139,13 +139,19 @@ done
 #    producer into rc=141 under pipefail).
 LOG=~/.myndaix/state/drift-canary.out
 mkdir -p ~/.myndaix/state                       # fresh host: state dir may not exist yet
+# service-presence asserted ONCE upfront (absent = fail fast with the real reason); a failing
+# query inside the loops below therefore means TRANSIENT — keep polling, never read it as "exited"
+launchctl print gui/$(id -u)/ai.myndaix.drift-canary >/dev/null 2>&1 \
+  || { echo "drift-canary service not loaded — run reconcile/bootstrap first" >&2; exit 1; }
 launchctl kill SIGTERM gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null || true   # quiesce; no-op if idle
 deadline=$((SECONDS + 120))
 until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
   (( SECONDS < deadline )) || { echo "Timed out waiting for the previous tick to quiesce" >&2; exit 1; }
   sleep 1
 done
-offset=$(wc -c < "$LOG" 2>/dev/null || echo 0)  # snapshot while quiet; absent log = start of file
+offset=$(wc -c 2>/dev/null < "$LOG" || echo 0)  # snapshot while quiet; absent log = start of file
+                                                # (2>/dev/null BEFORE < — redirects apply left-to-right,
+                                                # so a missing-log open error is already silenced)
 launchctl kickstart gui/$(id -u)/ai.myndaix.drift-canary
 until fresh=$(tail -c "+$((offset + 1))" "$LOG" 2>/dev/null || true); grep -qE 'canary: (no drift|config DRIFT)|DRIFT|ALARM|watch failed' <<<"$fresh"; do
   (( SECONDS < deadline )) || { echo "Timed out waiting for a fresh canary verdict; inspect $LOG" >&2; exit 1; }
@@ -191,7 +197,7 @@ set -euo pipefail
 # no EXIT trap here — a pasted runbook block must not clobber a trap the shell already set;
 # explicit rm below covers success, and an abort leaks only one unpredictable mktemp name
 GUARD=$(mktemp)
-awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
+awk '/^# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
   SETUP.md > "$GUARD"
 [ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
   && grep -q '^# -----' "$GUARD" \
