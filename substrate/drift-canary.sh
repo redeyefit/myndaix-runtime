@@ -16,7 +16,13 @@ SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SUBSTRATE_DIR/lib.sh"
 substrate_load_config
 
-STATE_DIR="$MYNDAIX_HOME/state"
+# DRIFT_CANARY_STATE_DIR relocates ONLY this script's streak/latch/identity files — the ones the
+# SINGLE-INSTANCE INVARIANT below protects. DEPLOY.md step 3 points it at a private scratch dir
+# so a foreground verify run can overlap a live launchd tick without racing its read-modify-write.
+# Reads of OTHER jobs' state (LIVENESS_OUT) deliberately stay on $MYNDAIX_HOME/state. launchd
+# never sets it. Absolute-only: a relative dir would silently land state under whatever cwd ran us.
+STATE_DIR="${DRIFT_CANARY_STATE_DIR:-$MYNDAIX_HOME/state}"
+[[ "$STATE_DIR" == /* ]] || die "DRIFT_CANARY_STATE_DIR must be an absolute path (got: $STATE_DIR)"
 mkdir -p "$STATE_DIR"
 STREAK_FILE="$STATE_DIR/drift-streak"
 ALERTED_FILE="$STATE_DIR/drift-alerted"
@@ -171,7 +177,9 @@ fi
 # invocations of a label, so ticks are serialized. Do NOT run concurrent manual instances (a
 # manual run while the tick is live can race the cat→rm→mv sequences and the fixed .tmp names;
 # reviews 73734/23749/34704 flag these — wontfix BECAUSE of this invariant, matching canary_emit's
-# established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine.
+# established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine,
+# and so is a manual run with DRIFT_CANARY_STATE_DIR set to a private dir (it then shares no
+# streak/latch/identity file with the live tick — the DEPLOY.md step-3 verify run).
 DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
 DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
 DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to

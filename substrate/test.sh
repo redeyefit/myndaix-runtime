@@ -1089,6 +1089,21 @@ ok 'ls "$DVH/inbox"/drift-alert-*.md >/dev/null 2>&1' "P2 inverse: config drift 
 ok '! ls "$DVH/inbox"/liveness-watch-alert-*.md >/dev/null 2>&1' "P2 inverse: a FRESH liveness watcher does not false-alert the reverse watch"
 ok 'grep -q "canary_emit" "$SUB/drift-canary.sh" && grep -q "LW_STREAK_FILE" "$SUB/drift-canary.sh" && grep -q "LW_ALERTED_FILE" "$SUB/drift-canary.sh"' "P2: drift-canary uses SEPARATE streak+latch files for the liveness-watch (structural)"
 
+echo "== drift-canary: DRIFT_CANARY_STATE_DIR private state (DEPLOY.md step-3 verify run) =="
+# The deploy-time foreground run overlaps a still-loaded launchd tick, so it must NOT touch the live
+# streak/latch files (safe only for one instance per state dir — review 82417 P1). DVH/state holds a
+# live drift streak+latch from the block above; a drifting private-dir run must leave it byte-identical.
+rm -f "$DVH/inbox"/*
+real_before="$(cd "$DVH/state" && ls -1 && cat drift-streak)"
+PSD="$LV/private-state"
+MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_STATE_DIR="$PSD" /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1
+ok '[[ "$(cat "$PSD/drift-streak" 2>/dev/null)" == 1 ]]' "private state: the drift streak lands in DRIFT_CANARY_STATE_DIR"
+ok '[[ "$(cd "$DVH/state" && ls -1 && cat drift-streak)" == "$real_before" ]]' "private state: the live tick's streak/latch files are untouched"
+ok '! ls "$DVH/inbox"/*.md >/dev/null 2>&1' "private state: one fresh-dir run never reaches an alert threshold"
+psrel_rc=0
+(cd "$LV" && MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC=0 DRIFT_CANARY_STATE_DIR="rel/state" /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1) || psrel_rc=$?
+ok '[[ "$psrel_rc" -ne 0 && ! -e "$LV/rel" ]]' "private state: a RELATIVE DRIFT_CANARY_STATE_DIR is refused before any write"
+
 echo "== drift-canary: DEV-tree drift watch (piece 1) + mxr freshness guard (piece 2) =="
 # A bare origin + a real work clone give us a tree we can push a clean 'main' to, then move OFF
 # main / AHEAD / dirty to exercise every drift reason the Mini's 09-14 six-day drift hit.
