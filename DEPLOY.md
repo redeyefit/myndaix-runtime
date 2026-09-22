@@ -128,20 +128,28 @@ until [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null || true)" == "$TARGET" 
   (( SECONDS < deadline )) || { echo "Timed out waiting for convergence to $TARGET; inspect reconcile.out" >&2; exit 1; }
   echo "waiting…"; sleep 5
 done
-# 3. force one watcher tick; wait for its verdict in newly appended output, FAIL on any drift.
-#    "canary: no drift" is ONLY the config sub-check (drift-canary.sh:253-256); the DEV-tree
-#    failure trailer prints AFTER it (:265) — so match every verdict variant and fail closed:
+# 3. force one watcher tick and judge ONLY that tick's output, fail-closed on any drift.
+#    Ordering constraints: the offset snapshot comes AFTER kickstart's kill (a still-running
+#    previous tick could otherwise land its verdict past the snapshot and be judged as ours);
+#    NO touch on the log (liveness-canary reads its mtime as execution evidence — a touch
+#    fabricates freshness for a stalled canary); no fixed sleeps — wait for the tick PROCESS
+#    to exit before judging, so the post-"no drift" DEV-tree trailer (drift-canary.sh:253-265)
+#    cannot slip in after the scan; verdicts are grepped from a variable, never a
+#    tail|grep pipeline (grep -q's early close can SIGPIPE tail into rc=141 under pipefail).
 LOG=~/.myndaix/state/drift-canary.out
-touch "$LOG"    # fresh host: the log may not exist yet and the offset read would die under set -e
-offset=$(wc -c < "$LOG")
+mkdir -p ~/.myndaix/state                       # fresh host: state dir may not exist yet
 launchctl kickstart -k gui/$(id -u)/ai.myndaix.drift-canary
+offset=$(wc -c < "$LOG" 2>/dev/null || echo 0)  # post-kill snapshot; absent log = start of file
 deadline=$((SECONDS + 120))
-until tail -c +$((offset + 1)) "$LOG" | grep -qE 'canary: (no drift|config DRIFT)|dev-tree watch failed|liveness-watch DRIFT|ALARM'; do
+until fresh=$(tail -c "+$((offset + 1))" "$LOG" 2>/dev/null || true); grep -qE 'canary: (no drift|config DRIFT)' <<<"$fresh"; do
   (( SECONDS < deadline )) || { echo "Timed out waiting for a fresh canary verdict; inspect $LOG" >&2; exit 1; }
   sleep 2
 done
-sleep 2    # let the post-"no drift" dev-tree trailer land before judging the tick
-fresh=$(tail -c +$((offset + 1)) "$LOG")
+until ! launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null | grep -q 'state = running'; do
+  (( SECONDS < deadline )) || { echo "Timed out waiting for the forced tick to exit; inspect $LOG" >&2; exit 1; }
+  sleep 1
+done
+fresh=$(tail -c "+$((offset + 1))" "$LOG")
 if grep -qE 'DRIFT|ALARM|watch failed' <<<"$fresh"; then
   echo "canary reported drift/failure — investigate before trusting this deploy:" >&2
   grep -E 'DRIFT|ALARM|watch failed' <<<"$fresh" >&2
@@ -175,7 +183,7 @@ block between the markers:
 #    shared box is a symlink-clobber target):
 set -euo pipefail
 GUARD=$(mktemp)
-trap 'rm -f -- "$GUARD"' EXIT
+trap 'rm -f -- "$GUARD"' EXIT   # standalone block: REPLACES any EXIT trap already set in this shell
 awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
   SETUP.md > "$GUARD"
 [ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
