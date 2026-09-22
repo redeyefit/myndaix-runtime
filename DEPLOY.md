@@ -116,19 +116,61 @@ On the Mini the substrate launchd jobs execute the script from the **deploy clon
 ships like this, after the PR merges to `main`:
 
 ```bash
-# 1. advance the deploy clone (ships the new substrate scripts):
+set -euo pipefail
+# 1. update the active tree before capturing the intended full merge SHA:
+git -C ~/code/active/myndaix-runtime switch main
+git -C ~/code/active/myndaix-runtime pull --ff-only
+TARGET=$(git -C ~/code/active/myndaix-runtime rev-parse HEAD)
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
-# 2. wait for the clone to reach the merge sha (reconcile is async — poll; ~30s):
-TARGET=$(git -C ~/code/active/myndaix-runtime rev-parse --short HEAD)
-until [[ "$(git -C ~/.myndaix/deploy/myndaix-runtime rev-parse --short HEAD)" == "$TARGET" ]]; do
+# 2. wait for successful convergence, not just the clone reset:
+deadline=$((SECONDS + 300))
+until [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null || true)" == "$TARGET" ]]; do
+  (( SECONDS < deadline )) || { echo "Timed out waiting for convergence to $TARGET; inspect reconcile.out" >&2; exit 1; }
   echo "waiting…"; sleep 5
 done
-# 3. force one watcher tick; wait for the tick to finish before reading the log:
-launchctl kickstart -k gui/$(id -u)/ai.myndaix.drift-canary
-sleep 2 && tail -4 ~/.myndaix/state/drift-canary.out   # expect "canary: no drift"
+# 3. force one watcher tick and judge ONLY that tick's output, fail-closed on any drift.
+#    Constraints this block encodes (each earned in review): quiesce -> snapshot -> start,
+#    because `kickstart -k` is kill+RESTART in one call — a snapshot taken after it races the
+#    replacement tick, whose early ALARM lines could land pre-snapshot and be swallowed;
+#    NO touch on the log (liveness-canary reads its mtime as execution evidence — a touch
+#    fabricates freshness for a stalled canary); the process-exit checks require the launchctl
+#    QUERY to succeed (a failed query must not read as "tick exited"); verdicts are grepped
+#    from captured variables, never a live pipeline (grep -q's early close can SIGPIPE the
+#    producer into rc=141 under pipefail).
+LOG=~/.myndaix/state/drift-canary.out
+mkdir -p ~/.myndaix/state                       # fresh host: state dir may not exist yet
+# service-presence asserted ONCE upfront (absent = fail fast with the real reason); a failing
+# query inside the loops below therefore means TRANSIENT — keep polling, never read it as "exited"
+launchctl print gui/$(id -u)/ai.myndaix.drift-canary >/dev/null 2>&1 \
+  || { echo "drift-canary service not loaded — run reconcile/bootstrap first" >&2; exit 1; }
+launchctl kill SIGTERM gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null || true   # quiesce; no-op if idle
+deadline=$((SECONDS + 120))
+until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
+  (( SECONDS < deadline )) || { echo "Timed out waiting for the previous tick to quiesce" >&2; exit 1; }
+  sleep 1
+done
+offset=$(wc -c 2>/dev/null < "$LOG" || echo 0)  # snapshot while quiet; absent log = start of file
+                                                # (2>/dev/null BEFORE < — redirects apply left-to-right,
+                                                # so a missing-log open error is already silenced)
+launchctl kickstart gui/$(id -u)/ai.myndaix.drift-canary
+until fresh=$(tail -c "+$((offset + 1))" "$LOG" 2>/dev/null || true); grep -qE 'canary: (no drift|config DRIFT)|DRIFT|ALARM|watch failed' <<<"$fresh"; do
+  (( SECONDS < deadline )) || { echo "Timed out waiting for a fresh canary verdict; inspect $LOG" >&2; exit 1; }
+  sleep 2
+done
+until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
+  (( SECONDS < deadline )) || { echo "Timed out waiting for the forced tick to exit; inspect $LOG" >&2; exit 1; }
+  sleep 1
+done
+fresh=$(tail -c "+$((offset + 1))" "$LOG")
+if grep -qE 'DRIFT|ALARM|watch failed' <<<"$fresh"; then
+  echo "canary reported drift/failure — investigate before trusting this deploy:" >&2
+  grep -E 'DRIFT|ALARM|watch failed' <<<"$fresh" >&2
+  exit 1
+fi
+grep -q 'canary: no drift' <<<"$fresh"   # the healthy verdict must be PRESENT, not merely nothing bad
 ```
 
-Advance the `~/code/active` tree too (`git pull --ff-only`) — the controller imports from it and the
+The `~/code/active` tree is updated first — the controller imports from it and the
 play-script `cp` sources from it, per [Orchestrator deploy](#orchestrator-deploy-the-review-loop).
 
 ### The inline mxr freshness guard — hand-spliced per machine from `SETUP.md`
@@ -149,24 +191,42 @@ exports, before the guard) and tail (the `exec ... python -m runtime.cli` line),
 block between the markers:
 
 ```bash
-# 1. extract the new guard from SETUP.md on the MacBook:
-awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
-  SETUP.md > /tmp/new-guard.txt
+# 1. extract the new guard from SETUP.md on the MacBook (mktemp — a predictable /tmp name on a
+#    shared box is a symlink-clobber target):
+set -euo pipefail
+# no EXIT trap here — a pasted runbook block must not clobber a trap the shell already set;
+# explicit rm below covers success, and an abort leaks only one unpredictable mktemp name
+GUARD=$(mktemp)
+awk '/^# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
+  SETUP.md > "$GUARD"
+[ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
+  && grep -q '^# -----' "$GUARD" \
+  || { echo "Guard markers missing in SETUP.md" >&2; exit 1; }
 
-# 2. copy to Mini + splice on the Mini (assembly + parse-check + atomic-swap, same filesystem):
-scp /tmp/new-guard.txt mini:/tmp/new-guard.txt
+# 2. stream to the Mini over ssh stdin (no shared /tmp handoff at all) + splice there:
+#    assembly + parse-check + atomic-swap in a mktemp stage on the same filesystem as the target.
 ssh mini '
   set -euo pipefail
-  N1=$(awk "/# --- runtime-tree freshness guard/{print NR; exit}" ~/.local/bin/mxr)
-  N2=$(awk -v n="$N1" "NR>n && /^# -----/{print NR; exit}" ~/.local/bin/mxr)
-  head -n $((N1-1))      ~/.local/bin/mxr  > ~/.local/bin/mxr.new
-  cat /tmp/new-guard.txt                   >> ~/.local/bin/mxr.new
-  tail -n +$((N2+1))     ~/.local/bin/mxr  >> ~/.local/bin/mxr.new
-  bash -n ~/.local/bin/mxr.new
-  cp ~/.local/bin/mxr /tmp/mxr-$(date +%Y%m%d%H%M%S).bak
-  chmod +x ~/.local/bin/mxr.new
-  mv -f ~/.local/bin/mxr.new ~/.local/bin/mxr
-'
+  stage=$(mktemp -d ~/.local/bin/mxr.XXXXXXXX)
+  trap "rm -rf -- \"$stage\"" EXIT
+  cp ~/.local/bin/mxr "$stage/mxr.snap"
+  cat > "$stage/guard"
+  [ -s "$stage/guard" ] && grep -q "^# --- runtime-tree freshness guard" "$stage/guard" \
+    && grep -q "^# -----" "$stage/guard" \
+    || { echo "Guard markers missing" >&2; exit 1; }
+  N1=$(awk "/# --- runtime-tree freshness guard/{print NR; exit}" "$stage/mxr.snap")
+  [[ "$N1" =~ ^[1-9][0-9]*$ ]] || { echo "start marker not found" >&2; exit 1; }
+  N2=$(awk -v n="$N1" "NR>n && /^# -----/{print NR; exit}" "$stage/mxr.snap")
+  [[ "$N2" =~ ^[1-9][0-9]*$ ]] || { echo "end marker not found" >&2; exit 1; }
+  head -n $((N1-1)) "$stage/mxr.snap" > "$stage/mxr.new"
+  cat "$stage/guard" >> "$stage/mxr.new"
+  tail -n +$((N2+1)) "$stage/mxr.snap" >> "$stage/mxr.new"
+  bash -n "$stage/mxr.new"
+  cp "$stage/mxr.snap" ~/.local/bin/mxr.bak.$(date +%Y%m%d%H%M%S)   # backup outside /tmp AND outside the auto-removed stage
+  chmod +x "$stage/mxr.new"
+  mv -f "$stage/mxr.new" ~/.local/bin/mxr
+' < "$GUARD"
+rm -f -- "$GUARD"
 ```
 
 **Verify it PASSES on clean main WITHOUT dispatching a job** (extract the guard from the now-live
@@ -175,10 +235,13 @@ dispatch; `REFUSING` = it would block):
 
 ```bash
 ssh mini '
-awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > /tmp/gbody.sh
-[ -s /tmp/gbody.sh ] || { echo "GUARD NOT FOUND — markers missing in live mxr"; exit 1; }
-{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat /tmp/gbody.sh; printf "echo PASSTHROUGH\n"; } > /tmp/grun.sh
-MYNDAIX_HOME=$HOME/.myndaix bash /tmp/grun.sh kilabz'    # factory + clean main -> PASSTHROUGH
+set -euo pipefail
+g=$(mktemp); run=$(mktemp)
+trap "rm -f -- \"$g\" \"$run\"" EXIT
+awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > "$g"
+[ -s "$g" ] || { echo "GUARD NOT FOUND — markers missing in live mxr"; exit 1; }
+{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat "$g"; printf "echo PASSTHROUGH\n"; } > "$run"
+MYNDAIX_HOME=$HOME/.myndaix bash "$run" kilabz'    # factory + clean main -> PASSTHROUGH
 ```
 
 The guard's LOGIC is covered by `substrate/test.sh` (extracted from `SETUP.md`, fixture repos: clean
