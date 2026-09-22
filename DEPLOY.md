@@ -128,46 +128,47 @@ until [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null || true)" == "$TARGET" 
   (( SECONDS < deadline )) || { echo "Timed out waiting for convergence to $TARGET; inspect reconcile.out" >&2; exit 1; }
   echo "waiting…"; sleep 5
 done
-# 3. force one watcher tick and judge ONLY that tick's output, fail-closed on any drift.
-#    Constraints this block encodes (each earned in review): quiesce -> snapshot -> start,
-#    because `kickstart -k` is kill+RESTART in one call — a snapshot taken after it races the
-#    replacement tick, whose early ALARM lines could land pre-snapshot and be swallowed;
-#    NO touch on the log (liveness-canary reads its mtime as execution evidence — a touch
-#    fabricates freshness for a stalled canary); the process-exit checks require the launchctl
-#    QUERY to succeed (a failed query must not read as "tick exited"); verdicts are grepped
-#    from captured variables, never a live pipeline (grep -q's early close can SIGPIPE the
-#    producer into rc=141 under pipefail).
-LOG=~/.myndaix/state/drift-canary.out
-mkdir -p ~/.myndaix/state                       # fresh host: state dir may not exist yet
-# service-presence asserted ONCE upfront (absent = fail fast with the real reason); a failing
-# query inside the loops below therefore means TRANSIENT — keep polling, never read it as "exited"
+# 3. run one canary tick in the foreground and judge its stdout + exit.
+#    The quiesce→snapshot→kickstart→tail-offset dance is CUT: StartInterval:900 could fire
+#    into the snapshot→kickstart gap, producing an ambiguous offset that judged an autonomous
+#    tick as the deliberate one (five rounds on this mechanism — third door: rip it out).
+#    The script logs ≥1 verdict line per run unconditionally and exits nonzero on drift/failure
+#    — foreground stdout + exit are unambiguous. Honest loss: does not prove launchd can START
+#    the job; covered by the print assertion below + the liveness watcher.
+#    PRIVATE state dir (DRIFT_CANARY_STATE_DIR): the launchd job stays loaded and can fire mid-run,
+#    and the script's streak/latch read-modify-write is safe only for ONE instance per state dir
+#    (its SINGLE-INSTANCE INVARIANT). A private-state run also delivers no alerts (the inbox is
+#    live shared state; undelivered alerts are logged instead). Still shared with a live tick: the
+#    deploy clone's git fetch/status — contention there fails CLOSED (a DRIFT line → rerun).
+#    ANY DRIFT line fails this check, sub-threshold watches included — by design: streak grace
+#    periods exist to keep the UNATTENDED alarm quiet, and an attended deploy check stays strict.
+#    Bounded by perl alarm+exec (macOS has no timeout(1)): rc 142 = killed at 120s. Output goes
+#    to a FILE, never $(): alarm kills only the canary's bash, and an orphaned child still holding
+#    a capture pipe would block $() until IT finished — silently voiding the bound (a stub
+#    `sleep 30` held a 3s-budget $() for 30s). An orphaned fetch may finish on its own; it
+#    touches only the deploy clone's remote-tracking ref.
+#    Verdicts are matched with [[ ]] on the captured output, not grep: in an `if`, a grep ERROR
+#    (rc 2) reads the same as "no match" and would skip the deny branch (fail-open).
 launchctl print gui/$(id -u)/ai.myndaix.drift-canary >/dev/null 2>&1 \
   || { echo "drift-canary service not loaded — run reconcile/bootstrap first" >&2; exit 1; }
-launchctl kill SIGTERM gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null || true   # quiesce; no-op if idle
-deadline=$((SECONDS + 120))
-until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
-  (( SECONDS < deadline )) || { echo "Timed out waiting for the previous tick to quiesce" >&2; exit 1; }
-  sleep 1
-done
-offset=$(wc -c 2>/dev/null < "$LOG" || echo 0)  # snapshot while quiet; absent log = start of file
-                                                # (2>/dev/null BEFORE < — redirects apply left-to-right,
-                                                # so a missing-log open error is already silenced)
-launchctl kickstart gui/$(id -u)/ai.myndaix.drift-canary
-until fresh=$(tail -c "+$((offset + 1))" "$LOG" 2>/dev/null || true); grep -qE 'canary: (no drift|config DRIFT)|DRIFT|ALARM|watch failed' <<<"$fresh"; do
-  (( SECONDS < deadline )) || { echo "Timed out waiting for a fresh canary verdict; inspect $LOG" >&2; exit 1; }
-  sleep 2
-done
-until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
-  (( SECONDS < deadline )) || { echo "Timed out waiting for the forced tick to exit; inspect $LOG" >&2; exit 1; }
-  sleep 1
-done
-fresh=$(tail -c "+$((offset + 1))" "$LOG")
-if grep -qE 'DRIFT|ALARM|watch failed' <<<"$fresh"; then
-  echo "canary reported drift/failure — investigate before trusting this deploy:" >&2
-  grep -E 'DRIFT|ALARM|watch failed' <<<"$fresh" >&2
+canary_state="$(mktemp -d)"
+canary_rc=0
+DRIFT_CANARY_STATE_DIR="$canary_state" perl -e 'alarm shift; exec @ARGV or exit 127' 120 \
+  bash ~/.myndaix/deploy/myndaix-runtime/substrate/drift-canary.sh > "$canary_state/verify.out" 2>&1 \
+  || canary_rc=$?
+canary_out="$(cat "$canary_state/verify.out")"
+# an orphan from a timed-out run can still be writing here; a failed cleanup must not mask the verdict
+rm -rf "$canary_state" || echo "note: could not remove $canary_state (orphaned canary child?)" >&2
+printf '%s\n' "$canary_out"
+[[ "$canary_rc" -ne 142 ]] \
+  || { echo "canary did not finish within 120s (killed) — rerun; if it repeats, run reconcile.sh --dry-run by hand" >&2; exit 1; }
+bad='DRIFT|ALARM|watch failed'
+if [[ "$canary_rc" -ne 0 || "$canary_out" =~ $bad ]]; then
+  echo "canary reported drift/failure (rc=$canary_rc) — investigate the output above before trusting this deploy" >&2
   exit 1
 fi
-grep -q 'canary: no drift' <<<"$fresh"   # the healthy verdict must be PRESENT, not merely nothing bad
+[[ "$canary_out" == *"canary: no drift"* ]] \
+  || { echo "canary printed no healthy verdict ('canary: no drift') — treat this deploy as UNVERIFIED" >&2; exit 1; }
 ```
 
 The `~/code/active` tree is updated first — the controller imports from it and the
@@ -214,7 +215,7 @@ ssh mini '
   [ -s "$stage/guard" ] && grep -q "^# --- runtime-tree freshness guard" "$stage/guard" \
     && grep -q "^# -----" "$stage/guard" \
     || { echo "Guard markers missing" >&2; exit 1; }
-  N1=$(awk "/# --- runtime-tree freshness guard/{print NR; exit}" "$stage/mxr.snap")
+  N1=$(awk "/^# --- runtime-tree freshness guard/{print NR; exit}" "$stage/mxr.snap")
   [[ "$N1" =~ ^[1-9][0-9]*$ ]] || { echo "start marker not found" >&2; exit 1; }
   N2=$(awk -v n="$N1" "NR>n && /^# -----/{print NR; exit}" "$stage/mxr.snap")
   [[ "$N2" =~ ^[1-9][0-9]*$ ]] || { echo "end marker not found" >&2; exit 1; }
