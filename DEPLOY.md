@@ -136,20 +136,42 @@ done
 #    into the snapshot→kickstart gap, producing an ambiguous offset that judged an autonomous
 #    tick as the deliberate one (five rounds on this mechanism — third door: rip it out).
 #    The script logs ≥1 verdict line per run unconditionally and exits nonzero on drift/failure
-#    — foreground stdout + exit are unambiguous; streak/latch side effects are identical to a
-#    launchd tick. Honest loss: does not prove launchd can START the job; covered by the
-#    print assertion below + the liveness watcher.
+#    — foreground stdout + exit are unambiguous. Honest loss: does not prove launchd can START
+#    the job; covered by the print assertion below + the liveness watcher.
+#    PRIVATE state dir (DRIFT_CANARY_STATE_DIR): the launchd job stays loaded and can fire mid-run,
+#    and the script's streak/latch read-modify-write is safe only for ONE instance per state dir
+#    (its SINGLE-INSTANCE INVARIANT). A private-state run also delivers no alerts (the inbox is
+#    live shared state; undelivered alerts are logged instead). Still shared with a live tick: the
+#    deploy clone's git fetch/status — contention there fails CLOSED (a DRIFT line → rerun).
+#    ANY DRIFT line fails this check, sub-threshold watches included — by design: streak grace
+#    periods exist to keep the UNATTENDED alarm quiet, and an attended deploy check stays strict.
+#    Bounded by perl alarm+exec (macOS has no timeout(1)): rc 142 = killed at 120s. Output goes
+#    to a FILE, never $(): alarm kills only the canary's bash, and an orphaned child still holding
+#    a capture pipe would block $() until IT finished — silently voiding the bound (a stub
+#    `sleep 30` held a 3s-budget $() for 30s). An orphaned fetch may finish on its own; it
+#    touches only the deploy clone's remote-tracking ref.
+#    Verdicts are matched with [[ ]] on the captured output, not grep: in an `if`, a grep ERROR
+#    (rc 2) reads the same as "no match" and would skip the deny branch (fail-open).
 launchctl print gui/$(id -u)/ai.myndaix.drift-canary >/dev/null 2>&1 \
   || { echo "drift-canary service not loaded — run reconcile/bootstrap first" >&2; exit 1; }
+canary_state="$(mktemp -d)"
 canary_rc=0
-canary_out="$(bash ~/.myndaix/deploy/myndaix-runtime/substrate/drift-canary.sh 2>&1)" || canary_rc=$?
+DRIFT_CANARY_STATE_DIR="$canary_state" perl -e 'alarm shift; exec @ARGV or exit 127' 120 \
+  bash ~/.myndaix/deploy/myndaix-runtime/substrate/drift-canary.sh > "$canary_state/verify.out" 2>&1 \
+  || canary_rc=$?
+canary_out="$(cat "$canary_state/verify.out")"
+# an orphan from a timed-out run can still be writing here; a failed cleanup must not mask the verdict
+rm -rf "$canary_state" || echo "note: could not remove $canary_state (orphaned canary child?)" >&2
 printf '%s\n' "$canary_out"
-if [[ "$canary_rc" -ne 0 ]] || grep -qE 'DRIFT|ALARM|watch failed' <<<"$canary_out"; then
-  echo "canary reported drift/failure — investigate before trusting this deploy:" >&2
-  grep -E 'DRIFT|ALARM|watch failed' <<<"$canary_out" >&2
+[[ "$canary_rc" -ne 142 ]] \
+  || { echo "canary did not finish within 120s (killed) — rerun; if it repeats, run reconcile.sh --dry-run by hand" >&2; exit 1; }
+bad='DRIFT|ALARM|watch failed'
+if [[ "$canary_rc" -ne 0 || "$canary_out" =~ $bad ]]; then
+  echo "canary reported drift/failure (rc=$canary_rc) — investigate the output above before trusting this deploy" >&2
   exit 1
 fi
-grep -q 'canary: no drift' <<<"$canary_out"   # healthy verdict must be PRESENT, not merely nothing bad
+[[ "$canary_out" == *"canary: no drift"* ]] \
+  || { echo "canary printed no healthy verdict ('canary: no drift') — treat this deploy as UNVERIFIED" >&2; exit 1; }
 ```
 
 The `~/code/active` tree is updated first — the controller imports from it and the
