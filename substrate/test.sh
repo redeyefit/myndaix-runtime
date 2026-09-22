@@ -1099,10 +1099,20 @@ PSD="$LV/private-state"
 MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_STATE_DIR="$PSD" /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1
 ok '[[ "$(cat "$PSD/drift-streak" 2>/dev/null)" == 1 ]]' "private state: the drift streak lands in DRIFT_CANARY_STATE_DIR"
 ok '[[ "$(cd "$DVH/state" && ls -1 && cat drift-streak)" == "$real_before" ]]' "private state: the live tick's streak/latch files are untouched"
-ok '! ls "$DVH/inbox"/*.md >/dev/null 2>&1' "private state: one fresh-dir run never reaches an alert threshold"
+# Alert isolation (review 68869 P2): drive the SAME private dir to the config-drift threshold (2).
+# The alert must NOT reach the live inbox, must still be logged, and must not latch.
+MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_STATE_DIR="$PSD" /bin/bash "$SUB/drift-canary.sh" > "$LV/ps2.out" 2>&1
+ok '[[ "$(cat "$PSD/drift-streak" 2>/dev/null)" == 2 ]]' "private state: second verify run reaches the alert threshold (precondition)"
+ok '! ls "$DVH/inbox"/*.md >/dev/null 2>&1' "private state: a verify run AT threshold never delivers to the live OPERATOR_INBOX"
+ok 'grep -q "config DRIFT alert not delivered" "$LV/ps2.out"' "private state: the undelivered alert is still logged for the operator"
+ok '[[ ! -e "$PSD/drift-alerted" ]]' "private state: an undelivered alert does not latch"
 psrel_rc=0
 (cd "$LV" && MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC=0 DRIFT_CANARY_STATE_DIR="rel/state" /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1) || psrel_rc=$?
 ok '[[ "$psrel_rc" -ne 0 && ! -e "$LV/rel" ]]' "private state: a RELATIVE DRIFT_CANARY_STATE_DIR is refused before any write"
+real_before="$(cd "$DVH/state" && ls -1 && cat drift-streak)"
+psempty_rc=0
+MYNDAIX_HOME="$DVH" HOME="$DFH" DRIFT_CANARY_TEST_RC=1 DRIFT_CANARY_STATE_DIR="" /bin/bash "$SUB/drift-canary.sh" >/dev/null 2>&1 || psempty_rc=$?
+ok '[[ "$psempty_rc" -ne 0 && "$(cd "$DVH/state" && ls -1 && cat drift-streak)" == "$real_before" ]]' "private state: an EMPTY DRIFT_CANARY_STATE_DIR is refused, never a silent fallback to live state"
 
 echo "== drift-canary: DEV-tree drift watch (piece 1) + mxr freshness guard (piece 2) =="
 # A bare origin + a real work clone give us a tree we can push a clean 'main' to, then move OFF

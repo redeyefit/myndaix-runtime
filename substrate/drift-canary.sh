@@ -21,9 +21,16 @@ substrate_load_config
 # so a foreground verify run can overlap a live launchd tick without racing its read-modify-write.
 # Reads of OTHER jobs' state (LIVENESS_OUT) deliberately stay on $MYNDAIX_HOME/state. launchd
 # never sets it. Absolute-only: a relative dir would silently land state under whatever cwd ran us.
-STATE_DIR="${DRIFT_CANARY_STATE_DIR:-$MYNDAIX_HOME/state}"
-[[ "$STATE_DIR" == /* ]] || die "DRIFT_CANARY_STATE_DIR must be an absolute path (got: $STATE_DIR)"
+# `-` not `:-`: an explicitly EMPTY override (a caller's failed mktemp) must hit the absolute-path
+# refusal, not silently fall back to the live state dir it was meant to avoid.
+STATE_DIR="${DRIFT_CANARY_STATE_DIR-$MYNDAIX_HOME/state}"
+[[ "$STATE_DIR" == /* ]] || die "DRIFT_CANARY_STATE_DIR must be an absolute path (got: '$STATE_DIR')"
 mkdir -p "$STATE_DIR"
+# A private-state run delivers NO alerts: the inbox is live shared state too — a fresh streak meets
+# DEV_TREE_DRIFT_THRESHOLD=1 (valid config) on its first tick, and alert names are only
+# second-unique, so a same-second live alert would share the .tmp (review 68869 P2). Blanking
+# OPERATOR_INBOX routes canary_emit down its existing not-delivered path: logs the body, no latch.
+if [[ -n "${DRIFT_CANARY_STATE_DIR:-}" ]]; then OPERATOR_INBOX=""; fi
 STREAK_FILE="$STATE_DIR/drift-streak"
 ALERTED_FILE="$STATE_DIR/drift-alerted"
 THRESHOLD=2   # consecutive drifting checks before alerting (~2 intervals)

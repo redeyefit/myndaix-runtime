@@ -137,9 +137,11 @@ done
 #    the job; covered by the print assertion below + the liveness watcher.
 #    PRIVATE state dir (DRIFT_CANARY_STATE_DIR): the launchd job stays loaded and can fire mid-run,
 #    and the script's streak/latch read-modify-write is safe only for ONE instance per state dir
-#    (its SINGLE-INSTANCE INVARIANT). A fresh dir starts every streak at 0, so this run can log
-#    DRIFT but never reach an alert threshold. Still shared with a live tick: the deploy clone's
-#    git fetch/status — contention there fails CLOSED (a DRIFT line → just rerun this step).
+#    (its SINGLE-INSTANCE INVARIANT). A private-state run also delivers no alerts (the inbox is
+#    live shared state; undelivered alerts are logged instead). Still shared with a live tick: the
+#    deploy clone's git fetch/status — contention there fails CLOSED (a DRIFT line → rerun).
+#    ANY DRIFT line fails this check, sub-threshold watches included — by design: streak grace
+#    periods exist to keep the UNATTENDED alarm quiet, and an attended deploy check stays strict.
 #    Bounded by perl alarm+exec (macOS has no timeout(1)): rc 142 = killed at 120s. Output goes
 #    to a FILE, never $(): alarm kills only the canary's bash, and an orphaned child still holding
 #    a capture pipe would block $() until IT finished — silently voiding the bound (a stub
