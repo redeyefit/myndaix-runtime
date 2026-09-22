@@ -12,9 +12,15 @@ set -euo pipefail
 # buys nothing for a script that is only ever run by launchd and test.sh).
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then echo "drift-canary.sh must be executed, not sourced" >&2; return 1; fi
 SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Both launchd and foreground runs enter the same lock/deadline supervisor.
+if [[ "${1:-}" != "--supervised" ]]; then
+  exec python3 "$SUBSTRATE_DIR/drift_canary_run.py" "$SUBSTRATE_DIR/drift-canary.sh"
+fi
 # shellcheck source=substrate/lib.sh
 source "$SUBSTRATE_DIR/lib.sh"
 substrate_load_config
+canary_path="$(cfg_get AGENT_CLI_PATH)"
+[[ -z "$canary_path" ]] || export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$canary_path"
 
 STATE_DIR="$MYNDAIX_HOME/state"
 mkdir -p "$STATE_DIR"
@@ -166,12 +172,8 @@ fi
 # hand-edit gets live-dev grace; only PERSISTENT drift alerts. Gated on DEV_TREE being configured —
 # labs never set it (their working tree is dirty by design), and drift-canary is a factory-only tick
 # anyway, so in practice this runs only on the Mini. Runs regardless of the config-drift outcome.
-# SINGLE-INSTANCE INVARIANT (all streak/latch/identity read-modify-write in this script relies on
-# it): drift-canary runs ONLY as the launchd job ai.myndaix.drift-canary — launchd never overlaps
-# invocations of a label, so ticks are serialized. Do NOT run concurrent manual instances (a
-# manual run while the tick is live can race the cat→rm→mv sequences and the fixed .tmp names;
-# reviews 73734/23749/34704 flag these — wontfix BECAUSE of this invariant, matching canary_emit's
-# established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine.
+# SINGLE-INSTANCE INVARIANT: the supervisor holds the shared lock across all updates,
+# including foreground runs while the launchd job is loaded.
 DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
 DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
 DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to
