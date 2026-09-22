@@ -129,23 +129,29 @@ until [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null || true)" == "$TARGET" 
   echo "waiting…"; sleep 5
 done
 # 3. force one watcher tick and judge ONLY that tick's output, fail-closed on any drift.
-#    Ordering constraints: the offset snapshot comes AFTER kickstart's kill (a still-running
-#    previous tick could otherwise land its verdict past the snapshot and be judged as ours);
+#    Constraints this block encodes (each earned in review): quiesce -> snapshot -> start,
+#    because `kickstart -k` is kill+RESTART in one call — a snapshot taken after it races the
+#    replacement tick, whose early ALARM lines could land pre-snapshot and be swallowed;
 #    NO touch on the log (liveness-canary reads its mtime as execution evidence — a touch
-#    fabricates freshness for a stalled canary); no fixed sleeps — wait for the tick PROCESS
-#    to exit before judging, so the post-"no drift" DEV-tree trailer (drift-canary.sh:253-265)
-#    cannot slip in after the scan; verdicts are grepped from a variable, never a
-#    tail|grep pipeline (grep -q's early close can SIGPIPE tail into rc=141 under pipefail).
+#    fabricates freshness for a stalled canary); the process-exit checks require the launchctl
+#    QUERY to succeed (a failed query must not read as "tick exited"); verdicts are grepped
+#    from captured variables, never a live pipeline (grep -q's early close can SIGPIPE the
+#    producer into rc=141 under pipefail).
 LOG=~/.myndaix/state/drift-canary.out
 mkdir -p ~/.myndaix/state                       # fresh host: state dir may not exist yet
-launchctl kickstart -k gui/$(id -u)/ai.myndaix.drift-canary
-offset=$(wc -c < "$LOG" 2>/dev/null || echo 0)  # post-kill snapshot; absent log = start of file
+launchctl kill SIGTERM gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null || true   # quiesce; no-op if idle
 deadline=$((SECONDS + 120))
-until fresh=$(tail -c "+$((offset + 1))" "$LOG" 2>/dev/null || true); grep -qE 'canary: (no drift|config DRIFT)' <<<"$fresh"; do
+until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
+  (( SECONDS < deadline )) || { echo "Timed out waiting for the previous tick to quiesce" >&2; exit 1; }
+  sleep 1
+done
+offset=$(wc -c < "$LOG" 2>/dev/null || echo 0)  # snapshot while quiet; absent log = start of file
+launchctl kickstart gui/$(id -u)/ai.myndaix.drift-canary
+until fresh=$(tail -c "+$((offset + 1))" "$LOG" 2>/dev/null || true); grep -qE 'canary: (no drift|config DRIFT)|DRIFT|ALARM|watch failed' <<<"$fresh"; do
   (( SECONDS < deadline )) || { echo "Timed out waiting for a fresh canary verdict; inspect $LOG" >&2; exit 1; }
   sleep 2
 done
-until ! launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null | grep -q 'state = running'; do
+until state=$(launchctl print gui/$(id -u)/ai.myndaix.drift-canary 2>/dev/null) && ! grep -q 'state = running' <<<"$state"; do
   (( SECONDS < deadline )) || { echo "Timed out waiting for the forced tick to exit; inspect $LOG" >&2; exit 1; }
   sleep 1
 done
@@ -182,8 +188,9 @@ block between the markers:
 # 1. extract the new guard from SETUP.md on the MacBook (mktemp — a predictable /tmp name on a
 #    shared box is a symlink-clobber target):
 set -euo pipefail
+# no EXIT trap here — a pasted runbook block must not clobber a trap the shell already set;
+# explicit rm below covers success, and an abort leaks only one unpredictable mktemp name
 GUARD=$(mktemp)
-trap 'rm -f -- "$GUARD"' EXIT   # standalone block: REPLACES any EXIT trap already set in this shell
 awk '/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
   SETUP.md > "$GUARD"
 [ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
@@ -213,6 +220,7 @@ ssh mini '
   chmod +x "$stage/mxr.new"
   mv -f "$stage/mxr.new" ~/.local/bin/mxr
 ' < "$GUARD"
+rm -f -- "$GUARD"
 ```
 
 **Verify it PASSES on clean main WITHOUT dispatching a job** (extract the guard from the now-live
