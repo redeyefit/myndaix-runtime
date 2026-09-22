@@ -167,13 +167,14 @@ export PYTHONSAFEPATH=1   # don't prepend CWD to sys.path — else running mxr f
                           # checkout's dir could shadow-import a DIFFERENT runtime (ignored <3.11)
 
 # --- runtime-tree freshness guard (FACTORY only) -----------------------------------------
-# The pool runs the code at $PYTHONPATH; on the FACTORY that path is a live DEV checkout, so a
-# tree off clean main silently dispatches WRONG runtime code (the 09-14 six-day drift). Refuse
-# LOUD so a human converges the tree instead of the factory shipping stale code. The LAB is a dev
-# machine (its tree is dirty/branched by design) → the guard enforces ONLY when this machine's
-# MACHINE_ROLE is `factory`. Read-only / recovery verbs (get, help) are NEVER gated — `mxr get
-# <jid> --reply` must recover a stranded reply mid-drift (the exemption is first-positional-arg
-# only, by design: `mxr <agent> --help` is a dispatch and is gated). Override with MXR_ALLOW_DIRTY=1.
+# The CLI runs the code at $PYTHONPATH; on the FACTORY that path is the deploy clone (reconcile
+# keeps it at origin/main), so a tree off clean main silently dispatches WRONG runtime code (the
+# 09-14 six-day drift). Refuse LOUD so a human converges the tree instead of the factory shipping
+# stale code. The LAB is a dev machine (its tree is dirty/branched by design) → the guard enforces
+# ONLY when this machine's MACHINE_ROLE is `factory`. Read-only / recovery verbs (get, help) are
+# NEVER gated — `mxr get <jid> --reply` must recover a stranded reply mid-drift (the exemption is
+# first-positional-arg only, by design: `mxr <agent> --help` is a dispatch and is gated). Override
+# with MXR_ALLOW_DIRTY=1.
 # INLINE by design: a guard sourced from the tree would rot WITH the tree it guards. config.env is
 # READ, never sourced — the role token is only compared, never executed.
 # Cross-family review hardening: the role sed strips inline `#comments` + ALL whitespace (a CRLF or

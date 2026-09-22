@@ -39,12 +39,15 @@ them is a **half-deploy** — it looks done but runs a mix of old and new code. 
 2026-07-02: `play-review.sh` was updated but the repo tree was left on a stale branch, so the
 `controller` half of the same PR silently didn't ship. Update ALL THREE:
 
-1. **Repo working tree — must be on `main` at `origin/main`.** Both the `serve` pool and the
-   `controller` launchd job import Python (`src/runtime/controller.py`, `registry.py`, `runner.py`)
-   FROM this tree via `PYTHONPATH`. The `controller` spawns fresh each launchd tick, so it picks up
-   tree changes on the next tick automatically; `serve` is long-lived and needs the restart above.
-   **The Mini is a PULL-ONLY MIRROR** — it must never carry a local commit or sit on a feature
-   branch on `main`. Verify with `git branch --show-current` (want `main`) + `git log -1`.
+1. **Repo working tree — must be on `main` at `origin/main`.** On the **lab** (MacBook), `serve`
+   and `controller` import Python (`src/runtime/controller.py`, `registry.py`, `runner.py`) via
+   `PYTHONPATH` FROM this tree, so it must be current. On the **factory** (Mini), `serve` and
+   `controller` already run from the deploy clone (`PYTHONPATH` in each plist); but this tree is
+   still the SOURCE for the `cp` in step 2, so it must be current there too. The `controller`
+   spawns fresh each launchd tick, so it picks up tree changes on the next tick automatically;
+   `serve` is long-lived and needs the restart above. **The Mini is a PULL-ONLY MIRROR** — it must
+   never carry a local commit or sit on a feature branch on `main`. Verify with
+   `git branch --show-current` (want `main`) + `git log -1`.
 
 2. **`$ORCH/play-review.sh` (and `play-fix.sh`) — the TRUSTED INSTALLED COPY.** The pre-push hook
    and the controller re-exec the worker from `$ORCH` (`PLAY_SELF=$HOME/.myndaix/orchestrator/
