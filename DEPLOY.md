@@ -185,9 +185,10 @@ fi
   || { echo "canary printed no healthy verdict ('canary: no drift') — treat this deploy as UNVERIFIED" >&2; exit 1; }
 ```
 
-Once reconcile has converged, install the copied surface from that health-gated commit
-(`deploy-sync.sh --apply "$(cat ~/.myndaix/state/RUNNING_SHA)"`), per
-[Orchestrator deploy](#orchestrator-deploy-the-review-loop).
+Once reconcile has converged, install the copied surface from that health-gated commit with the
+validated `S=… --apply "$S"` block in [Orchestrator deploy](#orchestrator-deploy-the-review-loop) —
+never an inline `$(cat RUNNING_SHA)`: an empty value reads as no ref and deploy-sync falls back to
+`origin/main`, ungated.
 
 ### The inline mxr freshness guard — hand-spliced per machine from `SETUP.md`
 
