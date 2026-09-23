@@ -95,12 +95,26 @@ mkdir -p "$EVIL_DEST"
 DEPLOY_SYNC_DEST="$EVIL_DEST" "$SYNC" --apply "$REF" >/dev/null 2>&1 || true
 [[ ! -e "$PWN" ]] && ok "a \$()-bearing DEPLOY_SYNC_DEST does not execute on trap fire" || bad "TRAP INJECTION FIRED"
 
-echo "== --apply with an explicitly EMPTY ref fails closed (never the origin/main default; review 37732 #2) =="
-EMPTY_DEST="$SCRATCH/empty-ref-dest"; mkdir -p "$EMPTY_DEST"
-er_rc=0; er_out="$(DEPLOY_SYNC_DEST="$EMPTY_DEST" DEPLOY_SYNC_BIN="$EMPTY_DEST/bin" "$SYNC" --apply "" 2>&1)" || er_rc=$?
-[[ "$er_rc" -ne 0 ]] && ok "empty ref exits nonzero" || bad "empty ref was ACCEPTED (rc=0)"
-grep -q "empty ref argument" <<<"$er_out" && ok "empty ref names itself" || bad "empty ref: no explicit refusal ($er_out)"
-[[ ! -e "$EMPTY_DEST/play-fix.sh" && ! -e "$EMPTY_DEST/bin/mxr-phone" ]] && ok "empty ref installs nothing" || bad "empty ref installed files"
+echo "== --apply with NO usable ref fails closed — never the origin/main default (reviews 37732 #2, 97191) =="
+# three shapes of "no ref": quoted empty (\$#==2), an UNQUOTED empty var that word-splitting drops
+# (\$#==1 — the case a \$#-based guard misses), and the ref simply omitted.
+EMPTY_REF=""
+for shape in quoted unquoted omitted; do
+  d="$SCRATCH/noref-$shape"; mkdir -p "$d"; er_rc=0
+  case "$shape" in
+    quoted)   er_out="$(DEPLOY_SYNC_DEST="$d" DEPLOY_SYNC_BIN="$d/bin" "$SYNC" --apply "" 2>&1)" || er_rc=$? ;;
+    unquoted)
+      # shellcheck disable=SC2086  # deliberately UNQUOTED: reproduces the arg-collapse call shape
+      er_out="$(DEPLOY_SYNC_DEST="$d" DEPLOY_SYNC_BIN="$d/bin" "$SYNC" --apply $EMPTY_REF 2>&1)" || er_rc=$? ;;
+    omitted)  er_out="$(DEPLOY_SYNC_DEST="$d" DEPLOY_SYNC_BIN="$d/bin" "$SYNC" --apply 2>&1)" || er_rc=$? ;;
+  esac
+  [[ "$er_rc" -ne 0 ]] && ok "$shape ref exits nonzero" || bad "$shape ref was ACCEPTED (rc=0)"
+  grep -q "requires an explicit, non-empty ref" <<<"$er_out" && ok "$shape ref names itself" || bad "$shape ref: no explicit refusal ($er_out)"
+  [[ ! -e "$d/play-fix.sh" && ! -e "$d/bin/mxr-phone" ]] && ok "$shape ref installs nothing" || bad "$shape ref installed files"
+done
+# read-only --check keeps its origin/main default (only the MUTATING mode lost it)
+ck_out="$(DEPLOY_SYNC_DEST="$SCRATCH" "$SYNC" --check 2>&1)" || true   # drift rc is irrelevant here; only the refusal text matters
+! grep -q "requires an explicit" <<<"$ck_out" && ok "--check with no ref still runs (default kept)" || bad "--check lost its default ($ck_out)"
 
 echo ""
 echo "== RESULT: $PASS passed, $FAIL failed =="
