@@ -73,6 +73,7 @@ class WorkerPool:
         self.worker_faults = 0                    # caught worker errors (none fatal)
         self.truncated = False                    # set if run_until_idle hit the cap
         self._janitor_faults = 0                  # janitor's current reclaim fault streak
+        self._reclaim_pending = False             # reclaim pass has not finished yet
         self.reconciled = 0                       # repo_concurrency rows the janitor healed
         self._stop = asyncio.Event()
         self._inflight = 0
@@ -169,6 +170,7 @@ class WorkerPool:
             return
         self._janitor_faults = 0
         while not self._stop.is_set():
+            self._reclaim_pending = True
             try:
                 n = await self.ledger.reclaim_expired()
                 if self._janitor_faults:
@@ -187,6 +189,8 @@ class WorkerPool:
                 self._janitor_faults += 1
                 self._log_fault(self._janitor_faults, exc,
                                 "pool janitor: reclaim_expired failed; continuing")
+            finally:
+                self._reclaim_pending = False
             await self._maybe_sweep_worktrees()
             await self._maybe_reconcile_cap()
             await self._pause(self._fault_backoff(self.janitor_interval_s, self._janitor_faults))
@@ -270,6 +274,7 @@ class WorkerPool:
         self._stop.clear()
         self._touch()
         self.truncated = False
+        self._reclaim_pending = hasattr(self.ledger, "reclaim_expired")
         self._tasks = [asyncio.ensure_future(self._worker(f"w{i}")) for i in range(self.size)]
         self._tasks.append(asyncio.ensure_future(self._janitor()))
         started = time.monotonic()
@@ -277,11 +282,12 @@ class WorkerPool:
             while True:
                 await asyncio.sleep(min(quiet_s / 3, 0.1))
                 queued = await self._queued()
-                # Not idle while the janitor is in a reclaim fault streak: an expired lease is
+                # Not idle while reclaim is pending or in a fault streak: an expired lease is
                 # invisible to both _inflight and the queue count, and its backed-off retry can
                 # land after quiet_s — declaring "done" then would strand crash recovery.
                 # max_runtime_s stays the fallback (truncated=True) if reclaim never recovers.
                 if (self._inflight == 0 and queued == 0 and self._janitor_faults == 0
+                        and not self._reclaim_pending
                         and (time.monotonic() - self._last) > quiet_s):
                     break
                 if (time.monotonic() - started) > max_runtime_s:
