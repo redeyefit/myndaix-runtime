@@ -1,0 +1,41 @@
+name: actionlint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    # SELF-HOSTED (mirrors ci.yml): Actions minutes on self-hosted runners are unmetered, and this
+    # is a static lint over YAML + embedded shell — no external services needed.
+    runs-on: [self-hosted, mini]
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint (workflow lint + embedded shellcheck)
+        # BLOCKING, not report-only: baseline measured clean on this tree both WITH and WITHOUT
+        # actionlint's embedded shellcheck pass over run: blocks (checked locally against HEAD
+        # before adding this gate), so this runs the FULL check — shellcheck integration is
+        # actionlint's default, left enabled, no -shellcheck= disable flag — not a weakened
+        # version just to keep it green.
+        #
+        # actionlint silently DISABLES its shellcheck pass (still exits 0) if the shellcheck
+        # binary isn't found at the configured path — verified locally with a bogus
+        # -shellcheck= path. That would quietly downgrade this from "lint + shellcheck" to
+        # "lint only" with no signal, so install-if-missing for BOTH tools, then hard-verify
+        # each binary actually landed before running — never skip a checker silently.
+        #
+        # .github/actionlint.yaml declares the "mini" self-hosted-runner label so
+        # runs-on: [self-hosted, mini] isn't flagged as an unknown GitHub-hosted label.
+        run: |
+          set -euo pipefail
+          command -v actionlint >/dev/null 2>&1 || brew install -q actionlint
+          command -v shellcheck >/dev/null 2>&1 || brew install -q shellcheck
+          command -v actionlint >/dev/null 2>&1 || { echo "actionlint missing after install attempt" >&2; exit 1; }
+          command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck missing after install attempt" >&2; exit 1; }
+          actionlint -version
+          shellcheck --version
+          actionlint

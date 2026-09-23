@@ -1,0 +1,5 @@
+# actionlint config — declares our self-hosted runner's custom label so `runs-on: [self-hosted,
+# mini]` (the Mac Mini runner; see ci.yml) doesn't false-positive as an unknown GitHub-hosted label.
+self-hosted-runner:
+  labels:
+    - mini
