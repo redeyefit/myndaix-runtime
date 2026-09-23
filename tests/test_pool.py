@@ -11,6 +11,7 @@ Run:    LEDGER_TEST_DSN=postgresql://localhost/runtime_test \\
 """
 import asyncio
 import inspect
+import logging
 import os
 import subprocess
 import tempfile
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from runtime.contracts import Authority, Reach
 from runtime.ledger.postgres_store import PostgresLedger
-from runtime.pool import WorkerPool
+from runtime.pool import FAULT_BACKOFF_CAP_S, WorkerPool
 from runtime.registry import REGISTRY, AgentSpec
 
 # isolate the (now stable, shared-by-default) worktree GC root for this suite
@@ -285,6 +286,105 @@ async def test_janitor_sweep_skips_ledger_without_support():
     pool = WorkerPool(MinimalLedger(), size=1, worktree_sweep_interval_s=0.0)
     await pool._maybe_sweep_worktrees()              # must not raise
     assert pool.worktrees_swept == 0
+
+
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _capture_pool_log():
+    lg = logging.getLogger("runtime.pool")
+    cap = _Capture()
+    lg.addHandler(cap)
+    old = lg.level
+    lg.setLevel(logging.DEBUG)
+    return cap, lambda: (lg.removeHandler(cap), lg.setLevel(old))
+
+
+async def test_worker_lease_outage_backs_off_one_traceback_per_streak():
+    """A ledger outage must not flood the log (2026-09-22: 33 GB of per-poll tracebacks on the
+    Mini). Consecutive LEASE failures back off from poll_s (doubling, capped) and log the full
+    traceback only on the first failure of a streak; a clean lease resets the streak, so the
+    NEXT outage gets its own traceback."""
+    class FlakyLedger:
+        # 3 failures, 1 clean lease, 2 failures, then a clean lease that stops the pool
+        script = ["err", "err", "err", "ok", "err", "err", "stop"]
+
+        async def lease_job(self, worker_id, caps):
+            step = self.script.pop(0)
+            if step == "err":
+                raise OSError(49, "Can't assign requested address")
+            if step == "stop":
+                pool._stop.set()
+            return None
+
+    pool = WorkerPool(FlakyLedger(), size=1, poll_s=0.01)
+    delays = []
+
+    async def fake_pause(d):
+        delays.append(round(d, 4))
+    pool._pause = fake_pause
+    cap, restore = _capture_pool_log()
+    try:
+        await pool._worker("w0")
+    finally:
+        restore()
+    tracebacks = [r for r in cap.records if r.exc_info]
+    assert len(tracebacks) == 2, f"one traceback per outage streak, got {len(tracebacks)}"
+    assert delays == [0.02, 0.04, 0.08, 0.02, 0.04], delays   # doubles; resets after recovery
+    repeats = [r.getMessage() for r in cap.records if "in a row" in r.getMessage()]
+    assert len(repeats) == 3 and all("OSError" in m for m in repeats), repeats
+    assert sum("recovered" in r.getMessage() for r in cap.records) == 2
+    assert pool.worker_faults == 5
+
+
+async def test_janitor_reclaim_outage_backs_off_one_traceback():
+    """Same flood guard for the janitor's reclaim loop; a healthy tick keeps the normal cadence."""
+    class DownLedger:
+        failures = 4
+
+        async def reclaim_expired(self):
+            if self.failures:
+                self.failures -= 1
+                raise OSError(49, "Can't assign requested address")
+            pool._stop.set()
+            return 0
+
+    pool = WorkerPool(DownLedger(), size=1, janitor_interval_s=0.2)
+    delays = []
+
+    async def fake_pause(d):
+        delays.append(round(d, 4))
+    pool._pause = fake_pause
+    cap, restore = _capture_pool_log()
+    try:
+        await pool._janitor()
+    finally:
+        restore()
+    assert len([r for r in cap.records if r.exc_info]) == 1
+    assert delays == [0.4, 0.8, 1.6, 3.2, 0.2], delays        # backoff, then normal cadence
+
+
+async def test_fault_backoff_caps_and_never_overflows():
+    assert WorkerPool._fault_backoff(0.02, 1) == 0.04
+    assert WorkerPool._fault_backoff(0.02, 20) == FAULT_BACKOFF_CAP_S
+    assert WorkerPool._fault_backoff(0.02, 10 ** 6) == FAULT_BACKOFF_CAP_S   # no OverflowError
+
+
+async def test_pause_wakes_on_stop():
+    """A capped backoff must not stall shutdown: _pause returns as soon as stop is set."""
+    class Nothing:
+        pass
+    pool = WorkerPool(Nothing(), size=1)
+    asyncio.get_running_loop().call_later(0.05, pool._stop.set)
+    t0 = asyncio.get_running_loop().time()
+    await pool._pause(FAULT_BACKOFF_CAP_S)
+    assert asyncio.get_running_loop().time() - t0 < 1.0
 
 
 async def _main():
