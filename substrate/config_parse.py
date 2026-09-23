@@ -162,6 +162,9 @@ _SCHEMA = {
     "AGENT_CLI_PATH":   (_cli_path,  False, False),
     "POLL_INTERVAL_S":  (_poll,      False, False),
     "DEPLOY_CLONE":     (_abspath,   False, False),  # override; default derived below
+    # Deprecated for one release: accepted for existing configs; no runtime consumers.
+    "DEV_TREE":        (_abspath,   False, False),
+    "DEV_TREE_DRIFT_THRESHOLD": (_days, False, False),
     # Inbox Assistant — ALL optional on every role (labs and unconfigured factories
     # must keep converging). Absent INBOX_ACCOUNTS = component off, never an error.
     "INBOX_ACCOUNTS":      (_email_list,     False, False),

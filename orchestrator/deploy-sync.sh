@@ -22,7 +22,7 @@
 #   --preflight   ADVISORY (always exit 0): warn if deployed copies drift OR the repo working tree
 #                 HEAD != the stamped deploy sha (branch-float). Safe to call at pool start.
 #
-#   deploy-sync.sh <mode> [ref]      ref defaults to origin/main
+#   deploy-sync.sh <mode> [ref]      check/preflight default to origin/main; apply requires a verified full commit SHA
 #
 # House rules: bash-scripts.md — set -euo pipefail, PATH pin, atomic mv, quote all, no eval.
 set -euo pipefail
@@ -94,10 +94,13 @@ do_check(){
 do_apply(){
   # _LOCK stays SCRIPT-scope on purpose (top-of-file comment: the EXIT trap must see it) —
   # r6 P5's "make it local" would strand the lock at trap time. _head_now IS local.
-  local pair src dst ddir f want tmp bak deployed_sha _head_now _branch _branch_re
-  # scope this call's ref mutations (normalization, qualification, commit pin) — bash
+  local pair src dst ddir f want tmp bak deployed_sha _head_now
+  # scope this call's commit pin — bash
   # locals are dynamically scoped, so ref_blob() still reads this value (r13 #3)
   local ref="$ref"
+  # A moving ref can advance after the operator's health gate. Require its verified SHA.
+  [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die "--apply requires the full commit SHA verified by the health gate (not HEAD or a branch)"
   # serialize (review MED-1): two concurrent --apply could interleave the per-file mv's and leave a
   # torn deploy (play-fix from ref A, play-review from ref B, stamp = last writer). Atomic mkdir lock
   # (portable — no flock binary dep); no stale-reaper (a human deploy tool: a stranded lock is a
@@ -111,49 +114,18 @@ do_apply(){
     else die "cannot create lock $_LOCK: $mkerr"; fi
   fi
   trap _release_lock EXIT                             # function form — no path interpolation (r2 CRIT)
-  # refresh the tracking ref when deploying from a remote. Fetch failure is FATAL in --apply (review
-  # r4): silently deploying a stale/rolled-back local origin/main is the exact silent-non-deploy this
-  # tool exists to prevent. (--preflight tolerates it — it's advisory.)
-  # explicit DESTINATION refspec (r7 #2), DERIVED from the requested ref (r8 P1: a
-  # hardcoded main would refresh the wrong ref for --apply origin/<other> and then bless
-  # the stale local tracking ref — the exact silent-non-deploy this tool prevents). A bare
-  # `fetch origin <branch>` lands only in FETCH_HEAD under non-wildcard fetch configs.
-  # No stderr suppression: fetch warnings are signal. Non-ff (rolled-back origin) -> die.
-  # normalize the fully-qualified spelling FIRST (r11 #1: refs/remotes/origin/<x> matched
-  # no case arm and skipped the fetch entirely — same stale-ref fail-open, different door)
-  case "$ref" in refs/remotes/origin/*) ref="origin/${ref#refs/remotes/origin/}" ;; esac
-  case "$ref" in
-    origin/*)
-      _branch="${ref#origin/}"
-      # PLAIN branch names only — anything else DIES (r10 #1: the bare-fetch fallback for
-      # revision expressions could no-op under a narrow remote.origin.fetch and bless a
-      # stale tracking ref — the exact fail-open this script prevents; expressions like
-      # origin/main~1 must be operator-resolved to a sha first). First char alphanumeric
-      # (r10 #3: a leading '-' would parse as a git OPTION, not a refspec). Regex in a
-      # var (house idiom; probed fine unquoted on 3.2.57, the var form is the belt).
-      _branch_re='^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)*$'
-      [[ "$_branch" =~ $_branch_re ]] \
-        || die "unsupported ref '$ref' for --apply: use origin/<branch>, HEAD, or a full sha (resolve revision expressions like ~1 to a sha first)"
-      git -C "$REPO" fetch --quiet origin "${_branch}:refs/remotes/origin/${_branch}" \
-        || die "fetch failed for $ref — refusing to deploy a possibly-stale local ref"
-      # resolve the FULLY-QUALIFIED name we just fetched (r12 #1): shorthand origin/<b>
-      # goes through git's disambiguation, where a local branch/tag literally named
-      # 'origin/<b>' would shadow the tracking ref we refreshed
-      ref="refs/remotes/origin/${_branch}"
-      ;;
-  esac
-  deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref")" || die "cannot resolve ref: $ref"
+  deployed_sha="$(git -C "$REPO" rev-parse --verify "$ref^{commit}")" || die "cannot resolve commit: $ref"
   # version-skew guard (review r5 #2, hardened r6 P1): the phone wrapper's marker contract
   # runs against the CHECKED-OUT tree's cli.py — deploying a ref that advanced past the
   # running checkout silently skews wrapper vs serve. FAIL CLOSED: warn-and-continue was
-  # exactly the mixed-tree deploy this guard exists to stop. --apply HEAD never trips it;
+  # exactly the mixed-tree deploy this guard exists to stop.
   # DEPLOY_SYNC_ALLOW_SKEW=1 is the deliberate operator override.
   _head_now="$(git -C "$REPO" rev-parse --verify --quiet HEAD || echo unknown)"
   if [[ "$_head_now" != "$deployed_sha" ]]; then
     if [[ "${DEPLOY_SYNC_ALLOW_SKEW:-}" == "1" ]]; then
       log "WARN: SKEW override — deploying $deployed_sha over working-tree HEAD $_head_now"
     else
-      die "refusing skewed deploy: ref resolves to $deployed_sha but working-tree HEAD is $_head_now — pull first, use '--apply HEAD', or set DEPLOY_SYNC_ALLOW_SKEW=1"
+      die "refusing skewed deploy: ref resolves to $deployed_sha but working-tree HEAD is $_head_now — wait for convergence and verify the target SHA, or set DEPLOY_SYNC_ALLOW_SKEW=1"
     fi
   fi
   # PIN to the immutable commit for the rest of the loop (review r3 MAJOR-1): reading blobs through
