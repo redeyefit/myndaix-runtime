@@ -511,6 +511,12 @@ autofix_fire(){
     *) note autofix "skip: non-branch or missing ref '${ref:-<empty>}' (fail-closed)"; return 0 ;;
   esac
   [[ "$ref" == *"fix/auto/"* ]] && { note autofix "skip: autofix-authored ref (loop guard)"; return 0; }
+  # main ONLY: a feature branch always has a human folding its NEEDS-FIX by hand, so a fire there
+  # only races that fold — a duplicate fix/auto PR whose review also takes this repo's lock and
+  # SKIPS the human's next push. 30-day data (2026-09-22): fix/auto PRs into main 6 merged / 0
+  # closed; into feature branches 0 merged / 6 closed. Checked BEFORE the push gate so the skip
+  # reason recorded is this one.
+  [[ "$ref" == "refs/heads/main" ]] || { note autofix "skip: non-main branch '$ref' (autofix is main-only)"; return 0; }
   [[ "${pushed:-0}" == "1" ]]       || { note autofix "skip: push not confirmed"; return 0; }
   [[ -s "$run/fixlist.txt" ]]       || { note autofix "skip: empty fixlist"; return 0; }
   # repo MUST be configured fail_to_pass:null, else a 3-arg auto-fire could exceed the UNVERIFIED

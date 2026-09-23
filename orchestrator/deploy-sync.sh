@@ -47,6 +47,10 @@ _LOCK=""                                              # script-scope so the EXIT
 
 log(){ printf '[%s] [deploy-sync] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die(){ log "ERROR: $*" >&2; exit 1; }
+# An explicitly EMPTY ref must fail closed: ${2:-origin/main} treats "" like unset, so a caller's
+# unset/empty sha variable (e.g. an unreadable RUNNING_SHA) would silently deploy origin/main —
+# ungated (review 37732 #2). Only an ABSENT second arg takes the default.
+if [[ $# -ge 2 && -z "$2" ]]; then die "empty ref argument — pass origin/<branch>, HEAD, or a full sha (or omit it for origin/main)"; fi
 # lock release as a FUNCTION (never interpolate a path into a trap string — a $()-bearing
 # DEPLOY_SYNC_DEST would inject live command substitution at trap-fire time; review r2 CRITICAL).
 _release_lock(){ [[ -n "${_LOCK:-}" ]] && rmdir "$_LOCK" 2>/dev/null; return 0; }

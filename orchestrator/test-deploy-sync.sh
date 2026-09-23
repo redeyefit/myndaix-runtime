@@ -95,6 +95,13 @@ mkdir -p "$EVIL_DEST"
 DEPLOY_SYNC_DEST="$EVIL_DEST" "$SYNC" --apply "$REF" >/dev/null 2>&1 || true
 [[ ! -e "$PWN" ]] && ok "a \$()-bearing DEPLOY_SYNC_DEST does not execute on trap fire" || bad "TRAP INJECTION FIRED"
 
+echo "== --apply with an explicitly EMPTY ref fails closed (never the origin/main default; review 37732 #2) =="
+EMPTY_DEST="$SCRATCH/empty-ref-dest"; mkdir -p "$EMPTY_DEST"
+er_rc=0; er_out="$(DEPLOY_SYNC_DEST="$EMPTY_DEST" DEPLOY_SYNC_BIN="$EMPTY_DEST/bin" "$SYNC" --apply "" 2>&1)" || er_rc=$?
+[[ "$er_rc" -ne 0 ]] && ok "empty ref exits nonzero" || bad "empty ref was ACCEPTED (rc=0)"
+grep -q "empty ref argument" <<<"$er_out" && ok "empty ref names itself" || bad "empty ref: no explicit refusal ($er_out)"
+[[ ! -e "$EMPTY_DEST/play-fix.sh" && ! -e "$EMPTY_DEST/bin/mxr-phone" ]] && ok "empty ref installs nothing" || bad "empty ref installed files"
+
 echo ""
 echo "== RESULT: $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

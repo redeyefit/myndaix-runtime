@@ -677,6 +677,14 @@ echo "63. autofix_fire forwards the triggering remote as MYNDAIX_FIX_REMOTE (rev
   bareR="$ROOT/bare-remote63.git"; git init -q --bare "$bareR"; git -C "$REPO" push -q "$bareR" "$TIP:refs/heads/main" 2>/dev/null
   STUB_TRIAGE="1. fix it" run_af "$bareR"; wait_fixer
   if grep -q "REMOTE=$bareR" "$FAKE/.myndaix/fixer-env" 2>/dev/null; then echo "  ok: triggering remote forwarded to the fixer"; PASS=$((PASS+1)); else echo "  FAIL: MYNDAIX_FIX_REMOTE not forwarded (env: $(tr '\n' ' ' < "$FAKE/.myndaix/fixer-env" 2>/dev/null))"; FAIL=$((FAIL+1)); fi
+echo "64. autofix is main-only: a NEEDS-FIX on a feature branch never fires (and says why)"; reset; af_repos "$NULLCFG"
+  bareR="$ROOT/bare-remote64.git"; git init -q --bare "$bareR"; git -C "$REPO" push -q "$bareR" "$TIP:refs/heads/feat/x" 2>/dev/null
+  env HOME="$FAKE" PLAY_AUTOFIX=1 PLAY_AUTOFIX_TEST_MODE=1 PLAY_FIX_SELF="$FIXER" STUB_TRIAGE="1. fix it" \
+    bash "$SCRIPT" --worker "$REPO" "$EMPTY" "$TIP" refs/heads/feat/x "$bareR" 2>/dev/null; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "feature-branch NEEDS-FIX -> no auto-fire"
+  # the skip must be THIS gate (not e.g. an unconfirmed push) — else the case passes vacuously
+  rj="$(ls -t "$RUNS"/*/play.jsonl 2>/dev/null | head -1)"
+  ck "skip reason is the main-only gate" "autofix is main-only" "$rj"
 
 echo; echo "=== $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
