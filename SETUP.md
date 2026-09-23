@@ -182,7 +182,8 @@ export PYTHONSAFEPATH=1   # don't prepend CWD to sys.path — else running mxr f
 # inherited hook env can't redirect the probe yet the exec'd runtime child still sees them; the tree
 # is VALIDATED as a git work tree — PYTHONPATH set-but-unresolvable REFUSES (a deleted/moved .git
 # must not dispatch unverifiable code; that fail-open was a .git-delete bypass), while PYTHONPATH
-# unset/empty (editable-venv install) is the one fail-open+warn branch; the status probe is
+# unset/empty (editable-venv install) is one of TWO fail-open+warn branches (the other: config.env
+# absent, below); the status probe is
 # --untracked-files=all + --no-optional-locks. NB: this is a point-in-time tripwire at dispatch,
 # not a running-pool integrity guarantee (a concurrent checkout can still race it).
 case "${1:-}" in
@@ -220,7 +221,8 @@ case "${1:-}" in
         ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
           if [ -z "${PYTHONPATH:-}" ]; then
             # PYTHONPATH legitimately unset/empty (editable-venv install) — there is no tree to
-            # verify, so fail OPEN with a warning. This is the ONLY fail-open branch.
+            # verify, so fail OPEN with a warning. One of TWO fail-open branches (the other:
+            # config.env absent, further down) — each is justified at its own site.
             echo "mxr: WARNING — PYTHONPATH unset; freshness guard skipped (editable-venv install?)." >&2
             exit 0
           fi

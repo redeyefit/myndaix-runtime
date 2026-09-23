@@ -114,7 +114,9 @@ for shape in quoted unquoted omitted; do
 done
 # read-only --check keeps its origin/main default (only the MUTATING mode lost it)
 ck_out="$(DEPLOY_SYNC_DEST="$SCRATCH" "$SYNC" --check 2>&1)" || true   # drift rc is irrelevant here; only the refusal text matters
-! grep -q "requires an explicit" <<<"$ck_out" && ok "--check with no ref still runs (default kept)" || bad "--check lost its default ($ck_out)"
+# grep rc 1 = no match = default kept; `! grep` would also pass on rc 2 (grep error) — require exactly 1.
+grep -q "requires an explicit" <<<"$ck_out"; ck_rc=$?
+[[ "$ck_rc" -eq 1 ]] && ok "--check with no ref still runs (default kept)" || bad "--check lost its default, or grep failed (rc=$ck_rc): $ck_out"
 
 echo ""
 echo "== RESULT: $PASS passed, $FAIL failed =="
