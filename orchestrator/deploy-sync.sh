@@ -22,7 +22,7 @@
 #   --preflight   ADVISORY (always exit 0): warn if deployed copies drift OR the repo working tree
 #                 HEAD != the stamped deploy sha (branch-float). Safe to call at pool start.
 #
-#   deploy-sync.sh <mode> [ref]      ref defaults to origin/main
+#   deploy-sync.sh <mode> [ref]      --apply requires ref; otherwise defaults to origin/main
 #
 # House rules: bash-scripts.md — set -euo pipefail, PATH pin, atomic mv, quote all, no eval.
 set -euo pipefail
@@ -47,10 +47,9 @@ _LOCK=""                                              # script-scope so the EXIT
 
 log(){ printf '[%s] [deploy-sync] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die(){ log "ERROR: $*" >&2; exit 1; }
-# An explicitly EMPTY ref must fail closed: ${2:-origin/main} treats "" like unset, so a caller's
-# unset/empty sha variable (e.g. an unreadable RUNNING_SHA) would silently deploy origin/main —
-# ungated (review 37732 #2). Only an ABSENT second arg takes the default.
-if [[ $# -ge 2 && -z "$2" ]]; then die "empty ref argument — pass origin/<branch>, HEAD, or a full sha (or omit it for origin/main)"; fi
+# --apply requires an explicit nonempty ref: an unquoted empty sha disappears from argv
+# and must not silently deploy origin/main. Other modes may default only when ref is absent.
+if [[ ( "$mode" == --apply || $# -ge 2 ) && -z "${2:-}" ]]; then die "empty ref argument — pass origin/<branch>, HEAD, or a full sha (--apply requires a ref)"; fi
 # lock release as a FUNCTION (never interpolate a path into a trap string — a $()-bearing
 # DEPLOY_SYNC_DEST would inject live command substitution at trap-fire time; review r2 CRITICAL).
 _release_lock(){ [[ -n "${_LOCK:-}" ]] && rmdir "$_LOCK" 2>/dev/null; return 0; }
@@ -224,7 +223,7 @@ do_preflight(){
     [[ "$head_sha" == "$stamped" ]] || \
       log "PREFLIGHT WARN: working-tree HEAD ($head_sha) != stamped deploy sha ($stamped) — pool may run un-deployed code (branch-float)"
   else
-    log "PREFLIGHT WARN: no .deployed-sha stamp — run 'deploy-sync.sh --apply' to establish it"
+    log "PREFLIGHT WARN: no .deployed-sha stamp — run 'deploy-sync.sh --apply origin/main' to establish it"
   fi
   return 0
 }
@@ -233,5 +232,5 @@ case "$mode" in
   --check)     do_check ;;
   --apply)     do_apply ;;
   --preflight) do_preflight ;;
-  *) die "usage: deploy-sync.sh --check|--apply|--preflight [ref]" ;;
+  *) die "usage: deploy-sync.sh --check|--apply|--preflight [ref] (--apply requires a ref)" ;;
 esac
