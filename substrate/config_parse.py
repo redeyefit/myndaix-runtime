@@ -28,7 +28,9 @@ from typing import NoReturn
 
 # ---------------------------------------------------------------------------
 # Whitelist. Every key config.env may carry is declared here with a validator.
-# An unknown key is a hard error (a typo must not silently no-op a security value).
+# An unknown key is a hard error (a typo must not silently no-op a security value). So REMOVING a
+# key is a migration: strip it from every live config.env BEFORE this parser ships, or reconcile and
+# both canaries fail validation (DEV_TREE / DEV_TREE_DRIFT_THRESHOLD, removed 2026-09-22, were).
 # ---------------------------------------------------------------------------
 ROLES = ("lab", "factory")
 

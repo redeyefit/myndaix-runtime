@@ -20,9 +20,11 @@ never payload text.
 ## Install (Mini, as jefe — the wrapper is in deploy-sync's GUARDED copied surface)
 
 ```
-orchestrator/deploy-sync.sh --apply HEAD   # installs ~/.myndaix/bin/mxr-phone (+ the play workers) from THIS commit
-bash orchestrator/phone/test.sh            # fixture leg — must end "0 failed" (count grows with folds; don't pin it here)
-bash orchestrator/phone/test.sh --sshd     # REAL boundary leg (loopback sshd) — must pass before wiring the phone
+# from the Mini's DEPLOY CLONE (it has no other checkout), pinned to the health-gated commit:
+D=~/.myndaix/deploy/myndaix-runtime; S=$(cat ~/.myndaix/state/RUNNING_SHA)
+"$D/orchestrator/deploy-sync.sh" --apply "$S"   # installs ~/.myndaix/bin/mxr-phone (+ the play workers) from that commit
+bash "$D/orchestrator/phone/test.sh"            # fixture leg — must end "0 failed" (count grows with folds; don't pin it here)
+bash "$D/orchestrator/phone/test.sh" --sshd     # REAL boundary leg (loopback sshd) — must pass before wiring the phone
 ```
 
 Full ordering (tree first — markers + migration 0015 — then the copy): DEPLOY.md → "Phone

@@ -1132,6 +1132,10 @@ TREE_NOREF="$TMP/tree-noref"; mk_clone "$TREE_NOREF"; git -C "$TREE_NOREF" updat
 TREE_BEHIND="$TMP/tree-behind"; mk_clone "$TREE_BEHIND"
 ( cd "$TMP/dt-seed" && printf 'advance\n' >> src/x.py && git add -A && git commit -qm advance && git push -q origin main ) >/dev/null 2>&1
 git -C "$TREE_BEHIND" fetch -q origin 2>/dev/null   # origin/main ref advances; HEAD stays 1 commit behind
+git init -q --bare -b main "$TMP/tree-bare.git"      # BARE fixture: rev-parse --is-inside-work-tree prints false with EXIT 0
+# A missing dir fails the same guard branch, so the bare test would silently pass without this fixture
+# (the DEV-tree removal once deleted its init — review 99718 P3). Prove it IS bare before relying on it.
+ok '[[ "$(git -C "$TMP/tree-bare.git" rev-parse --is-bare-repository 2>/dev/null)" == true ]]' "guard fixture: tree-bare.git is a real bare repo (not a missing dir)"
 
 # --- the mxr freshness guard, EXTRACTED from SETUP.md's canonical heredoc ---------
 # Pull the guard block straight out of SETUP.md so the test covers the SHIPPED text (the live

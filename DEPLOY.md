@@ -84,12 +84,16 @@ follow from the SAME commit):
 ```bash
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 # wait until ~/.myndaix/state/RUNNING_SHA == the merge sha (Substrate deploy, step 2), then:
-~/.myndaix/deploy/myndaix-runtime/orchestrator/deploy-sync.sh --apply HEAD
+S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ ]] || { echo "no valid RUNNING_SHA" >&2; exit 1; }
+~/.myndaix/deploy/myndaix-runtime/orchestrator/deploy-sync.sh --apply "$S"
 ```
 
-`--apply HEAD` installs `$ORCH/play-review.sh`, `$ORCH/play-fix.sh` and `~/.myndaix/bin/mxr-phone`
-from the commit the deploy clone converged to — all three together, never a partial copy (the
-half-deploy this doc exists to prevent), and never newer than the running serve.
+This installs `$ORCH/play-review.sh`, `$ORCH/play-fix.sh` and `~/.myndaix/bin/mxr-phone` from the
+commit reconcile HEALTH-GATED (`RUNNING_SHA` is written last, only on a good converge) — all three
+together, never a partial copy (the half-deploy this doc exists to prevent). Pin the sha, never
+`HEAD`: a later reconcile tick can move the clone past the gate between your wait and the apply
+(review 99718 P2). If it did, deploy-sync REFUSES the skew (clone HEAD ≠ the pinned sha) — rerun
+from the wait; never override with `DEPLOY_SYNC_ALLOW_SKEW`.
 
 **Autofix apply rung (2026-09-11, docs/autofix-apply-rung-design.md):** verified fixes
 (`SUITE_GREEN` / `REGRESSION_CHECK_ONLY`) commit + push `fix/auto/*` branches and open PRs when
@@ -128,8 +132,9 @@ ships like this, after the PR merges to `main`:
 ```bash
 set -euo pipefail
 # 1. capture the intended full merge SHA from origin (read-only — reconcile alone moves the clone):
-TARGET=$(git -C ~/.myndaix/deploy/myndaix-runtime ls-remote origin refs/heads/main | cut -f1)
-[[ "$TARGET" =~ ^[0-9a-f]{40}$ ]] || { echo "could not resolve origin/main" >&2; exit 1; }
+TARGET=$(git -C ~/.myndaix/deploy/myndaix-runtime ls-remote origin refs/heads/main | cut -f1) \
+  || { echo "ls-remote failed (network/auth) — cannot resolve origin/main" >&2; exit 1; }
+[[ "$TARGET" =~ ^[0-9a-f]{40}$ ]] || { echo "origin/main did not resolve to a sha" >&2; exit 1; }
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 # 2. wait for successful convergence, not just the clone reset:
 deadline=$((SECONDS + 300))
@@ -180,8 +185,9 @@ fi
   || { echo "canary printed no healthy verdict ('canary: no drift') — treat this deploy as UNVERIFIED" >&2; exit 1; }
 ```
 
-Once reconcile has converged, install the copied surface from the same commit
-(`deploy-sync.sh --apply HEAD`), per [Orchestrator deploy](#orchestrator-deploy-the-review-loop).
+Once reconcile has converged, install the copied surface from that health-gated commit
+(`deploy-sync.sh --apply "$(cat ~/.myndaix/state/RUNNING_SHA)"`), per
+[Orchestrator deploy](#orchestrator-deploy-the-review-loop).
 
 ### The inline mxr freshness guard — hand-spliced per machine from `SETUP.md`
 
@@ -273,14 +279,16 @@ migration `0015` applied, so the code it talks to must land FIRST:
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 # wait until ~/.myndaix/state/RUNNING_SHA == the merge sha (Substrate deploy, step 2), then:
 D=~/.myndaix/deploy/myndaix-runtime
-"$D/orchestrator/deploy-sync.sh" --apply HEAD \
+S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ ]] || { echo "no valid RUNNING_SHA" >&2; exit 1; }
+"$D/orchestrator/deploy-sync.sh" --apply "$S" \
   && bash "$D/orchestrator/phone/test.sh" && bash "$D/orchestrator/phone/test.sh" --sshd
 ```
 
-(`--apply HEAD`, not the default `origin/main`: apply re-fetches, and a remote that
-advanced after reconcile converged would deploy a NEWER wrapper against the OLDER
-running serve — the exact skew the marker rule forbids. HEAD pins wrapper-and-tree to
-one commit; deploy-sync warns loudly when the applied ref differs from HEAD.)
+(The health-gated `RUNNING_SHA`, not the default `origin/main`: apply re-fetches, and a remote
+that advanced after reconcile converged would deploy a NEWER wrapper against the OLDER running
+serve — the exact skew the marker rule forbids. Not `HEAD` either: a later reconcile tick can move
+the clone past the gate first; with a pinned sha deploy-sync REFUSES that skew instead of
+installing an ungated commit — rerun from the wait.)
 
 1. reconcile converges: the deploy clone advances and serve restarts, auto-applying migrations
    (0015 `outbound.created_at`); the clone's `cli.py` now emits the `MXR_*` stderr markers the
