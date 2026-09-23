@@ -75,6 +75,7 @@ class WorkerPool:
         self.reconciled = 0                       # repo_concurrency rows the janitor healed
         self._stop = asyncio.Event()
         self._inflight = 0
+        self._janitor_faults = 0                   # consecutive reclaim_expired failures
         self._last = 0.0
         self._last_sweep = 0.0
         self._last_reconcile = 0.0
@@ -166,13 +167,13 @@ class WorkerPool:
     async def _janitor(self) -> None:
         if not hasattr(self.ledger, "reclaim_expired"):
             return
-        faults = 0                                # consecutive reclaim_expired failures
         while not self._stop.is_set():
             try:
                 n = await self.ledger.reclaim_expired()
-                if faults:
-                    log.warning("pool janitor: reclaim recovered after %d failure(s)", faults)
-                    faults = 0
+                if self._janitor_faults:
+                    log.warning("pool janitor: reclaim recovered after %d failure(s)",
+                                self._janitor_faults)
+                    self._janitor_faults = 0
                 if n:
                     self.reclaimed += n
                     self._touch()              # reclaim requeued work; keep the pool alive
@@ -181,15 +182,16 @@ class WorkerPool:
             except Exception as exc:
                 # a transient ledger error must NOT permanently disable reclaim
                 # (that would silently revoke the crash-recovery guarantee).
-                faults += 1
-                self._log_fault(faults, exc, "pool janitor: reclaim_expired failed; continuing")
+                self._janitor_faults += 1
+                self._log_fault(self._janitor_faults, exc,
+                                "pool janitor: reclaim_expired failed; continuing")
             await self._maybe_sweep_worktrees()
             await self._maybe_reconcile_cap()
             # Deliberately NO backoff here, unlike the worker: run_until_idle's guard only
             # promises janitor_interval_s < quiet_s, so a backed-off retry could land after the
             # idle exit and strand a crash-recovery reclaim (review 51857). One traceback per
             # streak already cuts the janitor's outage log to one short line per interval.
-            await asyncio.sleep(self.janitor_interval_s)
+            await self._pause(self.janitor_interval_s)
 
     async def _maybe_sweep_worktrees(self) -> None:
         """Slow-cadence GC of hard-crash orphan worktrees (PR-1c) — runs at most every
@@ -277,7 +279,7 @@ class WorkerPool:
             while True:
                 await asyncio.sleep(min(quiet_s / 3, 0.1))
                 queued = await self._queued()
-                if (self._inflight == 0 and queued == 0
+                if (self._inflight == 0 and queued == 0 and self._janitor_faults == 0
                         and (time.monotonic() - self._last) > quiet_s):
                     break
                 if (time.monotonic() - started) > max_runtime_s:
