@@ -126,14 +126,22 @@ def changed_py_files(repo_root: Path, base_commit: str) -> list[ChangedFile]:
     # Untracked new .py files (created but never `git add`ed) are invisible to `git diff` against
     # a commit — it only compares tracked content. Fold them in as bare adds so a local pre-commit
     # check catches them the same way CI would once they land in a commit.
-    proc = git(repo_root, "status", "--porcelain", "--no-renames", "--", "*.py")
+    # -z (NUL-separated, unquoted paths) instead of the default quoted-line format: a path with a
+    # space or other special char is otherwise wrapped in double quotes by porcelain, and
+    # `.endswith(".py")` then fails on the trailing quote char, silently dropping the file.
+    # (An entirely-untracked new directory is still enumerated file-by-file here, not collapsed to
+    # the dir name, because the `-- "*.py"` pathspec itself forces git to recurse into it —
+    # verified: the same command with no pathspec collapses to `?? newdir/`, but this one lists
+    # `?? newdir/inner.py` — so `--untracked-files=all` isn't needed.)
+    proc = git(repo_root, "status", "--porcelain", "--no-renames", "-z", "--", "*.py")
     if proc.returncode == 0:
         known = {f.new_path for f in files}
-        for line in proc.stdout.splitlines():
-            if line.startswith("??"):
-                path = line[3:].strip()
-                if path.endswith(".py") and path not in known:
-                    files.append(ChangedFile("A", None, path))
+        for token in proc.stdout.split("\0"):
+            if not token.startswith("??"):
+                continue
+            path = token[3:]
+            if path.endswith(".py") and path not in known:
+                files.append(ChangedFile("A", None, path))
     return files
 
 
@@ -255,16 +263,28 @@ def main(argv: list[str]) -> int:
     rename_new = 0
     for key, head_n in head_counts.items():
         base_n = base_counts.get(key, 0)
+        # Deliberate: this nets counts per (file, rule, message), not per specific occurrence —
+        # fixing one instance and introducing another with the identical message in the same
+        # file cancels out to new_n=0. Accepted tradeoff, not a bug: line numbers shift too much
+        # across an edit to match findings by location instead, and net counting still holds the
+        # ratchet invariant that matters (existing debt can never grow unnoticed).
         new_n = max(0, head_n - base_n)
         if key[0] in rename_paths:
-            rename_new += new_n
+            # Still blocking, and still recorded in new_findings (below) so the per-finding
+            # print loop reports its file/rule/message like any other new finding — only the
+            # `inherited` headline count skips renamed files (see comment above).
+            if new_n:
+                new_findings[key] = new_n
+                rename_new += new_n
             continue
         inherited += min(head_n, base_n)
         if new_n:
             new_findings[key] = new_n
 
+    # rename_new entries are already inside new_findings (added above), so total_new alone
+    # is the full blocking count — do not add rename_new again or it double-counts.
     total_new = sum(new_findings.values())
-    total_blocking = total_new + rename_new
+    total_blocking = total_new
 
     if total_blocking == 0:
         suffix = f", {rename_new} in renamed files" if rename_paths else ""

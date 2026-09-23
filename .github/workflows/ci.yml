@@ -66,6 +66,10 @@ jobs:
       - name: Ruff version matches the pyproject pin
         run: ruff --version | grep -qx 'ruff 0.16.8' || { echo "::error::$(ruff --version) on PATH; pyproject pins ruff==0.16.8"; exit 1; }
 
+      # HEAD^1 assumes HEAD's immediate parent is the base tip — false on a multi-commit direct
+      # push to main (HEAD^1 would be a commit INSIDE that same push). Declined as unreachable:
+      # main is PR-only (branch protection, enforce_admins on), so every change lands here via a
+      # PR run, where HEAD is the merge commit and HEAD^1 is always the base tip it merged into.
       - name: Ruff — NEW findings vs base (blocking)
         run: python tools/ruff_new.py HEAD^1
 
