@@ -41,7 +41,7 @@ FILES=(
 )
 
 mode="${1:-}"
-ref="${2:-origin/main}"
+ref="${2-origin/main}"
 
 _LOCK=""                                              # script-scope so the EXIT trap sees it (review r2 CRIT)
 
