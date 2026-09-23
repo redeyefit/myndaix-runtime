@@ -53,7 +53,9 @@ Two targets; know which one your change touches:
   trusted installed copy at `~/.myndaix/orchestrator/`, NOT the repo tree. A script change ships
   ONLY via the `cp` (both scripts, always). Full three-surface checklist + the one-line Mini
   deploy: `DEPLOY.md`.
-- **The Mini is a PULL-ONLY MIRROR** — never a local commit, never a feature branch on `main`.
+- **The Mini is a PULL-ONLY MIRROR with NO working tree** — everything runs from the deploy clone
+  (reconcile-owned); the loop's git work runs in the machine-owned `~/.myndaix/work/<repo>`
+  (`repos.json`). Never commit or branch there, never recreate a checkout under `~/code`.
 
 ## Migrations
 

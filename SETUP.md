@@ -214,15 +214,14 @@ case "${1:-}" in
         _mxr_tree="${PYTHONPATH:-}"; _mxr_tree="${_mxr_tree%/src}"   # :-  keeps nounset wrappers alive when a venv edit dropped PYTHONPATH
         # Run the WHOLE git inspection in a subshell so the GIT_* unset is SCOPED and never leaks to
         # the exec'd python child below (oracle MED: a global unset would strip
-        # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE from the runtime — drift-canary's dev_tree_drift avoids
-        # this by running in a $()-subshell; the wrapper must too). The subshell exits 78 on drift;
+        # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE from the runtime). The subshell exits 78 on drift;
         # any other status (clean, or fail-open warn) falls through to dispatch.
         _mxr_grc=0
         ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
           if [ -z "${PYTHONPATH:-}" ]; then
             # PYTHONPATH legitimately unset/empty (editable-venv install) — there is no tree to
             # verify, so fail OPEN with a warning. This is the ONLY fail-open branch.
-            echo "mxr: WARNING — PYTHONPATH unset; freshness guard skipped (editable-venv install?). The drift-canary DEV-tree watch is the backstop." >&2
+            echo "mxr: WARNING — PYTHONPATH unset; freshness guard skipped (editable-venv install?)." >&2
             exit 0
           fi
           # Require `true` (not just exit 0): a BARE repo prints `false`/exit-0 and would else read as
@@ -297,8 +296,8 @@ case "${1:-}" in
         # matching the PYTHONPATH-unset branch's visibility contract (review 67726 P2).
         # DECLINED hardening (review 6838 P1, wontfix): requiring MXR_ALLOW_DIRTY=1 here would
         # kill every fresh-install wrapper to close a deploy-deletes-config.env edge the warning +
-        # drift-canary DEV-tree watch already surface.
-        printf '%s\n' "mxr: WARNING — config.env absent ($_mxr_cfg); freshness guard skipped (unconfigured install?). The drift-canary DEV-tree watch is the backstop." >&2
+        # drift-canary (it dies loud without config.env) already surface.
+        printf '%s\n' "mxr: WARNING — config.env absent ($_mxr_cfg); freshness guard skipped (unconfigured install?)." >&2
       fi
     fi
     ;;

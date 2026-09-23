@@ -41,13 +41,14 @@ them is a **half-deploy** — it looks done but runs a mix of old and new code. 
 
 1. **Repo working tree — must be on `main` at `origin/main`.** On the **lab** (MacBook), `serve`
    and `controller` import Python (`src/runtime/controller.py`, `registry.py`, `runner.py`) via
-   `PYTHONPATH` FROM this tree, so it must be current. On the **factory** (Mini), `serve` and
-   `controller` already run from the deploy clone (`PYTHONPATH` in each plist); but this tree is
-   still the SOURCE for the `cp` in step 2, so it must be current there too. The `controller`
-   spawns fresh each launchd tick, so it picks up tree changes on the next tick automatically;
-   `serve` is long-lived and needs the restart above. **The Mini is a PULL-ONLY MIRROR** — it must
-   never carry a local commit or sit on a feature branch on `main`. Verify with
-   `git branch --show-current` (want `main`) + `git log -1`.
+   `PYTHONPATH` FROM this tree, so it must be current. The `controller` spawns fresh each launchd
+   tick, so it picks up tree changes on the next tick automatically; `serve` is long-lived and
+   needs the restart above. Verify with `git branch --show-current` (want `main`) + `git log -1`.
+   **The factory (Mini) has NO working tree** (removed 2026-09-22): `serve`, `controller`,
+   automerge and the substrate jobs all run from the pull-only deploy clone, which only reconcile
+   advances; the loop's git work (review diffs, fix worktrees, automerge pins) runs in the
+   machine-owned work repo `~/.myndaix/work/myndaix-runtime` — the `$ORCH/repos.json` path. Never
+   edit, commit in, or check out a branch in either; never recreate a checkout under `~/code` there.
 
 2. **`$ORCH/play-review.sh` (and `play-fix.sh`) — the TRUSTED INSTALLED COPY.** The pre-push hook
    and the controller re-exec the worker from `$ORCH` (`PLAY_SELF=$HOME/.myndaix/orchestrator/
@@ -60,6 +61,10 @@ them is a **half-deploy** — it looks done but runs a mix of old and new code. 
 
    (When autofix is armed, `orchestrator/autofix-arm.sh arm` does this cp for BOTH scripts + re-runs
    its gates — prefer it on an autofix host. Run it only from a clean, up-to-date `main` checkout.)
+   On the Mini the tick plists set `PLAY_SELF` to the DEPLOY CLONE's `play-review.sh` (and
+   `play-fix.sh` resolves next to it), so the controller/automerge never run the `$ORCH` copies;
+   they matter there only for manual `--worker` runs. `deploy-sync.sh` keeps them (and
+   `mxr-phone`) in sync — see the Mini deploy below.
 
 3. **`serve` restart** — `launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime`, to reload
    `registry.py`/`runner.py` into the long-lived pool (e.g. an agent profile-timeout or adapter
@@ -71,20 +76,20 @@ them is a **half-deploy** — it looks done but runs a mix of old and new code. 
 health-gate on `to_regclass(migration_head.txt)` → kickstart). A hand `kickstart` restarts serve
 on whatever the clone already has. To force a Mini serve deploy NOW:
 `launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile` (proved: advanced the clone + applied a
-new migration in one tick). The `~/code/active` tree on the Mini still matters for the
-CONTROLLER (PYTHONPATH import each tick) and as the `cp` source for the `$ORCH` scripts.
+new migration in one tick).
 
-**The full Mini deploy, one line** (controller tree + trusted scripts; serve rides reconcile):
+**The full Mini deploy** (serve + controller + substrate ride reconcile; the installed copies
+follow from the SAME commit):
 
 ```bash
-cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
-  && cp orchestrator/play-review.sh orchestrator/play-fix.sh ~/.myndaix/orchestrator/ \
-  && launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
+launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
+# wait until ~/.myndaix/state/RUNNING_SHA == the merge sha (Substrate deploy, step 2), then:
+~/.myndaix/deploy/myndaix-runtime/orchestrator/deploy-sync.sh --apply HEAD
 ```
 
-Both worker scripts ship because the trusted installed surface is `$ORCH/play-review.sh` AND
-`$ORCH/play-fix.sh` — copying only the review script leaves a `play-fix.sh` change live-stale on the
-autofix host (the half-deploy this doc exists to prevent).
+`--apply HEAD` installs `$ORCH/play-review.sh`, `$ORCH/play-fix.sh` and `~/.myndaix/bin/mxr-phone`
+from the commit the deploy clone converged to — all three together, never a partial copy (the
+half-deploy this doc exists to prevent), and never newer than the running serve.
 
 **Autofix apply rung (2026-09-11, docs/autofix-apply-rung-design.md):** verified fixes
 (`SUITE_GREEN` / `REGRESSION_CHECK_ONLY`) commit + push `fix/auto/*` branches and open PRs when
@@ -92,11 +97,13 @@ autofix host (the half-deploy this doc exists to prevent).
 MacBook only; the Mini's launchd callers hard-disable autofix). Arm `touch` / disarm `rm` —
 after any play-script deploy, re-check the flag state matches intent.
 
-**Verify the deploy landed** (read-only): `git log -1` (the merge sha), a `grep` for the new code in
-the repo `src/runtime/controller.py` AND in BOTH installed workers (`$ORCH/play-review.sh` and
-`$ORCH/play-fix.sh`), and a fresh serve pid (`launchctl print gui/$(id -u)/ai.myndaix.runtime | grep
-pid`). A claimed deploy that skipped the `cp` runs the OLD worker(s); one that skipped the branch/pull
-runs the OLD controller.
+**Verify the deploy landed** (read-only): `git log -1` (the merge sha — on the Mini, `git -C
+~/.myndaix/deploy/myndaix-runtime log -1`), a `grep` for the new code in the repo
+`src/runtime/controller.py` (the deploy clone's on the Mini) AND in BOTH installed workers
+(`$ORCH/play-review.sh` and `$ORCH/play-fix.sh`), and a fresh serve pid (`launchctl print
+gui/$(id -u)/ai.myndaix.runtime | grep pid`). A claimed deploy that skipped the `cp`/`deploy-sync`
+runs the OLD worker(s); one that skipped the pull (lab) or reconcile's convergence (Mini) runs the
+OLD controller.
 
 ## Substrate deploy (the GitOps watchers + the mxr guard)
 
@@ -107,8 +114,8 @@ launchd jobs and its `mxr` wrapper is deliberately NOT gated (its dev tree is di
 
 ### Watchers (`drift-canary` / `liveness-canary`) — via the DEPLOY CLONE
 
-On the Mini the substrate launchd jobs execute the script from the **deploy clone**, NOT the
-`~/code/active` tree:
+On the Mini the substrate launchd jobs execute the script from the **deploy clone** (the Mini
+has no other checkout):
 
 ```
 /Users/jefe/.myndaix/deploy/myndaix-runtime/substrate/drift-canary.sh   # <- what ai.myndaix.drift-canary runs
@@ -120,10 +127,9 @@ ships like this, after the PR merges to `main`:
 
 ```bash
 set -euo pipefail
-# 1. update the active tree before capturing the intended full merge SHA:
-git -C ~/code/active/myndaix-runtime switch main
-git -C ~/code/active/myndaix-runtime pull --ff-only
-TARGET=$(git -C ~/code/active/myndaix-runtime rev-parse HEAD)
+# 1. capture the intended full merge SHA from origin (read-only — reconcile alone moves the clone):
+TARGET=$(git -C ~/.myndaix/deploy/myndaix-runtime ls-remote origin refs/heads/main | cut -f1)
+[[ "$TARGET" =~ ^[0-9a-f]{40}$ ]] || { echo "could not resolve origin/main" >&2; exit 1; }
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 # 2. wait for successful convergence, not just the clone reset:
 deadline=$((SECONDS + 300))
@@ -174,8 +180,8 @@ fi
   || { echo "canary printed no healthy verdict ('canary: no drift') — treat this deploy as UNVERIFIED" >&2; exit 1; }
 ```
 
-The `~/code/active` tree is updated first — the controller imports from it and the
-play-script `cp` sources from it, per [Orchestrator deploy](#orchestrator-deploy-the-review-loop).
+Once reconcile has converged, install the copied surface from the same commit
+(`deploy-sync.sh --apply HEAD`), per [Orchestrator deploy](#orchestrator-deploy-the-review-loop).
 
 ### The inline mxr freshness guard — hand-spliced per machine from `SETUP.md`
 
@@ -244,7 +250,7 @@ g=$(mktemp); run=$(mktemp)
 trap "rm -f -- \"$g\" \"$run\"" EXIT
 awk "/# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}" ~/.local/bin/mxr > "$g"
 [ -s "$g" ] || { echo "GUARD NOT FOUND — markers missing in live mxr"; exit 1; }
-{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/code/active/myndaix-runtime/src\n"; cat "$g"; printf "echo PASSTHROUGH\n"; } > "$run"
+{ printf "#!/bin/bash\nexport PYTHONPATH=/Users/jefe/.myndaix/deploy/myndaix-runtime/src\n"; cat "$g"; printf "echo PASSTHROUGH\n"; } > "$run"
 MYNDAIX_HOME=$HOME/.myndaix bash "$run" kilabz'    # factory + clean main -> PASSTHROUGH
 ```
 
@@ -264,19 +270,21 @@ its drift like the others.
 migration `0015` applied, so the code it talks to must land FIRST:
 
 ```bash
-cd ~/code/active/myndaix-runtime && git switch main && git pull --ff-only \
-  && launchctl kickstart -k gui/$(id -u)/ai.myndaix.runtime \
-  && orchestrator/deploy-sync.sh --apply HEAD \
-  && bash orchestrator/phone/test.sh && bash orchestrator/phone/test.sh --sshd
+launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
+# wait until ~/.myndaix/state/RUNNING_SHA == the merge sha (Substrate deploy, step 2), then:
+D=~/.myndaix/deploy/myndaix-runtime
+"$D/orchestrator/deploy-sync.sh" --apply HEAD \
+  && bash "$D/orchestrator/phone/test.sh" && bash "$D/orchestrator/phone/test.sh" --sshd
 ```
 
 (`--apply HEAD`, not the default `origin/main`: apply re-fetches, and a remote that
-advanced between your pull and the apply would deploy a NEWER wrapper against the OLDER
+advanced after reconcile converged would deploy a NEWER wrapper against the OLDER
 running serve — the exact skew the marker rule forbids. HEAD pins wrapper-and-tree to
 one commit; deploy-sync warns loudly when the applied ref differs from HEAD.)
 
-1. pull + kickstart: serve auto-applies migrations (0015 `outbound.created_at`) and the tree's
-   `cli.py` now emits the `MXR_*` stderr markers the wrapper matches.
+1. reconcile converges: the deploy clone advances and serve restarts, auto-applying migrations
+   (0015 `outbound.created_at`); the clone's `cli.py` now emits the `MXR_*` stderr markers the
+   wrapper matches.
 2. `deploy-sync.sh --apply`: installs/heals all three guarded copies, including `mxr-phone`.
 3. both test legs ON the target box; `--sshd` asserts the real boundary (forced command, no
    pty, AcceptEnv carries nothing beyond Apple's stock `LANG LC_*`, env abuse inert).

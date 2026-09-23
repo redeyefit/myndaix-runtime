@@ -55,12 +55,7 @@ substrate_load_config() {
   MYNDAIX_DSN="$(cfg_get MYNDAIX_DSN)"
   OPERATOR_INBOX="$(cfg_get OPERATOR_INBOX)"
   POLL_INTERVAL_S="$(cfg_get POLL_INTERVAL_S)"
-  # DEV_TREE is OPTIONAL: an absent key emits "" (watch OFF). The threshold always resolves
-  # (config_parse default 5), so cfg_get never returns empty for it.
-  DEV_TREE="$(cfg_get DEV_TREE)"
-  DEV_TREE_DRIFT_THRESHOLD="$(cfg_get DEV_TREE_DRIFT_THRESHOLD)"
   export MYNDAIX_HOME MACHINE_ROLE DEPLOY_CLONE MYNDAIX_DSN OPERATOR_INBOX POLL_INTERVAL_S
-  export DEV_TREE DEV_TREE_DRIFT_THRESHOLD
 }
 
 # substrate_assert_deploy_clone — before ANY mutating op, prove we run from exactly the
