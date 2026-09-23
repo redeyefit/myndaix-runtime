@@ -374,6 +374,46 @@ async def test_fault_backoff_caps_and_never_overflows():
     assert WorkerPool._fault_backoff(0.02, 1) == 0.04
     assert WorkerPool._fault_backoff(0.02, 20) == FAULT_BACKOFF_CAP_S
     assert WorkerPool._fault_backoff(0.02, 10 ** 6) == FAULT_BACKOFF_CAP_S   # no OverflowError
+    # review 51857 P2: no streak = the configured cadence, even above the cap (a healthy 300s
+    # janitor must not be sped up to 30s), and a streak never retries FASTER than healthy
+    assert WorkerPool._fault_backoff(300.0, 0) == 300.0
+    assert WorkerPool._fault_backoff(300.0, 3) == 300.0
+    assert WorkerPool._fault_backoff(0.2, 0) == 0.2
+
+
+async def test_run_until_idle_waits_out_a_janitor_fault_streak():
+    """Review 51857 P1: while reclaim is failing, the janitor's backed-off retry can land after
+    quiet_s; an expired lease is invisible to _inflight and the queue count, so the idle check
+    must not declare "done" until the janitor recovers — and max_runtime_s still truncates if
+    reclaim never recovers."""
+    class Ledger:
+        def __init__(self, failures):
+            self.failures = failures
+            self.reclaims_ok = 0
+
+        async def lease_job(self, worker_id, caps):
+            return None
+
+        async def count_queued(self):
+            return 0
+
+        async def reclaim_expired(self):
+            if self.failures:
+                self.failures -= 1
+                raise OSError(49, "Can't assign requested address")
+            self.reclaims_ok += 1
+            return 0
+
+    led = Ledger(failures=2)                   # retries at ~0.4s then ~0.8s later: past quiet_s
+    pool = WorkerPool(led, size=1, janitor_interval_s=0.2)
+    await pool.run_until_idle(quiet_s=0.5, max_runtime_s=10.0)
+    assert led.reclaims_ok >= 1, "declared idle before the janitor's reclaim recovered"
+    assert not pool.truncated
+
+    stuck = Ledger(failures=10 ** 6)           # reclaim never recovers -> truncation, not a hang
+    pool = WorkerPool(stuck, size=1, janitor_interval_s=0.2)
+    await pool.run_until_idle(quiet_s=0.5, max_runtime_s=1.5)
+    assert pool.truncated and stuck.reclaims_ok == 0
 
 
 async def test_pause_wakes_on_stop():

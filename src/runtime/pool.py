@@ -72,6 +72,7 @@ class WorkerPool:
         self.worktrees_swept = 0                  # orphan worktrees GC'd by the janitor
         self.worker_faults = 0                    # caught worker errors (none fatal)
         self.truncated = False                    # set if run_until_idle hit the cap
+        self._janitor_faults = 0                  # janitor's current reclaim fault streak
         self.reconciled = 0                       # repo_concurrency rows the janitor healed
         self._stop = asyncio.Event()
         self._inflight = 0
@@ -90,8 +91,12 @@ class WorkerPool:
 
     @staticmethod
     def _fault_backoff(base_s: float, streak: int) -> float:
-        # exponent clamped: 2**huge * float raises OverflowError, and 2**30 already exceeds the cap
-        return min(base_s * (2 ** min(streak, 30)), FAULT_BACKOFF_CAP_S)
+        # No streak = the configured cadence, untouched (a janitor_interval_s above the cap must not
+        # be sped up when healthy). In a streak, never retry FASTER than the healthy cadence.
+        # Exponent clamped: 2**huge * float raises OverflowError, and 2**30 already exceeds the cap.
+        if streak <= 0:
+            return base_s
+        return max(base_s, min(base_s * (2 ** min(streak, 30)), FAULT_BACKOFF_CAP_S))
 
     async def _pause(self, delay_s: float) -> None:
         """Sleep that wakes early on stop(), so a capped backoff can't stall a graceful shutdown."""
@@ -162,13 +167,14 @@ class WorkerPool:
     async def _janitor(self) -> None:
         if not hasattr(self.ledger, "reclaim_expired"):
             return
-        faults = 0                                # consecutive reclaim_expired failures
+        self._janitor_faults = 0
         while not self._stop.is_set():
             try:
                 n = await self.ledger.reclaim_expired()
-                if faults:
-                    log.warning("pool janitor: reclaim recovered after %d failure(s)", faults)
-                    faults = 0
+                if self._janitor_faults:
+                    log.warning("pool janitor: reclaim recovered after %d failure(s)",
+                                self._janitor_faults)
+                    self._janitor_faults = 0
                 if n:
                     self.reclaimed += n
                     self._touch()              # reclaim requeued work; keep the pool alive
@@ -178,11 +184,12 @@ class WorkerPool:
                 # a transient ledger error must NOT permanently disable reclaim
                 # (that would silently revoke the crash-recovery guarantee) — it backs off
                 # instead (capped, lease-scale-safe: leases are minutes, the cap is 30s).
-                faults += 1
-                self._log_fault(faults, exc, "pool janitor: reclaim_expired failed; continuing")
+                self._janitor_faults += 1
+                self._log_fault(self._janitor_faults, exc,
+                                "pool janitor: reclaim_expired failed; continuing")
             await self._maybe_sweep_worktrees()
             await self._maybe_reconcile_cap()
-            await self._pause(self._fault_backoff(self.janitor_interval_s, faults))
+            await self._pause(self._fault_backoff(self.janitor_interval_s, self._janitor_faults))
 
     async def _maybe_sweep_worktrees(self) -> None:
         """Slow-cadence GC of hard-crash orphan worktrees (PR-1c) — runs at most every
@@ -270,7 +277,11 @@ class WorkerPool:
             while True:
                 await asyncio.sleep(min(quiet_s / 3, 0.1))
                 queued = await self._queued()
-                if (self._inflight == 0 and queued == 0
+                # Not idle while the janitor is in a reclaim fault streak: an expired lease is
+                # invisible to both _inflight and the queue count, and its backed-off retry can
+                # land after quiet_s — declaring "done" then would strand crash recovery.
+                # max_runtime_s stays the fallback (truncated=True) if reclaim never recovers.
+                if (self._inflight == 0 and queued == 0 and self._janitor_faults == 0
                         and (time.monotonic() - self._last) > quiet_s):
                     break
                 if (time.monotonic() - started) > max_runtime_s:
