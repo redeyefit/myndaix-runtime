@@ -22,7 +22,8 @@
 #   --preflight   ADVISORY (always exit 0): warn if deployed copies drift OR the repo working tree
 #                 HEAD != the stamped deploy sha (branch-float). Safe to call at pool start.
 #
-#   deploy-sync.sh <mode> [ref]      ref defaults to origin/main
+#   deploy-sync.sh --check|--preflight [ref]   ref defaults to origin/main (read-only)
+#   deploy-sync.sh --apply <ref>               ref REQUIRED — the mutating mode has no default
 #
 # House rules: bash-scripts.md — set -euo pipefail, PATH pin, atomic mv, quote all, no eval.
 set -euo pipefail
@@ -47,6 +48,11 @@ _LOCK=""                                              # script-scope so the EXIT
 
 log(){ printf '[%s] [deploy-sync] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die(){ log "ERROR: $*" >&2; exit 1; }
+# --apply (the ONE mutating mode) takes NO default ref: a missing ref must fail closed, never
+# silently deploy origin/main ungated. Testing $# is NOT enough — an UNQUOTED empty variable
+# (`--apply $S`, S="") is dropped by word-splitting, so the call arrives with $#==1, looking
+# exactly like "no ref given" (reviews 37732 #2, 97191). Read-only --check/--preflight keep the default.
+if [[ "$mode" == "--apply" && -z "${2:-}" ]]; then die "--apply requires an explicit, non-empty ref — origin/<branch>, HEAD, or a full sha"; fi
 # lock release as a FUNCTION (never interpolate a path into a trap string — a $()-bearing
 # DEPLOY_SYNC_DEST would inject live command substitution at trap-fire time; review r2 CRITICAL).
 _release_lock(){ [[ -n "${_LOCK:-}" ]] && rmdir "$_LOCK" 2>/dev/null; return 0; }
@@ -220,7 +226,7 @@ do_preflight(){
     [[ "$head_sha" == "$stamped" ]] || \
       log "PREFLIGHT WARN: working-tree HEAD ($head_sha) != stamped deploy sha ($stamped) — pool may run un-deployed code (branch-float)"
   else
-    log "PREFLIGHT WARN: no .deployed-sha stamp — run 'deploy-sync.sh --apply' to establish it"
+    log "PREFLIGHT WARN: no .deployed-sha stamp — run 'deploy-sync.sh --apply <ref>' to establish it"
   fi
   return 0
 }
