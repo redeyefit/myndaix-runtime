@@ -32,6 +32,11 @@ from runtime.workspace import WorkspaceManager
 
 log = logging.getLogger("runtime.pool")
 
+# Ceiling for the fault backoff below. Without a backoff, a ledger outage at the default
+# poll_s=0.02 made 8 workers log ~400 full tracebacks/s — 33 GB of the Mini's serve log
+# (2026-09-22). 30s bounds recovery latency once the ledger is back.
+FAULT_BACKOFF_CAP_S = 30.0
+
 
 class WorkerPool:
     def __init__(self, ledger, *, size: int = 4, poll_s: float = 0.02,
@@ -83,11 +88,41 @@ class WorkerPool:
             return await self.ledger.count_queued()
         return 0
 
+    @staticmethod
+    def _fault_backoff(base_s: float, streak: int) -> float:
+        # No streak = the configured cadence, untouched (a janitor_interval_s above the cap must not
+        # be sped up when healthy). In a streak, never retry FASTER than the healthy cadence.
+        # Exponent clamped: 2**huge * float raises OverflowError, and 2**30 already exceeds the cap.
+        if streak <= 0:
+            return base_s
+        return max(base_s, min(base_s * (2 ** min(streak, 30)), FAULT_BACKOFF_CAP_S))
+
+    async def _pause(self, delay_s: float) -> None:
+        """Sleep that wakes early on stop(), so a capped backoff can't stall a graceful shutdown."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=delay_s)
+        except asyncio.TimeoutError:
+            pass
+
+    @staticmethod
+    def _log_fault(streak: int, exc: BaseException, msg: str, *args) -> None:
+        # Full traceback on the FIRST fault of a streak only; repeats are one line, because the
+        # traceback is already in the log and repeating it per retry is what flooded the disk.
+        if streak == 1:
+            log.error(msg, *args, exc_info=exc)
+        else:
+            log.warning(msg + " (%d in a row; %s: %s)", *args, streak, type(exc).__name__, exc)
+
     async def _worker(self, worker_id: str) -> None:
+        lease_faults = 0                          # consecutive lease_job failures (ledger down)
         while not self._stop.is_set():
             attempt_id = None
             try:
                 attempt_id = await self.ledger.lease_job(worker_id, [])
+                if lease_faults:
+                    log.warning("pool worker %s: ledger lease recovered after %d failure(s)",
+                                worker_id, lease_faults)
+                    lease_faults = 0
                 if attempt_id is None:
                     await asyncio.sleep(self.poll_s)
                     continue
@@ -103,39 +138,57 @@ class WorkerPool:
                     self._touch()
             except asyncio.CancelledError:
                 raise  # shutdown cancellation - let the task end
-            except Exception:
+            except Exception as exc:
                 # a poison job (bad adapter, transient ledger error) must NEVER kill
                 # the worker. Fail the attempt TERMINAL so it isn't reclaimed forever,
                 # then carry on - one bad job can't decimate the fleet.
                 self.worker_faults += 1
+                if attempt_id is None:
+                    # The LEASE itself failed, so nothing was leased and there is no attempt
+                    # to fail: the ledger is down or unreachable. Back off and log one
+                    # traceback per streak. Poison jobs (attempt_id set) keep the full
+                    # traceback each time below — each is a distinct job worth a record.
+                    lease_faults += 1
+                    self._log_fault(lease_faults, exc,
+                                    "pool worker %s: lease failed; backing off", worker_id)
+                    await self._pause(self._fault_backoff(self.poll_s, lease_faults))
+                    continue
                 log.exception("pool worker %s: unexpected error; continuing", worker_id)
-                if attempt_id is not None:
-                    try:
-                        await self.ledger.fail_attempt(attempt_id, Result(
-                            status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
-                            text="worker caught an unexpected error"))
-                    except Exception:
-                        log.exception("pool worker %s: could not fail attempt %s",
-                                      worker_id, attempt_id)
+                try:
+                    await self.ledger.fail_attempt(attempt_id, Result(
+                        status=ResultStatus.ERROR, error_class=ErrorClass.TERMINAL,
+                        text="worker caught an unexpected error"))
+                except Exception:
+                    log.exception("pool worker %s: could not fail attempt %s",
+                                  worker_id, attempt_id)
                 await asyncio.sleep(self.poll_s)
 
     async def _janitor(self) -> None:
         if not hasattr(self.ledger, "reclaim_expired"):
             return
+        faults = 0                                # consecutive reclaim_expired failures
         while not self._stop.is_set():
             try:
                 n = await self.ledger.reclaim_expired()
+                if faults:
+                    log.warning("pool janitor: reclaim recovered after %d failure(s)", faults)
+                    faults = 0
                 if n:
                     self.reclaimed += n
                     self._touch()              # reclaim requeued work; keep the pool alive
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # a transient ledger error must NOT permanently disable reclaim
                 # (that would silently revoke the crash-recovery guarantee).
-                log.exception("pool janitor: reclaim_expired failed; continuing")
+                faults += 1
+                self._log_fault(faults, exc, "pool janitor: reclaim_expired failed; continuing")
             await self._maybe_sweep_worktrees()
             await self._maybe_reconcile_cap()
+            # Deliberately NO backoff here, unlike the worker: run_until_idle's guard only
+            # promises janitor_interval_s < quiet_s, so a backed-off retry could land after the
+            # idle exit and strand a crash-recovery reclaim (review 51857). One traceback per
+            # streak already cuts the janitor's outage log to one short line per interval.
             await asyncio.sleep(self.janitor_interval_s)
 
     async def _maybe_sweep_worktrees(self) -> None:
