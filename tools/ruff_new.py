@@ -182,7 +182,12 @@ def to_relative(findings: list[dict], root: Path) -> Counter[FindingKey]:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # __doc__ is str | None to the type checker (a module can lack one) — this one never does,
+    # but Pyright's report is real (reportOptionalMemberAccess), so fall back instead of
+    # asserting the impossible away.
+    doc_lines = (__doc__ or "").splitlines()
+    description = doc_lines[0] if doc_lines else "ruff finding-diff ratchet"
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("base_ref", help="git ref/commit to diff against (e.g. HEAD^1, origin/main)")
     parser.add_argument("--config", help="path to the ruff config (default: auto-detect pyproject.toml at repo root)")
     args = parser.parse_args(argv[1:])
