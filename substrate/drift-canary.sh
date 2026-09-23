@@ -170,11 +170,11 @@ else
 fi
 
 # ---- DEV-tree drift watch (INDEPENDENT streak+latch) --------------------------------------
-# The factory runs mxr / controller / orchestrator scripts from the DEV_TREE checkout (NOT the
-# pull-only deploy clone). A DEV_TREE off clean main / ahead of origin / long-dirty silently ships
-# WRONG code to the factory (root cause of the 09-14 six-day drift) and fail-OPENs the librarian
-# recall-gate that is pinned to a tree path. ALERT-ONLY: this NEVER touches the tree — the human
-# converges it. Own streak+latch (a standing DEV-tree latch must not mute config drift or the
+# The factory's orchestrator scripts (play-review.sh / play-fix.sh) are installed by `cp` from the
+# DEV_TREE checkout (DEPLOY.md) — mxr, controller and serve run the pull-only deploy clone. A
+# DEV_TREE off clean main / ahead of origin / long-dirty can ship WRONG code to the factory on the
+# next `cp` (the 09-14 six-day drift hit when mxr still ran from this tree). ALERT-ONLY: this NEVER
+# touches the tree — the human converges it. Own streak+latch (a standing DEV-tree latch must not mute config drift or the
 # liveness watch, and vice versa) + its OWN larger threshold (DEV_TREE_DRIFT_THRESHOLD): a brief
 # hand-edit gets live-dev grace; only PERSISTENT drift alerts. Gated on DEV_TREE being configured —
 # labs never set it (their working tree is dirty by design), and drift-canary is a factory-only tick
@@ -231,7 +231,7 @@ if [[ -n "${DEV_TREE:-}" ]]; then
   dt_reason="$(dev_tree_drift "$DEV_TREE")"
   if [[ -n "$dt_reason" ]]; then
     canary_emit "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "dev-tree-alert" "DEV-tree DRIFT" \
-      "drift-canary DEV-tree watch: $DEV_TREE $dt_reason. The factory runs mxr / controller / orchestrator scripts from this checkout — while it is off clean main the factory may ship WRONG code and the librarian recall-gate fail-OPENs. Converge it by hand: cd $DEV_TREE && git status; then restore a clean main at origin (git stash / commit+push, or git checkout main && git pull --ff-only). This alert is loud-only — nothing here mutates the tree." \
+      "drift-canary DEV-tree watch: $DEV_TREE $dt_reason. The factory's orchestrator scripts are cp-installed from this checkout — while it is off clean main the next deploy may ship WRONG code. Converge it by hand: cd $DEV_TREE && git status; then restore a clean main at origin (git stash / commit+push, or git checkout main && git pull --ff-only). This alert is loud-only — nothing here mutates the tree." \
       "${DEV_TREE_DRIFT_THRESHOLD:-5}"
   else
     # die, not WARN: a failing clear here leaves a stale latch that would mute this SAME tree's

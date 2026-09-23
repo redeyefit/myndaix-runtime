@@ -1,7 +1,7 @@
 ---
 name: atomic-stale-eviction
 description: Prefer kernel flock; mv-evict stale locks, never rm-recreate
-path_trigger: "tools/*.sh substrate/*.sh substrate/lab/*.sh orchestrator/*.sh orchestrator/phone/*.sh orchestrator/librarian/*.sh orchestrator/librarian/hooks/*.sh orchestrator/librarian/keepalive/*.sh"
+path_trigger: "tools/*.sh substrate/*.sh substrate/lab/*.sh orchestrator/*.sh orchestrator/phone/*.sh"
 ---
 
 Shell advisory locks come in three strengths — the phone surface walked all three in
