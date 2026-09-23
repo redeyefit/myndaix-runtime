@@ -7,7 +7,7 @@
 # this job's .out mtime is execution evidence for liveness-canary's freshness check.
 set -euo pipefail
 # EXECUTE-ONLY: this script owns its shell options (set -euo pipefail above, and a bare set +e /
-# set -e bracket around the DEV-tree subshell below). Sourcing it would clobber the caller's
+# set -e bracket around the reconcile --dry-run capture below). Sourcing it would clobber the caller's
 # options, so refuse (review 28330 P3 — the alternative, save-and-restore of prior errexit state,
 # buys nothing for a script that is only ever run by launchd and test.sh).
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then echo "drift-canary.sh must be executed, not sourced" >&2; return 1; fi
@@ -16,8 +16,16 @@ SUBSTRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SUBSTRATE_DIR/lib.sh"
 substrate_load_config
 
-# DRIFT_CANARY_STATE_DIR relocates ONLY this script's streak/latch/identity files — the ones the
-# SINGLE-INSTANCE INVARIANT below protects. DEPLOY.md step 3 points it at a private scratch dir
+# SINGLE-INSTANCE INVARIANT (all streak/latch read-modify-write in this script relies on it):
+# drift-canary runs ONLY as the launchd job ai.myndaix.drift-canary — launchd never overlaps
+# invocations of a label, so ticks are serialized. Do NOT run concurrent manual instances (a
+# manual run while the tick is live can race the cat→rm→mv sequences and the fixed .tmp names;
+# reviews 73734/23749/34704 flag these — wontfix BECAUSE of this invariant, matching canary_emit's
+# established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine,
+# and so is a manual run with DRIFT_CANARY_STATE_DIR set to a private dir (it then shares no
+# streak/latch file with the live tick — the DEPLOY.md step-3 verify run).
+# DRIFT_CANARY_STATE_DIR relocates ONLY this script's streak/latch files — the ones the
+# SINGLE-INSTANCE INVARIANT above protects. DEPLOY.md step 3 points it at a private scratch dir
 # so a foreground verify run can overlap a live launchd tick without racing its read-modify-write.
 # Reads of OTHER jobs' state (LIVENESS_OUT) deliberately stay on $MYNDAIX_HOME/state. launchd
 # never sets it. Absolute-only: a relative dir would silently land state under whatever cwd ran us.
@@ -26,9 +34,8 @@ substrate_load_config
 STATE_DIR="${DRIFT_CANARY_STATE_DIR-$MYNDAIX_HOME/state}"
 [[ "$STATE_DIR" == /* ]] || die "DRIFT_CANARY_STATE_DIR must be an absolute path (got: '$STATE_DIR')"
 mkdir -p "$STATE_DIR"
-# A private-state run delivers NO alerts: the inbox is live shared state too — a fresh streak meets
-# DEV_TREE_DRIFT_THRESHOLD=1 (valid config) on its first tick, and alert names are only
-# second-unique, so a same-second live alert would share the .tmp (review 68869 P2). Blanking
+# A private-state run delivers NO alerts: the inbox is live shared state too, and alert names are
+# only second-unique, so a same-second live alert would share the .tmp (review 68869 P2). Blanking
 # OPERATOR_INBOX routes canary_emit down its existing not-delivered path: logs the body, no latch.
 if [[ -n "${DRIFT_CANARY_STATE_DIR:-}" ]]; then OPERATOR_INBOX=""; fi
 STREAK_FILE="$STATE_DIR/drift-streak"
@@ -36,13 +43,12 @@ ALERTED_FILE="$STATE_DIR/drift-alerted"
 THRESHOLD=2   # consecutive drifting checks before alerting (~2 intervals)
 
 # canary_emit SFILE AFILE PREFIX LABEL BODY [THRESHOLD] — shared streak+latch+alert used by the
-# config-drift watch, the (independent) liveness-execution watch, and the DEV-tree drift watch.
+# config-drift watch and the (independent) liveness-execution watch.
 # Each passes its OWN streak+latch files so a standing latch on one NEVER suppresses the other: a
 # QUARANTINED hold keeps config drift latched for days, and the execution watcher dying under it
 # must STILL alert (deep-audit P2 — the mutual watch must not share fate with config drift). Bumps
 # the streak; at THRESHOLD drops ONE alert + latches on success (fail-closed writes,
-# latch-after-write). THRESHOLD defaults to the config-drift $THRESHOLD; the DEV-tree watch passes
-# its own (larger) value so brief hand-edits get live-dev grace before an alert.
+# latch-after-write). THRESHOLD defaults to the config-drift $THRESHOLD.
 canary_emit() {
   local sfile="$1" afile="$2" prefix="$3" label="$4" body="$5" threshold="${6:-$THRESHOLD}" streak alert
   streak="$(cat "$sfile" 2>/dev/null || echo 0)"
@@ -70,68 +76,6 @@ canary_emit() {
     # interval is noisy-but-recoverable; the next interval retries delivery, then latches on success.
     log "canary: OPERATOR_INBOX unavailable (${OPERATOR_INBOX:-<unset>}) — $label alert not delivered:"$'\n'"$body"
   fi
-}
-
-# dev_tree_drift DIR — echo a one-line human reason if the DEV tree is drifted (off main / ahead of
-# origin/main / dirty), or NOTHING if it is clean at origin/main. READ-ONLY: only git symbolic-ref /
-# rev-list / status, never a mutation, and NO explicit fetch here — the surrounding reconcile
-# --dry-run already refreshed the deploy clone's origin this run, and a second network fetch in a
-# DIFFERENT repo could hang the canary; "ahead" is judged against DEV_TREE's LAST-KNOWN origin/main
-# (a normal push updates that ref locally, so it is honest for the factory's own commits). Always
-# returns 0 (the caller drives the alert). ALWAYS runs in the caller's $(...) subshell, so the
-# GIT_* unset below is scoped and never leaks to the main canary.
-#   - Validity requires `git rev-parse --is-inside-work-tree` to print exactly `true`, NOT just
-#     exit 0 and NOT `[[ -d "$dir/.git" ]]`: a linked git WORKTREE stores .git as a FILE (the old
-#     dir-test falsely called it "missing"), while a BARE repo prints `false` with EXIT 0 (a bare
-#     dir would then swallow the later status error and read as clean — cross-family review R2
-#     regression). A missing / non-git / bare dir is itself a drift reason.
-#   - GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE unset so an inherited hook env can't redirect the probe
-#     to a DIFFERENT repo (cross-family review). status is --untracked-files=all (a config
-#     status.showUntrackedFiles=no would otherwise hide stray untracked runtime code) and
-#     --no-optional-locks (strict read-only; never take the index lock); a status ERROR (nonzero
-#     rc) is reported as drift, never silently read as clean (cross-family review #2).
-dev_tree_drift() {
-  local dir="$1" branch ahead behind st strc
-  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-  [[ "$(git -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]] \
-    || { printf 'is missing, bare, or not a git work tree (%s)' "$dir"; return 0; }
-  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached HEAD)')"
-  if [[ "$branch" != "main" ]]; then
-    printf 'is on %s, not main' "$branch"; return 0
-  fi
-  # rev-list FAILURE (origin/main ref missing) must read as DRIFT, never as "0 ahead = clean"
-  # (review R4 P2: `|| echo 0` swallowed an unverifiable state). Non-numeric output ⇒ drift reason.
-  ahead="$(git -C "$dir" rev-list --count origin/main..HEAD 2>/dev/null || true)"
-  if ! [[ "$ahead" =~ ^[0-9]+$ ]]; then
-    printf 'has no verifiable origin/main (rev-list failed — remote ref missing or repo corrupt)'; return 0
-  fi
-  if (( 10#$ahead > 0 )); then
-    printf 'is %s commit(s) ahead of origin/main (unpushed local commits)' "$ahead"; return 0
-  fi
-  # BEHIND origin/main is drift too: a clean checkout sitting on an OLDER commit of main (ahead=0)
-  # still ships STALE code — the "clean but never pulled" gap the ahead-only check missed (review
-  # 68864 P2: origin/main..HEAD counts only ahead, so a fetched-not-pulled tree read as clean).
-  # origin/main is already known-resolvable here (the ahead rev-list above would have failed and
-  # returned otherwise), so this only fails on real corruption; non-numeric output ⇒ drift reason.
-  behind="$(git -C "$dir" rev-list --count HEAD..origin/main 2>/dev/null || true)"
-  if ! [[ "$behind" =~ ^[0-9]+$ ]]; then
-    printf 'has no verifiable origin/main (rev-list failed — remote ref missing or repo corrupt)'; return 0
-  fi
-  if (( 10#$behind > 0 )); then
-    printf 'is %s commit(s) behind origin/main (stale — a clean tree that was never pulled)' "$behind"; return 0
-  fi
-  # `|| strc=$?` disarms this script's set -e AND records the real rc — a bare `; strc=$?` would
-  # never run: under set -e a failing substitution-assignment kills the $() subshell mid-function,
-  # aborting the whole canary tick instead of reporting drift (review R6, verified live-reachable).
-  strc=0
-  st="$(git -C "$dir" --no-optional-locks status --porcelain --untracked-files=all 2>/dev/null)" || strc=$?
-  if [[ "$strc" -ne 0 ]]; then
-    printf 'git status errored (rc=%s) — tree state unverifiable' "$strc"; return 0
-  fi
-  if [[ -n "$st" ]]; then
-    printf 'has uncommitted changes (dirty working tree)'; return 0
-  fi
-  return 0   # clean at origin/main — no reason emitted
 }
 
 # Test-only seam (mirrors liveness-canary's LCTL): drive rc without a heavy real reconcile run so
@@ -169,103 +113,7 @@ else
   rm -f "$LW_STREAK_FILE" "$LW_ALERTED_FILE" || log "canary: WARN could not clear liveness-watch streak/latch"
 fi
 
-# ---- DEV-tree drift watch (INDEPENDENT streak+latch) --------------------------------------
-# The factory's orchestrator scripts (play-review.sh / play-fix.sh) are installed by `cp` from the
-# DEV_TREE checkout (DEPLOY.md) — mxr, controller and serve run the pull-only deploy clone. A
-# DEV_TREE off clean main / ahead of origin / long-dirty can ship WRONG code to the factory on the
-# next `cp` (the 09-14 six-day drift hit when mxr still ran from this tree). ALERT-ONLY: this NEVER
-# touches the tree — the human converges it. Own streak+latch (a standing DEV-tree latch must not mute config drift or the
-# liveness watch, and vice versa) + its OWN larger threshold (DEV_TREE_DRIFT_THRESHOLD): a brief
-# hand-edit gets live-dev grace; only PERSISTENT drift alerts. Gated on DEV_TREE being configured —
-# labs never set it (their working tree is dirty by design), and drift-canary is a factory-only tick
-# anyway, so in practice this runs only on the Mini. Runs regardless of the config-drift outcome.
-# SINGLE-INSTANCE INVARIANT (all streak/latch/identity read-modify-write in this script relies on
-# it): drift-canary runs ONLY as the launchd job ai.myndaix.drift-canary — launchd never overlaps
-# invocations of a label, so ticks are serialized. Do NOT run concurrent manual instances (a
-# manual run while the tick is live can race the cat→rm→mv sequences and the fixed .tmp names;
-# reviews 73734/23749/34704 flag these — wontfix BECAUSE of this invariant, matching canary_emit's
-# established fixed-suffix pattern). A one-off manual run while the launchd job is unloaded is fine,
-# and so is a manual run with DRIFT_CANARY_STATE_DIR set to a private dir (it then shares no
-# streak/latch/identity file with the live tick — the DEPLOY.md step-3 verify run).
-DT_STREAK_FILE="$STATE_DIR/dev-tree-streak"
-DT_ALERTED_FILE="$STATE_DIR/dev-tree-alerted"
-DT_WATCHED_FILE="$STATE_DIR/dev-tree-watched"   # records WHICH tree the streak/latch belong to
-# The DEV-tree watch runs in a SUBSHELL so a die-LOUD failure fails THIS tick nonzero WITHOUT
-# skipping the INDEPENDENT config-drift watch below (review 36499 P2: any dev-tree die exited before
-# the config-drift block, so a stale config-drift latch never cleared on a subsequent clean tick —
-# the cross-watch independence the separate streak/latch files give for LATCHES must hold for
-# FAILURES too). dt_rc carries the failure out; die's `exit 1` exits only the subshell.
-# The capture is DECOUPLED from the subshell (set +e / bare subshell / dt_rc=$? / set -e) — a
-# subshell on the left of `||` (or any tested position) has errexit suppressed for its ENTIRE
-# body, inner `set -e` included, so the ()||dt_rc=$? form silently continued past unguarded
-# failures (review 98003 F1; also review 62436). The bare set -e restore is safe: the top-of-file
-# guard refuses sourcing, so this script owns its own options.
-dt_rc=0
-set +e
-(
-set -e
-# Test-only seam: an stderr marker then a BARE false. `die` exits explicitly and would pass the
-# abort test even with errexit dead — only an unguarded plain-command failure proves errexit is
-# live inside the subshell (review 98003 F1).
-if [[ -n "${DRIFT_CANARY_TEST_DT_ABORT:-}" ]]; then
-  echo "DT_ABORT seam: injecting unguarded failure (errexit must abort the tick)" >&2
-  false
-fi
-if [[ -n "${DEV_TREE:-}" ]]; then
-  # Bind the streak/latch to the watched checkout's identity: if DEV_TREE was RETARGETED (or the
-  # watch was just re-enabled), a stale latch from the PREVIOUS tree must not suppress the new
-  # tree's first alert (cross-family review). Reset state whenever the recorded path differs.
-  # ORDER + die are load-bearing: CLEAR FIRST, COMMIT IDENTITY LAST — the identity file is the
-  # "reset complete" marker, so ANY interruption (kill, failed write) leaves it mismatched and the
-  # next run retries the whole reset (rm -f is idempotent). Both steps die LOUD on failure (like
-  # canary_emit's streak write): warn-and-continue silently suppressed alerts while ticking exit-0
-  # (review 2164 #3), and the write-identity-FIRST variant tore the other way — identity committed
-  # + old latch left behind = the new tree's alerts suppressed under a matching identity (review
-  # 23749: never commit the marker before the state it vouches for is actually clean).
-  if [[ "$(cat "$DT_WATCHED_FILE" 2>/dev/null || true)" != "$DEV_TREE" ]]; then
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" \
-      || die "could not clear dev-tree streak/latch for retarget"
-    { printf '%s\n' "$DEV_TREE" > "$DT_WATCHED_FILE.tmp" && mv -f "$DT_WATCHED_FILE.tmp" "$DT_WATCHED_FILE"; } \
-      || die "could not record dev-tree identity ($DT_WATCHED_FILE)"
-  fi
-  dt_reason="$(dev_tree_drift "$DEV_TREE")"
-  if [[ -n "$dt_reason" ]]; then
-    canary_emit "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "dev-tree-alert" "DEV-tree DRIFT" \
-      "drift-canary DEV-tree watch: $DEV_TREE $dt_reason. The factory's orchestrator scripts are cp-installed from this checkout — while it is off clean main the next deploy may ship WRONG code. Converge it by hand: cd $DEV_TREE && git status; then restore a clean main at origin (git stash / commit+push, or git checkout main && git pull --ff-only). This alert is loud-only — nothing here mutates the tree." \
-      "${DEV_TREE_DRIFT_THRESHOLD:-5}"
-  else
-    # die, not WARN: a failing clear here leaves a stale latch that would mute this SAME tree's
-    # next drift, and the identity matches so nothing ever retries it — same silent-suppression
-    # class as the retarget path (review 23749 series). Before dying, POISON the identity file
-    # (best-effort rm): a matching identity is what would skip recovery, so breaking it forces the
-    # next tick through the retarget reset, which retries the clear with its own die-loud path
-    # (review 34704 P1: die alone left latch+identity intact across a transient failure — perms
-    # recover, same tree re-drifts, alert muted while ticks exit 0). ACCEPTED RESIDUAL / WONTFIX
-    # (reviews 68864/13355/36499/62436): if the WHOLE state/ dir loses write perm the poison rm ALSO
-    # fails, so a matching identity + stale latch can mute the SAME tree's next episode AFTER perms
-    # recover. But every tick DIES LOUD the entire time state/ is unwritable (liveness-canary sees the
-    # sick tick), so the operator is alerted then; only a post-recovery re-drift before a clean tick
-    # is the gap. A RESET_REQUIRED-sentinel fix was built and deliberately REVERTED: it requires a
-    # chmod of the factory's state dir (never observed on a single-operator box) and each hardening
-    # layer spawned a narrower edge case — an infinite fold on a never-fired path, not worth the
-    # recovery-code complexity. Do NOT re-raise without a real-world trigger.
-    rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" || {
-      rm -f "$DT_WATCHED_FILE" 2>/dev/null || true
-      die "could not clear dev-tree streak/latch (identity poisoned for retarget-reset recovery)"
-    }
-  fi
-else
-  # Watch DISABLED (DEV_TREE unset): clear any stale streak/latch/identity so a LATER re-enable
-  # starts fresh — a standing latch from a prior watched tree would otherwise suppress the
-  # re-enabled watch's first alert (cross-family review: the disable path must not preserve state).
-  rm -f "$DT_STREAK_FILE" "$DT_ALERTED_FILE" "$DT_WATCHED_FILE" \
-    || die "could not clear disabled dev-tree state (stale latch/streak left intact — re-enable may be suppressed)"
-fi
-)
-dt_rc=$?
-set -e
-
-# ---- config-drift watch (runs regardless of DEV-tree outcome) ----------------------------
+# ---- config-drift watch ------------------------------------------------------------------
 if [[ "$rc" -eq 0 ]]; then
   rm -f "$STREAK_FILE" "$ALERTED_FILE"
   log "canary: no drift"
@@ -275,7 +123,4 @@ else
 
 $report"
 fi
-# Surface a DEV-tree watch failure LOUD now that config-drift has been processed (review 36499 P2:
-# the dev-tree die must fail the tick without having skipped the config-drift latch handling above).
-[[ "$dt_rc" -eq 0 ]] || { log "canary: dev-tree watch failed (rc=$dt_rc) — see ALARM above"; exit "$dt_rc"; }
 exit 0
