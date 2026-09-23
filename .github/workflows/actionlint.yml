@@ -6,7 +6,16 @@ on:
   pull_request:
 
 jobs:
-  lint:
+  # Named "actionlint" (not the generic "lint") so its check-run context is unambiguous: a
+  # required-status-check named "lint" could be satisfied by any future job that happens to
+  # share that id (review finding, myndaix-runtime#ci/actionlint). Renaming here is the part
+  # of the fix that lives in this file; wiring it into branch protection and into
+  # src/runtime/automerge.py's _ci_green (today it only polls the "test" check) are deliberate
+  # follow-ups, not done in this PR: branch protection is a GitHub admin setting (Jefe's call,
+  # and adding it before this workflow has reported once would strand open PRs on "Expected —
+  # waiting for status"); automerge.py is a different file, out of this PR's scope. Until both
+  # land, a red "actionlint" run is a strong signal, not a merge-blocker — check it manually.
+  actionlint:
     # SELF-HOSTED (mirrors ci.yml): Actions minutes on self-hosted runners are unmetered, and this
     # is a static lint over YAML + embedded shell — no external services needed.
     runs-on: [self-hosted, mini]
@@ -15,12 +24,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Guardrails (config can't silently weaken this gate)
+        # Two ways this gate can go quietly blind without ever turning red, both found by
+        # review and reproduced locally (myndaix-runtime#ci/actionlint):
+        #
+        # 1) actionlint only shellchecks a `run:` step whose shell is bare `bash` or `sh`
+        #    (the default, or an explicit `shell: bash`/`shell: sh`). `shell: /bin/bash -e {0}`
+        #    (an absolute path) or `shell: zsh {0}` are silently NOT shellchecked — exit 0,
+        #    no signal — confirmed with `actionlint -debug` showing no "Run shellcheck" line.
+        #    No workflow uses a `shell:` override today, so this is latent, not active; this
+        #    guard keeps it that way by failing loudly the day one is added instead of letting
+        #    a step's shellcheck coverage evaporate unnoticed. Covers `defaults.run.shell` too.
+        # 2) `.github/actionlint.yaml`'s `paths:` key can `ignore:` findings by regex, and a
+        #    self-hosted-runner label of `"*"` matches everything — either one makes actionlint
+        #    exit 0 with a real bug still present (reproduced: an SC2086 script + either change
+        #    -> exit 0, nothing printed). That config file lives in THIS PR's scope, so a future
+        #    "fix" that quietly adds either one to make a red run green must fail loudly instead.
+        run: |
+          set -euo pipefail
+          if grep -nE '^[[:space:]]*(-[[:space:]]*)?shell:' .github/workflows/*.y*ml 2>/dev/null \
+              | grep -vE 'shell:[[:space:]]*(bash|sh)([[:space:]]|$)'; then
+            echo "unsupported shell: value escapes actionlint's shellcheck pass (only bare bash/sh are covered)" >&2
+            exit 1
+          fi
+          cfg=".github/actionlint.yaml"
+          if [ -f "$cfg" ]; then
+            if grep -qE '^[[:space:]]*paths[[:space:]]*:' "$cfg"; then
+              echo "$cfg: a top-level 'paths' key can silently suppress real findings — not allowed" >&2
+              exit 1
+            fi
+            bad_labels="$(grep -E '^[[:space:]]*-[[:space:]]*[^[:space:]]' "$cfg" \
+              | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]*#.*$//' \
+              | grep -vE '^[A-Za-z0-9_-]+$' || true)"
+            if [ -n "$bad_labels" ]; then
+              echo "$cfg: self-hosted-runner label(s) must be literal (letters/digits/-/_ only); found: $bad_labels" >&2
+              exit 1
+            fi
+          fi
+
       - name: actionlint (workflow lint + embedded shellcheck)
-        # BLOCKING, not report-only: baseline measured clean on this tree both WITH and WITHOUT
-        # actionlint's embedded shellcheck pass over run: blocks (checked locally against HEAD
-        # before adding this gate), so this runs the FULL check — shellcheck integration is
-        # actionlint's default, left enabled, no -shellcheck= disable flag — not a weakened
-        # version just to keep it green.
+        # BLOCKING in the sense that a failure exits nonzero and turns this check red — no
+        # continue-on-error, no `|| true` (contrast the squawk step in the FieldVision repo's
+        # equivalent gate, which is deliberately report-only). Whether a red run actually stops
+        # a merge is a separate question — see the job-naming comment above.
+        #
+        # baseline measured clean on this tree both WITH and WITHOUT actionlint's embedded
+        # shellcheck pass over run: blocks (checked locally against HEAD before adding this
+        # gate), so this runs the FULL check — shellcheck integration is actionlint's default,
+        # left enabled, no -shellcheck= disable flag — not a weakened version just to keep it
+        # green.
         #
         # actionlint silently DISABLES its shellcheck pass (still exits 0) if the shellcheck
         # binary isn't found at the configured path — verified locally with a bogus
@@ -32,10 +84,27 @@ jobs:
         # runs-on: [self-hosted, mini] isn't flagged as an unknown GitHub-hosted label.
         run: |
           set -euo pipefail
+          # A SHELLCHECK_OPTS inherited from the runner's environment (or a future launchd/.env
+          # change) can silently narrow or downgrade every finding shellcheck reports — e.g.
+          # `-e SC2086` or `--severity=warning` turns a real bug into exit 0 with no output
+          # (reproduced locally). actionlint itself runs with --norc so .shellcheckrc can't do
+          # this, but shellcheck still honors SHELLCHECK_OPTS from the environment, so clear it
+          # here rather than trust the runner never sets it.
+          unset SHELLCHECK_OPTS
           command -v actionlint >/dev/null 2>&1 || brew install -q actionlint
           command -v shellcheck >/dev/null 2>&1 || brew install -q shellcheck
           command -v actionlint >/dev/null 2>&1 || { echo "actionlint missing after install attempt" >&2; exit 1; }
           command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck missing after install attempt" >&2; exit 1; }
           actionlint -version
           shellcheck --version
+          # Functional canary: prove the shellcheck pass is actually live (not silently
+          # disabled by a stub binary, a bad -shellcheck= path, or SHELLCHECK_OPTS) by feeding
+          # actionlint a known-bad inline script and requiring it to come back flagged. A
+          # canary that itself reports clean means the checker isn't real; fail closed.
+          # shellcheck disable=SC2016  # deliberately single-quoted: $CANARY must reach actionlint literal, unexpanded
+          canary_out="$(printf 'on: push\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $CANARY\n' | actionlint -stdin-filename canary.yml - 2>&1 || true)"
+          if ! grep -q 'SC2086' <<<"$canary_out"; then
+            echo "actionlint shellcheck pass not live (canary SC2086 not detected)" >&2
+            exit 1
+          fi
           actionlint
