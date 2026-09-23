@@ -965,13 +965,10 @@ touch "$LVH/orchestrator/controller.out"                          # fresh exit 0
 lv7c="$(LV_MODE=clean lvrun)"
 ok '! printf "%s" "$lv7c" | grep -q "controller: exited nonzero" && [[ ! -e "$LVH/state/liveness-ec-ai.myndaix.controller" ]]' "#3: a fresh exit 0 clears the consecutive-fail memory (recovered)"
 ok 'printf "%s" "$lv7c" | grep -q "all declared jobs alive"' "past grace + fresh evidence -> the strong all-alive line still fires (no grace-skips)"
-# run 8 — rogue sweep: an undeclared loaded ai.myndaix.* label flags; declared + known-handmanaged don't.
-# ai.myndaix.librarian-rc = the librarian keepalive (hand-managed outside substrate) — the LIVE deploy
-# caught the canary flagging it rogue; it must be excluded (allowlist), never a bootout remedy.
-lv8="$(LV_MODE=clean LV_LIST="ai.myndaix.rogue ai.myndaix.controller ai.myndaix.librarian-rc" lvrun)"
+# run 8 — rogue sweep: an undeclared loaded ai.myndaix.* label flags; a declared one doesn't.
+lv8="$(LV_MODE=clean LV_LIST="ai.myndaix.rogue ai.myndaix.controller" lvrun)"
 ok 'printf "%s" "$lv8" | grep -q "ai.myndaix.rogue: ROGUE"' "reverse sweep: undeclared loaded label -> rogue divergence"
 ok '! printf "%s" "$lv8" | grep -q "ai.myndaix.controller: ROGUE"' "reverse sweep: declared label never flagged rogue"
-ok '! printf "%s" "$lv8" | grep -q "ai.myndaix.librarian-rc"' "reverse sweep: the librarian keepalive (known hand-managed) is EXCLUDED, not flagged rogue (live-deploy fold)"
 # run 9 — ARMED sentinel-gated job IS watched (missing evidence -> divergence)
 touch "$LVH/RECONCILE_ARMED"
 rm -f "$LVH/state/reconcile.out"   # run 6 pre-touched it (targets ignore arming; bash gates it)

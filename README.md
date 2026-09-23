@@ -234,9 +234,9 @@ the ledger core:
   ([outcomes](docs/outcomes-ledger-design.md), [dial](docs/shadow-dial-design.md),
   [skills](docs/learning-rung-design.md)).
 - **A second brain.** A tsvector-indexed knowledge corpus over real folders (`curate`, `mxr ask`) with
-  cited answers from the zero-tool `librarian` — phone-reachable through a Remote-Control session whose
-  PreToolUse hook allows exactly one command shape, so a poisoned document can at worst produce a wrong
-  answer, never a file read or a dispatch ([curator](docs/curator-design.md),
+  cited answers from the zero-tool `librarian` responder, so a poisoned document can at worst produce a
+  wrong answer, never a file read or a dispatch — phone-reachable through an SSH forced-command wrapper
+  exposing four fixed verbs ([phone](docs/phone-tailnet-surface-design.md), [curator](docs/curator-design.md),
   [ask](docs/mx-ask-librarian-design.md)).
 - **Substrate: GitOps for two machines** — the laptop (the lab) and an always-on Mac Mini (the
   factory). The factory converges on `origin/main` via a 15-minute reconcile — config parsed, never
@@ -281,7 +281,7 @@ live-verified end to end against the real API):**
 **Not built, or built but deliberately not armed (named on purpose):**
 
 - A redelivering chat transport — Telegram is [designed](docs/telegram-transport-design.md), not built;
-  the phone surface shipped via the librarian's Remote-Control front door instead.
+  the phone surface shipped as the tailnet SSH wrapper (`orchestrator/phone/`) instead.
 - The C4 admission budgets (cost/chain-TTL) and capability-gated routing — specified in `DESIGN.md`,
   not yet exercised in code. Composite authority ships as a value (`recon` is composite, treated
   fail-closed for retries), but the multi-call net-authority semantics are not built.
@@ -365,7 +365,7 @@ src/runtime/
   transport/
     terminal.py              C3 terminal transport (dumb pipe over the ledger)
 orchestrator/                the autonomous review loop (play-review.sh, play-fix.sh,
-                             controller-tick.sh) + the librarian confinement kit
+                             controller-tick.sh) + the phone SSH wrapper
 substrate/                   two-machine GitOps: reconcile, drift + liveness canaries,
                              nightly ledger backup, the lab's tailnet-watch
 tests/                       32 suites / 592 test functions (wired into CI)
