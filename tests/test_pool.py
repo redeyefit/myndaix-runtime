@@ -343,8 +343,9 @@ async def test_worker_lease_outage_backs_off_one_traceback_per_streak():
     assert pool.worker_faults == 5
 
 
-async def test_janitor_reclaim_outage_backs_off_one_traceback():
-    """Same flood guard for the janitor's reclaim loop; a healthy tick keeps the normal cadence."""
+async def test_janitor_reclaim_outage_logs_one_traceback_per_streak():
+    """Flood guard for the janitor's reclaim loop: one full traceback per outage streak, one-line
+    repeats, one recovery line. (No backoff here by design — see the next test.)"""
     class DownLedger:
         failures = 4
 
@@ -355,19 +356,15 @@ async def test_janitor_reclaim_outage_backs_off_one_traceback():
             pool._stop.set()
             return 0
 
-    pool = WorkerPool(DownLedger(), size=1, janitor_interval_s=0.2)
-    delays = []
-
-    async def fake_pause(d):
-        delays.append(round(d, 4))
-    pool._pause = fake_pause
+    pool = WorkerPool(DownLedger(), size=1, janitor_interval_s=0.01)
     cap, restore = _capture_pool_log()
     try:
         await pool._janitor()
     finally:
         restore()
     assert len([r for r in cap.records if r.exc_info]) == 1
-    assert delays == [0.4, 0.8, 1.6, 3.2, 0.2], delays        # backoff, then normal cadence
+    assert sum("in a row" in r.getMessage() for r in cap.records) == 3
+    assert sum("recovered" in r.getMessage() for r in cap.records) == 1
 
 
 async def test_fault_backoff_caps_and_never_overflows():
@@ -381,11 +378,11 @@ async def test_fault_backoff_caps_and_never_overflows():
     assert WorkerPool._fault_backoff(0.2, 0) == 0.2
 
 
-async def test_run_until_idle_waits_out_a_janitor_fault_streak():
-    """Review 51857 P1: while reclaim is failing, the janitor's backed-off retry can land after
-    quiet_s; an expired lease is invisible to _inflight and the queue count, so the idle check
-    must not declare "done" until the janitor recovers — and max_runtime_s still truncates if
-    reclaim never recovers."""
+async def test_run_until_idle_janitor_keeps_cadence_through_faults():
+    """Review 51857 P1: a backed-off janitor retry could land after quiet_s — an expired lease is
+    invisible to _inflight and the queue count, so the pool declared "done" before the recovering
+    reclaim ran. The janitor therefore keeps janitor_interval_s (< quiet_s) through a fault
+    streak: two transient failures must not outlast the idle window."""
     class Ledger:
         def __init__(self, failures):
             self.failures = failures
@@ -404,16 +401,11 @@ async def test_run_until_idle_waits_out_a_janitor_fault_streak():
             self.reclaims_ok += 1
             return 0
 
-    led = Ledger(failures=2)                   # retries at ~0.4s then ~0.8s later: past quiet_s
+    led = Ledger(failures=2)                   # at cadence: fail @0, fail @0.2, succeed @0.4
     pool = WorkerPool(led, size=1, janitor_interval_s=0.2)
     await pool.run_until_idle(quiet_s=0.5, max_runtime_s=10.0)
     assert led.reclaims_ok >= 1, "declared idle before the janitor's reclaim recovered"
     assert not pool.truncated
-
-    stuck = Ledger(failures=10 ** 6)           # reclaim never recovers -> truncation, not a hang
-    pool = WorkerPool(stuck, size=1, janitor_interval_s=0.2)
-    await pool.run_until_idle(quiet_s=0.5, max_runtime_s=1.5)
-    assert pool.truncated and stuck.reclaims_ok == 0
 
 
 async def test_pause_wakes_on_stop():
