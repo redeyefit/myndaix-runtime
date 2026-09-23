@@ -75,6 +75,7 @@ class WorkerPool:
         self.reconciled = 0                       # repo_concurrency rows the janitor healed
         self._stop = asyncio.Event()
         self._inflight = 0
+        self._janitor_faults = 0
         self._last = 0.0
         self._last_sweep = 0.0
         self._last_reconcile = 0.0
@@ -90,6 +91,8 @@ class WorkerPool:
 
     @staticmethod
     def _fault_backoff(base_s: float, streak: int) -> float:
+        if not streak:
+            return base_s
         # exponent clamped: 2**huge * float raises OverflowError, and 2**30 already exceeds the cap
         return min(base_s * (2 ** min(streak, 30)), FAULT_BACKOFF_CAP_S)
 
@@ -120,7 +123,7 @@ class WorkerPool:
                                 worker_id, lease_faults)
                     lease_faults = 0
                 if attempt_id is None:
-                    await asyncio.sleep(self.poll_s)
+                    await self._pause(self.poll_s)
                     continue
                 self._inflight += 1
                 self._touch()
@@ -157,18 +160,19 @@ class WorkerPool:
                 except Exception:
                     log.exception("pool worker %s: could not fail attempt %s",
                                   worker_id, attempt_id)
-                await asyncio.sleep(self.poll_s)
+                await self._pause(self.poll_s)
 
     async def _janitor(self) -> None:
         if not hasattr(self.ledger, "reclaim_expired"):
             return
-        faults = 0                                # consecutive reclaim_expired failures
+        self._janitor_faults = 0                  # consecutive reclaim_expired failures
         while not self._stop.is_set():
             try:
                 n = await self.ledger.reclaim_expired()
-                if faults:
-                    log.warning("pool janitor: reclaim recovered after %d failure(s)", faults)
-                    faults = 0
+                if self._janitor_faults:
+                    log.warning("pool janitor: reclaim recovered after %d failure(s)",
+                                self._janitor_faults)
+                    self._janitor_faults = 0
                 if n:
                     self.reclaimed += n
                     self._touch()              # reclaim requeued work; keep the pool alive
@@ -178,11 +182,12 @@ class WorkerPool:
                 # a transient ledger error must NOT permanently disable reclaim
                 # (that would silently revoke the crash-recovery guarantee) — it backs off
                 # instead (capped, lease-scale-safe: leases are minutes, the cap is 30s).
-                faults += 1
-                self._log_fault(faults, exc, "pool janitor: reclaim_expired failed; continuing")
+                self._janitor_faults += 1
+                self._log_fault(self._janitor_faults, exc,
+                                "pool janitor: reclaim_expired failed; continuing")
             await self._maybe_sweep_worktrees()
             await self._maybe_reconcile_cap()
-            await self._pause(self._fault_backoff(self.janitor_interval_s, faults))
+            await self._pause(self._fault_backoff(self.janitor_interval_s, self._janitor_faults))
 
     async def _maybe_sweep_worktrees(self) -> None:
         """Slow-cadence GC of hard-crash orphan worktrees (PR-1c) — runs at most every
@@ -270,7 +275,7 @@ class WorkerPool:
             while True:
                 await asyncio.sleep(min(quiet_s / 3, 0.1))
                 queued = await self._queued()
-                if (self._inflight == 0 and queued == 0
+                if (self._inflight == 0 and queued == 0 and not self._janitor_faults
                         and (time.monotonic() - self._last) > quiet_s):
                     break
                 if (time.monotonic() - started) > max_runtime_s:
