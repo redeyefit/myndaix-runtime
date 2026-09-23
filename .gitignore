@@ -14,3 +14,4 @@ build/
 .runtime.log
 .playwright-mcp/
 docs/diagrams/
+.ci-venv/
