@@ -305,16 +305,23 @@ async def test_transient_streak_alerts_once_and_delivery_resets(led: PostgresLed
     await _truncate(led)
     fresh_seam("streak"); repo = make_repo("streak")
     alerts: list = []
+    bodies: list = []
     saved = C._alert_jefe
-    C._alert_jefe = lambda subject, body: alerts.append(subject)
+    C._alert_jefe = lambda subject, body: (alerts.append(subject), bodies.append(body))
     try:
         await C.process_repo(led, repo, [0])             # baseline
         head2 = advance(repo, "c1")
         await C.process_repo(led, repo, [0])             # dispatch #1
         for _ in range(4):                               # 4 transient cycles: streak 1..4
-            C._transient_marker(repo, repo.watch_ref, head2).write_text("")
+            # the worker writes its cause label into the marker; hostile bytes must not survive
+            C._transient_marker(repo, repo.watch_ref, head2).write_text(
+                "kilabz OUT OF CREDITS\x1b[31m;$(rm -rf x)`|<b>\n")
             await C.process_repo(led, repo, [0])         # forgive + re-dispatch each tick
         assert len(alerts) == 1, f"alert fires ONLY at streak=={C.TRANSIENT_ALERT_STREAK}, got {len(alerts)}"
+        assert "kilabz OUT OF CREDITS" in alerts[0], f"alert subject must name the cause: {alerts[0]!r}"
+        assert "OUT OF CREDITS = add credits" in bodies[0], "alert body must map the cause to its action"
+        for bad in ("\x1b", ";", "$", "`", "|", "<", "[", "\n"):
+            assert bad not in alerts[0], f"{bad!r} survived the cause sanitizer: {alerts[0]!r}"
         assert C._transient_streak_file(repo.repo_id).exists(), "streak persists while the outage lasts"
         C._done_marker(repo, repo.watch_ref, head2).write_text("")       # the review finally delivers
         await C.process_repo(led, repo, [0])             # advance pass consumes the marker

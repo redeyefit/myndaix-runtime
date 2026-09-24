@@ -84,6 +84,10 @@ MAX_DISPATCH_PER_TICK = _int_env("MYNDAIX_CONTROLLER_MAX_DISPATCH", 3)
 MAX_DISPATCH_PER_DAY = _int_env("MYNDAIX_CONTROLLER_MAX_DAY", 20)
 MAX_ATTEMPTS = _int_env("MYNDAIX_CONTROLLER_MAX_ATTEMPTS", 3)
 TRANSIENT_ALERT_STREAK = _int_env("MYNDAIX_CONTROLLER_TRANSIENT_STREAK", 3)
+# The transient marker's content is play-review's cause label ("kilabz OUT OF CREDITS", "USAGE
+# LIMIT (Sep 24th, 2026 3:00 PM)"). It is a file in the shared state dir, so only the label's
+# own alphabet reaches the alert.
+_TRANSIENT_CAUSE_STRIP = re.compile(r"[^A-Za-z0-9 ():,.?-]")
 # PENDING_STALE must exceed BOTH the play-review worst-case worker runtime AND the tick interval
 # (3600s): the worker OUTLIVES the dispatching tick (nohup-detached + AbandonProcessGroup, so
 # launchd no longer reaps it on tick exit), and a stale row reclaimed while its worker is still
@@ -674,8 +678,15 @@ async def _try_forgive_transient(led: PostgresLedger, repo: Repo, rid: str, ref:
     re-check so the consume/forgive/streak logic cannot drift between the two sites. Returns
     True iff an attempt was forgiven (callers log their own site-specific line)."""
     tm = _transient_marker(repo, ref, sha)
-    if not tm.exists():
+    try:                                                 # EAFP: absent = nothing to forgive; the
+        raw = tm.read_text(errors="replace")             # worker writes its cause label here
+    except FileNotFoundError:
         return False
+    except OSError as e:                                 # present but unreadable: still consume +
+        log(f"{rid}: transient marker for {sha[:8]} unreadable ({type(e).__name__}) — "
+            f"alerting without a cause label")           # forgive; only the label is lost
+        raw = ""
+    cause = _TRANSIENT_CAUSE_STRIP.sub("", raw)[:80].strip()
     try:
         tm.unlink()                                      # consume: a stale marker must not
     except OSError:                                      # forgive a FUTURE dispatch of this sha
@@ -684,11 +695,15 @@ async def _try_forgive_transient(led: PostgresLedger, repo: Repo, rid: str, ref:
     if not await led.forgive_transient(rid, ref, sha):
         return False
     if _bump_transient_streak(rid) == TRANSIENT_ALERT_STREAK:
-        _alert_jefe(f"review backstop: transient canary failures on {rid}",
+        _alert_jefe(f"review backstop: transient canary failures on {rid}"
+                    + (f" — {cause}" if cause else ""),
                     f"{TRANSIENT_ALERT_STREAK} consecutive review dispatches for {rid} "
-                    f"aborted at the canary stage (agent/pool unreachable). The controller "
-                    f"is refunding attempts and retrying each tick — nothing is blocked — "
-                    f"but the pool or an agent (kilabz/oracle auth, serve) likely needs a look.")
+                    f"aborted at the canary stage (latest cause: {cause or 'not recorded'}). "
+                    f"OUT OF CREDITS = add credits (the login is fine); USAGE LIMIT = resets on "
+                    f"its own; AUTH 401 = re-login that CLI on this machine; POOL = check serve; "
+                    f"LOCK CONTENTION = a review lock is held (it stale-reaps on its own). "
+                    f"The controller refunds attempts and retries each tick, so nothing is "
+                    f"blocked, but merged code stays unreviewed until the cause is fixed.")
     return True
 
 
