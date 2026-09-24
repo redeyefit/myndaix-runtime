@@ -145,6 +145,8 @@ cktitle(){ # cktitle <label> <exact-title-substring> — asserts on the delivery
   reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='ERROR: Your workspace is out of credits. Add credits to continue.' run
   cktitle "credits" "review ABORTED — canary: kilabz OUT OF CREDITS"
   if [[ "$(cat "$TMARKER" 2>/dev/null)" == "kilabz OUT OF CREDITS" ]]; then echo "  ok: marker carries the cause"; PASS=$((PASS+1)); else echo "  FAIL: marker content '$(cat "$TMARKER" 2>/dev/null)'"; FAIL=$((FAIL+1)); fi
+  # atomic tmp+mv write: no temp file may be left behind next to the marker
+  if ls "$STATE"/transient-*.tmp.* >/dev/null 2>&1; then echo "  FAIL: marker temp file left behind"; FAIL=$((FAIL+1)); else echo "  ok: marker written atomically (no temp left)"; PASS=$((PASS+1)); fi
   ck "body says the login is fine" "login is fine"
   reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR="ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 24th, 2026 3:00 PM." run
   cktitle "usage limit + reset time" "canary: kilabz USAGE LIMIT (Sep 24th, 2026 3:00 PM)"

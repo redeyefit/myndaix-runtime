@@ -678,12 +678,15 @@ async def _try_forgive_transient(led: PostgresLedger, repo: Repo, rid: str, ref:
     re-check so the consume/forgive/streak logic cannot drift between the two sites. Returns
     True iff an attempt was forgiven (callers log their own site-specific line)."""
     tm = _transient_marker(repo, ref, sha)
-    if not tm.exists():
+    try:                                                 # EAFP: absent = nothing to forgive; the
+        raw = tm.read_text(errors="replace")             # worker writes its cause label here
+    except FileNotFoundError:
         return False
-    try:                                                 # the worker writes its cause label here
-        cause = _TRANSIENT_CAUSE_STRIP.sub("", tm.read_text(errors="replace"))[:80].strip()
-    except OSError:
-        cause = ""
+    except OSError as e:                                 # present but unreadable: still consume +
+        log(f"{rid}: transient marker for {sha[:8]} unreadable ({type(e).__name__}) — "
+            f"alerting without a cause label")           # forgive; only the label is lost
+        raw = ""
+    cause = _TRANSIENT_CAUSE_STRIP.sub("", raw)[:80].strip()
     try:
         tm.unlink()                                      # consume: a stale marker must not
     except OSError:                                      # forgive a FUTURE dispatch of this sha

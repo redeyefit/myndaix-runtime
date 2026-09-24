@@ -413,8 +413,15 @@ abort(){ note "$1" "ABORT: $2"   # abort <stage> <body> [title-detail]
   # slot for prompt re-dispatch. Push-mode only (gate exited above). Other stages (diff/review/
   # triage) still count toward the ceiling — a poison diff is what CAUSES those failures.
   # The marker's CONTENT is the cause label: the controller's streak alert reads it (sanitized).
-  [[ "$1" == canary ]] && { printf '%s\n' "${3:-}" > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true; }
+  [[ "$1" == canary ]] && mark_transient "${3:-}"
   deliver "review ABORTED — $1${3:+: $3}" "$2" || true; exit 0; }
+
+mark_transient(){ # mark_transient <cause-label> — ATOMIC tmp+mv: the controller may read + unlink
+  # the marker at any moment, and a plain `>` exposes a truncated (empty) file mid-write, which
+  # would silently drop the cause from the streak alert. Best-effort like every marker write.
+  local m="$STATE/transient-$marker_slug-$tip"
+  { printf '%s\n' "$1" > "$m.tmp.$$" && mv -f "$m.tmp.$$" "$m"; } 2>/dev/null || { rm -f "$m.tmp.$$" 2>/dev/null || true; }
+}
 
 # canary_cause <agent> -> ONE fixed-vocabulary label for why its canary failed, read from the
 # captured $run/<agent>.err. Never echoes .err text (agent/CLI output) except the usage-limit
@@ -623,7 +630,7 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
   # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
   # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
-  printf 'LOCK CONTENTION\n' > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true   # content = cause label for the controller's streak alert
+  mark_transient "LOCK CONTENTION"   # content = cause label for the controller's streak alert
   if [[ "$_skrec" == "1" ]]; then
     deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. The skipped range is recorded: the next completed review of this branch folds it in automatically (within $PRUNE_DAYS days; an over-cap fold falls back loudly). Retrigger now: git commit --allow-empty -m retrigger && git push. Immediate manual option: orchestrator/xreview.sh code $repo ${base}..${tip}" || true
   else
