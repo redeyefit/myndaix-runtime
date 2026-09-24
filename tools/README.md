@@ -15,6 +15,7 @@ bats tests/bash/           # the bash test suite (lint gate + your unit tests)
 ```
 
 ## What's here
+- **`ruff_new.py`** — ruff finding-diff ratchet used by CI (`python tools/ruff_new.py HEAD^1`): blocks findings NEW vs the base commit; the pyproject `[tool.ruff.lint] select` is explicit and ruff is pinned in the dev extra. Whole-repo debt: `ruff check --statistics .`.
 - **`bash-rules.semgrep.yml`** — MyndAIX's *own* recurring bash bugs (from `~/.claude/rules/*.md`) as
   enforceable rules: `python3 -c` interpolation, `curl|bash`, `eval`, unguarded `rm -rf $var`, macOS
   `date -jf`. Shellcheck catches the *generic* bugs; this catches *ours*.

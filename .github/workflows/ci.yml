@@ -40,6 +40,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 2, not the default 1: the ruff ratchet below diffs HEAD^1. On a pull_request run HEAD is
+          # the PR MERGE commit, so HEAD^1 is the base tip; on a push to main it is the previous main
+          # tip. With depth 1 that commit is absent and tools/ruff_new.py fails CLOSED (rc 2).
+          fetch-depth: 2
 
       # Mini-local Python instead of setup-python: on self-hosted macOS the action insists
       # on the GitHub-hosted toolcache path (/Users/runner — permission denied) and ignores
@@ -51,7 +56,27 @@ jobs:
           echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install
-        run: pip install -e ".[dev]"          # dev extra brings pytest (+ pytest-asyncio)
+        run: pip install -e ".[dev]"          # dev extra brings pytest (+ pytest-asyncio) + the PINNED ruff
+
+      # Ruff BEFORE the suites: a NEW finding vs HEAD^1 turns the job red in seconds instead of after the
+      # 4-minute test run. tools/ruff_new.py is a finding-diff ratchet (the semantics of semgrep
+      # --baseline-commit): pre-existing findings in a touched file never block, a fresh one anywhere in
+      # it does. The rule set is the EXPLICIT [tool.ruff.lint] select in pyproject — ruff's defaults
+      # drift between releases (0.16 turned on ~550 findings with no select configured).
+      - name: Ruff version matches the pyproject pin
+        run: ruff --version | grep -qx 'ruff 0.16.8' || { echo "::error::$(ruff --version) on PATH; pyproject pins ruff==0.16.8"; exit 1; }
+
+      # HEAD^1 assumes HEAD's immediate parent is the base tip — false on a multi-commit direct
+      # push to main (HEAD^1 would be a commit INSIDE that same push). Declined as unreachable:
+      # main is PR-only (branch protection, enforce_admins on), so every change lands here via a
+      # PR run, where HEAD is the merge commit and HEAD^1 is always the base tip it merged into.
+      - name: Ruff — NEW findings vs base (blocking)
+        run: python tools/ruff_new.py HEAD^1
+
+      # The ~48 pre-existing findings for the same rule set, as a burn-down number. Never red. When it
+      # reaches 0, drop --exit-zero here and delete the ratchet step: whole-repo blocking.
+      - name: Ruff — whole-repo debt (report only)
+        run: ruff check --exit-zero --statistics .
 
       - name: Run all test suites
         run: |
@@ -73,7 +98,7 @@ jobs:
         # bug-rules + pipefail); bats runs the shell test suite. See tools/README.md.
         run: |
           set -e
-          pip install semgrep
+          pip install semgrep==1.177.0
           if [ "$(uname)" = "Darwin" ]; then
             # self-hosted Mini: install-if-missing, idempotent after the first run
             command -v shellcheck >/dev/null || brew install -q shellcheck
