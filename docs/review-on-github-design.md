@@ -1,7 +1,7 @@
 # Review on GitHub — make the AI verdict a required check, delete the scaffolding (design, 2026-09-24)
 
-**Status:** DRAFT v3, for round 3 of cross-family design review. Rounds 1 and 2 are folded; see
-"Review log". Direction approved by Jefe 2026-09-24.
+**Status:** DRAFT v4. Rounds 1–3 of cross-family design review are folded; see "Review log".
+Remaining open items are live tests, listed as cutover gates in Rollout. Direction approved by Jefe 2026-09-24.
 **Supersedes** `review-subtraction-design.md` (NOT PASS, 2 blockers). Its blocker 1 was "a human
 can click Merge on a PR the AI rejected; the backstop is the only catch". This design closes that
 gap with a GitHub primitive instead of keeping the backstop.
@@ -16,8 +16,10 @@ gap with a GitHub primitive instead of keeping the backstop.
   - Today every one of these fails OPEN. Under this design each one holds the merge.
 - **What the gate is NOT for: a hostile actor holding Jefe's GitHub identity.**
   - Agents run `gh` as Jefe (admin). Anything "only Jefe can do" is a convention for them: the
-    admin bypass, enabling auto-merge, or adding a workflow that reports a `review` check.
-    That is true today too, and this design does not make it worse.
+    editing branch protection, posting a status, or enabling auto-merge. That is true today
+    too, and this design does not make it worse.
+  - What IS in scope: an agent's well-meaning mistakes, like reaching for `--admin` on a
+    blocked merge. `enforce_admins: true` makes that fail (round 3).
   - The real fix is a separate non-admin GitHub account for agents. That is a later rung, named
     here and not built.
 - **Authors are same-repo only** (Jefe plus his agents). Injected content can reach a reviewer
@@ -72,9 +74,11 @@ One workflow per repo, `.github/workflows/review.yml`, on that repo's Mini runne
 
 ```
 pull_request_target [opened, synchronize, reopened, ready_for_review, edited]  # workflow comes from MAIN
-  job runs only if: head.repo == this repo AND not draft          # never schedules fork code on the Mini
+  job runs only if: head.repo == this repo AND not draft AND base.ref == main
+                                                                  # never schedules fork code on the Mini;
+                                                                  # main is FV's ONLY protected branch
   concurrency: review-<PR#>, cancel-in-progress                   # only the latest head is reviewed
-  permissions: contents: read, statuses: write, pull-requests: write
+  permissions: contents: read, statuses: write               # no pull-requests: write — nothing is commented
   steps (every script from the BASE checkout; PR content is data, never executed):
     1. H = event head sha. git fetch <H> into a private ref; fetched sha must == H, else FAIL
     2. diff = git -c core.hooksPath=/dev/null -c core.fsmonitor=false
@@ -89,14 +93,29 @@ pull_request_target [opened, synchronize, reopened, ready_for_review, edited]  #
          FAIL  on findings, timeout, cancel, failed or empty or malformed or truncated verdict,
                or a sha mismatch
          oracle: advisory; its failure or findings never veto (body carries them for Jefe)
-    5. post commit STATUS `ai-review` on H (success | failure) — THIS is the required context,
-       NOT the job. A skipped job posts nothing, so the status stays absent and blocks the merge.
-       Forks and drafts therefore can never satisfy the gate.
-    6. private repo: post one PR comment (verdict body + H), gitleaks'd first (belt).
-       The job log prints NOTHING from reviewers: all reviewer I/O goes to the run dir + ledger.
-required context `ai-review` in a ruleset; bypass = repository admin, "pull requests only"
-  (verify live on a throwaway PR at build). Classic protection is unchanged.
+    5. POST /repos/{repo}/statuses/{H} (the event head sha, NEVER $GITHUB_SHA), context
+       `mx/ai-review`, state success|failure, description in a FIXED format built by trusted code
+       ("PASS" | "<n> findings" | "reviewer unavailable" + " · job <uuid>"); no target_url.
+       Check the response; a failed post = job FAIL. THIS status is the required context, NOT
+       the job. A skipped job posts nothing, so the status stays absent and blocks the merge.
+    6. verdict BODY → the existing private delivery (play-review's deliver() to the jefe inbox,
+       synced to the MacBook, relayed by Mack) + the ledger. NOTHING reviewer-generated is posted
+       to GitHub: no PR comment, no check summary, no annotation. The job log prints nothing
+       from reviewers; all reviewer I/O goes to the run dir + ledger.
+required context `mx/ai-review` added to FV's CLASSIC branch protection, where
+  enforce_admins: true already applies. NO ruleset, NO bypass actor: `gh pr merge --admin` fails
+  for everyone, agents included.
 ```
+
+- **Why base == main only** (round 3, HIGH: a status binds to a sha, not a base; a success on
+  `H` reviewed against one base could authorize `H` retargeted to another):
+  - The only diff ever certified is `merge-base(main, H)...H`, which is a function of H.
+  - As main advances, that merge-base only moves forward, so the diff can only shrink. A
+    success certifies a superset of what would merge.
+  - A PR against another base gets no status. When it is retargeted to main, `edited` reviews it.
+- **Same-sha reviewer variance:** two runs over the SAME `H` review the SAME diff, and the last
+  status posted wins. That is model nondeterminism, not a different diff. Accepted as a residual;
+  `cancel-in-progress` makes it rare.
 
 - **Why a commit status, not the job, is the required check** (round 2, HIGH): a skipped job
   counts as success. With the status, absent means blocking, and it binds to the exact sha reviewed.
@@ -117,18 +136,18 @@ required context `ai-review` in a ruleset; bypass = repository admin, "pull requ
 | Removed | Replaced by |
 |---|---|
 | pre-push hook + `play-review.sh` FRONT (trunk_ref/lag/fold_walk, lock/contention/STALE) | `pull_request_target` + concurrency |
-| controller backstop + `review_cursor` + chunker | required `ai-review` status (the skills indexer stays) |
+| controller backstop + `review_cursor` + chunker | required `mx/ai-review` status (the skills indexer stays) |
 | `automerge-tick/preflight` + PLAY_GATE | GitHub auto-merge (2 merges ever: `automerge_seen` 2026-09-24) |
 | `deploy-sync.sh` + trusted-install verification | main-branch workflow — ONLY after an audit shows what still supplies installed `mxr`/profiles |
-| inbox relay of routine verdicts | status + PR comment; Mack reads via `gh`/`mxr get` |
 | autofix: `autofix-arm.sh`, `play-fix.sh`, `fix-sweep.sh`, `autofix_fire()` + their launchd registrations | nothing; its only trigger dies with the backstop |
 
 Per-repo cutover removes only that repo's hook, backstop watch and registrations. **Build
 checklist:** every launchd job, installed hook, queued job and caller of each deleted piece,
 retired together with it.
 
-**Kept:** the pool/ledger/Command API, outcome labeling, substrate deploy, the doorbell for
-non-review alerts.
+**Kept:** the pool/ledger/Command API, outcome labeling, substrate deploy, the doorbell, and
+**the jefe-inbox delivery (deliver() + Syncthing)**. The inbox is the private channel for verdict
+bodies (round 3: GitHub comments are not private; see Security).
 
 ## Security surface
 
@@ -140,11 +159,21 @@ non-review alerts.
   The reviewer's snapshot is the existing `mxr review` staging seam, and the build must specify
   and test its exact command, symlink handling (no dereference outside the snapshot) and config
   discovery (AGENTS.md / project config in the snapshot).
+- **Verdict bodies never go to GitHub, even on a private repo.** GitHub renders external images
+  in private comments through its Camo proxy, so a reviewer induced to encode a secret into an
+  image URL would get an outbound channel (round 3). The status description is plain text built
+  by trusted code; the only reviewer-derived value in it is an integer.
 - **Accepted residuals under the threat model:**
   - A reviewer in codex's read-only sandbox can still RUN readable scripts and READ what `jefe`
-    can read. On FV (private) the outputs reach only Jefe.
-  - The pass/fail bit is a 1-bit channel.
-  - A same-repo workflow could forge `ai-review`.
+    can read. Its output goes only to the ledger and the private inbox.
+  - The pass/fail bit and the finding count are low-bandwidth channels, visible only to repo
+    collaborators (Jefe).
+  - Name collision: a check or status named `mx/ai-review` from another producer could satisfy
+    the requirement. GitHub can't pin a context to one workflow. Mitigations: an unusual name,
+    plus a cutover gate test (absent status + same-name job).
+  - An agent that DELIBERATELY posts a status or edits branch protection with Jefe's admin token.
+    Accidental `--admin` merges are blocked by `enforce_admins`. Deliberate API misuse is the
+    hostile case the bot-account rung fixes.
   - Confinement (curator pattern) and the agent bot account are the later fixes.
 - **Stale comment:** `ci.yml`'s ACCEPTED RISK note says runtime is "private". Fix it in the build
   PR, or it becomes true when Jefe flips visibility.
@@ -152,9 +181,15 @@ non-review alerts.
 ## Failure modes
 
 - **Reviewer unavailable** (credits, pool, canary, auth, Mini offline): no `success` status, so the
-  merge waits (fail-closed). Escape hatch: the ruleset's admin bypass on that one PR.
-  - The bypass must also clear FV's classic-protection checks if those are red. Verify how the
-    layering behaves live (round 2).
+  merge waits (fail-closed).
+  - **Escape hatch (Jefe only, manual, audit-logged):** remove `mx/ai-review` from FV's required
+    contexts in Settings, merge what must merge, then re-add it. This drops the gate
+    repo-wide for the outage window, but during an outage no review can run anyway.
+  - The other classic checks (`web`, `security-test`) stay required throughout. The hatch is
+    AI-review-only (round 3: a ruleset bypass could never clear classic checks, so the v3
+    ruleset was contradictory and is deleted).
+  - Why not a standing bypass: round 3 showed a well-meaning agent reaching for `--admin` on a
+    blocked merge is an ACCIDENT under this threat model. `enforce_admins` makes that fail.
 - **Dependabot PRs:** reviewed like any other. Test token/secret behavior under
   `pull_request_target` in the pilot; never exempt them blindly.
 - **Base retarget** (`edited`), force-push, rebase: a new run for the current head. Draft→ready:
@@ -162,24 +197,43 @@ non-review alerts.
 
 ## Rollout (one repo at a time)
 
-1. FV: land `review.yml` NOT required. Shadow it on the next 3 PRs next to the pre-push review;
-   compare verdicts, costs and the status-binding tests.
-   - Adversarial tests: fork-like skip, draft→ready, retarget, force-push mid-run, late result,
-     malformed verdict, a same-name job from a PR workflow.
-2. FV: require `ai-review` via the ruleset; verify the bypass on a throwaway PR; turn on repo
-   auto-merge.
-3. FV: remove its pre-push hook and backstop watch.
-4. Runtime: only after it is private, repeat 1–3. Then delete the shared code.
+**Prerequisites (shared runtime work, before FV step 1):** #117 structured verdict; the `mxr
+review` staging seam specified and tested (exact snapshot command, no symlink dereference outside
+the snapshot, AGENTS.md / project config discovery); `mx/ai-review` posting via the event head sha.
+
+1. FV: land `review.yml` NOT required. Shadow it on the next 3 PRs next to the pre-push review
+   (during shadow both deliver to the inbox; that doubling is intended).
+2. **Cutover gate tests** — every one must show its expected outcome on a throwaway PR:
+
+   | Case | Expected |
+   |---|---|
+   | No `mx/ai-review` status | merge blocked |
+   | Same-name JOB green or skipped, genuine status absent | blocked; if it satisfies the gate, rename or pin before cutover |
+   | Status on the head sha vs a same-name result on the test-merge sha | record which GitHub evaluates |
+   | Old success on H1, new head H2 | blocked until H2 is reviewed |
+   | PR opened against a non-main base, then retargeted to main | no status until `edited` review |
+   | draft → ready at the same head | `ready_for_review` run posts the status |
+   | kilabz PASS + oracle failed / kilabz failed + oracle PASS / zero findings from a FAILED kilabz job / wrong sha / malformed / empty / truncated | PASS, FAIL, FAIL, FAIL, FAIL, FAIL, FAIL |
+   | Dependabot PR | status posts (or the restriction is documented and handled) |
+   | `gh pr merge --admin` on a blocked PR | refused |
+   | git hooks / attributes / submodule / LFS / symlink in the head | nothing executes, nothing outside the snapshot is read |
+
+3. FV: add `mx/ai-review` to classic required contexts; turn on repo auto-merge.
+4. FV: remove its pre-push hook and its backstop watch, plus its registrations and queued work.
+   Runtime's push review and all shared machinery keep running (mixed state is expected).
+5. Runtime: only after it is private, repeat 1–4. Then delete the shared code (last consumer).
+   "One ledger, one label queue" is this FINAL state, not the FV-only pilot state.
 
 ## Deliberately NOT built
 
 No chunking, cursor, backstop, override label, merge queue, new table, or Command-API change.
 **Not Codex's native `@codex review`:** comment-only, separately billed, and it can't write our
 ledger. **Not an agent bot account** yet (a named later rung).
-**Removed from v2:**
-- The `destructive-blocker` deny of `gh pr merge --admin` (round 2: theater; the API is
-  reachable other ways).
-- The claims "verdict body never leaves the ledger" and "human-only opt-in".
+**Removed across rounds:**
+- The `destructive-blocker` deny of `gh pr merge --admin` (round 2: theater; `enforce_admins`
+  does this job for real, round 3).
+- The claims "verdict body never leaves the ledger" and "human-only opt-in" (round 2).
+- The ruleset and its admin bypass; PR comments and gitleaks-on-verdict (round 3).
 
 ## Review log
 
@@ -203,6 +257,21 @@ ledger. **Not an agent bot account** yet (a named later rung).
   - MED Dependabot → pilot test.
   - MED deletion audit → build checklist; shared code last.
   - Oracle's round-1 "confirmed closed" list was overstated; those cases are now pilot tests.
+- **Round 3 (both families), NOT PASS, no CRITICAL:**
+  - HIGH status binds to sha, not base → review only base == main (FV's only protected branch);
+    the certified diff is a function of H and only shrinks as main advances.
+  - HIGH context collision → `mx/ai-review` name + a cutover gate test.
+  - HIGH accidental admin use → no ruleset, no bypass; `mx/ai-review` joins classic protection
+    under `enforce_admins`. Escape hatch = Jefe removes the context in Settings.
+  - HIGH Camo image channel in private comments → no reviewer text on GitHub at all; bodies go
+    to the existing private inbox.
+  - HIGH inbox double-notify during the pilot → REFUTED: only play-review/play-fix write the
+    inbox, and the workflow calls the pool directly (shadow doubling is intended).
+  - HIGH legacy automerge racing native auto-merge on FV → REFUTED: `automerge_seen` on the
+    Mini has 0 FV rows ever; automerge only acts on runtime.
+  - MED ruleset vs classic contradiction → closed by deleting the ruleset.
+  - MED deferred closures → named cutover gate tests (Rollout step 2).
+  - Accepted: same-sha reviewer variance (last status wins; same diff).
 
 ## Still next, independent of this design
 
