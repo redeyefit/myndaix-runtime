@@ -185,17 +185,13 @@ echo "3d. merge bar: advisory-only triage = PASS (advisory); a late/trailing tok
   reset; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n**Blocking**\n1. real bug A' run
   cktitle "advisory token + a bold Blocking heading -> NEEDS-FIX" "review NEEDS-FIX"
   _fixlist(){ local d; d="$(ls -t "$RUNS" 2>/dev/null | head -1)"; cat "$RUNS/$d/fixlist.txt" 2>/dev/null; }
-  reset; STUB_TRIAGE=$'## Blocking\n1. real bug A\n## Advisory\n- nit B' run
-  if _fixlist | grep -q "real bug A" && ! _fixlist | grep -q "nit B"; then echo "  ok: the fixer gets the blocking section only"; PASS=$((PASS+1)); else echo "  FAIL: fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
-  ck "the delivered review still shows the advisories" "nit B"
+  # scope cut (r3): the fixer gets the WHOLE triage, advisories included — exact equality, not grep
+  _mixed=$'## Blocking\n1. real bug A\n## Advisory\n- nit B'
+  reset; STUB_TRIAGE="$_mixed" run
+  if [[ "$(_fixlist)" == "$_mixed" ]]; then echo "  ok: the fixer gets the whole triage (no section filtering)"; PASS=$((PASS+1)); else echo "  FAIL: fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
+  ck "the delivered review shows the advisories" "nit B"
   reset; STUB_TRIAGE="1. fix it" run
   if [[ "$(_fixlist)" == "1. fix it" ]]; then echo "  ok: a legacy (headerless) fix-list passes through whole"; PASS=$((PASS+1)); else echo "  FAIL: legacy fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
-  reset; STUB_TRIAGE=$'## Blocking\n1. real bug A\nAdvisory locks do not protect this path.\n2. real bug C\n## Advisory\n- nit B' run
-  if _fixlist | grep -q "real bug C" && ! _fixlist | grep -q "nit B"; then echo "  ok: 'Advisory ...' prose inside a blocker does not cut the fixer's list"; PASS=$((PASS+1)); else echo "  FAIL: prose-cut fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
-  reset; STUB_TRIAGE=$'## Blocking\n1. real bug A\n## Advisory\n- nit B\nBlocking I/O note C' run
-  if _fixlist | grep -q "real bug A" && ! _fixlist | grep -q "note C"; then echo "  ok: 'Blocking ...' prose in the advisory section never reaches the fixer"; PASS=$((PASS+1)); else echo "  FAIL: prose-open fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
-  reset; af_repos "$NULLCFG"; STUB_TRIAGE=$'## Blocking\n\n## Advisory\n- nit B' run_af; settle
-  cknofile "$FAKE/.myndaix/fixer-argv" "an EMPTY blocking section fires no autofix (advisories never auto-implemented)"
   # fail-closed: if the has_blocking scan itself fails, an advisory token must NOT pass. A stub awk
   # (first on the worker's PATH) fails ONLY that scan, recognized by its unique `print b + 0`.
   printf '%s\n' '#!/bin/bash' 'case "$*" in *"print b + 0"*) exit 2 ;; esac' 'exec /usr/bin/awk "$@"' > "$FAKE/.local/bin/awk"; chmod +x "$FAKE/.local/bin/awk"

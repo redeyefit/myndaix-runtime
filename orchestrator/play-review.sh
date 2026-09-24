@@ -1057,20 +1057,13 @@ else
   note "done" needs-fix
   # always stage the fix-list (single-writer run dir) + a copy-paste manual hint. The auto note is
   # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
-  # the FIXER gets the blocking section only: advisories are optional by the merge bar and must not
-  # be auto-implemented. Section boundaries are HEADINGS only (#... or **...): a finding's own prose
-  # ("Advisory locks do not...") must never close the blocking section or open one (review r2).
-  has_heading="$(awk 'tolower($0) ~ /^[ \t\r]*(#+|\*\*)[ \t]*blocking/ { print 1; exit }' <<<"$triage" || true)"
-  fixlist="$(awk 'tolower($0) ~ /^[ \t\r]*(#+|\*\*)[ \t]*blocking/ { on = 1; next }
-                  on && tolower($0) ~ /^[ \t\r]*(#+|\*\*)[ \t]*advisory/ { exit }
-                  on { print }' <<<"$triage" || true)"
-  # No blocking heading at all (a legacy/unstructured reply) -> the whole triage, as before. A
-  # heading over an EMPTY section writes an empty list: autofix_fire skips on `-s`, so advisories
-  # are never auto-implemented through the fallback (review r2).
-  if [[ -z "$has_heading" ]]; then fixlist="$triage"
-  elif [[ -z "${fixlist//[[:space:]]/}" ]]; then fixlist=""; fi
+  # The fixer gets the WHOLE triage, advisories included — exactly as before the merge bar. Do NOT
+  # re-add a blocking-section filter: it needs two parsers of free-form model text to agree, and
+  # three review rounds each found a new way they didn't (prose "Advisory ..." cutting the list,
+  # a plain "Blocking:" label, an awk failure) — scope cut 2026-09-24. Autofix only DRAFTS a PR for
+  # a human merge, so an advisory in the draft costs review time, not safety.
   # a failed write may leave a PARTIAL file that `-s` would fire on — remove it so autofix skips
-  printf '%s' "$fixlist" > "$run/fixlist.txt" 2>/dev/null \
+  printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null \
     || { rm -f "$run/fixlist.txt" 2>/dev/null; note "done" "fixlist.txt write FAILED — removed; autofix skips this run"; }
   autonote=""
   autofix_armed && autonote='
