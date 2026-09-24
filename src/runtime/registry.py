@@ -42,6 +42,15 @@ class AgentSpec(BaseModel):
         return v
 
 
+# codex features that give kilabz reach OUTSIDE its read-only seatbelt (see the kilabz spec).
+# Verified present on codex 0.154.0 (Mini) and 0.156.1 (MacBook) on 2026-09-24; a name unknown
+# to a host's codex fails argument parsing, so re-check on every codex upgrade.
+KILABZ_DISABLED_FEATURES = (
+    "apps", "plugins", "remote_plugin", "plugin_sharing", "browser_use", "browser_use_external",
+    "browser_use_full_cdp_access", "computer_use", "hooks", "memories", "multi_agent",
+    "skill_mcp_dependency_install", "image_generation",
+)
+
 # v1 seed roster (data - expected to change). See DESIGN.md S5.
 V1_ROSTER: list[AgentSpec] = [
     # CLI agents declare env_passthrough = their OWN auth key only (the rest of the pool's
@@ -175,8 +184,23 @@ V1_ROSTER: list[AgentSpec] = [
               # --sandbox read-only seatbelt is unchanged (writes+net OS-denied); the
               # accepted §5 residual — read-only exec of snapshot entry points — is
               # capability-identical to its existing un-path-scoped Read.
+              # CONFINEMENT (2026-09-24 attack pass): the seatbelt only covers kilabz's own shell.
+              # Under the host's real ~/.codex it also inherited reach that runs OUTSIDE it — the
+              # account's connectors (`apps`; a review reported trying the GitHub connector),
+              # plugins, browser/computer use, hooks, cross-run `memories` (populated on the Mini:
+              # injected text could bias later verdicts) and ~94 stale openclaw `allow` exec rules.
+              # A reviewer reads agent-authored diffs, so it gets NONE of it: skip user config +
+              # rules, persist nothing, disable every reach feature, and don't load an AGENTS.md
+              # from the reviewed snapshot as instructions (the PR would steer its own gate).
+              # Flags, NOT scratch_home: the scratch seed copies auth.json, and a token refresh
+              # inside the throwaway copy would be lost on cleanup on a many-calls-a-day agent.
+              # Every --disable name must exist on BOTH hosts' codex (unknown name = parse error
+              # = every review aborts); tests/test_kilabz_confinement.py pins the set.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
                        "-c", "model=gpt-6-astra", "-c", "model_reasoning_effort=high",
+                       "--ignore-user-config", "--ignore-rules", "--ephemeral",
+                       "-c", "project_doc_max_bytes=0",
+                       *[a for f in KILABZ_DISABLED_FEATURES for a in ("--disable", f)],
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "staging_cwd": "optional",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
