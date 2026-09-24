@@ -1,6 +1,8 @@
 # Review subtraction — cut the scaffolding, keep the gate (design, 2026-09-23)
 
-**Status:** DRAFT for cross-family review. Direction approved by Jefe 2026-09-23 ("yes do it").
+**Status:** SUPERSEDED 2026-09-24 by `review-on-github-design.md` (this draft's review: NOT PASS,
+2 blockers). Items 2 and 3 carry over there. Kept for the evidence and the review trail.
+Direction approved by Jefe 2026-09-23 ("yes do it").
 **Supersedes** the review-dedup design (chain-certified backstop skip via GitHub commit statuses +
 lazy canary). That design drew 5 blocking findings in its own review (xreview design 2026-09-23):
 3 were soundness holes in the certification with no attacker needed. Adding a mechanism to trim
