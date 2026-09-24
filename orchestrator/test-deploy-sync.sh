@@ -113,7 +113,14 @@ for shape in quoted unquoted omitted; do
   [[ ! -e "$d/play-fix.sh" && ! -e "$d/bin/mxr-phone" ]] && ok "$shape ref installs nothing" || bad "$shape ref installed files"
 done
 # read-only --check keeps its origin/main default (only the MUTATING mode lost it)
-ck_out="$(DEPLOY_SYNC_DEST="$SCRATCH" "$SYNC" --check 2>&1)" || true   # drift rc is irrelevant here; only the refusal text matters
+ck_rc=0; ck_out="$(DEPLOY_SYNC_DEST="$SCRATCH" "$SYNC" --check 2>&1)" || ck_rc=$?
+# rc 0 = in sync and 1 = drift are both a check that RAN; anything else is a crash. rc 1 is also
+# die()'s code, so require positive evidence too: a SAME/DRIFT verdict line and no ERROR line.
+# Without this, a crash whose output lacked the refusal text passed the grep below (review 73700).
+grep -qE '\] (SAME|DRIFT) ' <<<"$ck_out"; ck_verdict=$?
+grep -q 'ERROR:' <<<"$ck_out"; ck_err=$?
+[[ ("$ck_rc" -eq 0 || "$ck_rc" -eq 1) && "$ck_verdict" -eq 0 && "$ck_err" -eq 1 ]] \
+  && ok "--check ran to a SAME/DRIFT verdict (rc=$ck_rc)" || bad "--check did not run to a verdict (rc=$ck_rc): $ck_out"
 # grep rc 1 = no match = default kept; `! grep` would also pass on rc 2 (grep error) — require exactly 1.
 grep -q "requires an explicit" <<<"$ck_out"; ck_rc=$?
 [[ "$ck_rc" -eq 1 ]] && ok "--check with no ref still runs (default kept)" || bad "--check lost its default, or grep failed (rc=$ck_rc): $ck_out"
