@@ -158,11 +158,16 @@ V1_ROSTER: list[AgentSpec] = [
               # adversarial gate; codex auth is a flat-rate ChatGPT subscription, so the
               # API-price argument stays moot). If kilabz 404s again, re-derive the pin from
               # ~/.codex/models_cache.json, not from memory.
-              # timeout_s=900: xhigh on a real review diff regularly exceeds the dead 300s
+              # effort=high (Jefe 2026-09-24, was xhigh): cost — the workspace ran out of credits
+              # twice on 2026-09-23 and every canary + review ran at xhigh. No quality data on
+              # high yet: watch kilabz's confirmed-real vs dismissed rate in finding_outcome
+              # before going lower.
+              # timeout_s=900: xhigh on a real review diff regularly exceeded the dead 300s
               # per-attempt default (2026-07-03: two killed attempts + one ok stranded a DONE
-              # reply in the ledger while play-review's wait expired). invoke_cli uses THIS
-              # profile timeout when job.timeout_s is unset (== the 300s field default); an
-              # explicitly-set job.timeout_s wins in EITHER direction — see runner exec_timeout.
+              # reply in the ledger while play-review's wait expired). Kept at 900 under high as
+              # headroom. invoke_cli uses THIS profile timeout when job.timeout_s is unset (== the
+              # 300s field default); an explicitly-set job.timeout_s wins in EITHER direction —
+              # see runner exec_timeout.
               profile=Profile(timeout_s=900),
               # staging_cwd "optional" (mxr-review-context D3/D5): a caller MAY stage a
               # de-linked, non-writable snapshot of the reviewed tip as the cwd so kilabz
@@ -172,7 +177,7 @@ V1_ROSTER: list[AgentSpec] = [
               # accepted §5 residual — read-only exec of snapshot entry points — is
               # capability-identical to its existing un-path-scoped Read.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
-                       "-c", "model=gpt-6-astra", "-c", "model_reasoning_effort=xhigh",
+                       "-c", "model=gpt-6-astra", "-c", "model_reasoning_effort=high",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "staging_cwd": "optional",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
