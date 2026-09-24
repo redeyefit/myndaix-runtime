@@ -153,7 +153,10 @@ $(fence pushed-diff "$diff" "$nonce_in")"
     [[ -n "${oracle//[[:space:]]/}" ]] || oracle="(oracle unavailable — proceeding on the kilabz gate alone)"
   fi
 
-  synth_intro="These are two reviews of a CODE change. kilabz ${snap_note} and is the AUTHORITATIVE gate; oracle reviewed the diff BLIND and is a weak decorrelated backup. Merge into ONE ordered fix-list, ranked by severity. SYNTHESIS RULE: when they DISAGREE about whether an issue is real or already closed, keep it OPEN unless kilabz explicitly retracts it — never close on oracle's say-so. If NEITHER has a real actionable issue, reply with EXACTLY the token PLAY_PASS."
+  # MERGE_BAR: the SAME rubric text as play-review.sh (why: see its stage-2 comment); test.sh
+  # fails if the two copies drift.
+  MERGE_BAR="MERGE BAR — classify every finding you keep. BLOCKING = in normal use of the code as it exists today it would produce wrong results, lose or corrupt data, bypass a security or safety check (including a check that can pass without testing what it claims), crash, or break the build or tests. ADVISORY = everything else: hardening for inputs or states not reachable today, hypothetical future callers, defense-in-depth on paths that already fail closed, diagnostics/logging/style, test-harness robustness that fails safe. Never rank a finding above the severity its raising reviewer gave it. A finding raised only by oracle is BLOCKING only if you confirmed it against the code snapshot. OUTPUT: no findings at all -> EXACTLY the single token PLAY_PASS. Only advisory findings -> the first line EXACTLY PLAY_PASS_ADVISORY, then the advisory list. Any blocking finding -> a '## Blocking' ordered fix-list first, then '## Advisory'."
+  synth_intro="These are two reviews of a CODE change. kilabz ${snap_note} and is the AUTHORITATIVE gate; oracle reviewed the diff BLIND and is a weak decorrelated backup. Merge into ONE list, ranked by severity. SYNTHESIS RULE: when they DISAGREE about whether an issue is real or already closed, keep it OPEN unless kilabz explicitly retracts it — never close on oracle's say-so. ${MERGE_BAR}"
   a_label="kilabz-review (authoritative, ${snap_note})"; a_content="$kilabz"
   b_label="oracle-review (weak backup, blind)";           b_content="$oracle"
 else
