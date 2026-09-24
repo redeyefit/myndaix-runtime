@@ -1018,9 +1018,13 @@ deg_banner=""
 # writer, and under pipefail a found match would read as not-found (fail-open on has_blocking).
 # Trim BEFORE the blank test: a line holding only "\r" has NF=1 and would otherwise be the "head".
 triage_head="$(awk '{ gsub(/^[ \t\r]+|[ \t\r]+$/, "") } $0 != "" { print; exit }' <<<"$triage" || true)"
-# ANY blocking heading (## / ** / plain) means NEEDS-FIX even under an advisory token — the token
-# alone must never pass a reply that also lists blockers (a model misformat or a steered triage).
-has_blocking="$(awk 'tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*blocking/ { print 1; exit }' <<<"$triage" || true)"
+# ANY line starting with "blocking" (## / ** / plain) means NEEDS-FIX even under an advisory token —
+# the token alone must never pass a reply that also lists blockers (a model misformat or a steered
+# triage). Deliberately BROAD: a prose line that merely starts with the word also forces NEEDS-FIX,
+# the safe direction. The scan must PROVE "0": if awk itself fails, fail CLOSED (review r2 P1).
+if ! has_blocking="$(awk 'tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*blocking/ { b = 1; exit } END { print b + 0 }' <<<"$triage")"; then
+  has_blocking=1
+fi
 if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimmed match — no embedded-space forgery
   gate && { note "done" gate-pass; write_verdict "PASS"; exit 0; }   # automerge gate: structured PASS, no deliver/done/autofix
   note "done" clean-pass
@@ -1031,7 +1035,7 @@ $review"; then
     mark_done
     outcomes_record        # CLOSE phase runs on a clean PASS too (design §2); fail-open, bounded
   fi
-elif [[ "$triage_head" == "PLAY_PASS_ADVISORY" && -z "$has_blocking" ]]; then
+elif [[ "$triage_head" == "PLAY_PASS_ADVISORY" && "$has_blocking" == "0" ]]; then
   # the automerge gate stays STRICT: an UNATTENDED merge still needs a clean PLAY_PASS. Letting
   # advisories through there widens an acting rung — a separate, deliberate decision.
   gate && { note "done" gate-needs-fix; write_verdict "NEEDS-FIX"; exit 1; }
@@ -1054,12 +1058,20 @@ else
   # always stage the fix-list (single-writer run dir) + a copy-paste manual hint. The auto note is
   # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
   # the FIXER gets the blocking section only: advisories are optional by the merge bar and must not
-  # be auto-implemented. No blocking heading (a legacy/unstructured reply) -> the whole triage.
-  fixlist="$(awk 'tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*blocking/ { on = 1; next }
-                  on && tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*advisory/ { exit }
+  # be auto-implemented. Section boundaries are HEADINGS only (#... or **...): a finding's own prose
+  # ("Advisory locks do not...") must never close the blocking section or open one (review r2).
+  has_heading="$(awk 'tolower($0) ~ /^[ \t\r]*(#+|\*\*)[ \t]*blocking/ { print 1; exit }' <<<"$triage" || true)"
+  fixlist="$(awk 'tolower($0) ~ /^[ \t\r]*(#+|\*\*)[ \t]*blocking/ { on = 1; next }
+                  on && tolower($0) ~ /^[ \t\r]*(#+|\*\*)[ \t]*advisory/ { exit }
                   on { print }' <<<"$triage" || true)"
-  [[ -n "${fixlist//[[:space:]]/}" ]] || fixlist="$triage"
-  printf '%s' "$fixlist" > "$run/fixlist.txt" 2>/dev/null || true
+  # No blocking heading at all (a legacy/unstructured reply) -> the whole triage, as before. A
+  # heading over an EMPTY section writes an empty list: autofix_fire skips on `-s`, so advisories
+  # are never auto-implemented through the fallback (review r2).
+  if [[ -z "$has_heading" ]]; then fixlist="$triage"
+  elif [[ -z "${fixlist//[[:space:]]/}" ]]; then fixlist=""; fi
+  # a failed write may leave a PARTIAL file that `-s` would fire on — remove it so autofix skips
+  printf '%s' "$fixlist" > "$run/fixlist.txt" 2>/dev/null \
+    || { rm -f "$run/fixlist.txt" 2>/dev/null; note "done" "fixlist.txt write FAILED — removed; autofix skips this run"; }
   autonote=""
   autofix_armed && autonote='
 

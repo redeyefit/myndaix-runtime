@@ -190,6 +190,18 @@ echo "3d. merge bar: advisory-only triage = PASS (advisory); a late/trailing tok
   ck "the delivered review still shows the advisories" "nit B"
   reset; STUB_TRIAGE="1. fix it" run
   if [[ "$(_fixlist)" == "1. fix it" ]]; then echo "  ok: a legacy (headerless) fix-list passes through whole"; PASS=$((PASS+1)); else echo "  FAIL: legacy fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
+  reset; STUB_TRIAGE=$'## Blocking\n1. real bug A\nAdvisory locks do not protect this path.\n2. real bug C\n## Advisory\n- nit B' run
+  if _fixlist | grep -q "real bug C" && ! _fixlist | grep -q "nit B"; then echo "  ok: 'Advisory ...' prose inside a blocker does not cut the fixer's list"; PASS=$((PASS+1)); else echo "  FAIL: prose-cut fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
+  reset; STUB_TRIAGE=$'## Blocking\n1. real bug A\n## Advisory\n- nit B\nBlocking I/O note C' run
+  if _fixlist | grep -q "real bug A" && ! _fixlist | grep -q "note C"; then echo "  ok: 'Blocking ...' prose in the advisory section never reaches the fixer"; PASS=$((PASS+1)); else echo "  FAIL: prose-open fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
+  reset; af_repos "$NULLCFG"; STUB_TRIAGE=$'## Blocking\n\n## Advisory\n- nit B' run_af; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "an EMPTY blocking section fires no autofix (advisories never auto-implemented)"
+  # fail-closed: if the has_blocking scan itself fails, an advisory token must NOT pass. A stub awk
+  # (first on the worker's PATH) fails ONLY that scan, recognized by its unique `print b + 0`.
+  printf '%s\n' '#!/bin/bash' 'case "$*" in *"print b + 0"*) exit 2 ;; esac' 'exec /usr/bin/awk "$@"' > "$FAKE/.local/bin/awk"; chmod +x "$FAKE/.local/bin/awk"
+  reset; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n- harmless nit' run
+  rm -f "$FAKE/.local/bin/awk"
+  cktitle "a FAILED blocking scan fails closed -> NEEDS-FIX" "review NEEDS-FIX"
   reset; rm -f "$ROOT/verdict.json"; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n- x' gate_run; ckexit $? 1 "automerge gate: advisory is NOT a pass (exit 1)"
   ck "gate verdict says NEEDS-FIX" '"verdict":"NEEDS-FIX"' "$ROOT/verdict.json"
   reset; STUB_TRIAGE="PLAY_PASS" run
