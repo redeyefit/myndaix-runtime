@@ -1014,7 +1014,13 @@ deg_banner=""
 # --- gate: three outcomes, each keyed on an EXACT trimmed token (no forgeable substring) ---
 # PLAY_PASS must be the WHOLE reply; PLAY_PASS_ADVISORY must be the whole FIRST non-blank line, so
 # a token quoted later in a fix-list, or trailing text on the token line, reads as NEEDS-FIX.
-triage_head="$(printf '%s\n' "$triage" | awk 'NF { gsub(/^[ \t\r]+|[ \t\r]+$/, ""); print; exit }' || true)"
+# awk reads here-strings, never `printf | awk ... exit`/`| grep -q`: an early exit can SIGPIPE the
+# writer, and under pipefail a found match would read as not-found (fail-open on has_blocking).
+# Trim BEFORE the blank test: a line holding only "\r" has NF=1 and would otherwise be the "head".
+triage_head="$(awk '{ gsub(/^[ \t\r]+|[ \t\r]+$/, "") } $0 != "" { print; exit }' <<<"$triage" || true)"
+# ANY blocking heading (## / ** / plain) means NEEDS-FIX even under an advisory token — the token
+# alone must never pass a reply that also lists blockers (a model misformat or a steered triage).
+has_blocking="$(awk 'tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*blocking/ { print 1; exit }' <<<"$triage" || true)"
 if [[ "$triage" =~ ^[[:space:]]*PLAY_PASS[[:space:]]*$ ]]; then   # EXACT trimmed match — no embedded-space forgery
   gate && { note "done" gate-pass; write_verdict "PASS"; exit 0; }   # automerge gate: structured PASS, no deliver/done/autofix
   note "done" clean-pass
@@ -1025,13 +1031,14 @@ $review"; then
     mark_done
     outcomes_record        # CLOSE phase runs on a clean PASS too (design §2); fail-open, bounded
   fi
-elif [[ "$triage_head" == "PLAY_PASS_ADVISORY" ]]; then
+elif [[ "$triage_head" == "PLAY_PASS_ADVISORY" && -z "$has_blocking" ]]; then
   # the automerge gate stays STRICT: an UNATTENDED merge still needs a clean PLAY_PASS. Letting
   # advisories through there widens an acting rung — a separate, deliberate decision.
   gate && { note "done" gate-needs-fix; write_verdict "NEEDS-FIX"; exit 1; }
   note "done" pass-advisory    # the 2-week merge-bar check joins these runs to their finding labels
-  advisories="$(printf '%s\n' "$triage" | awk 'seen { print } NF && !seen { seen = 1 }' || true)"
-  printf '%s' "$advisories" > "$run/advisory.txt" 2>/dev/null || true
+  advisories="$(awk 'seen { print; next } { t = $0; gsub(/^[ \t\r]+|[ \t\r]+$/, "", t) } t != "" { seen = 1 }' <<<"$triage" || true)"
+  printf '%s' "$advisories" > "$run/advisory.txt" 2>/dev/null \
+    || note "done" "advisory.txt write FAILED — the 2-week merge-bar check loses this run's advisory text"
   if deliver "review PASS (advisory) — $ref" "${deg_banner}No blocking issues. The advisory findings below are NOT required before merge (merge bar); label them as usual.
 
 ${advisories:-(no advisory text)}
@@ -1046,7 +1053,13 @@ else
   note "done" needs-fix
   # always stage the fix-list (single-writer run dir) + a copy-paste manual hint. The auto note is
   # NEUTRAL: we deliver BEFORE the fire gate resolves, so we can't claim the fix actually launched.
-  printf '%s' "$triage" > "$run/fixlist.txt" 2>/dev/null || true
+  # the FIXER gets the blocking section only: advisories are optional by the merge bar and must not
+  # be auto-implemented. No blocking heading (a legacy/unstructured reply) -> the whole triage.
+  fixlist="$(awk 'tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*blocking/ { on = 1; next }
+                  on && tolower($0) ~ /^[ \t\r]*[#*]*[ \t]*advisory/ { exit }
+                  on { print }' <<<"$triage" || true)"
+  [[ -n "${fixlist//[[:space:]]/}" ]] || fixlist="$triage"
+  printf '%s' "$fixlist" > "$run/fixlist.txt" 2>/dev/null || true
   autonote=""
   autofix_armed && autonote='
 

@@ -176,6 +176,20 @@ echo "3d. merge bar: advisory-only triage = PASS (advisory); a late/trailing tok
   cktitle "token quoted AFTER a blocking list -> NEEDS-FIX" "review NEEDS-FIX"
   reset; STUB_TRIAGE='PLAY_PASS_ADVISORY but item 1 is blocking' run
   cktitle "trailing text on the token line -> NEEDS-FIX" "review NEEDS-FIX"
+  reset; STUB_TRIAGE=$'\r\nPLAY_PASS_ADVISORY\r\n- x' run
+  cktitle "a CRLF-only leading line is blank (trim before the blank test)" "review PASS (advisory)"
+  reset; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n## Non-blocking\n- x' run
+  cktitle "a 'Non-blocking' heading is not a blocker" "review PASS (advisory)"
+  reset; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n## Blocking\n1. real bug A\n## Advisory\n- nit B' run
+  cktitle "advisory token + a Blocking section -> NEEDS-FIX (review r1 HIGH)" "review NEEDS-FIX"
+  reset; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n**Blocking**\n1. real bug A' run
+  cktitle "advisory token + a bold Blocking heading -> NEEDS-FIX" "review NEEDS-FIX"
+  _fixlist(){ local d; d="$(ls -t "$RUNS" 2>/dev/null | head -1)"; cat "$RUNS/$d/fixlist.txt" 2>/dev/null; }
+  reset; STUB_TRIAGE=$'## Blocking\n1. real bug A\n## Advisory\n- nit B' run
+  if _fixlist | grep -q "real bug A" && ! _fixlist | grep -q "nit B"; then echo "  ok: the fixer gets the blocking section only"; PASS=$((PASS+1)); else echo "  FAIL: fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
+  ck "the delivered review still shows the advisories" "nit B"
+  reset; STUB_TRIAGE="1. fix it" run
+  if [[ "$(_fixlist)" == "1. fix it" ]]; then echo "  ok: a legacy (headerless) fix-list passes through whole"; PASS=$((PASS+1)); else echo "  FAIL: legacy fixlist='$(_fixlist)'"; FAIL=$((FAIL+1)); fi
   reset; rm -f "$ROOT/verdict.json"; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n- x' gate_run; ckexit $? 1 "automerge gate: advisory is NOT a pass (exit 1)"
   ck "gate verdict says NEEDS-FIX" '"verdict":"NEEDS-FIX"' "$ROOT/verdict.json"
   reset; STUB_TRIAGE="PLAY_PASS" run
