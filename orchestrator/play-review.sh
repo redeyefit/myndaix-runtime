@@ -406,14 +406,45 @@ deliver(){ # deliver <subject> <body>  — single printf so an OPEN failure hits
   return 0                                            # durable write succeeded
 }
 
-abort(){ note "$1" "ABORT: $2"
+abort(){ note "$1" "ABORT: $2"   # abort <stage> <body> [title-detail]
   gate && { write_verdict "ABORTED"; exit 2; }               # gate: abort = TRANSIENT (exit 2 -> retry), distinct from a real NEEDS-FIX (exit 1)
   # canary abort = agent/pool unreachable = INFRA-transient, never a poison head: mark it so the
   # controller refunds the attempt (transient can't climb the blocked ceiling) and releases the
   # slot for prompt re-dispatch. Push-mode only (gate exited above). Other stages (diff/review/
   # triage) still count toward the ceiling — a poison diff is what CAUSES those failures.
-  [[ "$1" == canary ]] && { : > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true; }
-  deliver "review ABORTED — $1" "$2" || true; exit 0; }
+  # The marker's CONTENT is the cause label: the controller's streak alert reads it (sanitized).
+  [[ "$1" == canary ]] && { printf '%s\n' "${3:-}" > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true; }
+  deliver "review ABORTED — $1${3:+: $3}" "$2" || true; exit 0; }
+
+# canary_cause <agent> -> ONE fixed-vocabulary label for why its canary failed, read from the
+# captured $run/<agent>.err. Never echoes .err text (agent/CLI output) except the usage-limit
+# reset time, extracted by a strict pattern. Specific causes are matched BEFORE the generic
+# MXR_JOB_FAILED/DEAD wrapper, which every agent-side error also carries. Earned 2026-09-24:
+# 34 aborts over ~14h all read "auth or pool down" while the .err said "out of credits".
+canary_cause(){
+  local f="$run/$1.err" when
+  [[ -s "$f" ]] || { printf 'POOL DOWN?'; return 0; }
+  if LC_ALL=C grep -qiE 'out of credits|credit balance is too low' "$f"; then printf 'OUT OF CREDITS'
+  elif LC_ALL=C grep -qi 'usage limit' "$f"; then
+    when="$(LC_ALL=C grep -oE 'try again at [A-Z][a-z]{2} [0-9]{1,2}(st|nd|rd|th), [0-9]{4} [0-9]{1,2}:[0-9]{2} [AP]M' "$f" | head -1 || true)"
+    printf 'USAGE LIMIT%s' "${when:+ (${when#try again at })}"
+  # "401" only in an HTTP context: job ids / tmp paths in the same file are hex and contain "401"
+  elif LC_ALL=C grep -qiE 'HTTP error: 401|401 Unauthorized|not logged in|please (log|sign) in|refresh token' "$f"; then printf 'AUTH 401'
+  elif LC_ALL=C grep -q '^MXR_SYNC_TIMEOUT' "$f"; then printf 'POOL SLOW'
+  elif LC_ALL=C grep -qE '^MXR_JOB_(FAILED|DEAD)' "$f"; then printf 'JOB FAILED'
+  else printf 'UNKNOWN'; fi
+}
+
+canary_hint(){ # canary_hint <agent> <label> -> the one action that label needs
+  case "$2" in
+    "OUT OF CREDITS") printf 'The %s login is fine: its workspace has no credits left. Nothing recovers until credits are added.' "$1" ;;
+    "USAGE LIMIT"*)   printf 'The %s login is fine: a usage window is exhausted and resets on its own; the controller keeps retrying.' "$1" ;;
+    "AUTH 401")       printf 'The %s CLI on this machine needs a fresh login (codex login / claude setup-token).' "$1" ;;
+    "POOL SLOW")      printf 'The pool accepted the job but the sync wait expired; check serve load.' ;;
+    "POOL DOWN?")     printf 'mxr produced no output at all; check that serve (ai.myndaix.runtime) is running.' ;;
+    *)                printf 'Cause not recognized; read the captured error file.' ;;
+  esac
+}
 
 fence(){ # fence <label> <text> — nonce-gated on BOTH boundaries
   printf '===BEGIN UNTRUSTED %s nonce=%s===\n' "$1" "$nonce"
@@ -592,7 +623,7 @@ contention(){ # lock held by a live worker: record the skip (NEVER silent), then
   # surfaces a chronically wedged lock — blocking on contention was never intended). Push mode
   # only (gate exited above): mark it so the controller refunds the attempt + re-dispatches,
   # instead of the dispatching row waiting out PENDING_STALE while costing an attempt.
-  : > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true
+  printf 'LOCK CONTENTION\n' > "$STATE/transient-$marker_slug-$tip" 2>/dev/null || true   # content = cause label for the controller's streak alert
   if [[ "$_skrec" == "1" ]]; then
     deliver "review SKIPPED — $ref" "Another review was running, so this push ($tip) was not reviewed. The skipped range is recorded: the next completed review of this branch folds it in automatically (within $PRUNE_DAYS days; an over-cap fold falls back loudly). Retrigger now: git commit --allow-empty -m retrigger && git push. Immediate manual option: orchestrator/xreview.sh code $repo ${base}..${tip}" || true
   else
@@ -690,7 +721,10 @@ note canary "${canary_agents[*]}"
 for a in "${canary_agents[@]}"; do
   # clamp MXR_TIMEOUT_S=180 EXPLICITLY (not by omission): a dead agent must be detected fast, even
   # if the orchestrator was invoked with MXR_TIMEOUT_S already exported (oracle: omission inherits it).
-  MXR_TIMEOUT_S=180 call "$a" "reply with exactly: READY" >/dev/null || abort canary "$a unreachable (codex/claude auth or pool down)"
+  if ! MXR_TIMEOUT_S=180 call "$a" "reply with exactly: READY" >/dev/null; then
+    canary_label="$(canary_cause "$a")"
+    abort canary "$a canary failed: $canary_label. $(canary_hint "$a" "$canary_label") Raw error: $run/$a.err" "$a $canary_label"
+  fi
 done
 
 # --- diff the pushed range; over-cap = FAIL fast (don't feed a 300s timeout) ---

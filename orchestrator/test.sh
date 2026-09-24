@@ -50,7 +50,11 @@ case "$agent" in
     printf 'review-reap\n' >> "$HOME/.myndaix/reap-calls" 2>/dev/null || true; exit 0 ;;
 esac
 case "$prompt" in
-  *READY*) [[ "${STUB_CANARY_FAIL:-}" == "$agent" ]] && exit 1; echo READY; exit 0 ;;
+  *READY*) if [[ "${STUB_CANARY_FAIL:-}" == "$agent" ]]; then
+             [[ -n "${STUB_CANARY_ERR:-}" ]] && printf '%b\n' "$STUB_CANARY_ERR" >&2   # the captured .err the cause label is read from
+             exit 1
+           fi
+           echo READY; exit 0 ;;
 esac
 case "$agent" in
   kilabz)  [[ -n "${STUB_KILABZ_FAIL:-}" ]] && exit 1; echo "${STUB_REVIEW:-bug: line 1 returns a-b}" ;;
@@ -132,6 +136,30 @@ echo "3b. canary abort marks transient (push mode); gate mode does NOT"; reset; 
   ckfile "$TMARKER" "push-mode canary abort writes the scoped transient marker"
   reset; STUB_CANARY_FAIL=kilabz gate_run >/dev/null 2>&1 || true
   cknofile "$TMARKER" "gate-mode canary abort writes NO transient marker"
+echo "3c. canary abort names the REAL cause in the title + the transient marker (not 'auth or pool down')"
+cktitle(){ # cktitle <label> <exact-title-substring> — asserts on the delivery's FIRST line only
+  local f; f="$(latest)"
+  if [[ -n "$f" ]] && head -1 "$f" | grep -qF "$2"; then echo "  ok: $1"; PASS=$((PASS+1));
+  else echo "  FAIL: $1 (title '$( [[ -n "$f" ]] && head -1 "$f")' lacks '$2')"; FAIL=$((FAIL+1)); fi
+}
+  reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='ERROR: Your workspace is out of credits. Add credits to continue.' run
+  cktitle "credits" "review ABORTED — canary: kilabz OUT OF CREDITS"
+  if [[ "$(cat "$TMARKER" 2>/dev/null)" == "kilabz OUT OF CREDITS" ]]; then echo "  ok: marker carries the cause"; PASS=$((PASS+1)); else echo "  FAIL: marker content '$(cat "$TMARKER" 2>/dev/null)'"; FAIL=$((FAIL+1)); fi
+  ck "body says the login is fine" "login is fine"
+  reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR="ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 24th, 2026 3:00 PM." run
+  cktitle "usage limit + reset time" "canary: kilabz USAGE LIMIT (Sep 24th, 2026 3:00 PM)"
+  reset; STUB_CANARY_FAIL=lobster STUB_CANARY_ERR='Credit balance is too low' run
+  cktitle "claude-side credits wording" "canary: lobster OUT OF CREDITS"
+  reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='ERROR codex_api: failed to connect to websocket: HTTP error: 401 Unauthorized' run
+  cktitle "auth" "canary: kilabz AUTH 401"
+  reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='JOB_ID=00483e09-4013-401d-b99d-f4b80ea01610\nMXR_JOB_FAILED' run
+  cktitle "hex '401' in a job id is NOT auth" "canary: kilabz JOB FAILED"
+  reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='MXR_SYNC_TIMEOUT' run
+  cktitle "sync-wait timeout" "canary: kilabz POOL SLOW"
+  reset; STUB_CANARY_FAIL=kilabz run
+  cktitle "no output at all" "canary: kilabz POOL DOWN?"
+  reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='\033[31mweird\033[0m $(touch /tmp/x) try again at <script>' run
+  cktitle "unrecognized -> UNKNOWN, raw text never in the title" "canary: kilabz UNKNOWN"
 echo "4. dedupe (2nd no-op)"; reset; STUB_TRIAGE="PLAY_PASS" run; before="$(ls "$INBOX" | wc -l)"; STUB_TRIAGE="PLAY_PASS" run; after="$(ls "$INBOX" | wc -l)"
   if [[ "$before" == "$after" ]]; then echo "  ok: 2nd run produced no new delivery"; PASS=$((PASS+1)); else echo "  FAIL: dedupe ($before -> $after)"; FAIL=$((FAIL+1)); fi
 echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-repo-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"
