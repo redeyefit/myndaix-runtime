@@ -33,13 +33,14 @@ Exit codes:
     0 — no changed .py files, or changed files produced zero new findings.
     1 — one or more new findings (printed to stdout).
     2 — could not run: ruff missing from PATH, base ref unresolvable, a git/ruff invocation
-        failed, or ruff's JSON output was unparseable. This path NEVER prints "0 new findings" —
+        failed, or ruff's JSON output was missing or unparseable. This path NEVER prints "0 new findings" —
         an inability to check is not a pass.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -58,9 +59,9 @@ def die(message: str) -> NoReturn:
     sys.exit(2)
 
 
-def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, check=False)
+        return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, check=False, env=env)
     except OSError as exc:
         die(f"failed to run {cmd[0]!r}: {exc}")
 
@@ -129,19 +130,21 @@ def changed_py_files(repo_root: Path, base_commit: str) -> list[ChangedFile]:
     # -z (NUL-separated, unquoted paths) instead of the default quoted-line format: a path with a
     # space or other special char is otherwise wrapped in double quotes by porcelain, and
     # `.endswith(".py")` then fails on the trailing quote char, silently dropping the file.
-    # (An entirely-untracked new directory is still enumerated file-by-file here, not collapsed to
-    # the dir name, because the `-- "*.py"` pathspec itself forces git to recurse into it —
-    # verified: the same command with no pathspec collapses to `?? newdir/`, but this one lists
-    # `?? newdir/inner.py` — so `--untracked-files=all` isn't needed.)
-    proc = git(repo_root, "status", "--porcelain", "--no-renames", "-z", "--", "*.py")
-    if proc.returncode == 0:
-        known = {f.new_path for f in files}
-        for token in proc.stdout.split("\0"):
-            if not token.startswith("??"):
-                continue
-            path = token[3:]
-            if path.endswith(".py") and path not in known:
-                files.append(ChangedFile("A", None, path))
+    # --untracked-files=all is REQUIRED even though the `-- "*.py"` pathspec already makes git
+    # recurse into a new directory: a local/CI `status.showUntrackedFiles=no` otherwise drops every
+    # untracked row with no error, and a new file's findings vanish from the gate (review finding).
+    # A failed status is a die(), like the diff above: an inability to list files is not a pass.
+    proc = git(repo_root, "status", "--porcelain", "--no-renames", "--untracked-files=all", "-z",
+               "--", "*.py")
+    if proc.returncode != 0:
+        die(f"git status (untracked .py discovery) failed: {proc.stderr.strip()}")
+    known = {f.new_path for f in files}
+    for token in proc.stdout.split("\0"):
+        if not token.startswith("??"):
+            continue
+        path = token[3:]
+        if path.endswith(".py") and path not in known:
+            files.append(ChangedFile("A", None, path))
     return files
 
 
@@ -165,15 +168,21 @@ def ruff_json(
     cmd = [ruff_bin, "check", "--output-format=json", "--exit-zero", "--no-cache"]
     if config is not None:
         cmd += ["--config", str(config)]
-    cmd += rel_paths
-    proc = run(cmd, cwd=cwd)
+    cmd += ["--", *rel_paths]  # a path beginning with "-" must never parse as a ruff option
+    # ruff honors RUFF_OUTPUT_FILE and writes the JSON THERE, leaving stdout empty — which read as
+    # "zero findings", a false pass (verified). Strip it from the child env; and because ruff
+    # prints "[]" for zero findings, an EMPTY stdout can only mean the output went elsewhere.
+    env = {k: v for k, v in os.environ.items() if k != "RUFF_OUTPUT_FILE"}
+    proc = run(cmd, cwd=cwd, env=env)
     # --exit-zero makes ruff return 0 for lint findings (incl. E9 syntax errors, which are
     # findings under our select) — a NON-zero return here means ruff itself couldn't run:
     # a broken pyproject.toml, an unknown rule code, a bad CLI arg. Fail closed, never guess.
     if proc.returncode != 0:
         die(f"ruff invocation failed (config or CLI problem): {proc.stderr.strip()}")
+    if not proc.stdout.strip():
+        die("ruff printed no JSON on stdout (output redirected?) — refusing to read that as zero findings")
     try:
-        return json.loads(proc.stdout) if proc.stdout.strip() else []
+        return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         die(f"could not parse ruff JSON output: {exc}")
 
