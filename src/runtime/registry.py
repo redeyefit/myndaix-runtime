@@ -158,6 +158,10 @@ V1_ROSTER: list[AgentSpec] = [
               # adversarial gate; codex auth is a flat-rate ChatGPT subscription, so the
               # API-price argument stays moot). If kilabz 404s again, re-derive the pin from
               # ~/.codex/models_cache.json, not from memory.
+              # effort=high, NOT xhigh (Jefe, 2026-09-24): the subscription is flat-rate but
+              # CREDIT-CAPPED — xhigh drained the workspace 3x in 2 days (09-22/23), and in
+              # those windows two security PRs (FieldVision #145/#151) merged with NO kilabz
+              # pass. A gate that is always up beats a deeper one that is offline.
               # timeout_s=900: xhigh on a real review diff regularly exceeds the dead 300s
               # per-attempt default (2026-07-03: two killed attempts + one ok stranded a DONE
               # reply in the ledger while play-review's wait expired). invoke_cli uses THIS
@@ -172,7 +176,7 @@ V1_ROSTER: list[AgentSpec] = [
               # accepted §5 residual — read-only exec of snapshot entry points — is
               # capability-identical to its existing un-path-scoped Read.
               adapter={"kind": "cli", "argv": ["codex", "exec", "--sandbox", "read-only",
-                       "-c", "model=gpt-6-astra", "-c", "model_reasoning_effort=xhigh",
+                       "-c", "model=gpt-6-astra", "-c", "model_reasoning_effort=high",
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
                        "staging_cwd": "optional",
                        "env_passthrough": ["OPENAI_API_KEY"]}),
