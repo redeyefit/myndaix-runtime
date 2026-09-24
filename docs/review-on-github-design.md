@@ -1,6 +1,7 @@
 # Review on GitHub — make the AI verdict a required check, delete the scaffolding (design, 2026-09-24)
 
-**Status:** DRAFT for cross-family design review (oracle leads, kilabz trust boundaries).
+**Status:** DRAFT, round 2 of cross-family design review. Round 1 (oracle only) is folded; see
+"Review round 1".
 Direction approved by Jefe 2026-09-24 ("yes"). **Supersedes** `review-subtraction-design.md`
 (NOT PASS, 2 blockers). Its blocker 1 was "a human can click Merge on a PR the AI rejected;
 the backstop is the only catch". This design removes that gap with a GitHub primitive instead
@@ -50,11 +51,18 @@ pull_request_target [opened, synchronize, reopened, ready_for_review]   # workfl
     3. submit to the pool: mxr review (kilabz gate, de-linked read-only snapshot of head)
                            + oracle second opinion (agy, fenced diff)       # existing staging seam
     4. verdict = NEEDS-FIX iff a kilabz `finding:` line (oracle is advisory, as in subtraction #2)
-    5. gitleaks the verdict text -> any hit: do NOT post, FAIL              # public repo
-    6. post one PR review comment (verdict body + reviewed head sha)
-    7. exit 0 on PASS, 1 on NEEDS-FIX or reviewer-unavailable               # this job = check `review`
-branch protection: add required check `review`.  Merging on green = GitHub auto-merge (per PR).
+    5. PUBLIC repo (runtime): post NOTHING but the check result + one line
+       "NEEDS-FIX: <n> findings (ledger job <id>)". The verdict BODY never leaves the ledger.
+       PRIVATE repo (FV): gitleaks the body -> any hit: don't post, FAIL; else post one PR comment
+    6. exit 0 on PASS, 1 on NEEDS-FIX or reviewer-unavailable               # this job = check `review`
+ruleset (not classic protection): required check `review`, bypass actor = repository admin,
+  bypass mode = "pull requests only" (Jefe can merge ONE PR past a red/pending review in the UI;
+  nobody can direct-push). Classic protection is unchanged. Merge on green = GitHub auto-merge.
 ```
+
+**The review is always of the FULL PR diff** (`base...head`), never incremental since the last
+reviewed sha. Fold pushes change callers of earlier pushes, and full-diff needs no stored state.
+Cost is held down by `cancel-in-progress` + skipping drafts, not by shrinking the diff.
 
 - **Reviewer reuse, not a rewrite.** Steps 3–4 call the existing pool (`mxr review`, profiles,
   canary, timeouts). The ledger records jobs and outcome tags exactly as today (invariant 1;
@@ -74,13 +82,16 @@ branch protection: add required check `review`.  Merging on green = GitHub auto-
 | controller backstop + `review_cursor` + chunker | required check (the skills indexer stays) |
 | `automerge-tick/preflight` + PLAY_GATE | GitHub auto-merge |
 | `deploy-sync.sh` + trusted-install verification | main-branch workflow |
-| inbox relay of routine verdicts | PR comment; Mack reads via `gh` |
+| inbox relay of routine verdicts | check result (+ PR comment on private repos); Mack reads bodies via `mxr get` |
 | `repo_id = basename(cwd)` | `github.repository` |
+| autofix: `autofix-arm.sh`, `play-fix.sh`, `fix-sweep.sh`, `autofix_fire()` | nothing — its only trigger (main-branch reviews, #179) dies with the backstop. Deleted, not parked; recoverable from git |
+
+**Automerge needs no replacement classifier:** `automerge_seen` on the Mini (2026-09-24) shows
+**2 merges ever** (the last on 2026-06-29), 91 skipped and 5 needs_fix. Native auto-merge is
+opt-in per PR by a human, and that choice is the classification.
 
 **Kept:** the pool/ledger/Command API, outcome labeling (no GitHub analog; it's the learning
 data), substrate deploy (not review), the doorbell for non-review alerts.
-**Parked:** autofix. It fires only on main-branch reviews (#179), and those disappear with the
-backstop. Revisit separately.
 
 ## Security surface
 
@@ -92,21 +103,34 @@ backstop. Revisit separately.
 - **The same-repo `if:` is mandatory, not belt.** Assumption to verify: fork-triggered
   `pull_request_target` runs are NOT held by the fork-approval setting.
 - **Exfil path:** codex's read-only sandbox can still READ what `jefe` can read (auth.json,
-  `.secrets`, ops DB). An injected reviewer could echo a secret into the verdict, and on a public
-  repo that is publication.
-  - Mitigations: gitleaks on the verdict before posting (fail closed); same-repo-only authors.
-  - Residual: a non-pattern secret. Stronger fix, later: run the reviewer under the curator
-    confinement pattern (scratch HOME, `--tools`, `--strict-mcp-config`).
+  `.secrets`, ops DB), so an injected reviewer could echo a secret into its verdict.
+  - A pattern scanner can't stop this: base64, rot13 or spaced-out text defeats gitleaks
+    (oracle, round 1, CRITICAL).
+  - Closed by **not publishing**: on the public repo the verdict body never leaves the ledger,
+    and the only public output is one bit plus a count.
+  - On private FV, comments reach repo collaborators only (Jefe); gitleaks there is belt.
+  - This is today's exposure unchanged: verdicts already land in the private inbox.
+  - Confinement (curator pattern: scratch HOME, `--tools`, `--strict-mcp-config`) stays a later
+    hardening, not a launch gate, BECAUSE nothing is published.
+- **Fork PRs never get a `review` result**, so they can never merge without Jefe's admin bypass.
+  Intended: a solo repo, 0 forks, and outside code should need Jefe anyway.
 - **Pin third-party actions by SHA** (repo has `sha_pinning_required: false`).
 - **Stale comment fix:** `ci.yml`'s ACCEPTED RISK note says "private" — the repo is public; fix
   the comment in the build PR.
 
 ## Failure modes
 
-- **Reviewer unavailable** (credits out, pool down, canary fail, Mini offline): the check fails
-  or stays pending, and merges wait. That is fail-closed by design. **No override label** (agents
-  run `gh` as Jefe, so they could self-override). The escape hatch is Jefe editing branch
-  protection: manual, rare, visible.
+- **Reviewer unavailable** (credits out, pool down, canary fail, auth lost, Mini offline): the
+  check fails or stays pending. That is fail-closed by design.
+  - Escape hatch (oracle round 1, HIGH: "no override" is unsurvivable after a ~15h outage day):
+    the ruleset's **admin bypass, pull-requests-only**. Jefe merges that one PR in the web UI;
+    the gate stays up for every other PR.
+  - **No override label.** Agents run `gh` as Jefe, so they could self-apply one.
+  - For the same reason the MacBook `destructive-blocker` hook denies `gh pr merge --admin`: a
+    bypass is a human click, never an agent command.
+  - Two real cases on 2026-09-23/24 show why fail-closed matters: Mini Codex credits ran out, and
+    the MacBook Codex login file was lost when the disk filled. Today both failed OPEN (reviews
+    aborted, merges proceeded). Under this design both hold the merge.
 - **Diff too large:** fail "split the PR". A **failing diff:** fail closed.
 - **Force-push or rebase mid-review:** the run is cancelled and the new head reviewed.
 - **Web-UI edit:** it's a PR, so it gets reviewed. Direct push to `main` is blocked by protection.
@@ -126,17 +150,31 @@ No chunking, cursor, backstop, override label, merge queue, new table, or Comman
 **Not Codex's native `@codex review`:** comment-only (no evidence it can be a required check),
 separately billed, and runs in OpenAI's cloud, so it can't record outcomes to our ledger.
 
-## Open questions for review
+## Review round 1 (2026-09-24, oracle only; kilabz was logged out) — folded
+
+1. CRITICAL exfil via obfuscation: folded as "don't publish" (Security).
+2. HIGH fork PRs stuck: accepted as intended (Security).
+3. HIGH no override: folded as the ruleset admin bypass, PRs only, plus the `--admin` hook
+   deny. Oracle's suggested setting ("bypass required pull requests") only exempts the PR
+   requirement, not a status check, so it was not taken.
+4. MED automerge classification: refuted by data (2 merges ever).
+5. MED full vs incremental diff: full (Design).
+6. LOW autofix orphaned: delete, not park (Deleted table).
+
+Confirmed closed by oracle: the required check covers web-UI edits, force-pushes, stale results
+from older shas, and Dependabot (same-repo branches).
+
+## Open questions for round 2 (kilabz trust boundaries)
 
 1. `pull_request_target` + the same-repo `if:` + no-execute: is there any path where main's
-   workflow still executes PR-controlled content?
-2. Do fork `pull_request_target` runs bypass the outside-contributor approval gate? (Assumed yes.)
-3. Full PR diff per push vs incremental since the last reviewed sha (read from the previous
-   verdict comment). Per-review cost rises and review count falls. Decide from shadow data.
-4. Is "no override" survivable given yesterday's two credit outages (~15h total)?
-5. Dependabot PRs under `pull_request_target`: token and secret scope, and should they be
+   workflow still executes PR-controlled content (e.g. the reviewer's read-only snapshot, git
+   hooks/attributes/filters in the fetched head, submodules)?
+2. Does "pull requests only" ruleset bypass exist for a user-owned public repo with a
+   repository-admin actor? Verify at build with a throwaway PR before relying on it.
+3. Dependabot PRs under `pull_request_target`: token and secret scope, and should they be
    reviewed at all?
-6. Is gitleaks-on-verdict enough for launch, or is confinement a prerequisite on a public repo?
+4. Is the one public line ("NEEDS-FIX: n findings (ledger job id)") truly free of
+   attacker-controlled content?
 
 ## Still next, independent of this design
 
