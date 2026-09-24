@@ -162,6 +162,26 @@ cktitle(){ # cktitle <label> <exact-title-substring> — asserts on the delivery
   cktitle "no output at all" "canary: kilabz POOL DOWN?"
   reset; STUB_CANARY_FAIL=kilabz STUB_CANARY_ERR='\033[31mweird\033[0m $(touch /tmp/x) try again at <script>' run
   cktitle "unrecognized -> UNKNOWN, raw text never in the title" "canary: kilabz UNKNOWN"
+echo "3d. merge bar: advisory-only triage = PASS (advisory); a late/trailing token = NEEDS-FIX; automerge gate stays strict"
+  reset; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n## Advisory\n- harden the X parser' run
+  cktitle "advisory-only -> PASS (advisory)" "review PASS (advisory) — refs/heads/main"
+  ck "advisory list is delivered" "harden the X parser"
+  ck "says advisories are not required" "NOT required before merge"
+  ckfile "$DMARKER" "advisory PASS marks the tip done"
+  reset; af_repos "$NULLCFG"; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n- harden X' run_af; settle
+  cknofile "$FAKE/.myndaix/fixer-argv" "advisory PASS never fires autofix (no fix-list)"
+  reset; STUB_TRIAGE=$'\n  PLAY_PASS_ADVISORY \r\n- x' run
+  cktitle "leading blank line + spaces + CR on the token line still parse" "review PASS (advisory)"
+  reset; STUB_TRIAGE=$'## Blocking\n1. real bug\nPLAY_PASS_ADVISORY' run
+  cktitle "token quoted AFTER a blocking list -> NEEDS-FIX" "review NEEDS-FIX"
+  reset; STUB_TRIAGE='PLAY_PASS_ADVISORY but item 1 is blocking' run
+  cktitle "trailing text on the token line -> NEEDS-FIX" "review NEEDS-FIX"
+  reset; rm -f "$ROOT/verdict.json"; STUB_TRIAGE=$'PLAY_PASS_ADVISORY\n- x' gate_run; ckexit $? 1 "automerge gate: advisory is NOT a pass (exit 1)"
+  ck "gate verdict says NEEDS-FIX" '"verdict":"NEEDS-FIX"' "$ROOT/verdict.json"
+  reset; STUB_TRIAGE="PLAY_PASS" run
+  if grep '^lobster' "$FAKE/.myndaix/mxr-argv.log" 2>/dev/null | grep -q "MERGE BAR — classify every finding"; then echo "  ok: the rubric reaches lobster"; PASS=$((PASS+1)); else echo "  FAIL: lobster prompt lacks the MERGE BAR rubric"; FAIL=$((FAIL+1)); fi
+  _bar_pr="$(grep -o 'MERGE_BAR="[^"]*"' "$SCRIPT" | head -1)"; _bar_xr="$(grep -o 'MERGE_BAR="[^"]*"' "$(dirname "$SCRIPT")/xreview.sh" | head -1)"
+  if [[ -n "$_bar_pr" && "$_bar_pr" == "$_bar_xr" ]]; then echo "  ok: play-review + xreview carry the identical rubric"; PASS=$((PASS+1)); else echo "  FAIL: MERGE_BAR drifted between play-review.sh and xreview.sh"; FAIL=$((FAIL+1)); fi
 echo "4. dedupe (2nd no-op)"; reset; STUB_TRIAGE="PLAY_PASS" run; before="$(ls "$INBOX" | wc -l)"; STUB_TRIAGE="PLAY_PASS" run; after="$(ls "$INBOX" | wc -l)"
   if [[ "$before" == "$after" ]]; then echo "  ok: 2nd run produced no new delivery"; PASS=$((PASS+1)); else echo "  FAIL: dedupe ($before -> $after)"; FAIL=$((FAIL+1)); fi
 echo "5. daily cap";         reset; mkdir -p "$STATE"; printf 9999 > "$STATE/count-repo-$(date +%Y%m%d)"; STUB_TRIAGE="PLAY_PASS" run; ck "aborts on cap" "ABORTED — cap"
