@@ -35,11 +35,15 @@ jobs:
         #    No workflow uses a `shell:` override today, so this is latent, not active; this
         #    guard keeps it that way by failing loudly the day one is added instead of letting
         #    a step's shellcheck coverage evaporate unnoticed. Covers `defaults.run.shell` too.
-        # 2) `.github/actionlint.yaml`'s `paths:` key can `ignore:` findings by regex, and a
+        # 2) A repo actionlint config's `paths:` key can `ignore:` findings by regex, and a
         #    self-hosted-runner label of `"*"` matches everything — either one makes actionlint
-        #    exit 0 with a real bug still present (reproduced: an SC2086 script + either change
-        #    -> exit 0, nothing printed). That config file lives in THIS PR's scope, so a future
-        #    "fix" that quietly adds either one to make a red run green must fail loudly instead.
+        #    exit 0 with a real bug still present. actionlint auto-loads `.github/actionlint.yaml`
+        #    AND `.yml`, and regex guards over that file were bypassable (a `.yml` config skipped
+        #    them entirely; flow-style YAML evaded them — review r1). So the config is PINNED
+        #    here instead and passed with -config-file, which makes actionlint ignore any repo
+        #    config of either extension (verified: weakening .yaml/.yml -> auto rc 0, pinned rc 1).
+        #    Local run with the same config:
+        #    actionlint -config-file <(printf 'self-hosted-runner:\n  labels:\n    - mini\n')
         run: |
           set -euo pipefail
           if grep -nE '^[[:space:]]*(-[[:space:]]*)?shell:' .github/workflows/*.y*ml 2>/dev/null \
@@ -47,22 +51,9 @@ jobs:
             echo "unsupported shell: value escapes actionlint's shellcheck pass (only bare bash/sh are covered)" >&2
             exit 1
           fi
-          cfg=".github/actionlint.yaml"
-          if [ -f "$cfg" ]; then
-            # optional quotes: a quoted `"paths":` key is valid YAML and actionlint honors it
-            # (reproduced: quoted key + ignore -> SC2086 suppressed, exit 0) — review 2026-09-23 #1
-            if grep -qE "^[[:space:]]*[\"']?paths[\"']?[[:space:]]*:" "$cfg"; then
-              echo "$cfg: a top-level 'paths' key can silently suppress real findings — not allowed" >&2
-              exit 1
-            fi
-            bad_labels="$(grep -E '^[[:space:]]*-[[:space:]]*[^[:space:]]' "$cfg" \
-              | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]*#.*$//' \
-              | grep -vE '^[A-Za-z0-9_-]+$' || true)"
-            if [ -n "$bad_labels" ]; then
-              echo "$cfg: self-hosted-runner label(s) must be literal (letters/digits/-/_ only); found: $bad_labels" >&2
-              exit 1
-            fi
-          fi
+          # the ONLY config actionlint sees: declares the Mac Mini runner's "mini" label (ci.yml's
+          # runs-on: [self-hosted, mini]) so it isn't flagged as an unknown GitHub-hosted label
+          printf 'self-hosted-runner:\n  labels:\n    - mini\n' > "$RUNNER_TEMP/actionlint.yaml"
 
       - name: actionlint (workflow lint + embedded shellcheck)
         # BLOCKING in the sense that a failure exits nonzero and turns this check red — no
@@ -82,8 +73,7 @@ jobs:
         # "lint only" with no signal, so install-if-missing for BOTH tools, then hard-verify
         # each binary actually landed before running — never skip a checker silently.
         #
-        # .github/actionlint.yaml declares the "mini" self-hosted-runner label so
-        # runs-on: [self-hosted, mini] isn't flagged as an unknown GitHub-hosted label.
+        # -config-file: the pinned config from the Guardrails step (never a repo config file).
         run: |
           set -euo pipefail
           # A SHELLCHECK_OPTS inherited from the runner's environment (or a future launchd/.env
@@ -103,10 +93,12 @@ jobs:
           # disabled by a stub binary, a bad -shellcheck= path, or SHELLCHECK_OPTS) by feeding
           # actionlint a known-bad inline script and requiring it to come back flagged. A
           # canary that itself reports clean means the checker isn't real; fail closed.
+          cfg="$RUNNER_TEMP/actionlint.yaml"
+          [ -s "$cfg" ] || { echo "pinned actionlint config missing ($cfg) — Guardrails step did not run" >&2; exit 1; }
           # shellcheck disable=SC2016  # deliberately single-quoted: $CANARY must reach actionlint literal, unexpanded
-          canary_out="$(printf 'on: push\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $CANARY\n' | actionlint -stdin-filename canary.yml - 2>&1 || true)"
+          canary_out="$(printf 'on: push\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $CANARY\n' | actionlint -config-file "$cfg" -stdin-filename canary.yml - 2>&1 || true)"
           if ! grep -q 'SC2086' <<<"$canary_out"; then
             echo "actionlint shellcheck pass not live (canary SC2086 not detected)" >&2
             exit 1
           fi
-          actionlint
+          actionlint -config-file "$cfg"
