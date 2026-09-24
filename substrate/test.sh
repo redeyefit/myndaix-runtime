@@ -1242,11 +1242,12 @@ ok 'grep -qi "does not resolve to a git work tree" "$TMP/g.warn"' "guard: unreso
 # A BARE repo is equally unresolvable (rev-parse prints false/exit-0 — the ==true check catches it) -> REFUSE.
 MXR_TEST_TREE="$TMP/tree-bare.git" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.bare.err"; r=$?
 ok '[[ "$r" -eq 78 ]] && grep -qi "does not resolve" "$TMP/g.bare.err"' "guard: a BARE repo is REFUSED (not read as clean-main via false/exit-0)"
-# PYTHONPATH legitimately UNSET (editable-venv install): the ONE fail-open branch — warn + dispatch.
+# PYTHONPATH legitimately UNSET (editable-venv install): a fail-open branch (the other is config.env
+# absent) — warn + dispatch.
 GUARD3="$TMP/mxr-guard-nopypath"
 { printf '#!/bin/bash\nunset PYTHONPATH\n'; cat "$GUARDBODY"; printf 'echo PASSTHROUGH\n'; } > "$GUARD3"; chmod +x "$GUARD3"
 g="$(MYNDAIX_HOME="$FAC" bash "$GUARD3" kilabz 2>"$TMP/g.nopy.err")"; r=$?
-ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "PYTHONPATH unset" "$TMP/g.nopy.err"' "guard: PYTHONPATH unset (venv install) is the ONLY fail-open branch — warns + dispatches"
+ok '[[ "$r" -eq 0 && "$g" == PASSTHROUGH ]] && grep -qi "PYTHONPATH unset" "$TMP/g.nopy.err"' "guard: PYTHONPATH unset (venv install) fails open — warns + dispatches"
 # origin/main ref GONE -> ahead-ness unverifiable -> REFUSE (R4 P2: `|| echo 0` read it as clean).
 MXR_TEST_TREE="$TREE_NOREF" MYNDAIX_HOME="$FAC" bash "$GUARD" kilabz >/dev/null 2>"$TMP/g.noref.err"; r=$?
 ok '[[ "$r" -eq 78 ]] && grep -q "ahead=unverifiable" "$TMP/g.noref.err"' "guard: missing origin/main ref -> REFUSED as unverifiable (rev-list failure never reads as 0-ahead)"

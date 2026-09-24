@@ -83,8 +83,12 @@ follow from the SAME commit):
 
 ```bash
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
-# wait until ~/.myndaix/state/RUNNING_SHA == the merge sha (Substrate deploy, step 2), then:
-S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ ]] || { echo "no valid RUNNING_SHA" >&2; exit 1; }
+# The wait is CODE, not a comment: this block gets pasted whole, and an unwaited read takes the
+# PRE-merge RUNNING_SHA — deploy-sync then cleanly reinstalls the OLD copies and exits 0 (review 11391).
+M=$(git -C ~/.myndaix/deploy/myndaix-runtime ls-remote origin refs/heads/main | cut -f1)
+[[ "$M" =~ ^[0-9a-f]{40}$ ]] || { echo "ls-remote failed (network/auth) — cannot resolve origin/main" >&2; exit 1; }
+for _ in $(seq 60); do [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null)" == "$M" ]] && break; sleep 5; done
+S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ && "$S" == "$M" ]] || { echo "reconcile has not converged to $M (RUNNING_SHA=$S) — check reconcile, do NOT apply" >&2; exit 1; }
 ~/.myndaix/deploy/myndaix-runtime/orchestrator/deploy-sync.sh --apply "$S"
 ```
 
@@ -93,7 +97,12 @@ commit reconcile HEALTH-GATED (`RUNNING_SHA` is written last, only on a good con
 together, never a partial copy (the half-deploy this doc exists to prevent). Pin the sha, never
 `HEAD`: a later reconcile tick can move the clone past the gate between your wait and the apply
 (review 99718 P2). If it did, deploy-sync REFUSES the skew (clone HEAD ≠ the pinned sha) — rerun
-from the wait; never override with `DEPLOY_SYNC_ALLOW_SKEW`.
+from the wait; never override with `DEPLOY_SYNC_ALLOW_SKEW`. The refusal covers the window BEFORE
+validation only: a tick that lands mid-apply is not refused, and takes no lock — every installed
+file is read from the pinned sha, so the install is still one consistent commit; the clone just
+moved on, same as a merge landing a second later (`--preflight` flags it; the next apply covers it).
+Not guarded: a `git gc` repacking the clone during the read (low probability; if the apply
+errors, rerun it from the wait).
 
 **Autofix apply rung (2026-09-11, docs/autofix-apply-rung-design.md):** verified fixes
 (`SUITE_GREEN` / `REGRESSION_CHECK_ONLY`) commit + push `fix/auto/*` branches and open PRs when
@@ -278,9 +287,12 @@ migration `0015` applied, so the code it talks to must land FIRST:
 
 ```bash
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
-# wait until ~/.myndaix/state/RUNNING_SHA == the merge sha (Substrate deploy, step 2), then:
 D=~/.myndaix/deploy/myndaix-runtime
-S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ ]] || { echo "no valid RUNNING_SHA" >&2; exit 1; }
+# real wait, not a comment — see the full Mini deploy above (review 11391)
+M=$(git -C "$D" ls-remote origin refs/heads/main | cut -f1)
+[[ "$M" =~ ^[0-9a-f]{40}$ ]] || { echo "ls-remote failed (network/auth) — cannot resolve origin/main" >&2; exit 1; }
+for _ in $(seq 60); do [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null)" == "$M" ]] && break; sleep 5; done
+S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ && "$S" == "$M" ]] || { echo "reconcile has not converged to $M (RUNNING_SHA=$S) — check reconcile, do NOT apply" >&2; exit 1; }
 "$D/orchestrator/deploy-sync.sh" --apply "$S" \
   && bash "$D/orchestrator/phone/test.sh" && bash "$D/orchestrator/phone/test.sh" --sshd
 ```
