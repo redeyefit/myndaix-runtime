@@ -36,5 +36,5 @@ bats tests/bash/           # the bash test suite (lint gate + your unit tests)
 
 ## Write a bash test
 Copy a `@test` from `example.bats`. `run <cmd>` captures `$status` + `$output`; `setup_file`/`teardown_file`
-for a temp workspace. Keep bash **thin** — when a script grows real logic, port it to Python (CodeQL +
-the ruff ratchet + pytest run on it in CI).
+for a temp workspace. Keep bash **thin** — when a script grows real logic, port it to Python (the ruff
+ratchet + pytest run on it in CI).
