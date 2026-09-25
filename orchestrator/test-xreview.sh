@@ -142,6 +142,11 @@ echo "8b. code mode: lobster snapshot staging FAILURE degrades LOUDLY to reconci
 echo "9. code mode: an unresolvable repo is a usage error (exit 2)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   run code /no/such/repo "$RANGE" >/dev/null 2>&1; ckx $? 2 "unresolvable repo -> exit 2"
 
+echo "9b. code mode: a git WORKTREE path resolves (its .git is a FILE, not a dir)"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
+  WT="$ROOT/wt"; git -C "$REPO" worktree add -q --detach "$WT" HEAD
+  run code "$WT" "$RANGE" >/dev/null; ckx $? 0 "code review from a worktree exits 0"
+  ck "$(log)" "review kilabz --repo $WT --range" "kilabz gate dispatched against the worktree path"
+
 echo "10. design mode: oracle LEADS (dispatched), verdict printed, no snapshot verb"; rm -f "$FAKE/mxr-argv.log" "$FAKE/.oc"
   out="$(run design "$DOC")"; ckx $? 0 "design review exits 0"
   if grep -q "oracle" "$(log)" && grep -q "kilabz" "$(log)"; then echo "  ok: both oracle (lead) + kilabz dispatched"; PASS=$((PASS+1)); else echo "  FAIL: design routing missing a family"; FAIL=$((FAIL+1)); fi

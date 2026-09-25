@@ -81,8 +81,10 @@ nonce_syn="$(openssl rand -hex 16 2>/dev/null || printf 's%s%s' "$$" "${RANDOM:-
 clean(){ LC_ALL=C tr -d '\000-\010\013-\037\177'; }   # 0-8, 11-31 (incl CR/ESC), 127 — keep \t(9) \n(10)
 fence(){ printf '===BEGIN UNTRUSTED %s nonce=%s===\n' "$1" "$3"; printf '%s' "$2" | clean; printf '\n===END UNTRUSTED nonce=%s===\n' "$3"; }
 
-# resolve a repo_id|path to an on-disk repo path (needed to compute the diff for oracle's backup)
-_repo_path(){ [[ -d "$1/.git" ]] && { printf '%s' "$1"; return 0; }
+# resolve a repo_id|path to an on-disk repo path (needed to compute the diff for oracle's backup).
+# -e not -d: in a git WORKTREE `.git` is a FILE (gitdir pointer), and worktrees are the house
+# discipline for runtime fixes — a -d test refused every review run from one.
+_repo_path(){ [[ -e "$1/.git" ]] && { printf '%s' "$1"; return 0; }
               local rj="${MYNDAIX_REPOS_JSON:-$HOME/.myndaix/orchestrator/repos.json}"
               have jq && jq -r --arg r "$1" '.[$r].path // empty' "$rj" 2>/dev/null || true; }
 
@@ -95,7 +97,7 @@ if [[ "$mode" == code ]]; then
   repo="${1:-}"; range="${2:-}"; objf="${3:-}"
   [[ -n "$repo" && "$range" == *..* ]] || die "code mode: xreview.sh code <repo_id|path> <base>..<head> [obj-file]"
   base="${range%%..*}"; head="${range##*..}"
-  rp="$(_repo_path "$repo")"; [[ -d "$rp/.git" ]] || die "cannot resolve a repo path for '$repo' (need an abs path or a repos.json entry)"
+  rp="$(_repo_path "$repo")"; [[ -e "$rp/.git" ]] || die "cannot resolve a repo path for '$repo' (need an abs path or a repos.json entry)"
   # r3 finding #2: resolve BOTH endpoints to immutable commit SHAs up front. A symbolic ref (HEAD, a
   # branch) can MOVE during the long kilabz call, so the gate and the oracle backup would otherwise
   # review DIFFERENT changes. Pin the gate's --range AND the oracle diff to the SAME SHAs -> a genuinely

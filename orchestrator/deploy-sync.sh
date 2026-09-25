@@ -57,7 +57,8 @@ if [[ "$mode" == "--apply" && -z "${2:-}" ]]; then die "--apply requires an expl
 # DEPLOY_SYNC_DEST would inject live command substitution at trap-fire time; review r2 CRITICAL).
 _release_lock(){ [[ -n "${_LOCK:-}" ]] && rmdir "$_LOCK" 2>/dev/null; return 0; }
 
-[[ -d "$REPO/.git" ]] || die "repo not a git dir: $REPO"
+# -e not -d: `.git` is a FILE in a git worktree — running this from one must not be refused
+[[ -e "$REPO/.git" ]] || die "repo not a git dir: $REPO"
 [[ -d "$DEST" ]]      || die "deploy dest missing: $DEST"
 
 # blob sha of a path AT a git ref (the intended/committed content); arg = repo-relative path
