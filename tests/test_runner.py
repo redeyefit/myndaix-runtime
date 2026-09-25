@@ -656,9 +656,14 @@ def test_roster_cli_agents_get_only_their_own_key():
         # claude agents (lobster/mack/mini) get ONLY CLAUDE_CODE_OAUTH_TOKEN — the long-lived Max
         # SUBSCRIPTION token (headless-safe, unlike the keychain Max login) — and NOT ANTHROPIC_API_KEY
         # (a stale key would 401; the 2026-07-02 lobster-canary bug). Every other secret is dropped.
+        # kilabz gets NONE (fixed 2026-09-25, registry.py:205 comment): it auths via the host's
+        # flat-rate ChatGPT session (~/.codex/auth.json), never an API key — passing OPENAI_API_KEY
+        # through actively broke it, because codex CLI prefers a present env-var key over the
+        # session even when the key is stale/wrong-scope for that auth path (silent 401s on every
+        # kilabz review). codex (the fixer, still API-key-based) is unaffected by that fix.
         expect = {"lobster": {"CLAUDE_CODE_OAUTH_TOKEN"}, "mack": {"CLAUDE_CODE_OAUTH_TOKEN"},
                   "mini": {"CLAUDE_CODE_OAUTH_TOKEN"},
-                  "kilabz": {"OPENAI_API_KEY"}, "codex": {"OPENAI_API_KEY"},
+                  "kilabz": set(), "codex": {"OPENAI_API_KEY"},
                   "oracle": {"GEMINI_API_KEY", "GOOGLE_API_KEY"}}
         for aid, own in expect.items():
             env = runner._cli_env(REGISTRY[aid])
