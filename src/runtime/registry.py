@@ -202,8 +202,19 @@ V1_ROSTER: list[AgentSpec] = [
                        "-c", "project_doc_max_bytes=0",
                        *[a for f in KILABZ_DISABLED_FEATURES for a in ("--disable", f)],
                        "--skip-git-repo-check"], "prompt_channel": "stdin",
-                       "staging_cwd": "optional",
-                       "env_passthrough": ["OPENAI_API_KEY"]}),
+                       "staging_cwd": "optional"
+                       # env_passthrough ["OPENAI_API_KEY"] REMOVED (2026-09-25): kilabz is
+                       # designed to auth via the host's flat-rate ChatGPT session
+                       # (~/.codex/auth.json — see "codex auth is a flat-rate ChatGPT
+                       # subscription" above, and the scratch_home note re preserving that
+                       # session's token refresh), never an API key. codex CLI prefers an
+                       # OPENAI_API_KEY env var over the session when BOTH are present, so a
+                       # stale/wrong-scope key in ~/.myndaix/.secrets (an sk-svcacct key, valid
+                       # for api.openai.com, NOT for the chatgpt.com backend codex CLI's session
+                       # mode talks to) silently 401'd every kilabz review even though
+                       # `codex:setup` reported the session alone as ready. Do not re-add this
+                       # passthrough without re-verifying codex CLI's auth precedence first.
+                       }),
     AgentSpec(agent_id="codex", reach=Reach.CLI, authority=Authority.WORKSPACE_ACTOR,
               model="gpt-6-astra", role="builder/debugger",
               # PIN the model here too (2026-09-10): this agent ran the CLI default under its
