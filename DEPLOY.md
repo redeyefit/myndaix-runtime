@@ -15,10 +15,10 @@ There are **three deploy targets**, and a change can touch any or all:
 
 **Pasting the multi-line blocks below:** every block that can `exit 1` is wrapped in `( … )`, so
 that exit — and the `set -e` some of them turn on — ends the block, never your terminal. They
-carry `#` comments, and interactive zsh on BOTH machines has `interactivecomments` OFF: run
-`setopt interactivecomments` first, or every comment line errors (`command not found: #`) and the
-`set -e` blocks stop at the first one. Non-interactive runs (`ssh mini '…'`, an agent's shell
-tool) need neither.
+carry `#` comments, which interactive zsh rejects by default (`interactivecomments` is OFF):
+every comment line errors (`command not found: #`) and the `set -e` blocks stop at the first one.
+Both machines' `~/.zshrc` set `setopt interactivecomments` (2026-09-24); on any other shell, run
+it first. Non-interactive runs (`ssh mini '…'`, an agent's shell tool) need neither.
 
 ## TL;DR (serve)
 
