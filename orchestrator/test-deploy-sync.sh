@@ -10,7 +10,8 @@ REF="HEAD"                                            # committed content, branc
 SCRATCH="$(mktemp -d)"
 export DEPLOY_SYNC_DEST="$SCRATCH"
 export DEPLOY_SYNC_BIN="$SCRATCH/bin"                 # the phone wrapper's forced-command home
-trap 'rm -rf "$SCRATCH"' EXIT
+# the worktree case registers a scratch worktree in this repo's git dir — deregister it on exit
+trap 'git -C "$DIR/.." worktree remove --force "$SCRATCH/wt" >/dev/null 2>&1; rm -rf "$SCRATCH"' EXIT
 
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -124,6 +125,19 @@ grep -q 'ERROR:' <<<"$ck_out"; ck_err=$?
 # grep rc 1 = no match = default kept; `! grep` would also pass on rc 2 (grep error) — require exactly 1.
 grep -q "requires an explicit" <<<"$ck_out"; ck_rc=$?
 [[ "$ck_rc" -eq 1 ]] && ok "--check with no ref still runs (default kept)" || bad "--check lost its default, or grep failed (rc=$ck_rc): $ck_out"
+
+echo "== runs from a git WORKTREE (its .git is a FILE, not a dir) =="
+# REPO is derived from the script's own location, so the case needs a copy of THIS working-tree
+# script inside a real worktree; the installed surface is still read from the ref, not the copy.
+if git -C "$DIR/.." worktree add -q --detach "$SCRATCH/wt" HEAD >/dev/null 2>&1; then
+  cp "$SYNC" "$SCRATCH/wt/orchestrator/deploy-sync.sh"; mkdir -p "$SCRATCH/wt-dest"
+  wt_rc=0; wt_out="$(DEPLOY_SYNC_DEST="$SCRATCH/wt-dest" DEPLOY_SYNC_BIN="$SCRATCH/wt-dest/bin" \
+    "$SCRATCH/wt/orchestrator/deploy-sync.sh" --apply HEAD 2>&1)" || wt_rc=$?
+  [[ "$wt_rc" -eq 0 && -f "$SCRATCH/wt-dest/play-review.sh" ]] \
+    && ok "--apply from a worktree installs" || bad "--apply from a worktree refused (rc=$wt_rc): $wt_out"
+else
+  bad "could not create a scratch worktree to test against"
+fi
 
 echo ""
 echo "== RESULT: $PASS passed, $FAIL failed =="

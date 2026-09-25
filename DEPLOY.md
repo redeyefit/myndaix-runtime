@@ -13,6 +13,13 @@ There are **three deploy targets**, and a change can touch any or all:
    change does NOT ship by restarting serve — the watchers run from the DEPLOY CLONE, and the guard
    is a per-machine hand-splice from `SETUP.md`.
 
+**Pasting the multi-line blocks below:** every block that can `exit 1` is wrapped in `( … )`, so
+that exit — and the `set -e` some of them turn on — ends the block, never your terminal. They
+carry `#` comments, which interactive zsh rejects by default (`interactivecomments` is OFF):
+every comment line errors (`command not found: #`) and the `set -e` blocks stop at the first one.
+Both machines' `~/.zshrc` set `setopt interactivecomments` (2026-09-24); on any other shell, run
+it first. Non-interactive runs (`ssh mini '…'`, an agent's shell tool) need neither.
+
 ## TL;DR (serve)
 
 `serve` now **auto-applies pending migrations on startup**, so the old footgun is gone:
@@ -82,6 +89,7 @@ new migration in one tick).
 follow from the SAME commit):
 
 ```bash
+(
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 # The wait is CODE, not a comment: this block gets pasted whole, and an unwaited read takes the
 # PRE-merge RUNNING_SHA — deploy-sync then cleanly reinstalls the OLD copies and exits 0 (review 11391).
@@ -90,6 +98,7 @@ M=$(git -C ~/.myndaix/deploy/myndaix-runtime ls-remote origin refs/heads/main | 
 for _ in $(seq 60); do [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null)" == "$M" ]] && break; sleep 5; done
 S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ && "$S" == "$M" ]] || { echo "reconcile has not converged to $M (RUNNING_SHA=$S) — check reconcile, do NOT apply" >&2; exit 1; }
 ~/.myndaix/deploy/myndaix-runtime/orchestrator/deploy-sync.sh --apply "$S"
+)
 ```
 
 This installs `$ORCH/play-review.sh`, `$ORCH/play-fix.sh` and `~/.myndaix/bin/mxr-phone` from the
@@ -139,6 +148,7 @@ has no other checkout):
 ships like this, after the PR merges to `main`:
 
 ```bash
+(
 set -euo pipefail
 # 1. capture the intended full merge SHA from origin (read-only — reconcile alone moves the clone):
 TARGET=$(git -C ~/.myndaix/deploy/myndaix-runtime ls-remote origin refs/heads/main | cut -f1) \
@@ -192,6 +202,7 @@ if [[ "$canary_rc" -ne 0 || "$canary_out" =~ $bad ]]; then
 fi
 [[ "$canary_out" == *"canary: no drift"* ]] \
   || { echo "canary printed no healthy verdict ('canary: no drift') — treat this deploy as UNVERIFIED" >&2; exit 1; }
+)
 ```
 
 Once reconcile has converged, install the copied surface from that health-gated commit with the
@@ -217,12 +228,13 @@ exports, before the guard) and tail (the `exec ... python -m runtime.cli` line),
 block between the markers:
 
 ```bash
+(
 # 1. extract the new guard from SETUP.md on the MacBook (mktemp — a predictable /tmp name on a
 #    shared box is a symlink-clobber target):
 set -euo pipefail
-# no EXIT trap here — a pasted runbook block must not clobber a trap the shell already set;
-# explicit rm below covers success, and an abort leaks only one unpredictable mktemp name
-GUARD=$(mktemp)
+# the trap lives in the ( ) subshell, so it cleans up on abort too and never replaces a trap
+# the pasting shell already set
+GUARD=$(mktemp); trap 'rm -f -- "$GUARD"' EXIT
 awk '/^# --- runtime-tree freshness guard/{f=1} f{print} f&&/^# -----/{exit}' \
   SETUP.md > "$GUARD"
 [ -s "$GUARD" ] && grep -q '^# --- runtime-tree freshness guard' "$GUARD" \
@@ -252,7 +264,7 @@ ssh mini '
   chmod +x "$stage/mxr.new"
   mv -f "$stage/mxr.new" ~/.local/bin/mxr
 ' < "$GUARD"
-rm -f -- "$GUARD"
+)
 ```
 
 **Verify it PASSES on clean main WITHOUT dispatching a job** (extract the guard from the now-live
@@ -286,6 +298,7 @@ its drift like the others.
 migration `0015` applied, so the code it talks to must land FIRST:
 
 ```bash
+(
 launchctl kickstart gui/$(id -u)/ai.myndaix.reconcile
 D=~/.myndaix/deploy/myndaix-runtime
 # real wait, not a comment — see the full Mini deploy above (review 11391)
@@ -295,6 +308,7 @@ for _ in $(seq 60); do [[ "$(cat ~/.myndaix/state/RUNNING_SHA 2>/dev/null)" == "
 S=$(cat ~/.myndaix/state/RUNNING_SHA); [[ "$S" =~ ^[0-9a-f]{40}$ && "$S" == "$M" ]] || { echo "reconcile has not converged to $M (RUNNING_SHA=$S) — check reconcile, do NOT apply" >&2; exit 1; }
 "$D/orchestrator/deploy-sync.sh" --apply "$S" \
   && bash "$D/orchestrator/phone/test.sh" && bash "$D/orchestrator/phone/test.sh" --sshd
+)
 ```
 
 (The health-gated `RUNNING_SHA`, not the default `origin/main`: apply re-fetches, and a remote
