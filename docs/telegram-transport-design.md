@@ -1,5 +1,11 @@
 # Telegram Transport — DESIGN (v0.2)
 
+> **STATUS (2026-09-18): NOT BUILT — superseded.** No Telegram transport exists in the code
+> (nothing in `registry.py` / `contracts.py` / `src/`). The "phone access to the autonomous
+> brain" goal described below was met instead by the phone-tailnet / SSH surface
+> (`docs/phone-tailnet-surface-design.md`, PR #124). Kept as historical design context — do NOT
+> treat as current or planned.
+
 _A new **transport adapter** on the existing ledger spine — NOT a new system. The runtime already
 defines the transport contract (`transport/terminal.py`, the "dumb pipe over the ledger");
 Telegram is a second implementation of exactly that interface, so the spine, admission checks,
